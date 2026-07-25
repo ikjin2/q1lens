@@ -1,0 +1,525 @@
+{
+  "name": "q1lens",
+  "displayName": "Q1Lens",
+  "description": "Inspect Qblox schedules, symbolic pulses, Q1ASM timelines, and lowering provenance inside VS Code.",
+  "version": "0.1.0",
+  "publisher": "q1lens",
+  "author": {
+    "name": "Ik Kyeong Jin",
+    "url": "https://github.com/ikjin2"
+  },
+  "license": "SEE LICENSE IN LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ikjin2/q1lens.git"
+  },
+  "homepage": "https://github.com/ikjin2/q1lens#readme",
+  "bugs": {
+    "url": "https://github.com/ikjin2/q1lens/issues"
+  },
+  "pricing": "Free",
+  "icon": "media/q1lens-icon.png",
+  "engines": {
+    "vscode": "^1.90.0",
+    "node": ">=20"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:qbsTimeline.analyzeAndOpen",
+    "onCommand:qbsTimeline.refresh",
+    "onCommand:qbsTimeline.openNotebookTimelineFromCell",
+    "onCommand:qbsTimeline.markNotebookSetupCell",
+    "onCommand:qbsTimeline.markNotebookScheduleCell",
+    "onCommand:qbsTimeline.openCurrentFolderQ1Timeline",
+    "onCommand:q1timeline.openPreview",
+    "onCommand:q1timeline.refreshPreview",
+    "onCommand:q1timeline.selectProjectFile",
+    "onCommand:q1timeline.selectQ1asmFilesInFolder",
+    "onCommand:q1timeline.revealCurrentLineInTimeline",
+    "onLanguage:q1asm",
+    "workspaceContains:**/qbstimeline.yml",
+    "workspaceContains:**/qbstimeline.yaml",
+    "workspaceContains:**/*.q1asm",
+    "workspaceContains:**/*.ipynb",
+    "workspaceContains:**/q1timeline.yml",
+    "onView:qbsTimeline.sidebar"
+  ],
+  "main": "./out/src/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "qbsTimeline.analyzeAndOpen",
+        "title": "Analyze and Open",
+        "category": "Q1Lens"
+      },
+      {
+        "command": "qbsTimeline.refresh",
+        "title": "Refresh",
+        "category": "Q1Lens"
+      },
+      {
+        "command": "qbsTimeline.openIr",
+        "title": "Open QBS IR",
+        "category": "Q1Lens"
+      },
+      {
+        "command": "qbsTimeline.openRenderedHtml",
+        "title": "Open Rendered HTML",
+        "category": "Q1Lens"
+      },
+      {
+        "command": "qbsTimeline.openQ1asmFolder",
+        "title": "Open Q1ASM Folder",
+        "category": "Q1Lens"
+      },
+      {
+        "command": "qbsTimeline.openQ1Timeline",
+        "title": "Open Q1ASM Timeline",
+        "category": "Q1Lens"
+      },
+      {
+        "command": "qbsTimeline.openCurrentFolderQ1Timeline",
+        "title": "Open Current Folder Q1ASM",
+        "category": "Q1Lens"
+      },
+      {
+        "command": "qbsTimeline.openNotebookTimelineFromCell",
+        "title": "Open Q1Lens from This Cell",
+        "category": "Q1Lens"
+      },
+      {
+        "command": "qbsTimeline.markNotebookSetupCell",
+        "title": "Mark Cell as Q1Lens Setup",
+        "category": "Q1Lens"
+      },
+      {
+        "command": "qbsTimeline.markNotebookScheduleCell",
+        "title": "Mark Cell as Q1Lens Schedule",
+        "category": "Q1Lens"
+      },
+      {
+        "command": "q1timeline.openPreview",
+        "title": "Q1Lens: Open Timeline Preview"
+      },
+      {
+        "command": "q1timeline.refreshPreview",
+        "title": "Q1Lens: Refresh Timeline Preview"
+      },
+      {
+        "command": "q1timeline.selectProjectFile",
+        "title": "Q1Lens: Select Project File"
+      },
+      {
+        "command": "q1timeline.selectQ1asmFilesInFolder",
+        "title": "Q1Lens: Select Q1ASM Files in Folder..."
+      },
+      {
+        "command": "q1timeline.revealCurrentLineInTimeline",
+        "title": "Q1Lens: Reveal Current Line in Timeline"
+      }
+    ],
+    "languages": [
+      {
+        "id": "q1asm",
+        "aliases": [
+          "Q1ASM",
+          "q1asm"
+        ],
+        "extensions": [
+          ".q1asm"
+        ]
+      }
+    ],
+    "grammars": [
+      {
+        "language": "q1asm",
+        "scopeName": "source.q1asm",
+        "path": "./out/src/q1timeline/syntaxes/q1asm.tmLanguage.json"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "qbsTimeline",
+          "title": "Q1Lens",
+          "icon": "media/qbs-timeline.svg"
+        }
+      ]
+    },
+    "views": {
+      "qbsTimeline": [
+        {
+          "id": "qbsTimeline.sidebar",
+          "name": "Q1Lens"
+        }
+      ]
+    },
+    "menus": {
+      "editor/title": [
+        {
+          "command": "q1timeline.openPreview",
+          "when": "resourceExtname == .q1asm",
+          "group": "navigation"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "q1timeline.openPreview",
+          "when": "resourceExtname == .q1asm",
+          "group": "navigation@1"
+        },
+        {
+          "command": "q1timeline.revealCurrentLineInTimeline",
+          "when": "resourceExtname == .q1asm",
+          "group": "navigation@2"
+        },
+        {
+          "command": "q1timeline.selectQ1asmFilesInFolder",
+          "when": "resourceExtname == .q1asm",
+          "group": "navigation@3"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "q1timeline.openPreview",
+          "when": "resourceExtname == .q1asm",
+          "group": "navigation"
+        },
+        {
+          "command": "q1timeline.selectQ1asmFilesInFolder",
+          "when": "resourceExtname == .q1asm",
+          "group": "navigation@1"
+        }
+      ],
+      "notebook/toolbar": [
+        {
+          "command": "qbsTimeline.openNotebookTimelineFromCell",
+          "when": "notebookType == jupyter-notebook",
+          "group": "navigation"
+        }
+      ],
+      "notebook/cell/title": [
+        {
+          "command": "qbsTimeline.openNotebookTimelineFromCell",
+          "when": "notebookType == jupyter-notebook && cellType == code",
+          "group": "inline"
+        }
+      ],
+      "notebook/cell/context": [
+        {
+          "command": "qbsTimeline.openNotebookTimelineFromCell",
+          "when": "notebookType == jupyter-notebook && cellType == code",
+          "group": "navigation@1"
+        },
+        {
+          "command": "qbsTimeline.markNotebookSetupCell",
+          "when": "notebookType == jupyter-notebook && cellType == code",
+          "group": "navigation@2"
+        },
+        {
+          "command": "qbsTimeline.markNotebookScheduleCell",
+          "when": "notebookType == jupyter-notebook && cellType == code",
+          "group": "navigation@3"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Q1Lens",
+      "properties": {
+        "q1lens.pythonPath": {
+          "type": "string",
+          "default": "python",
+          "description": "Python executable used by Q1Lens, including integrated Q1ASM timeline workflows."
+        },
+        "q1lens.pythonArgs": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "description": "Additional Python launcher arguments inserted before Q1Lens module names."
+        },
+        "q1lens.qbs.autoRefresh": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically re-run QBS analysis after project or schedule files change."
+        },
+        "q1lens.qbs.outputDirOverride": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null,
+          "description": "Optional QBS generated artifact output directory."
+        },
+        "q1lens.revealOutputChannel": {
+          "type": "boolean",
+          "default": true,
+          "description": "Reveal the Q1Lens output channel during explicit analyze commands."
+        },
+        "q1lens.q1timelineCommand": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null,
+          "description": "Optional q1timeline CLI command used when no q1timeline VS Code command is available."
+        },
+        "q1lens.q1timeline.projectFile": {
+          "type": "string",
+          "default": "q1timeline.yml",
+          "description": "Q1ASM timeline project file name or relative path to search for in standalone Q1ASM workflows."
+        },
+        "q1lens.q1timeline.pythonPath": {
+          "type": "string",
+          "default": "python",
+          "description": "Optional Python executable override for standalone Q1ASM timeline analysis."
+        },
+        "q1lens.q1timeline.pythonArgs": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "description": "Optional Python launcher arguments for standalone Q1ASM timeline analysis."
+        },
+        "q1lens.q1timeline.updateMode": {
+          "type": "string",
+          "enum": [
+            "onSave",
+            "onType",
+            "manual"
+          ],
+          "default": "onSave",
+          "description": "When standalone Q1ASM timeline previews refresh."
+        },
+        "q1lens.q1timeline.debounceMs": {
+          "type": "number",
+          "default": 400,
+          "minimum": 0,
+          "description": "Debounce delay for on-type Q1ASM timeline refreshes."
+        },
+        "q1lens.q1timeline.view.defaultMode": {
+          "type": "string",
+          "enum": [
+            "normal",
+            "debug"
+          ],
+          "default": "normal",
+          "description": "Initial Q1ASM timeline view mode."
+        },
+        "q1lens.q1timeline.analyzer.timeoutMs": {
+          "type": "number",
+          "default": 30000,
+          "minimum": 1000,
+          "description": "Maximum Q1ASM timeline analyzer subprocess runtime."
+        },
+        "q1lens.q1timeline.analyzer.extraArgs": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "description": "Additional Q1ASM timeline analyzer arguments."
+        },
+        "q1lens.q1timeline.analyzer.env": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Environment variables added to Q1ASM timeline analyzer subprocesses."
+        },
+        "q1lens.q1timeline.render.maxEventsBeforeSimplify": {
+          "type": "number",
+          "default": 10000,
+          "minimum": 1,
+          "description": "Event count threshold for Q1ASM timeline simplification warnings."
+        },
+        "qbloxTimeline.pythonPath": {
+          "type": "string",
+          "default": "python",
+          "description": "Python executable used to run qbstimeline, including integrated q1timeline subcommands."
+        },
+        "qbloxTimeline.pythonArgs": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "description": "Additional Python launcher arguments inserted before module names."
+        },
+        "qbloxTimeline.qbs.autoRefresh": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically re-run QBS analysis after project or schedule files change."
+        },
+        "qbloxTimeline.qbs.outputDirOverride": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null,
+          "description": "Optional QBS generated artifact output directory."
+        },
+        "qbloxTimeline.q1timeline.projectFile": {
+          "type": "string",
+          "default": "q1timeline.yml",
+          "description": "q1timeline project file name or relative path to search for in standalone Q1ASM workflows."
+        },
+        "qbsTimeline.pythonPath": {
+          "type": "string",
+          "default": "python",
+          "description": "Python executable used to run python -m qbstimeline."
+        },
+        "qbsTimeline.autoRefresh": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically re-run analysis after project or schedule files change."
+        },
+        "qbsTimeline.outputDirOverride": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null,
+          "description": "Optional output directory override for generated Q1Lens artifacts."
+        },
+        "qbsTimeline.revealOutputChannel": {
+          "type": "boolean",
+          "default": true,
+          "description": "Reveal the Q1Lens output channel during explicit analyze commands."
+        },
+        "qbsTimeline.pythonArgs": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "description": "Additional arguments inserted before -m qbstimeline, such as -X or -3.12 when supported by the configured Python launcher."
+        },
+        "qbsTimeline.q1timelineCommand": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null,
+          "description": "Optional q1timeline CLI command used when no q1timeline VSCode command is available."
+        },
+        "q1timeline.pythonPath": {
+          "type": "string",
+          "default": "python",
+          "description": "Legacy Python executable setting for standalone q1timeline workflows; the extension invokes qbstimeline q1timeline."
+        },
+        "q1timeline.projectFile": {
+          "type": "string",
+          "default": "q1timeline.yml",
+          "description": "Legacy q1timeline project file name or relative path to search for."
+        },
+        "q1timeline.updateMode": {
+          "type": "string",
+          "enum": [
+            "onSave",
+            "onType",
+            "manual"
+          ],
+          "default": "onSave",
+          "description": "Legacy setting for when standalone q1timeline preview should refresh."
+        },
+        "q1timeline.debounceMs": {
+          "type": "number",
+          "default": 400,
+          "minimum": 0,
+          "description": "Legacy debounce delay for q1timeline on-type refreshes."
+        },
+        "q1timeline.view.defaultMode": {
+          "type": "string",
+          "enum": [
+            "normal",
+            "debug"
+          ],
+          "default": "normal",
+          "description": "Legacy initial q1timeline view mode."
+        },
+        "q1timeline.analyzer.timeoutMs": {
+          "type": "number",
+          "default": 30000,
+          "minimum": 1000,
+          "description": "Legacy maximum q1timeline analyzer subprocess runtime."
+        },
+        "q1timeline.analyzer.extraArgs": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "description": "Legacy additional q1timeline analyzer arguments."
+        },
+        "q1timeline.analyzer.env": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Legacy environment variables added to q1timeline analyzer subprocesses."
+        },
+        "q1timeline.render.maxEventsBeforeSimplify": {
+          "type": "number",
+          "default": 10000,
+          "minimum": 1,
+          "description": "Legacy event count threshold for q1timeline simplification warnings."
+        }
+      }
+    },
+    "taskDefinitions": [
+      {
+        "type": "qbs-timeline",
+        "required": [
+          "command",
+          "project"
+        ],
+        "properties": {
+          "command": {
+            "type": "string",
+            "description": "Q1Lens task command: analyze, render, or analyzeAndRender."
+          },
+          "project": {
+            "type": "string",
+            "description": "Workspace-relative qbstimeline.yml path."
+          },
+          "outputDir": {
+            "type": "string",
+            "description": "Generated artifact output directory for this task. Defaults to .qbs_timeline unless the extension output override is set."
+          }
+        }
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./ && node ./scripts/copy-extension-assets.js",
+    "watch": "tsc -watch -p ./",
+    "test": "npm run compile && mocha \"out/test/**/*.test.js\" --ignore \"out/test/suite/**/*.test.js\"",
+    "test:extension": "npm run compile && node ./out/test/runTest.js",
+    "package": "vsce package",
+    "verify:installed": "node ./scripts/verify-installed-assets.js",
+    "reinstall:local": "npm run package && code --install-extension q1lens-0.1.0.vsix --force && npm run verify:installed"
+  },
+  "dependencies": {
+    "yaml": "^2.5.0"
+  },
+  "overrides": {
+    "serialize-javascript": "^7.0.5"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.7",
+    "@types/node": "^20.14.10",
+    "@types/vscode": "^1.90.0",
+    "@vscode/test-electron": "^2.4.1",
+    "@vscode/vsce": "^3.9.2",
+    "mocha": "^11.7.6",
+    "typescript": "^5.5.4"
+  }
+}

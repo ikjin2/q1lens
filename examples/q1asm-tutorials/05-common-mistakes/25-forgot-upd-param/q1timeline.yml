@@ -1,0 +1,20 @@
+sequencers:
+  - id: drive
+    name: Forgot upd_param
+    file: drive.q1asm
+    module: QCM0
+
+alignment:
+  mode: first_wait_sync
+
+view:
+  default_mode: debug
+  show_q1_issue: true
+  show_queue: true
+  show_slack: true
+  show_loop_preview: false
+
+analysis:
+  loop_policy: compact_first_iteration
+  branch_policy: assume_fallthrough
+  underflow_policy: confidence_levels

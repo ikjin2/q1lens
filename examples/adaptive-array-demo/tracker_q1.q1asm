@@ -1,0 +1,47 @@
+.DEF TRIG_IDX {TRIGGER_INDEX}
+.DEF TRIG_WAIT {TRIGGER_TIMEOUT}
+.DEF IQ_Q0 {CH_IQ_Q0}
+.DEF IQ_Q1 {CH_IQ_Q1}
+.DEF IQ_Q2 {CH_IQ_Q2}
+.DEF IQ_Q3 {CH_IQ_Q3}
+.DEF TRACK_Q0 {CH_TRACK_Q0}
+.DEF TRACK_Q1 {CH_TRACK_Q1}
+.DEF TRACK_Q2 {CH_TRACK_Q2}
+.DEF TRACK_Q3 {CH_TRACK_Q3}
+.DEF GRANT_Q0 {CH_GRANT_Q0}
+.DEF GRANT_Q1 {CH_GRANT_Q1}
+.DEF GRANT_Q2 {CH_GRANT_Q2}
+.DEF GRANT_Q3 {CH_GRANT_Q3}
+.DEF TELEMETRY {CH_TELEMETRY}
+.DEF FAULT {CH_FAULT}
+wait_trigger $TRIG_IDX,$TRIG_WAIT
+wait 1540
+fb_pop_data $IQ_Q1,R0
+wait 8
+fb_pop_data $IQ_Q1,R1
+nop
+nop
+sub R0,R1,R2
+nop
+jge R2,1,@high
+jlt R2,4294967295,@low
+move 0,R3
+wait 48
+fb_com_data $TRACK_Q1,R3,4
+wait 24
+fb_com_data $TRACK_Q1,R2,4
+stop
+high:
+move 1,R3
+wait 48
+fb_com_data $TRACK_Q1,R3,4
+wait 24
+fb_com_data $TRACK_Q1,R2,4
+stop
+low:
+move -1,R3
+wait 48
+fb_com_data $TRACK_Q1,R3,4
+wait 24
+fb_com_data $TRACK_Q1,R2,4
+stop

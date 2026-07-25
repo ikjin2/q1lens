@@ -1,0 +1,8 @@
+wait_sync 4
+move 7,R0
+nop
+nop
+nop
+wait 80
+fb_com_data 16,R0,4
+stop

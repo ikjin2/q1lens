@@ -1,0 +1,11 @@
+wait_sync 16
+fb_pop_data 0,R0
+nop
+cmp R0,0
+jge R0,1,@skip_play
+add R0,1,R1
+nop
+xor R1,3,R2
+play 0,1,4
+skip_play:
+stop

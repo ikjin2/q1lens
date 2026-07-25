@@ -1,0 +1,222 @@
+    .DEF SHOT_PERIOD        {SHOT_PERIOD}
+    .DEF START_ALIGN        {START_ALIGN}
+    .DEF TRIGGER_WAIT       {TRIGGER_WAIT}
+    .DEF TRIG_HIGH          {TRIG_HIGH}
+    .DEF TRIG_LOW           {TRIG_LOW}
+    .DEF TRIG_MRK_MASK      {TRIG_MRK_MASK}
+    .DEF WAIT_CHUNK         {WAIT_CHUNK}
+    .DEF BLUE_PEAK_DELAY    {BLUE_PEAK_DELAY}
+    .DEF PEAK_DUR           {PEAK_DUR}
+    .DEF PEAK_UPDATE_SHOTS  {PEAK_UPDATE_SHOTS}
+    .DEF PEAK_STEP_MASK     {PEAK_STEP_MASK}
+    .DEF PEAK_OFFSET_SPAN   {PEAK_OFFSET_SPAN}
+    .DEF PEAK_OFFSET_MAX    {PEAK_OFFSET_MAX}
+    .DEF PRNG_SEED          {PRNG_SEED}
+    .DEF PEAK_GAIN_INIT     {PEAK_GAIN_INIT}
+    .DEF PEAK_GAIN_MIN      {PEAK_GAIN_MIN}
+    .DEF PEAK_GAIN_MAX      {PEAK_GAIN_MAX}
+    .DEF PEAK_GAIN_STEP_MASK {PEAK_GAIN_STEP_MASK}
+    .DEF PEAK_GAIN_PRNG_SEED {PEAK_GAIN_PRNG_SEED}
+    .DEF PEAK_W             0
+    .DEF ZERO               R0
+    .DEF SIGN_BIT           0x80000000
+
+    .DEF PEAK_OFFSET        R1
+    .DEF PEAK_WAIT          R2
+    .DEF POST_WAIT          R3
+    .DEF SHOT_COUNT         R4
+    .DEF SEED               R5
+    .DEF SCR                R6
+    .DEF STEP               R7
+    .DEF DIR                R8
+    .DEF TMP                R9
+    .DEF GAIN_SEED          R10
+    .DEF PEAK_GAIN          R11
+
+    wait_sync 4
+
+    move 0, $ZERO
+    move 0, $PEAK_OFFSET
+    move 0, $SHOT_COUNT
+    move $PRNG_SEED, $SEED
+    move $PEAK_GAIN_PRNG_SEED, $GAIN_SEED
+    move $PEAK_GAIN_INIT, $PEAK_GAIN
+    wait $START_ALIGN
+
+shot_loop:
+    wait_trigger 1, $TRIGGER_WAIT
+
+    set_mrk $TRIG_MRK_MASK
+    upd_param $TRIG_HIGH
+    set_mrk 0
+    upd_param $TRIG_LOW
+
+    move $BLUE_PEAK_DELAY, $PEAK_WAIT
+    nop
+    add $PEAK_WAIT, $PEAK_OFFSET, $PEAK_WAIT
+    nop
+
+    move $SHOT_PERIOD, $POST_WAIT
+    nop
+    sub $POST_WAIT, $TRIGGER_WAIT, $POST_WAIT
+    nop
+    sub $POST_WAIT, $TRIG_HIGH, $POST_WAIT
+    nop
+    sub $POST_WAIT, $TRIG_LOW, $POST_WAIT
+    nop
+    sub $POST_WAIT, $PEAK_WAIT, $POST_WAIT
+    nop
+    sub $POST_WAIT, $PEAK_DUR, $POST_WAIT
+    nop
+
+    wait $PEAK_WAIT
+    set_awg_gain $PEAK_GAIN, $ZERO
+    play $PEAK_W, $PEAK_W, $PEAK_DUR
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $POST_WAIT
+
+    add $SHOT_COUNT, 1, $SHOT_COUNT
+    nop
+    jge $SHOT_COUNT, $PEAK_UPDATE_SHOTS, @update_peak
+    nop
+    jmp @shot_loop
+    nop
+
+update_peak:
+    move 0, $SHOT_COUNT
+    asl $SEED, 13, $SCR
+    nop
+    xor $SEED, $SCR, $SEED
+    nop
+    asr $SEED, 17, $SCR
+    nop
+    and $SCR, 0x7FFF, $SCR
+    nop
+    xor $SEED, $SCR, $SEED
+    nop
+    asl $SEED, 5, $SCR
+    nop
+    xor $SEED, $SCR, $SEED
+    nop
+    and $SEED, $PEAK_STEP_MASK, $STEP
+    nop
+    asr $SEED, 5, $DIR
+    nop
+    and $DIR, 1, $DIR
+    nop
+    jlt $DIR, 1, @peak_forward
+    nop
+    sub $PEAK_OFFSET, $STEP, $TMP
+    nop
+    jge $TMP, $SIGN_BIT, @peak_floor
+    nop
+    move $TMP, $PEAK_OFFSET
+    jmp @update_gain
+    nop
+peak_floor:
+    sub $STEP, $PEAK_OFFSET, $PEAK_OFFSET
+    jmp @update_gain
+    nop
+peak_forward:
+    add $PEAK_OFFSET, $STEP, $PEAK_OFFSET
+    nop
+    jlt $PEAK_OFFSET, $PEAK_OFFSET_SPAN, @update_gain
+    nop
+    sub $PEAK_OFFSET, $PEAK_OFFSET_SPAN, $TMP
+    nop
+    sub $PEAK_OFFSET_MAX, $TMP, $PEAK_OFFSET
+    jmp @update_gain
+    nop
+
+update_gain:
+    asl $GAIN_SEED, 13, $SCR
+    nop
+    xor $GAIN_SEED, $SCR, $GAIN_SEED
+    nop
+    asr $GAIN_SEED, 17, $SCR
+    nop
+    and $SCR, 0x7FFF, $SCR
+    nop
+    xor $GAIN_SEED, $SCR, $GAIN_SEED
+    nop
+    asl $GAIN_SEED, 5, $SCR
+    nop
+    xor $GAIN_SEED, $SCR, $GAIN_SEED
+    nop
+    and $GAIN_SEED, $PEAK_GAIN_STEP_MASK, $STEP
+    nop
+    asr $GAIN_SEED, 5, $DIR
+    nop
+    and $DIR, 1, $DIR
+    nop
+    jlt $DIR, 1, @gain_up
+    nop
+    sub $PEAK_GAIN, $STEP, $TMP
+    nop
+    jlt $TMP, $PEAK_GAIN_MIN, @gain_to_min
+    nop
+    move $TMP, $PEAK_GAIN
+    jmp @shot_loop
+    nop
+gain_to_min:
+    move $PEAK_GAIN_MIN, $PEAK_GAIN
+    jmp @shot_loop
+    nop
+gain_up:
+    add $PEAK_GAIN, $STEP, $TMP
+    nop
+    jlt $TMP, $PEAK_GAIN_MAX, @gain_set
+    nop
+    move $PEAK_GAIN_MAX, $PEAK_GAIN
+    jmp @shot_loop
+    nop
+gain_set:
+    move $TMP, $PEAK_GAIN
+    jmp @shot_loop

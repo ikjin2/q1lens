@@ -1,0 +1,86 @@
+.DEF TRIG_IDX {TRIGGER_INDEX}
+.DEF TRIG_WAIT {TRIGGER_TIMEOUT}
+.DEF IQ_Q0 {CH_IQ_Q0}
+.DEF IQ_Q1 {CH_IQ_Q1}
+.DEF IQ_Q2 {CH_IQ_Q2}
+.DEF IQ_Q3 {CH_IQ_Q3}
+.DEF TRACK_Q0 {CH_TRACK_Q0}
+.DEF TRACK_Q1 {CH_TRACK_Q1}
+.DEF TRACK_Q2 {CH_TRACK_Q2}
+.DEF TRACK_Q3 {CH_TRACK_Q3}
+.DEF GRANT_Q0 {CH_GRANT_Q0}
+.DEF GRANT_Q1 {CH_GRANT_Q1}
+.DEF GRANT_Q2 {CH_GRANT_Q2}
+.DEF GRANT_Q3 {CH_GRANT_Q3}
+.DEF TELEMETRY {CH_TELEMETRY}
+.DEF FAULT {CH_FAULT}
+wait_trigger $TRIG_IDX,$TRIG_WAIT
+wait 80
+fb_com_data $FAULT,99,4
+wait 500
+fb_com_data $TELEMETRY,10,4
+wait 8
+fb_com_data $TELEMETRY,11,4
+wait 8
+fb_com_data $TELEMETRY,12,4
+wait 8
+fb_com_data $TELEMETRY,13,4
+wait 8
+fb_com_data $TELEMETRY,14,4
+wait 8
+fb_com_data $TELEMETRY,15,4
+wait 8
+fb_com_data $TELEMETRY,16,4
+wait 8
+fb_com_data $TELEMETRY,17,4
+wait 2400
+fb_pop_data $TRACK_Q0,R0
+fb_pop_data $TRACK_Q0,R1
+fb_pop_data $TRACK_Q1,R2
+fb_pop_data $TRACK_Q1,R3
+fb_pop_data $TRACK_Q2,R4
+fb_pop_data $TRACK_Q2,R5
+fb_pop_data $TRACK_Q3,R6
+fb_pop_data $TRACK_Q3,R7
+nop
+nop
+jge R0,1,@grant_q0
+set_mrk 0
+upd_param 4
+fb_com_data $GRANT_Q0,0,4
+jmp @q1
+grant_q0:
+set_mrk 1
+upd_param 4
+fb_com_data $GRANT_Q0,1,4
+q1:
+jge R2,1,@grant_q1
+set_mrk 0
+upd_param 4
+fb_com_data $GRANT_Q1,0,4
+jmp @q2
+grant_q1:
+set_mrk 1
+upd_param 4
+fb_com_data $GRANT_Q1,1,4
+q2:
+jge R4,1,@grant_q2
+set_mrk 0
+upd_param 4
+fb_com_data $GRANT_Q2,0,4
+jmp @q3
+grant_q2:
+set_mrk 1
+upd_param 4
+fb_com_data $GRANT_Q2,1,4
+q3:
+jge R6,1,@grant_q3
+set_mrk 0
+upd_param 4
+fb_com_data $GRANT_Q3,0,4
+stop
+grant_q3:
+set_mrk 1
+upd_param 4
+fb_com_data $GRANT_Q3,1,4
+stop

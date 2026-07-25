@@ -1,0 +1,15 @@
+wait_sync 4
+wait 64
+
+set_awg_gain 12000,-12000
+set_freq 50000000
+set_ph 250000000
+upd_param 4
+play 0,1,40
+
+set_awg_gain 8000,8000
+set_freq 65000000
+set_ph 125000000
+upd_param 4
+play 2,3,40
+stop

@@ -1,0 +1,20 @@
+sequencers:
+  - id: seq0
+    name: Too-tight loop
+    file: seq0.q1asm
+    module: QCM0
+
+alignment:
+  mode: none
+
+view:
+  default_mode: debug
+  show_q1_issue: true
+  show_queue: true
+  show_slack: true
+  show_loop_preview: true
+
+analysis:
+  loop_policy: compact_first_iteration
+  branch_policy: assume_fallthrough
+  underflow_policy: confidence_levels

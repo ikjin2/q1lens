@@ -1,0 +1,38 @@
+.DEF POS R0
+.DEF STEP R1
+
+move START_POS,$POS
+nop
+move SEED,$STEP
+nop
+mulu16 $STEP,SEED_MUL,$STEP
+nop
+add $STEP,SEED_INC,$STEP
+nop
+fb_pop_data FEEDBACK_ADDR,$STEP
+nop
+and $STEP,1,$STEP
+nop
+jge $STEP,1,@step_up
+move -1,$STEP
+jmp @apply_step
+step_up:
+move 1,$STEP
+apply_step:
+nop
+add $POS,$STEP,$POS
+nop
+jge $POS,MAX_POS,@hit_high
+jlt $POS,MIN_POS,@hit_low
+wait STEP_WAIT
+stop
+
+hit_high:
+move MAX_CLAMP,$POS
+wait STEP_WAIT
+stop
+
+hit_low:
+move MIN_POS,$POS
+wait STEP_WAIT
+stop

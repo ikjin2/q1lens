@@ -1,0 +1,125 @@
+    .DEF SHOT_PERIOD        {SHOT_PERIOD}
+    .DEF START_ALIGN        {START_ALIGN}
+    .DEF TRIGGER_WAIT       {TRIGGER_WAIT}
+    .DEF TRACKER_INIT_CENTER {TRACKER_INIT_CENTER}
+    .DEF TRACKER_MIN_CENTER {TRACKER_MIN_CENTER}
+    .DEF TRACKER_INIT_GAIN  {TRACKER_INIT_GAIN}
+    .DEF RF_GAIN_NUMERATOR  {RF_GAIN_NUMERATOR}
+    .DEF RF_GAIN_SHIFT      {RF_GAIN_SHIFT}
+    .DEF FREQ_CHANNEL       {FREQ_CHANNEL}
+    .DEF RF_GAIN_CHANNEL    {RF_GAIN_CHANNEL}
+    .DEF SINE_START_WAIT    {SINE_START_WAIT}
+    .DEF FREQ_BASE          {FREQ_BASE}
+    .DEF FREQ_CURSOR_SHIFT  {FREQ_CURSOR_SHIFT}
+    .DEF UPDATE_DUR         {UPDATE_DUR}
+    .DEF SINE_DUR           {SINE_DUR}
+    .DEF ORANGE_POST_WAIT   {ORANGE_POST_WAIT}
+    .DEF WAIT_CHUNK         {WAIT_CHUNK}
+    .DEF SINE_W             1
+    .DEF ZERO               R0
+
+    .DEF CURSOR_CENTER      R1
+    .DEF FREQ_WORD          R2
+    .DEF FREQ_OFFSET        R3
+    .DEF POST_WAIT          R4
+    .DEF SINE_GAIN          R5
+    .DEF SINE_OUTPUT_GAIN   R6
+
+    wait_sync 4
+
+    move 0, $ZERO
+    move $TRACKER_INIT_CENTER, $CURSOR_CENTER
+    move $TRACKER_INIT_GAIN, $SINE_GAIN
+    nop
+    mulu16 $SINE_GAIN, $RF_GAIN_NUMERATOR, $SINE_OUTPUT_GAIN
+    nop
+    asr $SINE_OUTPUT_GAIN, $RF_GAIN_SHIFT, $SINE_OUTPUT_GAIN
+    nop
+    sub $CURSOR_CENTER, $TRACKER_MIN_CENTER, $FREQ_OFFSET
+    nop
+    asl $FREQ_OFFSET, $FREQ_CURSOR_SHIFT, $FREQ_OFFSET
+    nop
+    add $FREQ_OFFSET, $FREQ_BASE, $FREQ_WORD
+    nop
+    set_awg_gain $SINE_OUTPUT_GAIN, $ZERO
+    set_freq $FREQ_WORD
+    wait $START_ALIGN
+    upd_param $UPDATE_DUR
+
+shot_loop:
+    wait_trigger 1, $TRIGGER_WAIT
+
+    wait $SINE_START_WAIT
+    reset_ph
+    upd_param $UPDATE_DUR
+    play $SINE_W, $SINE_W, $SINE_DUR
+
+    fb_pop_data $FREQ_CHANNEL, $CURSOR_CENTER
+    fb_pop_data $RF_GAIN_CHANNEL, $SINE_GAIN
+    nop
+    mulu16 $SINE_GAIN, $RF_GAIN_NUMERATOR, $SINE_OUTPUT_GAIN
+    nop
+    asr $SINE_OUTPUT_GAIN, $RF_GAIN_SHIFT, $SINE_OUTPUT_GAIN
+    nop
+    sub $CURSOR_CENTER, $TRACKER_MIN_CENTER, $FREQ_OFFSET
+    nop
+    asl $FREQ_OFFSET, $FREQ_CURSOR_SHIFT, $FREQ_OFFSET
+    nop
+    add $FREQ_OFFSET, $FREQ_BASE, $FREQ_WORD
+    nop
+    nop
+    set_awg_gain $SINE_OUTPUT_GAIN, $ZERO
+    set_freq $FREQ_WORD
+    upd_param $UPDATE_DUR
+    move $ORANGE_POST_WAIT, $POST_WAIT
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $POST_WAIT
+    jmp @shot_loop
+    nop

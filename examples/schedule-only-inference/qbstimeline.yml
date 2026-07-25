@@ -1,0 +1,14 @@
+schedule:
+  file: schedule.py
+  entrypoint: build_schedule
+  compiler: build_compiler
+
+outputs:
+  dir: .qbs_timeline
+
+low_level:
+  q1timeline: true
+
+artifacts:
+  circuit_diagram: false
+  analog_pulse_diagram: false

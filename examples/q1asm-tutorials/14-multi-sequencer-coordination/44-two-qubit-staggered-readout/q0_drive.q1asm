@@ -1,0 +1,5 @@
+wait_sync 4
+wait 80
+play 0,1,96
+wait 264
+stop

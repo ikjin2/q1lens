@@ -1,0 +1,53 @@
+sequencers:
+  - id: qcm_sum_ch1
+    name: QCM0 Ch0 sum + Ch1 peak
+    file: qcm_sum_ch1.q1asm
+    module: QCM0
+  - id: qcm_ch2_ch3
+    name: QCM0 Ch2 + Ch3 peaks
+    file: qcm_ch2_ch3.q1asm
+    module: QCM0
+  - id: qrm0_ch1_probe
+    name: QRM0 Ch1 cursor
+    file: qrm0_ch1_probe.q1asm
+    module: QRM0
+  - id: qrm0_ch1_tracker
+    name: QRM0 Ch1 tracker
+    file: qrm0_ch1_tracker.q1asm
+    module: QRM0
+  - id: qrm0_ch2_probe
+    name: QRM0 Ch2 cursor
+    file: qrm0_ch2_probe.q1asm
+    module: QRM0
+  - id: qrm0_ch2_tracker
+    name: QRM0 Ch2 tracker
+    file: qrm0_ch2_tracker.q1asm
+    module: QRM0
+  - id: qrm1_ch3_probe
+    name: QRM1 Ch3 cursor
+    file: qrm1_ch3_probe.q1asm
+    module: QRM1
+  - id: qrm1_ch3_tracker
+    name: QRM1 Ch3 tracker
+    file: qrm1_ch3_tracker.q1asm
+    module: QRM1
+
+params:
+  file: params.json
+
+alignment:
+  mode: first_anchor
+  anchor_kinds:
+    - wait_trigger
+
+view:
+  default_mode: normal
+  show_q1_issue: false
+  show_queue: false
+  show_slack: false
+  show_loop_preview: true
+
+analysis:
+  loop_policy: compact_first_iteration
+  branch_policy: assume_fallthrough
+  underflow_policy: confidence_levels

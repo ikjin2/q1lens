@@ -1,0 +1,718 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Adaptive Array Demo Overview</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #0f172a;
+      --panel: #111827;
+      --panel-2: #172033;
+      --text: #e5e7eb;
+      --muted: #a7b0c0;
+      --line: #334155;
+      --accent: #38bdf8;
+      --accent-2: #f59e0b;
+      --ok: #22c55e;
+      --warn: #f97316;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Segoe UI", Arial, sans-serif;
+      line-height: 1.55;
+    }
+
+    a {
+      color: var(--accent);
+    }
+
+    header {
+      border-bottom: 1px solid var(--line);
+      background: #0b1220;
+    }
+
+    .wrap {
+      width: min(1180px, calc(100% - 40px));
+      margin: 0 auto;
+    }
+
+    .hero {
+      padding: 48px 0 34px;
+    }
+
+    .eyebrow {
+      margin: 0 0 10px;
+      color: var(--accent);
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 0;
+      max-width: 840px;
+      font-size: clamp(34px, 6vw, 64px);
+      line-height: 1;
+      letter-spacing: 0;
+    }
+
+    .subtitle {
+      max-width: 820px;
+      margin: 18px 0 0;
+      color: var(--muted);
+      font-size: 18px;
+    }
+
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin: 30px 0 0;
+    }
+
+    .stat {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      padding: 16px;
+    }
+
+    .stat strong {
+      display: block;
+      color: white;
+      font-size: 28px;
+      line-height: 1.1;
+    }
+
+    .stat span {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    main {
+      padding: 34px 0 60px;
+    }
+
+    section {
+      margin: 0 0 34px;
+    }
+
+    h2 {
+      margin: 0 0 14px;
+      font-size: 25px;
+    }
+
+    h3 {
+      margin: 0 0 8px;
+      font-size: 18px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      padding: 18px;
+    }
+
+    .panel p {
+      margin: 0;
+      color: var(--muted);
+    }
+
+    .section-lede {
+      max-width: 880px;
+      margin: 0 0 14px;
+      color: var(--muted);
+    }
+
+    .io-map {
+      display: grid;
+      gap: 16px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #0b1220;
+      padding: 16px;
+    }
+
+    .io-main {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 12px;
+      align-items: stretch;
+    }
+
+    .diagram-node {
+      position: relative;
+      border: 1px solid var(--line);
+      border-top-width: 4px;
+      border-radius: 8px;
+      background: var(--panel);
+      padding: 14px;
+      min-width: 0;
+    }
+
+    .io-main .diagram-node:not(:last-child)::after {
+      content: "";
+      position: absolute;
+      z-index: 2;
+      right: -14px;
+      top: 50%;
+      width: 14px;
+      border-top: 2px solid var(--accent);
+    }
+
+    .io-main .diagram-node:not(:last-child)::before {
+      content: "";
+      position: absolute;
+      z-index: 3;
+      right: -18px;
+      top: calc(50% - 5px);
+      border-left: 8px solid var(--accent);
+      border-top: 5px solid transparent;
+      border-bottom: 5px solid transparent;
+    }
+
+    .diagram-node.source {
+      border-top-color: #38bdf8;
+    }
+
+    .diagram-node.readout {
+      border-top-color: #22c55e;
+    }
+
+    .diagram-node.tracker {
+      border-top-color: #a78bfa;
+    }
+
+    .diagram-node.arbiter {
+      border-top-color: #f59e0b;
+    }
+
+    .diagram-node.drive {
+      border-top-color: #fb7185;
+    }
+
+    .diagram-node.telemetry {
+      border-top-color: #14b8a6;
+    }
+
+    .diagram-node.fault {
+      border-top-color: #f97316;
+    }
+
+    .node-role {
+      margin: 0 0 6px;
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+
+    .diagram-node h3 {
+      margin-bottom: 10px;
+    }
+
+    .io-list {
+      display: grid;
+      gap: 9px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .io-list strong {
+      display: block;
+      color: white;
+      font-size: 12px;
+      text-transform: uppercase;
+    }
+
+    .diagram-node code,
+    .flow-tag code {
+      word-break: break-word;
+    }
+
+    .flow-tags {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .flow-tag {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #111827;
+      padding: 10px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .flow-tag strong {
+      display: block;
+      margin-bottom: 3px;
+      color: white;
+    }
+
+    .io-side {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 10px;
+      align-items: stretch;
+    }
+
+    .flow div {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel-2);
+      padding: 13px;
+      min-height: 112px;
+    }
+
+    .flow strong {
+      display: block;
+      margin-bottom: 6px;
+    }
+
+    .flow span {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+
+    th,
+    td {
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: #0b1220;
+      color: white;
+      font-size: 13px;
+      text-transform: uppercase;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    code {
+      color: #bfdbfe;
+      font-family: Consolas, "Liberation Mono", monospace;
+      font-size: 0.95em;
+    }
+
+    .note {
+      border-left: 4px solid var(--accent-2);
+      background: #1f2937;
+      padding: 14px 16px;
+      color: var(--muted);
+    }
+
+    .commands {
+      display: grid;
+      gap: 10px;
+    }
+
+    pre {
+      margin: 0;
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #020617;
+      color: #dbeafe;
+      padding: 14px;
+    }
+
+    @media (max-width: 900px) {
+      .stats,
+      .grid,
+      .io-main,
+      .flow-tags,
+      .io-side,
+      .flow {
+        grid-template-columns: 1fr;
+      }
+
+      .io-main .diagram-node:not(:last-child)::before,
+      .io-main .diagram-node:not(:last-child)::after {
+        display: none;
+      }
+
+      .wrap {
+        width: min(100% - 24px, 1180px);
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap hero">
+      <p class="eyebrow">Q1Lens advanced Q1ASM demo</p>
+      <h1>Adaptive Array Demo</h1>
+      <p class="subtitle">
+        A deliberately dense q1timeline simulation that demonstrates adaptive
+        multi-lane feedback behavior. It is not a hardware recipe and it does
+        not claim a real LINQ throughput number.
+      </p>
+      <p class="subtitle">
+        The analyzed shape contains 17 sequencers, 874 timeline events, and
+        27 feedback flows.
+      </p>
+      <div class="stats" aria-label="Demo size">
+        <div class="stat"><strong>17</strong><span>sequencers</span></div>
+        <div class="stat"><strong>874</strong><span>timeline events</span></div>
+        <div class="stat"><strong>27</strong><span>feedback flows</span></div>
+        <div class="stat"><strong>18</strong><span>intentional warnings</span></div>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section>
+      <h2>What This Demo Shows</h2>
+      <div class="grid">
+        <article class="panel">
+          <h3>Adaptive feedback topology</h3>
+          <p>
+            Four readout lanes publish IQ feedback, four tracker lanes consume
+            those payloads, and an arbiter turns tracker decisions into drive
+            grants for the next control window.
+          </p>
+        </article>
+        <article class="panel">
+          <h3>Timeline pressure</h3>
+          <p>
+            Dense telemetry feedback intentionally leaves Channel 60
+            over-produced, so the feedback balance panel has meaningful pressure
+            to inspect instead of a perfectly clean toy example.
+          </p>
+        </article>
+        <article class="panel">
+          <h3>Failure visibility</h3>
+          <p>
+            Channel 61 is popped too early on purpose, creating a
+            <code>feedback_latency_violation</code> diagnostic that is easy to
+            locate in the preview.
+          </p>
+        </article>
+      </div>
+    </section>
+
+    <section>
+      <h2>Sequencer Input/Output Map</h2>
+      <p class="section-lede">
+        Read the primary path from left to right. Each sequencer family lists
+        the inputs it waits for or pops, then the outputs it contributes to the
+        timeline or to LINQ feedback channels.
+      </p>
+      <div class="io-map" aria-label="Sequencer input and output map">
+        <div class="io-main">
+          <article class="diagram-node source">
+            <p class="node-role">Shared source</p>
+            <h3>Trigger and params</h3>
+            <ul class="io-list">
+              <li>
+                <strong>Inputs</strong>
+                <code>params.json</code> supplies trigger and channel aliases.
+              </li>
+              <li>
+                <strong>Outputs</strong>
+                <code>TRIG_IDX</code>, <code>TRIG_WAIT</code>, and named
+                <code>CH_*</code> bindings used by every lane.
+              </li>
+            </ul>
+          </article>
+
+          <article class="diagram-node readout">
+            <p class="node-role">4 sequencers</p>
+            <h3>Readout lanes</h3>
+            <ul class="io-list">
+              <li>
+                <strong>Inputs</strong>
+                Trigger timing, acquire windows, and per-lane marker state.
+              </li>
+              <li>
+                <strong>Outputs</strong>
+                Readout IQ feedback on <code>CH_IQ_Q0-CH_IQ_Q3</code>.
+              </li>
+            </ul>
+          </article>
+
+          <article class="diagram-node tracker">
+            <p class="node-role">4 sequencers</p>
+            <h3>Tracker lanes</h3>
+            <ul class="io-list">
+              <li>
+                <strong>Inputs</strong>
+                Two IQ payloads per lane from the readout channels.
+              </li>
+              <li>
+                <strong>Outputs</strong>
+                Tracker decisions and slope estimates on
+                <code>CH_TRACK_Q0-CH_TRACK_Q3</code>.
+              </li>
+            </ul>
+          </article>
+
+          <article class="diagram-node arbiter">
+            <p class="node-role">1 sequencer</p>
+            <h3>Arbiter</h3>
+            <ul class="io-list">
+              <li>
+                <strong>Inputs</strong>
+                Tracker decisions from all four lanes.
+              </li>
+              <li>
+                <strong>Outputs</strong>
+                Arbiter grants on <code>CH_GRANT_Q0-CH_GRANT_Q3</code>, plus
+                telemetry and fault traffic.
+              </li>
+            </ul>
+          </article>
+
+          <article class="diagram-node drive">
+            <p class="node-role">4 sequencers</p>
+            <h3>Drive lanes</h3>
+            <ul class="io-list">
+              <li>
+                <strong>Inputs</strong>
+                Grant payloads from the arbiter.
+              </li>
+              <li>
+                <strong>Outputs</strong>
+                Reset pulses, marker updates, gain/phase/frequency state, and
+                visible branch regions.
+              </li>
+            </ul>
+          </article>
+        </div>
+
+        <div class="flow-tags" aria-label="Major LINQ paths">
+          <div class="flow-tag">
+            <strong>Readout IQ feedback</strong>
+            <code>readout_q*</code> -> <code>tracker_q*</code>
+          </div>
+          <div class="flow-tag">
+            <strong>Tracker decisions</strong>
+            <code>tracker_q*</code> -> <code>arbiter</code>
+          </div>
+          <div class="flow-tag">
+            <strong>Arbiter grants</strong>
+            <code>arbiter</code> -> <code>drive_q*</code>
+          </div>
+          <div class="flow-tag">
+            <strong>Audit overlays</strong>
+            Scope lanes add play/acquire activity without changing feedback.
+          </div>
+        </div>
+
+        <div class="io-side">
+          <article class="diagram-node telemetry">
+            <p class="node-role">Pressure path</p>
+            <h3>Telemetry pressure</h3>
+            <ul class="io-list">
+              <li>
+                <strong>Input</strong>
+                Arbiter load burst.
+              </li>
+              <li>
+                <strong>Output</strong>
+                <code>CH_TELEMETRY</code> maps to Channel 60, where two
+                payloads intentionally remain unconsumed.
+              </li>
+            </ul>
+          </article>
+
+          <article class="diagram-node fault">
+            <p class="node-role">Diagnostic path</p>
+            <h3>Fault probe</h3>
+            <ul class="io-list">
+              <li>
+                <strong>Input</strong>
+                Arbiter fault seed.
+              </li>
+              <li>
+                <strong>Output</strong>
+                <code>CH_FAULT</code> maps to Channel 61, where the receive is
+                intentionally too early for the feedback latency check.
+              </li>
+            </ul>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Sequencer Groups</h2>
+      <div class="flow" aria-label="Sequencer group flow">
+        <div>
+          <strong>Drive lanes</strong>
+          <span><code>drive_q0</code> through <code>drive_q3</code> apply gain,
+          frequency, phase, marker, and reset pulses.</span>
+        </div>
+        <div>
+          <strong>Readout lanes</strong>
+          <span><code>readout_q0</code> through <code>readout_q3</code> acquire
+          IQ data and publish two feedback payloads per lane.</span>
+        </div>
+        <div>
+          <strong>Tracker lanes</strong>
+          <span>Trackers drain IQ payloads, compute a simple slope, branch on
+          it, and send two values to the arbiter.</span>
+        </div>
+        <div>
+          <strong>Arbiter</strong>
+          <span>The arbiter drains tracker messages, emits grants, and creates a
+          telemetry burst for load inspection.</span>
+        </div>
+        <div>
+          <strong>Audit and fault lanes</strong>
+          <span>Audit scopes add visual play/acquire activity; the fault probe
+          demonstrates a deliberate latency violation.</span>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>LINQ Channels</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Channel range</th>
+            <th>Role</th>
+            <th>Expected behavior</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>20-23</code></td>
+            <td>Readout IQ feedback</td>
+            <td>Balanced. Each readout acquire contributes two payload slots, and each tracker pops two values.</td>
+          </tr>
+          <tr>
+            <td><code>30-33</code></td>
+            <td>Tracker to arbiter</td>
+            <td>Balanced. Each tracker sends a decision and a slope estimate.</td>
+          </tr>
+          <tr>
+            <td><code>40-43</code></td>
+            <td>Arbiter to drive grants</td>
+            <td>Balanced. Each drive lane waits for one grant payload.</td>
+          </tr>
+          <tr>
+            <td><code>60</code></td>
+            <td>Telemetry pressure</td>
+            <td>Over-produced. Eight payloads are sent and six are consumed, leaving two unconsumed payloads.</td>
+          </tr>
+          <tr>
+            <td><code>61</code></td>
+            <td>Fault probe</td>
+            <td>Balanced in count, but popped too early to trigger the latency diagnostic.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>What To Inspect In Q1Lens</h2>
+      <div class="grid">
+        <article class="panel">
+          <h3>Branch regions</h3>
+          <p>
+            Tracker slope checks and arbiter grant decisions are intentionally
+            unresolved, so Q1Lens marks branch regions instead of pretending a
+            runtime path is known.
+          </p>
+        </article>
+        <article class="panel">
+          <h3>Latched state</h3>
+          <p>
+            Drive and audit lanes stage gain, frequency, phase, marker, and
+            scope changes before <code>upd_param</code> applies them.
+          </p>
+        </article>
+        <article class="panel">
+          <h3>Feedback balance</h3>
+          <p>
+            Compare balanced data channels with Channel 60 to see how leftover
+            payload pressure is represented in the rendered timeline.
+          </p>
+        </article>
+      </div>
+    </section>
+
+    <section>
+      <h2>Run The Demo</h2>
+      <div class="commands">
+        <pre><code>code --extensionDevelopmentPath "$PWD\vscode-extension" "$PWD\examples\adaptive-array-demo\adaptive-array-demo.code-workspace"</code></pre>
+        <pre><code>python -m q1timeline analyze --project q1timeline.yml</code></pre>
+      </div>
+      <p class="note">
+        In VS Code, open <code>q1timeline.yml</code> and run
+        <strong>Q1Lens: Open Timeline Preview</strong>. Start with the feedback
+        balance panel, then jump from the Channel 61 diagnostic to the
+        <code>fault_probe.q1asm</code> source line.
+      </p>
+    </section>
+
+    <section>
+      <h2>Related Files</h2>
+      <table>
+        <tbody>
+          <tr>
+            <td><a href="q1timeline.yml">q1timeline.yml</a></td>
+            <td>Sequencer topology and q1timeline view settings.</td>
+          </tr>
+          <tr>
+            <td><a href="params.json">params.json</a></td>
+            <td>Shared trigger and LINQ channel assignments.</td>
+          </tr>
+          <tr>
+            <td><a href="arbiter.q1asm">arbiter.q1asm</a></td>
+            <td>Central feedback drain, grant generation, and telemetry burst.</td>
+          </tr>
+          <tr>
+            <td><a href="fault_probe.q1asm">fault_probe.q1asm</a></td>
+            <td>Intentional Channel 61 early receive diagnostic.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+  </main>
+</body>
+</html>

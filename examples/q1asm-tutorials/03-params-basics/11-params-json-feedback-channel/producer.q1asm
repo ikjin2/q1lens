@@ -1,0 +1,10 @@
+.DEF CH {FEEDBACK_CHANNEL}
+
+wait_sync 4
+move 12,R0
+nop
+nop
+nop
+wait 80
+fb_com_data $CH,R0,4
+stop

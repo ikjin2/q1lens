@@ -1,0 +1,16 @@
+{
+  "folders": [
+    {
+      "path": "."
+    }
+  ],
+  "settings": {
+    "q1timeline.projectFile": "q1timeline.yml",
+    "q1timeline.updateMode": "onSave",
+    "q1timeline.view.defaultMode": "normal",
+    "q1timeline.analyzer.timeoutMs": 60000,
+    "q1timeline.analyzer.env": {
+      "PYTHONPATH": "../../src"
+    }
+  }
+}

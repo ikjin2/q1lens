@@ -1,0 +1,58 @@
+{
+  "events": [
+    {
+      "id": "seq0:e0",
+      "kind": "q1_issue",
+      "sequencer_id": "seq0",
+      "source": {
+        "file": "q1asm/seq0.q1asm",
+        "line": 4,
+        "raw": "set_awg_gain 32767,0"
+      },
+      "t0": {
+        "kind": "concrete",
+        "value": 12
+      },
+      "t1": {
+        "kind": "concrete",
+        "value": 16
+      }
+    },
+    {
+      "id": "seq0:e1",
+      "kind": "play",
+      "sequencer_id": "seq0",
+      "source": {
+        "file": "q1asm/seq0.q1asm",
+        "line": 5,
+        "raw": "play 0,1,4"
+      },
+      "t0": {
+        "kind": "concrete",
+        "value": 24
+      },
+      "t1": {
+        "kind": "concrete",
+        "value": 28
+      }
+    },
+    {
+      "id": "seq0:e2",
+      "kind": "wait",
+      "sequencer_id": "seq0",
+      "source": {
+        "file": "q1asm/seq0.q1asm",
+        "line": 6,
+        "raw": "wait 36"
+      },
+      "t0": {
+        "kind": "concrete",
+        "value": 28
+      },
+      "t1": {
+        "kind": "concrete",
+        "value": 64
+      }
+    }
+  ]
+}

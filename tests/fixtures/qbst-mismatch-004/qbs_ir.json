@@ -1,0 +1,50 @@
+{
+  "operations": [
+    {
+      "abs_time": 2e-08,
+      "duration": 4e-08,
+      "id": "x180",
+      "label": "X(q0)",
+      "operation_id": "x_q0"
+    }
+  ],
+  "q1asm_by_sequencer": {
+    "seq0": "wait_sync 4\nupd_param 4\nwait 16\nset_awg_gain 32767,0\nplay 0,1,4\nwait 36\nstop\n"
+  },
+  "q1asm_programs": [
+    {
+      "file": "q1asm/seq0.q1asm",
+      "sequencer_id": "seq0"
+    }
+  ],
+  "q1asm_provenance": [
+    {
+      "confidence": "compiler",
+      "instruction_roles": [
+        "set_awg_gain",
+        "play",
+        "wait"
+      ],
+      "operation_id": "x_q0",
+      "q1asm_line_end": 6,
+      "q1asm_line_start": 4,
+      "schedulable_id": "x180",
+      "sequencer_id": "seq0",
+      "source_id": "pulse:x180:pulse:0"
+    }
+  ],
+  "schedule": {
+    "name": "qbst-mismatch-004"
+  },
+  "symbolic_pulses": [
+    {
+      "abs_time": 2e-08,
+      "duration": 4e-08,
+      "id": "pulse:x180:pulse:0",
+      "kind": "pulse",
+      "operation_id": "x_q0",
+      "schedulable_id": "x180"
+    }
+  ],
+  "version": "0.1.0"
+}

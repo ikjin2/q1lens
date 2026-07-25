@@ -1,0 +1,9 @@
+{
+  "FEEDBACK_ADDR": 32,
+  "BASE_LEVEL": 0,
+  "HIGH_THRESH": 7,
+  "LOW_THRESH": 3,
+  "RESET_PULSE": 48,
+  "HOLD_WAIT": 64,
+  "RECOVERY_WAIT": 96
+}

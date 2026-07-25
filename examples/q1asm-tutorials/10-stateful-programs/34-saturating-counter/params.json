@@ -1,0 +1,6 @@
+{
+  "FEEDBACK_ADDR": 36,
+  "STEP": 4,
+  "MAX_COUNT": 8,
+  "TICK_WAIT": 40
+}

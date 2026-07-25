@@ -1,0 +1,8 @@
+wait_sync 4
+wait 24
+set_scope_en 1
+upd_param 4
+acquire 0,0,96
+set_scope_en 0
+upd_param 4
+stop

@@ -1,0 +1,35 @@
+.DEF TRIG_IDX {TRIGGER_INDEX}
+.DEF TRIG_WAIT {TRIGGER_TIMEOUT}
+.DEF IQ_Q0 {CH_IQ_Q0}
+.DEF IQ_Q1 {CH_IQ_Q1}
+.DEF IQ_Q2 {CH_IQ_Q2}
+.DEF IQ_Q3 {CH_IQ_Q3}
+.DEF TRACK_Q0 {CH_TRACK_Q0}
+.DEF TRACK_Q1 {CH_TRACK_Q1}
+.DEF TRACK_Q2 {CH_TRACK_Q2}
+.DEF TRACK_Q3 {CH_TRACK_Q3}
+.DEF GRANT_Q0 {CH_GRANT_Q0}
+.DEF GRANT_Q1 {CH_GRANT_Q1}
+.DEF GRANT_Q2 {CH_GRANT_Q2}
+.DEF GRANT_Q3 {CH_GRANT_Q3}
+.DEF TELEMETRY {CH_TELEMETRY}
+.DEF FAULT {CH_FAULT}
+wait_trigger $TRIG_IDX,$TRIG_WAIT
+wait 1050
+fb_pop_data $TELEMETRY,R0
+wait 12
+fb_pop_data $TELEMETRY,R1
+wait 12
+fb_pop_data $TELEMETRY,R2
+wait 12
+fb_pop_data $TELEMETRY,R3
+wait 12
+fb_pop_data $TELEMETRY,R4
+wait 12
+fb_pop_data $TELEMETRY,R5
+set_scope_en 1
+upd_param 4
+acquire_ttl 4,0,1,64
+set_scope_en 0
+upd_param 4
+stop

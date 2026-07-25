@@ -1,0 +1,11 @@
+wait_sync 4
+wait 120
+play 0,0,160
+acquire 0,0,240
+wait 32
+move 1,R0
+nop
+nop
+nop
+fb_com_data 16,R0,4
+stop

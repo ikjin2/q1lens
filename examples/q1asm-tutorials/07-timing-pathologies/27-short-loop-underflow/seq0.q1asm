@@ -1,0 +1,5 @@
+move 2,R0
+loop_start:
+play 0,1,4
+loop R0,@loop_start
+stop

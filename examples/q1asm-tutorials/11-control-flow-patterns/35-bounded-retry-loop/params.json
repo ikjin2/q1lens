@@ -1,0 +1,7 @@
+{
+  "RETRY_COUNT": 3,
+  "FEEDBACK_ADDR": 40,
+  "ACCEPT_CODE": 1,
+  "PROBE_WAIT": 24,
+  "ACCEPT_PULSE": 32
+}

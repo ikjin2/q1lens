@@ -1,0 +1,187 @@
+    .DEF T_TOTAL             {T_TOTAL}
+    .DEF START_ALIGN         {START_ALIGN}
+    .DEF TRIGGER_WAIT        8
+    .DEF ACQ_DUR             {ACQ_DUR}
+    .DEF MEAS_DELTA          {MEAS_DELTA}
+    .DEF WAIT_FOR_IQ         {WAIT_FOR_IQ}
+    .DEF FB_CFG_WAIT         {FB_CFG_WAIT}
+    .DEF FB_SEND_WAIT        {FB_SEND_WAIT}
+    .DEF IQ_SHIFT            {IQ_SHIFT}
+    .DEF IQ_ID               {CH3_IQ_ID}
+    .DEF DELAY_ID            {CH3_DELAY_ID}
+    .DEF GAIN_ID             {CH3_GAIN_ID}
+    .DEF EDGE_ACQ            {CH3_EDGE_ACQ}
+    .DEF POS_ACQ             {CH3_POS_ACQ}
+    .DEF POS_BIN_BASE        {CH3_POS_BIN_BASE}
+    .DEF INIT_DELAY          {CH3_INIT_DELAY}
+    .DEF MIN_DELAY           {CH3_MIN_DELAY}
+    .DEF MAX_DELAY           {CH3_MAX_DELAY}
+    .DEF TRACK_STEP          {TRACK_STEP}
+    .DEF SLOPE_DEADBAND      {SLOPE_DEADBAND}
+    .DEF CURSOR_GAIN_BASE    {CURSOR_GAIN_BASE}
+    .DEF CURSOR_GAIN_SHIFT   {CURSOR_GAIN_SHIFT}
+    .DEF MAX_GAIN            {MAX_GAIN}
+    .DEF TELEMETRY_ACQ_DUR   {TELEMETRY_ACQ_DUR}
+    .DEF POS_BIN_SHIFT       {POS_BIN_SHIFT}
+    .DEF SIGN_BIT            0x80000000
+
+    .DEF ZERO                R0
+    .DEF LEFT                R1
+    .DEF RIGHT               R2
+    .DEF DUMMY               R3
+    .DEF SLOPE               R4
+    .DEF ABS_SLOPE           R5
+    .DEF MEAS_DELAY          R6
+    .DEF TMP                 R7
+    .DEF CURSOR_GAIN         R8
+    .DEF POST_WAIT           R9
+    .DEF POS_BIN             R10
+    .DEF ALIGN_WAIT          R11
+
+    wait_sync 16
+
+    fb_acq_iq_id $IQ_ID, $FB_CFG_WAIT
+    fb_acq_iq_shift $IQ_SHIFT, $FB_CFG_WAIT
+
+    move 0, $ZERO
+    move $INIT_DELAY, $MEAS_DELAY
+    move 0, $LEFT
+    move 0, $RIGHT
+
+    move $START_ALIGN, $ALIGN_WAIT
+    nop
+    sub $ALIGN_WAIT, $FB_CFG_WAIT, $ALIGN_WAIT
+    nop
+    sub $ALIGN_WAIT, $FB_CFG_WAIT, $ALIGN_WAIT
+    nop
+    wait $ALIGN_WAIT
+
+    shot_loop:
+        wait_trigger 1, $TRIGGER_WAIT
+
+        move $T_TOTAL, $POST_WAIT
+        nop
+        sub $POST_WAIT, $TRIGGER_WAIT, $POST_WAIT
+        nop
+        sub $POST_WAIT, $MEAS_DELAY, $POST_WAIT
+        nop
+        sub $POST_WAIT, $ACQ_DUR, $POST_WAIT
+        nop
+        sub $POST_WAIT, $MEAS_DELTA, $POST_WAIT
+        nop
+        sub $POST_WAIT, $ACQ_DUR, $POST_WAIT
+        nop
+        sub $POST_WAIT, $WAIT_FOR_IQ, $POST_WAIT
+        nop
+        sub $POST_WAIT, $FB_SEND_WAIT, $POST_WAIT
+        nop
+        sub $POST_WAIT, $FB_SEND_WAIT, $POST_WAIT
+        nop
+        sub $POST_WAIT, $TELEMETRY_ACQ_DUR, $POST_WAIT
+        nop
+        sub $POST_WAIT, $FB_CFG_WAIT, $POST_WAIT
+        nop
+        sub $POST_WAIT, $FB_CFG_WAIT, $POST_WAIT
+
+        wait $MEAS_DELAY
+        acquire $EDGE_ACQ, 0, $ACQ_DUR
+        wait $MEAS_DELTA
+        acquire $EDGE_ACQ, 1, $ACQ_DUR
+
+        wait $WAIT_FOR_IQ
+        fb_pop_data $IQ_ID, $LEFT
+        fb_pop_data $IQ_ID, $DUMMY
+        fb_pop_data $IQ_ID, $RIGHT
+        fb_pop_data $IQ_ID, $DUMMY
+
+        jge $LEFT, $SIGN_BIT, @left_negative
+        nop
+        jmp @left_ok
+        nop
+    left_negative:
+        move 0, $LEFT
+    left_ok:
+        jge $RIGHT, $SIGN_BIT, @right_negative
+        nop
+        jmp @right_ok
+        nop
+    right_negative:
+        move 0, $RIGHT
+        nop
+    right_ok:
+        sub $RIGHT, $LEFT, $SLOPE
+        nop
+        jge $SLOPE, $SIGN_BIT, @slope_negative
+        nop
+        jlt $SLOPE, $SLOPE_DEADBAND, @delay_hold
+        nop
+        add $MEAS_DELAY, $TRACK_STEP, $MEAS_DELAY
+        jmp @after_track
+        nop
+
+    slope_negative:
+        sub $LEFT, $RIGHT, $ABS_SLOPE
+        nop
+        jlt $ABS_SLOPE, $SLOPE_DEADBAND, @delay_hold
+        nop
+        sub $MEAS_DELAY, $TRACK_STEP, $TMP
+        nop
+        jge $TMP, $SIGN_BIT, @delay_to_min
+        nop
+        move $TMP, $MEAS_DELAY
+        jmp @after_track
+        nop
+    delay_to_min:
+        move $MIN_DELAY, $MEAS_DELAY
+        jmp @after_track
+        nop
+    delay_hold:
+        nop
+
+    after_track:
+        jlt $MEAS_DELAY, $MIN_DELAY, @clamp_min
+        nop
+        jge $MEAS_DELAY, $MAX_DELAY, @clamp_max
+        nop
+        jmp @delay_ok
+        nop
+    clamp_min:
+        move $MIN_DELAY, $MEAS_DELAY
+        jmp @delay_ok
+        nop
+    clamp_max:
+        move $MAX_DELAY, $MEAS_DELAY
+    delay_ok:
+        add $LEFT, $RIGHT, $CURSOR_GAIN
+        nop
+        asr $CURSOR_GAIN, $CURSOR_GAIN_SHIFT, $CURSOR_GAIN
+        nop
+        add $CURSOR_GAIN, $CURSOR_GAIN_BASE, $CURSOR_GAIN
+        nop
+        jge $CURSOR_GAIN, $MAX_GAIN, @gain_clamp
+        nop
+        jmp @gain_ok
+        nop
+    gain_clamp:
+        move $MAX_GAIN, $CURSOR_GAIN
+    gain_ok:
+        fb_com_data $DELAY_ID, $MEAS_DELAY, $FB_SEND_WAIT
+        fb_com_data $GAIN_ID, $CURSOR_GAIN, $FB_SEND_WAIT
+        fb_acq_iq_id 0, $FB_CFG_WAIT
+
+        move $MEAS_DELAY, $POS_BIN
+        nop
+        sub $POS_BIN, $MIN_DELAY, $POS_BIN
+        nop
+        asr $POS_BIN, $POS_BIN_SHIFT, $POS_BIN
+        nop
+        add $POS_BIN, $POS_BIN_BASE, $POS_BIN
+        nop
+        acquire $POS_ACQ, $POS_BIN, $TELEMETRY_ACQ_DUR
+        fb_acq_iq_id $IQ_ID, $FB_CFG_WAIT
+
+        wait $POST_WAIT
+        jmp @shot_loop
+        nop
+
+    stop

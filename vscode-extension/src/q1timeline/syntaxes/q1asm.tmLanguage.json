@@ -1,0 +1,113 @@
+{
+  "name": "Q1ASM",
+  "scopeName": "source.q1asm",
+  "patterns": [
+    {
+      "include": "#comments"
+    },
+    {
+      "include": "#labels"
+    },
+    {
+      "include": "#directives"
+    },
+    {
+      "include": "#instructions"
+    },
+    {
+      "include": "#registers"
+    },
+    {
+      "include": "#numbers"
+    },
+    {
+      "include": "#templates"
+    }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.number-sign.q1asm",
+          "match": "#.*$"
+        },
+        {
+          "name": "comment.line.double-slash.q1asm",
+          "match": "//.*$"
+        }
+      ]
+    },
+    "labels": {
+      "patterns": [
+        {
+          "name": "entity.name.label.q1asm",
+          "match": "^\\s*([A-Za-z_][A-Za-z0-9_]*):"
+        }
+      ]
+    },
+    "directives": {
+      "patterns": [
+        {
+          "name": "keyword.control.directive.q1asm",
+          "match": "\\.[A-Za-z_][A-Za-z0-9_]*\\b"
+        }
+      ]
+    },
+    "instructions": {
+      "patterns": [
+        {
+          "name": "entity.name.function.q1asm",
+          "match": "\\b(acquire|acquire_digital|acquire_timetags|acquire_ttl|acquire_weighed|acquire_weighted|play|play_pulse)\\b"
+        },
+        {
+          "name": "constant.language.timing.q1asm",
+          "match": "\\b(wait|wait_sync|wait_trigger)\\b"
+        },
+        {
+          "name": "string.other.feedback.q1asm",
+          "match": "\\b(fb_acq_iq_id|fb_acq_iq_shift|fb_acq_tb_cfg|fb_acq_tb_extra|fb_acq_tb_id|fb_acq_tb_mock|fb_acq_tb_valid|fb_cmd|fb_com_cfg|fb_com_data|fb_com_extra|fb_llp_tags_id|fb_llp_ttls_id|fb_pop_data|fb_pull_data|fb_tdc_tags_id|fb_tdc_tdelta_id)\\b"
+        },
+        {
+          "name": "storage.modifier.state.q1asm",
+          "match": "\\b(latch_rst|reset_netzero|reset_ph|set_awg_gain|set_awg_offs|set_cond|set_digital|set_freq|set_latch_en|set_mrk|set_ph|set_ph_delta|set_scope_en|set_time_ref|upd_param|upd_thres)\\b"
+        },
+        {
+          "name": "keyword.control.flow.q1asm",
+          "match": "\\b(ja|jae|jb|jbe|jg|jge|jl|jle|jlt|jmp|jno|jns|jnz|jo|js|jz|loop|stop)\\b"
+        },
+        {
+          "name": "keyword.operator.alu.q1asm",
+          "match": "\\b(add|and|asl|asr|cmp|lsl|lsr|move|muls16|muls32|muls32h|muls32l|mulu16|mulu32|mulu32h|mulu32l|not|or|sub|test|xor)\\b"
+        },
+        {
+          "name": "support.constant.system.q1asm",
+          "match": "\\b(illegal|nop|sw_req)\\b"
+        }
+      ]
+    },
+    "registers": {
+      "patterns": [
+        {
+          "name": "variable.other.register.q1asm",
+          "match": "\\bR\\d+\\b"
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.q1asm",
+          "match": "\\b-?(?:0[xX][0-9A-Fa-f]+|0[bB][01]+|\\d+)\\b"
+        }
+      ]
+    },
+    "templates": {
+      "patterns": [
+        {
+          "name": "constant.other.placeholder.q1asm",
+          "match": "\\{[A-Za-z_][A-Za-z0-9_]*\\}"
+        }
+      ]
+    }
+  }
+}

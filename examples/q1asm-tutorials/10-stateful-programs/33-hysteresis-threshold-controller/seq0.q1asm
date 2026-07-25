@@ -1,0 +1,24 @@
+.DEF VALUE R0
+.DEF STATE R1
+
+move BASE_LEVEL,$STATE
+fb_pop_data FEEDBACK_ADDR,$VALUE
+nop
+jge $VALUE,HIGH_THRESH,@drive_high
+jlt $VALUE,LOW_THRESH,@drive_low
+wait HOLD_WAIT
+stop
+
+drive_high:
+move 1,$STATE
+set_awg_gain 12000,12000
+upd_param 4
+play 0,1,RESET_PULSE
+stop
+
+drive_low:
+move 0,$STATE
+set_awg_gain 2000,2000
+upd_param 4
+wait RECOVERY_WAIT
+stop

@@ -1,0 +1,107 @@
+        # --- Initialization ---
+        move            -1624000000, R1                 # Frequency center
+        move            20, R0 # Convergence condition
+        move            -4000, R4  # lower bound (a) -> R4
+        move            4000, R5   # upper bound (b) -> R5
+        move            0, R24                                  # Acquisition index
+        fb_acq_iq_id    50, 12                      # Enable IQ feedback
+        fb_acq_iq_shift 8, 8
+        set_awg_gain    32000, 0
+
+        check_conv:
+                sub             R5, R4, R6                  # (b) - (a) -> R6
+                nop
+                cmp             R6, R0                      # Compare against tolerance
+                jl              @stop_sequencer             # Exit if converged
+
+                # --- Calculate Probe Points ---
+                muls16          R6, 20251, R7            # ((b) - (a)) * invphi -> R7
+                nop
+                asr             R7, 15, R7                  # Normalize shift
+                nop
+                sub             R5, R7, R8                  # left probe (c) -> R8
+                add             R4, R7, R9                  # right probe (d) -> R9
+                nop
+
+                # --- Measure Point (c) ---
+                move            R8, R15                     # Pass R8 to measurement routine
+                move            @measure_point_ret_c, R27   # Pass R27 to measurement routine
+                jmp             @measure_point
+        measure_point_ret_c:
+                move            R13, R16                    # Store result (c) in R16
+
+                # --- Measure Point (d) ---
+                move            R9, R15                     # Pass R9 to measurement routine
+                move            @measure_point_ret_d, R27   # Pass R27 to measurement routine
+                jmp             @measure_point
+        measure_point_ret_d:
+                move            R13, R17                    # Store result (d) in R17
+
+                # --- Update Bounds ---
+                cmp             R24, 1000            # Safety break
+                jge             @stop_sequencer
+
+                cmp             R16, R17                    # Compare magnitude at (c) and (d)
+                jl              @pick_left                  # If s21(c) < s21(d) -> left interval
+
+        pick_right:                                         # Else -> right interval
+                move            R8, R4                      # (c) -> (a)
+                jmp             @check_conv
+
+        pick_left:
+                move            R9, R5                      # (d) -> (b)
+                jmp             @check_conv
+
+        stop_sequencer:
+                add             R4, R5, R28                 # Minimum at: ((b) + (a)) / 2 + freq_cen
+                nop
+                muls16          R28, 1000, R28
+                nop
+                asr             R28, 1, R28
+                nop
+                add             R28, R1, R28                # Frequency of minimum stored in R28
+
+                stop            4
+
+        # =========================================================
+        # SUBROUTINE: measure_point
+        # Input: R15 (relative freq offset)
+        # Input: R27 (return line number)
+        # Output: R13 (Magnitude squared: I^2 + Q^2)
+        # =========================================================
+        measure_point:
+                # --- Set the frequency for the next measurement ---
+                muls16          R15, 1000, R15
+                nop
+                add             R15, R1, R15                # Apply center offset
+                nop
+                set_freq        R15
+
+                set_awg_offs    2500, 0                     # Pulse ON
+                upd_param       4
+                acquire         0, R24, 4
+
+                # --- A long wait loop to measure the transmission of the resonator ---
+                move            15, R31
+        wait_loop:
+                wait            65535
+                sub             R31, 1, R31
+                jnz             @wait_loop
+                wait            16975
+
+                set_awg_offs    0, 0                        # Pulse OFF
+                upd_param       4
+                add             1, R24, R24                 # Increment shot index
+
+                wait            2000                        # Latency buffer
+                fb_pop_data     50, R23         # I
+                fb_pop_data     50, R10         # Q
+
+                muls32          R23, R23, R11, R20          # I^2
+                nop
+                muls32          R10, R10, R12, R21          # Q^2
+                nop
+                add             R20, R21, R13               # Final R13 = Power
+                nop
+
+                jmp             R27                         # Return to main routine

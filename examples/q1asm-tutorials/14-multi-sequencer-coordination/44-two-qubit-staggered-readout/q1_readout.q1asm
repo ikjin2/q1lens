@@ -1,0 +1,6 @@
+wait_sync 4
+wait 440
+play 6,7,160
+acquire 1,0,220
+wait 80
+stop

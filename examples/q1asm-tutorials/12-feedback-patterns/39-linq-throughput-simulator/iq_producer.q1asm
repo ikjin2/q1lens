@@ -1,0 +1,6 @@
+wait_sync 4
+wait 240
+fb_acq_iq_id 19,0
+acquire 0,0,80
+fb_acq_iq_id 0,0
+stop

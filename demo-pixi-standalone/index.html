@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Three Peak Demo 1 PixiJS Showcase</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #080b12;
+      --panel: #121823;
+      --panel-2: #17202e;
+      --line: #2a3444;
+      --text: #e9eef7;
+      --muted: #9aa6b8;
+      --cyan: #55d6f4;
+      --green: #45d68a;
+      --gold: #f2c85b;
+      --violet: #b58cff;
+      --red: #ff7d72;
+      --shadow: 0 18px 44px rgba(0, 0, 0, 0.32);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background:
+        linear-gradient(135deg, rgba(85, 214, 244, 0.12), transparent 28%),
+        linear-gradient(315deg, rgba(69, 214, 138, 0.10), transparent 32%),
+        var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+    }
+
+    .app {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 320px;
+      grid-template-rows: auto minmax(0, 1fr);
+      gap: 14px;
+      min-height: 100vh;
+      padding: 16px;
+    }
+
+    .topbar,
+    .side-panel,
+    .stage-shell {
+      border: 1px solid var(--line);
+      background: rgba(18, 24, 35, 0.88);
+      box-shadow: var(--shadow);
+    }
+
+    .topbar {
+      grid-column: 1 / -1;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      min-width: 0;
+      padding: 13px 15px;
+      border-radius: 8px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 18px;
+      line-height: 1.2;
+      font-weight: 650;
+    }
+
+    .subtitle {
+      max-width: 760px;
+      margin-top: 5px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.4;
+    }
+
+    .toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      flex-wrap: wrap;
+      gap: 8px;
+      min-width: 300px;
+    }
+
+    button {
+      min-height: 32px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 0 11px;
+      background: var(--panel-2);
+      color: var(--text);
+      font: inherit;
+      font-size: 12px;
+      line-height: 1;
+      cursor: pointer;
+    }
+
+    button:hover {
+      border-color: #4a5970;
+      background: #1d2a3d;
+    }
+
+    button[aria-pressed="true"] {
+      border-color: rgba(85, 214, 244, 0.9);
+      background: rgba(85, 214, 244, 0.16);
+      color: #dff9ff;
+    }
+
+    .stage-shell {
+      position: relative;
+      min-width: 0;
+      min-height: 560px;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    #pixi-stage {
+      position: absolute;
+      inset: 0;
+    }
+
+    .status-bar {
+      position: absolute;
+      left: 10px;
+      right: 10px;
+      bottom: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      min-width: 0;
+      padding: 8px 10px;
+      border: 1px solid rgba(42, 52, 68, 0.82);
+      border-radius: 7px;
+      background: rgba(8, 11, 18, 0.82);
+      color: var(--muted);
+      font-size: 12px;
+      pointer-events: none;
+      backdrop-filter: blur(6px);
+    }
+
+    #load-status {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    #fps-meter {
+      flex: 0 0 auto;
+      color: var(--green);
+      font-variant-numeric: tabular-nums;
+    }
+
+    #pixi-tooltip {
+      position: fixed;
+      z-index: 20;
+      max-width: min(340px, calc(100vw - 24px));
+      padding: 9px 10px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: rgba(8, 11, 18, 0.94);
+      box-shadow: var(--shadow);
+      color: var(--text);
+      font-size: 12px;
+      line-height: 1.45;
+      pointer-events: none;
+    }
+
+    #pixi-tooltip[hidden] {
+      display: none;
+    }
+
+    .side-panel {
+      min-width: 0;
+      border-radius: 8px;
+      padding: 14px;
+      overflow: auto;
+    }
+
+    .side-panel h2 {
+      margin: 0 0 10px;
+      font-size: 13px;
+      font-weight: 650;
+      color: var(--text);
+    }
+
+    .metric-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+
+    .metric {
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 9px;
+      background: rgba(23, 32, 46, 0.72);
+    }
+
+    .metric span {
+      display: block;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.2;
+    }
+
+    .metric strong {
+      display: block;
+      margin-top: 5px;
+      color: var(--text);
+      font-size: 18px;
+      line-height: 1;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .legend {
+      display: grid;
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+
+    .legend-item {
+      display: grid;
+      grid-template-columns: 16px minmax(0, 1fr);
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }
+
+    .swatch {
+      width: 16px;
+      height: 10px;
+      border-radius: 4px;
+    }
+
+    #inspector-details {
+      display: grid;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    .field {
+      min-width: 0;
+      border-top: 1px solid rgba(42, 52, 68, 0.7);
+      padding-top: 8px;
+    }
+
+    .field:first-child {
+      border-top: 0;
+      padding-top: 0;
+    }
+
+    .field span {
+      display: block;
+      margin-bottom: 2px;
+      color: #c8d3e3;
+      font-weight: 650;
+    }
+
+    .field code {
+      display: block;
+      overflow-wrap: anywhere;
+      color: var(--text);
+      font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+      font-size: 11px;
+    }
+
+    @media (max-width: 900px) {
+      .app {
+        grid-template-columns: minmax(0, 1fr);
+      }
+
+      .topbar {
+        align-items: stretch;
+        flex-direction: column;
+      }
+
+      .toolbar {
+        justify-content: flex-start;
+        min-width: 0;
+      }
+
+      .stage-shell {
+        min-height: 520px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <header class="topbar">
+      <div>
+        <h1>Three Peak Demo 1 PixiJS showcase</h1>
+        <div class="subtitle">Eight Q1ASM sequencers, three drifting Gaussian peaks, and feedback exchanges driven directly by TimelineIR feedback_flows.</div>
+      </div>
+      <div class="toolbar" aria-label="Timeline controls">
+        <button id="normal-mode" type="button">Normal</button>
+        <button id="debug-mode" type="button">Debug</button>
+        <button id="showcase-mode" type="button" aria-pressed="true">Showcase</button>
+        <button id="playback-toggle" type="button" aria-pressed="true">Pause</button>
+        <button id="fit-all" type="button">Fit</button>
+        <button id="reset-view" type="button">Reset</button>
+      </div>
+    </header>
+
+    <section class="stage-shell" aria-label="PixiJS timeline demo">
+      <div id="pixi-stage"></div>
+      <div class="status-bar">
+        <span id="load-status">Loading Three Peak Demo 1 TimelineIR...</span>
+        <span id="fps-meter">FPS --</span>
+      </div>
+    </section>
+
+    <aside class="side-panel" aria-label="Timeline inspector">
+      <h2>Run Metrics</h2>
+      <div class="metric-grid">
+        <div class="metric"><span>Events</span><strong id="metric-events">--</strong></div>
+        <div class="metric"><span>Feedback</span><strong id="metric-feedback">--</strong></div>
+        <div class="metric"><span>Sequencers</span><strong id="metric-sequencers">--</strong></div>
+      </div>
+
+      <h2>Encoding</h2>
+      <div class="legend">
+        <div class="legend-item"><span class="swatch" style="background:#55d6f4"></span><span>Timeline playhead</span></div>
+        <div class="legend-item"><span class="swatch" style="background:#b58cff"></span><span>Feedback acquisition result exchange</span></div>
+        <div class="legend-item"><span class="swatch" style="background:#f2c85b"></span><span>Runtime-dependent or assumed timing</span></div>
+      </div>
+
+      <h2>Inspector</h2>
+      <div id="inspector-details">
+        <div class="field"><span>Selection</span><code>No selection</code></div>
+      </div>
+    </aside>
+  </main>
+
+  <div id="pixi-tooltip" hidden></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/pixi.js@8.10.2/dist/pixi.min.js"></script>
+  <script src="pixi-standalone-demo.js?v=syncfeedback1"></script>
+</body>
+</html>

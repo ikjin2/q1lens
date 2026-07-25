@@ -1,0 +1,19 @@
+sequencers:
+  - id: golden_section
+    name: Golden-section search
+    file: golden_section.q1asm
+    module: QRM_RF
+
+alignment:
+  mode: none
+
+view:
+  default_mode: debug
+  show_q1_issue: true
+  show_queue: true
+  show_slack: true
+
+analysis:
+  loop_policy: compact_first_iteration
+  branch_policy: collapse_unresolved
+  underflow_policy: confidence_levels

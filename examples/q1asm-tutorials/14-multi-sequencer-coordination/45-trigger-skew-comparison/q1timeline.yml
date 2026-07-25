@@ -1,0 +1,28 @@
+sequencers:
+  - id: qcm_fast
+    name: QCM fast lane
+    file: qcm_fast.q1asm
+    module: QCM0
+  - id: qrm_nominal
+    name: QRM nominal readout
+    file: qrm_nominal.q1asm
+    module: QRM0
+  - id: qrm_skewed
+    name: QRM skewed readout
+    file: qrm_skewed.q1asm
+    module: QRM1
+
+alignment:
+  mode: first_wait_trigger
+
+view:
+  default_mode: debug
+  show_q1_issue: false
+  show_queue: false
+  show_slack: false
+  show_loop_preview: false
+
+analysis:
+  loop_policy: compact_first_iteration
+  branch_policy: assume_fallthrough
+  underflow_policy: confidence_levels

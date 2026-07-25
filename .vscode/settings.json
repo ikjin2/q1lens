@@ -1,0 +1,17 @@
+{
+  "python.analysis.extraPaths": [
+    "./src"
+  ],
+  "qbloxTimeline.pythonPath": "C:\\Users\\Ik\\Documents\\GitHub\\qblox-scheduler\\.venv\\Scripts\\python.exe",
+  "qbloxTimeline.pythonArgs": [],
+  "q1lens.pythonPath": "C:\\Users\\Ik\\Documents\\GitHub\\qblox-scheduler\\.venv\\Scripts\\python.exe",
+  "q1lens.pythonArgs": [],
+  "q1lens.q1timeline.pythonPath": "C:\\Users\\Ik\\Documents\\GitHub\\qblox-scheduler\\.venv\\Scripts\\python.exe",
+  "q1lens.q1timeline.pythonArgs": [],
+  "qbsTimeline.pythonPath": "C:\\Users\\Ik\\Documents\\GitHub\\qblox-scheduler\\.venv\\Scripts\\python.exe",
+  "qbsTimeline.pythonArgs": [],
+  "qbsTimeline.autoRefresh": false,
+  "qbsTimeline.outputDirOverride": null,
+  "qbsTimeline.revealOutputChannel": true,
+  "qbsTimeline.q1timelineCommand": null
+}

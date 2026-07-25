@@ -1,0 +1,475 @@
+.shared-timeline-stage {
+  min-width: 0;
+  overflow: auto;
+  border-right: 1px solid var(--vscode-panel-border);
+  color: var(--vscode-editor-foreground);
+  font-family: var(--vscode-font-family);
+  font-size: var(--vscode-font-size);
+}
+
+.shared-timeline-stage .stage-header {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 36px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--vscode-panel-border);
+  background: var(--vscode-editor-background);
+}
+
+.shared-timeline-stage .stage-heading {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.shared-timeline-stage .stage-title {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.shared-timeline-stage .stage-total {
+  color: var(--vscode-descriptionForeground);
+  font-size: 12px;
+}
+
+.shared-timeline-stage .ruler {
+  position: sticky;
+  top: 36px;
+  z-index: 2;
+  height: 34px;
+  margin-left: 168px;
+  border-bottom: 1px solid var(--vscode-panel-border);
+  background: var(--vscode-editor-background);
+}
+
+.shared-timeline-stage .tick {
+  position: absolute;
+  z-index: 1;
+  top: 0;
+  bottom: 0;
+  border-left: 1px solid var(--vscode-panel-border);
+  color: var(--vscode-descriptionForeground);
+  font-size: 11px;
+}
+
+.shared-timeline-stage .tick span {
+  display: block;
+  padding: 8px 0 0 5px;
+  white-space: nowrap;
+}
+
+.shared-timeline-stage .timeline-lanes {
+  position: relative;
+  min-width: 720px;
+}
+
+.shared-timeline-stage .timeline-row {
+  display: grid;
+  grid-template-columns: 168px minmax(520px, 1fr);
+  min-height: 36px;
+  border-bottom: 1px solid var(--vscode-panel-border);
+}
+
+.shared-timeline-stage .lane-label {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  padding: 0 10px;
+  color: var(--vscode-descriptionForeground);
+  background: var(--vscode-sideBar-background);
+  border-right: 1px solid var(--vscode-panel-border);
+  font-size: 11px;
+  line-height: 1.2;
+}
+
+.shared-timeline-stage .lane-label-text {
+  overflow: hidden;
+  min-width: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shared-timeline-stage .lane-track {
+  position: relative;
+  min-height: 36px;
+  background-image: linear-gradient(to right, var(--vscode-panel-border) 1px, transparent 1px);
+  background-size: 25% 100%;
+}
+
+.shared-timeline-stage .timeline-annotation {
+  box-sizing: border-box;
+  font-size: 9px;
+  line-height: 1;
+}
+
+.shared-timeline-stage .feedback-inline-capsule {
+  position: absolute;
+  z-index: 3;
+  bottom: 2px;
+  display: flex;
+  height: 12px;
+  min-width: 28px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 3px;
+  overflow: hidden;
+  padding: 0 4px;
+  border: 1px solid color-mix(in srgb, var(--vscode-descriptionForeground) 64%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--vscode-descriptionForeground) 16%, transparent);
+  color: var(--vscode-descriptionForeground);
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease, opacity 120ms ease;
+}
+
+.shared-timeline-stage .feedback-inline-capsule:focus-visible,
+.shared-timeline-stage .feedback-endpoint:focus-visible,
+.shared-timeline-stage .timeline-loop-range:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 2px;
+}
+
+.shared-timeline-stage .feedback-inline-capsule.is-active,
+.shared-timeline-stage .feedback-inline-capsule.is-selected,
+.shared-timeline-stage .feedback-endpoint.is-active,
+.shared-timeline-stage .feedback-endpoint.is-selected {
+  background: color-mix(in srgb, var(--vscode-focusBorder) 24%, transparent);
+  border-color: var(--vscode-focusBorder);
+  color: var(--vscode-focusBorder);
+  opacity: 1;
+}
+
+.shared-timeline-stage .feedback-dot {
+  flex: 0 0 auto;
+  width: 5px;
+  height: 5px;
+  border-radius: 999px;
+  background: currentColor;
+}
+
+.shared-timeline-stage .feedback-dot-target {
+  background: transparent;
+  border: 1px solid currentColor;
+}
+
+.shared-timeline-stage .feedback-label,
+.shared-timeline-stage .feedback-endpoint-label {
+  flex: 0 1 auto;
+  overflow: hidden;
+  max-width: 0;
+  min-width: 0;
+  opacity: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: max-width 120ms ease, opacity 120ms ease;
+}
+
+.shared-timeline-stage .feedback-inline-capsule.is-active .feedback-label,
+.shared-timeline-stage .feedback-inline-capsule.is-selected .feedback-label,
+.shared-timeline-stage .feedback-endpoint.is-active .feedback-endpoint-label,
+.shared-timeline-stage .feedback-endpoint.is-selected .feedback-endpoint-label {
+  max-width: 48px;
+  opacity: 1;
+}
+
+.shared-timeline-stage .feedback-mini-track {
+  position: relative;
+  flex: 1 1 8px;
+  min-width: 4px;
+  height: 1px;
+  background: currentColor;
+  opacity: 0.82;
+}
+
+.shared-timeline-stage .feedback-mini-track-after {
+  margin-right: 1px;
+}
+
+.shared-timeline-stage .feedback-mini-arrow {
+  position: absolute;
+  top: -3px;
+  right: -1px;
+  width: 0;
+  height: 0;
+  border-top: 3px solid transparent;
+  border-bottom: 3px solid transparent;
+  border-left: 5px solid currentColor;
+}
+
+.shared-timeline-stage .feedback-endpoint {
+  position: absolute;
+  z-index: 4;
+  bottom: 1px;
+  display: inline-flex;
+  height: 15px;
+  max-width: 62px;
+  align-items: center;
+  gap: 3px;
+  overflow: hidden;
+  padding: 1px 4px;
+  transform: translateX(-50%);
+  border: 1px solid color-mix(in srgb, var(--vscode-descriptionForeground) 64%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--vscode-editor-background) 90%, var(--vscode-descriptionForeground));
+  color: var(--vscode-descriptionForeground);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease, opacity 120ms ease;
+}
+
+.shared-timeline-stage .feedback-endpoint-marker {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: currentColor;
+}
+
+.shared-timeline-stage .feedback-endpoint[data-feedback-role="target"] .feedback-endpoint-marker {
+  background: transparent;
+  border: 1px solid currentColor;
+}
+
+.shared-timeline-stage .timeline-connector-layer {
+  position: absolute;
+  z-index: 2;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 168px;
+  pointer-events: none;
+}
+
+.shared-timeline-stage .feedback-connector-svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.shared-timeline-stage .feedback-connector {
+  fill: none;
+  stroke: var(--vscode-descriptionForeground);
+  stroke-width: 1.45;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  opacity: 0.44;
+  transition: opacity 120ms ease, stroke 120ms ease, stroke-width 120ms ease;
+}
+
+.shared-timeline-stage .feedback-connector.is-active,
+.shared-timeline-stage .feedback-connector.is-selected {
+  stroke: var(--vscode-focusBorder);
+  stroke-width: 2;
+  opacity: 0.94;
+}
+
+.shared-timeline-stage .feedback-bridge-arrowhead {
+  fill: context-stroke;
+  opacity: 0.94;
+}
+
+.shared-timeline-stage .timeline-loop-range {
+  position: absolute;
+  z-index: 2;
+  top: 0;
+  height: 14px;
+  min-width: 18px;
+  color: var(--vscode-charts-green);
+  cursor: pointer;
+  opacity: 0.9;
+  pointer-events: none;
+}
+
+.shared-timeline-stage .loop-range-rail {
+  position: absolute;
+  top: 5px;
+  right: 7px;
+  left: 7px;
+  height: 2px;
+  background: currentColor;
+  content: "";
+  opacity: 0.78;
+  pointer-events: auto;
+}
+
+.shared-timeline-stage .loop-range-cap {
+  position: absolute;
+  top: 2px;
+  width: 3px;
+  height: 9px;
+  border-radius: 999px;
+  background: currentColor;
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.shared-timeline-stage .loop-range-cap-start {
+  left: 0;
+}
+
+.shared-timeline-stage .loop-range-cap-end {
+  right: 0;
+}
+
+.shared-timeline-stage .timeline-loop-range.is-clipped-start .loop-range-cap-start,
+.shared-timeline-stage .timeline-loop-range.is-clipped-end .loop-range-cap-end {
+  opacity: 0.28;
+}
+
+.shared-timeline-stage .timeline-loop-range:hover,
+.shared-timeline-stage .timeline-loop-range.is-selected {
+  color: var(--vscode-focusBorder);
+  opacity: 1;
+}
+
+.shared-timeline-stage .timeline-loop-range:hover .loop-range-rail,
+.shared-timeline-stage .timeline-loop-range.is-selected .loop-range-rail {
+  height: 3px;
+  opacity: 1;
+}
+
+.shared-timeline-stage .loop-range-label {
+  position: absolute;
+  top: 0;
+  left: 8px;
+  max-width: 0;
+  overflow: hidden;
+  height: 11px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--vscode-editor-background) 90%, currentColor);
+  color: currentColor;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 9px;
+  opacity: 0;
+  pointer-events: none;
+  text-overflow: ellipsis;
+  transition: max-width 120ms ease, opacity 120ms ease, padding 120ms ease, border-color 120ms ease;
+  white-space: nowrap;
+}
+
+.shared-timeline-stage .timeline-loop-range:hover .loop-range-label,
+.shared-timeline-stage .timeline-loop-range.is-selected .loop-range-label {
+  max-width: calc(100% - 16px);
+  padding: 0 4px;
+  border-color: color-mix(in srgb, currentColor 42%, transparent);
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.shared-timeline-stage .timeline-block {
+  position: absolute;
+  z-index: 1;
+  top: 7px;
+  box-sizing: border-box;
+  display: flex;
+  min-width: 0;
+  height: 22px;
+  align-items: center;
+  gap: 5px;
+  overflow: hidden;
+  padding: 0 5px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--timeline-block-accent, var(--vscode-charts-yellow, var(--vscode-charts-orange))) 12%, transparent);
+  border-color: color-mix(in srgb, var(--timeline-block-accent, var(--vscode-panel-border)) 72%, transparent);
+  color: var(--vscode-editor-foreground);
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.shared-timeline-stage .timeline-block:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 2px;
+}
+
+.shared-timeline-stage .timeline-block-play,
+.shared-timeline-stage .timeline-block-marker_state {
+  background: color-mix(in srgb, var(--timeline-block-accent, var(--vscode-charts-green)) 16%, transparent);
+  border-color: color-mix(in srgb, var(--timeline-block-accent, var(--vscode-charts-green)) 54%, transparent);
+}
+
+.shared-timeline-stage .timeline-block-wait,
+.shared-timeline-stage .timeline-block-wait_sync,
+.shared-timeline-stage .timeline-block-wait_trigger {
+  background: color-mix(in srgb, var(--timeline-block-accent, var(--vscode-charts-purple)) 14%, transparent);
+  border-color: color-mix(in srgb, var(--timeline-block-accent, var(--vscode-charts-purple)) 52%, transparent);
+}
+
+.shared-timeline-stage .timeline-block-acquire {
+  background: color-mix(in srgb, var(--timeline-block-accent, var(--vscode-charts-orange)) 16%, transparent);
+  border-color: color-mix(in srgb, var(--timeline-block-accent, var(--vscode-charts-orange)) 54%, transparent);
+}
+
+.shared-timeline-stage .timeline-block-feedback_pop,
+.shared-timeline-stage .timeline-block-feedback_com {
+  background: color-mix(in srgb, var(--timeline-block-accent, var(--vscode-charts-purple)) 16%, transparent);
+  border-color: color-mix(in srgb, var(--timeline-block-accent, var(--vscode-charts-purple)) 54%, transparent);
+}
+
+.shared-timeline-stage .timeline-block[aria-selected="true"],
+.shared-timeline-stage .timeline-block.is-selected {
+  outline: 2px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
+  background: var(--vscode-list-activeSelectionBackground);
+  color: var(--vscode-list-activeSelectionForeground);
+}
+
+.shared-timeline-stage .timeline-block.is-compact {
+  gap: 0;
+  padding: 0;
+  border-radius: 2px;
+}
+
+.shared-timeline-stage .timeline-block.is-tiny {
+  gap: 0;
+  padding: 0;
+  border-radius: 2px;
+}
+
+.shared-timeline-stage .timeline-block.is-compact .block-label,
+.shared-timeline-stage .timeline-block.is-compact .block-detail {
+  display: none;
+}
+
+.shared-timeline-stage .timeline-block.is-tiny .block-label,
+.shared-timeline-stage .timeline-block.is-tiny .block-detail {
+  display: none;
+}
+
+.shared-timeline-stage .block-label {
+  overflow: hidden;
+  min-width: 0;
+  text-overflow: ellipsis;
+  font-weight: 600;
+}
+
+.shared-timeline-stage .block-detail {
+  flex: 0 0 auto;
+  color: var(--vscode-descriptionForeground);
+  font-size: 10px;
+}
+
+.shared-timeline-stage .time-selection {
+  position: absolute;
+  z-index: 0;
+  top: 0;
+  bottom: 0;
+  border-left: 1px solid var(--vscode-focusBorder);
+  border-right: 1px solid var(--vscode-focusBorder);
+  background: color-mix(in srgb, var(--vscode-focusBorder) 18%, transparent);
+  pointer-events: none;
+}

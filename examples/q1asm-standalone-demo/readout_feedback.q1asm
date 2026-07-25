@@ -1,0 +1,10 @@
+// Sibling file included by the generated folder project.
+
+.DEF T_READOUT {T_READOUT}
+wait_sync 4
+wait 40
+acquire 0,0,$T_READOUT
+fb_com_data 4,1,4
+wait 64
+fb_pop_data 4,R0
+stop

@@ -1,0 +1,23 @@
+sequencers:
+  - id: seq0
+    name: Bounded random walk
+    file: seq0.q1asm
+    module: QRM0
+
+params:
+  file: params.json
+
+alignment:
+  mode: none
+
+view:
+  default_mode: debug
+  show_q1_issue: true
+  show_queue: false
+  show_slack: false
+  show_loop_preview: true
+
+analysis:
+  loop_policy: compact_first_iteration
+  branch_policy: assume_fallthrough
+  underflow_policy: confidence_levels

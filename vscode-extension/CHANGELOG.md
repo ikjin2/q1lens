@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.2
+
+- Bundle runtime dependencies for Marketplace distribution.
+
 ## 0.1.1
 
 - Make the release test suite reproducible from a clean checkout.

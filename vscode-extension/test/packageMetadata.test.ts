@@ -149,7 +149,15 @@ describe("package metadata", () => {
     assert.equal(scripts["verify:installed"], "node ./scripts/verify-installed-assets.js");
     assert.equal(
       scripts["reinstall:local"],
-      "npm run package && code --install-extension q1lens-0.1.1.vsix --force && npm run verify:installed",
+      "npm run package && code --install-extension q1lens-0.1.2.vsix --force && npm run verify:installed",
     );
+  });
+
+  it("bundles runtime dependencies for Marketplace distribution", () => {
+    const manifest = packageJson();
+
+    assert.equal(manifest.main, "./dist/extension.js");
+    assert.ok(manifest.scripts["vscode:prepublish"].includes("npm run bundle"));
+    assert.ok(manifest.scripts.bundle.includes("--external:vscode"));
   });
 });

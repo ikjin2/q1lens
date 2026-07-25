@@ -5,7 +5,7 @@ type: software
 authors:
   - family-names: "Ik"
     given-names: "Kyeong Jin"
-version: 0.1.0
+version: 0.1.1
 date-released: 2026-07-25
 repository-code: "https://github.com/ikjin2/q1lens"
 url: "https://github.com/ikjin2/q1lens"

@@ -43,7 +43,7 @@ def main(argv=None):
 
     assert exit_code == 0
     captured = capsys.readouterr()
-    assert "q1timeline 0.1.0" in captured.out
+    assert "q1timeline 0.1.1" in captured.out
     assert "delegated:" not in captured.out
 
 
@@ -78,7 +78,7 @@ def main(argv=None):
 
     assert exit_code == 0
     captured = capsys.readouterr()
-    assert "q1timeline 0.1.0" in captured.out
+    assert "q1timeline 0.1.1" in captured.out
     assert "hijacked:" not in captured.out
 
 

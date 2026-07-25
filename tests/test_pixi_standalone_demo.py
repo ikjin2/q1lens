@@ -7,6 +7,8 @@ from pathlib import Path
 
 import yaml
 
+from q1timeline.cli import main as q1timeline_main
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DEMO_DIR = ROOT / "demo-pixi-standalone"
@@ -48,8 +50,14 @@ def test_three_peak_demo1_example_is_imported() -> None:
     }
 
 
-def test_three_peak_demo1_generated_ir_contains_feedback_routes() -> None:
-    ir = json.loads((EXAMPLE_DIR / ".q1timeline" / "timeline_ir.json").read_text(encoding="utf-8"))
+def test_three_peak_demo1_generated_ir_contains_feedback_routes(tmp_path: Path) -> None:
+    out_file = tmp_path / "three-peak-demo1-ir.json"
+    exit_code = q1timeline_main(
+        ["analyze", "--project", str(EXAMPLE_DIR / "q1timeline.yml"), "--out", str(out_file)]
+    )
+
+    assert exit_code == 0
+    ir = json.loads(out_file.read_text(encoding="utf-8"))
 
     assert len(ir["events"]) >= 700
     assert len(ir["feedback_flows"]) >= 18

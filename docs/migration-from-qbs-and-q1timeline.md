@@ -5,9 +5,9 @@ extensions for active development.
 
 ## Install
 
-1. Build or download `q1lens-0.1.0.vsix`.
+1. Build or download `q1lens-0.1.1.vsix`.
 2. Disable or uninstall `q1timeline.q1asm-live-timeline-debugger`.
-3. Install `q1lens-0.1.0.vsix`.
+3. Install `q1lens-0.1.1.vsix`.
 4. Reload VSCode.
 
 ## Commands

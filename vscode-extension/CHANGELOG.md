@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.1
+
+- Make the release test suite reproducible from a clean checkout.
+
 ## 0.1.0
 
 - Initial public release.

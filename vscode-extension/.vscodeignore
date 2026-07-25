@@ -1,7 +1,14 @@
 src/**
 test/**
 out/test/**
+out/src/extension.js
+out/src/settings.js
+out/src/integration/**
+out/src/q1timeline/*.js
+out/src/qbs/*.js
+out/src/qbs/webview/*.js
 .vscode-test/**
-node_modules/.cache/**
+node_modules/**
+scripts/**
 **/*.map
 tsconfig.json

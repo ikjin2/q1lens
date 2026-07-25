@@ -2,7 +2,7 @@
   "name": "q1lens",
   "displayName": "Q1Lens",
   "description": "Inspect Qblox schedules, symbolic pulses, Q1ASM timelines, and lowering provenance inside VS Code.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "publisher": "q1lens",
   "author": {
     "name": "Ik Kyeong Jin",
@@ -46,7 +46,7 @@
     "workspaceContains:**/q1timeline.yml",
     "onView:qbsTimeline.sidebar"
   ],
-  "main": "./out/src/extension.js",
+  "main": "./dist/extension.js",
   "contributes": {
     "commands": [
       {
@@ -498,14 +498,15 @@
     ]
   },
   "scripts": {
-    "vscode:prepublish": "npm run compile",
+    "vscode:prepublish": "npm run compile && npm run bundle",
+    "bundle": "esbuild ./src/extension.ts --bundle --platform=node --format=cjs --external:vscode --outfile=./dist/extension.js",
     "compile": "tsc -p ./ && node ./scripts/copy-extension-assets.js",
     "watch": "tsc -watch -p ./",
     "test": "npm run compile && mocha \"out/test/**/*.test.js\" --ignore \"out/test/suite/**/*.test.js\"",
     "test:extension": "npm run compile && node ./out/test/runTest.js",
     "package": "vsce package",
     "verify:installed": "node ./scripts/verify-installed-assets.js",
-    "reinstall:local": "npm run package && code --install-extension q1lens-0.1.1.vsix --force && npm run verify:installed"
+    "reinstall:local": "npm run package && code --install-extension q1lens-0.1.2.vsix --force && npm run verify:installed"
   },
   "dependencies": {
     "yaml": "^2.5.0"
@@ -519,6 +520,7 @@
     "@types/vscode": "^1.90.0",
     "@vscode/test-electron": "^2.4.1",
     "@vscode/vsce": "^3.9.2",
+    "esbuild": "^0.28.1",
     "mocha": "^11.7.6",
     "typescript": "^5.5.4"
   }

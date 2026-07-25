@@ -1,0 +1,60 @@
+name: Publish Python package
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: vscode-extension/package-lock.json
+      - name: Install Python development dependencies
+        run: python -m pip install --upgrade build twine .[dev]
+      - name: Test Python package
+        run: python -m pytest -q
+      - name: Build and check Python distributions
+        run: |
+          python -m build
+          python -m twine check dist/*
+      - name: Test and package VS Code extension
+        working-directory: vscode-extension
+        run: |
+          npm ci
+          npm test
+          npm run package
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-package
+          path: dist/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vscode-extension
+          path: vscode-extension/*.vsix
+          if-no-files-found: error
+
+  publish-pypi:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/q1lens/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-package
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

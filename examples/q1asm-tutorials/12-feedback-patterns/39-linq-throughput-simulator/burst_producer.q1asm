@@ -1,0 +1,20 @@
+wait_sync 4
+wait 24
+fb_com_data 18,900,4
+wait 120
+fb_com_data 16,100,4
+wait 24
+fb_com_data 16,101,4
+wait 24
+fb_com_data 16,102,4
+wait 24
+fb_com_data 16,103,4
+wait 24
+fb_com_data 16,104,4
+wait 24
+fb_com_data 16,105,4
+wait 24
+fb_com_data 16,106,4
+wait 24
+fb_com_data 16,107,4
+stop

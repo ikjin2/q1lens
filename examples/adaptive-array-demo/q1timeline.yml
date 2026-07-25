@@ -1,0 +1,87 @@
+sequencers:
+  - id: drive_q0
+    name: Q0 adaptive drive
+    file: drive_q0.q1asm
+    module: QCM0
+  - id: drive_q1
+    name: Q1 adaptive drive
+    file: drive_q1.q1asm
+    module: QCM0
+  - id: drive_q2
+    name: Q2 adaptive drive
+    file: drive_q2.q1asm
+    module: QCM1
+  - id: drive_q3
+    name: Q3 adaptive drive
+    file: drive_q3.q1asm
+    module: QCM1
+  - id: readout_q0
+    name: Q0 IQ readout
+    file: readout_q0.q1asm
+    module: QRM0
+  - id: readout_q1
+    name: Q1 IQ readout
+    file: readout_q1.q1asm
+    module: QRM0
+  - id: readout_q2
+    name: Q2 IQ readout
+    file: readout_q2.q1asm
+    module: QRM1
+  - id: readout_q3
+    name: Q3 IQ readout
+    file: readout_q3.q1asm
+    module: QRM1
+  - id: tracker_q0
+    name: Q0 tracker
+    file: tracker_q0.q1asm
+    module: QRM0
+  - id: tracker_q1
+    name: Q1 tracker
+    file: tracker_q1.q1asm
+    module: QRM0
+  - id: tracker_q2
+    name: Q2 tracker
+    file: tracker_q2.q1asm
+    module: QRM1
+  - id: tracker_q3
+    name: Q3 tracker
+    file: tracker_q3.q1asm
+    module: QRM1
+  - id: audit_scope_a
+    name: Audit scope A
+    file: audit_scope_a.q1asm
+    module: QRM2
+  - id: audit_scope_b
+    name: Audit scope B
+    file: audit_scope_b.q1asm
+    module: QRM3
+  - id: arbiter
+    name: Feedback arbiter and telemetry source
+    file: arbiter.q1asm
+    module: QCM2
+  - id: telemetry
+    name: Telemetry sidecar
+    file: telemetry.q1asm
+    module: QRM2
+  - id: fault_probe
+    name: Fault probe
+    file: fault_probe.q1asm
+    module: QRM2
+
+params:
+  file: params.json
+
+alignment:
+  mode: first_wait_trigger
+
+view:
+  default_mode: debug
+  show_q1_issue: true
+  show_queue: true
+  show_slack: true
+  show_loop_preview: true
+
+analysis:
+  loop_policy: compact_first_iteration
+  branch_policy: assume_fallthrough
+  underflow_policy: confidence_levels

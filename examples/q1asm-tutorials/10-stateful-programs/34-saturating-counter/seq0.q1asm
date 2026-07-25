@@ -1,0 +1,20 @@
+.DEF COUNT R0
+
+fb_pop_data FEEDBACK_ADDR,$COUNT
+nop
+add $COUNT,STEP,$COUNT
+nop
+jge $COUNT,MAX_COUNT,@clamp_high
+jlt $COUNT,0,@clamp_low
+wait TICK_WAIT
+stop
+
+clamp_high:
+move MAX_COUNT,$COUNT
+wait TICK_WAIT
+stop
+
+clamp_low:
+move 0,$COUNT
+wait TICK_WAIT
+stop

@@ -1,0 +1,4 @@
+wait_trigger 1,1000
+wait 40
+play 0,1,80
+stop

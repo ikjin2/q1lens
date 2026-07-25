@@ -1,0 +1,50 @@
+    .DEF T_TOTAL             {T_TOTAL}
+    .DEF START_ALIGN         {START_ALIGN}
+    .DEF TRIGGER_WAIT        8
+    .DEF CURSOR_DUR          {CURSOR_DUR}
+    .DEF CURSOR_W            0
+    .DEF INIT_DELAY          {CH2_INIT_DELAY}
+    .DEF INIT_GAIN           12000
+    .DEF DELAY_ID            {CH2_DELAY_ID}
+    .DEF GAIN_ID             {CH2_GAIN_ID}
+    .DEF POST_MULTICAST      {POST_MULTICAST}
+
+    .DEF ZERO                R0
+    .DEF MEAS_DELAY          R1
+    .DEF CURSOR_GAIN         R2
+    .DEF WAIT_FOR_FEEDBACK   R3
+
+    wait_sync 4
+
+    move 0, $ZERO
+    move $INIT_DELAY, $MEAS_DELAY
+    move $INIT_GAIN, $CURSOR_GAIN
+
+    wait $START_ALIGN
+
+    shot_loop:
+        wait_trigger 1, $TRIGGER_WAIT
+
+        move $T_TOTAL, $WAIT_FOR_FEEDBACK
+        nop
+        sub $WAIT_FOR_FEEDBACK, $TRIGGER_WAIT, $WAIT_FOR_FEEDBACK
+        nop
+        sub $WAIT_FOR_FEEDBACK, $MEAS_DELAY, $WAIT_FOR_FEEDBACK
+        nop
+        sub $WAIT_FOR_FEEDBACK, $CURSOR_DUR, $WAIT_FOR_FEEDBACK
+        nop
+        sub $WAIT_FOR_FEEDBACK, $POST_MULTICAST, $WAIT_FOR_FEEDBACK
+
+        wait $MEAS_DELAY
+        set_awg_gain $ZERO, $CURSOR_GAIN
+        play $CURSOR_W, $CURSOR_W, $CURSOR_DUR
+
+        wait $WAIT_FOR_FEEDBACK
+        fb_pop_data $DELAY_ID, $MEAS_DELAY
+        fb_pop_data $GAIN_ID, $CURSOR_GAIN
+
+        wait $POST_MULTICAST
+        jmp @shot_loop
+        nop
+
+    stop

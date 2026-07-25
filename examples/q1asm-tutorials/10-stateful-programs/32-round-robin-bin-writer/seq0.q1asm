@@ -1,0 +1,21 @@
+.DEF BIN R0
+.DEF N R1
+
+move START_BIN,$BIN
+nop
+move SHOTS,$N
+nop
+wait INIT_WAIT
+
+loop_start:
+acquire 0,$BIN,ACQ_DUR
+wait STEP_GAP
+add $BIN,1,$BIN
+nop
+jlt $BIN,BIN_COUNT,@next
+move 0,$BIN
+
+next:
+wait LOOP_GAP
+loop $N,@loop_start
+stop

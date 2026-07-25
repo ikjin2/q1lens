@@ -1,0 +1,7 @@
+.DEF CH {FEEDBACK_CHANNEL}
+.DEF WAIT_BUDGET {CONSUMER_WAIT}
+
+wait_sync 4
+wait $WAIT_BUDGET
+fb_pop_data $CH,R1
+stop

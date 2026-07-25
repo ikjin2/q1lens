@@ -1,0 +1,7 @@
+.DEF DRIVE_WAIT 80
+.DEF DRIVE_DURATION 64
+
+wait_sync 4
+wait $DRIVE_WAIT
+play 0,1,$DRIVE_DURATION
+stop

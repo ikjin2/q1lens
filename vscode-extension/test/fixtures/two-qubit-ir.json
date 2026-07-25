@@ -1,0 +1,452 @@
+{
+  "artifacts": {},
+  "capabilities": {
+    "artifacts": false,
+    "operations": true,
+    "q1asm": true,
+    "symbolic_pulses": true
+  },
+  "operations": [
+    {
+      "abs_time": 0.0,
+      "duration": 2e-08,
+      "id": "reset_q0",
+      "label": "Reset(q0)",
+      "operation_id": "reset_q0"
+    },
+    {
+      "abs_time": 0.0,
+      "duration": 2e-08,
+      "id": "reset_q1",
+      "label": "Reset(q1)",
+      "operation_id": "reset_q1"
+    },
+    {
+      "abs_time": 2e-08,
+      "duration": 2e-08,
+      "id": "x90_q0",
+      "label": "X90(q0)",
+      "operation_id": "x90_q0"
+    },
+    {
+      "abs_time": 2e-08,
+      "duration": 2e-08,
+      "id": "x90_q1",
+      "label": "X90(q1)",
+      "operation_id": "x90_q1"
+    },
+    {
+      "abs_time": 4.4e-08,
+      "duration": 8.8e-08,
+      "id": "cz_q0_q1",
+      "label": "CZ(q0,q1)",
+      "operation_id": "cz_q0_q1"
+    },
+    {
+      "abs_time": 1.32e-07,
+      "duration": 2e-08,
+      "id": "echo_q0",
+      "label": "X90(q0) echo",
+      "operation_id": "echo_q0"
+    },
+    {
+      "abs_time": 1.64e-07,
+      "duration": 4e-07,
+      "id": "measure_q0",
+      "label": "Measure(q0)",
+      "operation_id": "measure_q0"
+    },
+    {
+      "abs_time": 1.64e-07,
+      "duration": 4e-07,
+      "id": "measure_q1",
+      "label": "Measure(q1)",
+      "operation_id": "measure_q1"
+    }
+  ],
+  "project": {
+    "low_level_q1timeline": true,
+    "root": "<fixture-root>"
+  },
+  "q1asm_by_sequencer": {
+    "cluster0_module2_seq0": "wait_sync 4\nwait 20\nset_awg_gain 17203,0\nplay 0,1,20\nwait 92\nset_awg_gain -17203,0\nplay 2,3,20\nstop\n",
+    "cluster0_module2_seq1": "wait_sync 4\nwait 20\nset_awg_gain 15565,0\nplay 0,1,20\nstop\n",
+    "cluster0_module4_seq0": "wait_sync 4\nwait 44\nupd_param 4\nset_awg_gain 14746,0\nplay 0,0,8\nwait 72\nupd_param 4\nstop\n",
+    "cluster0_module6_seq0": "wait_sync 4\nwait 164\nplay 0,0,160\nacquire 0,0,240\nstop\n",
+    "cluster0_module6_seq1": "wait_sync 4\nwait 164\nplay 0,0,160\nacquire 1,0,240\nstop\n"
+  },
+  "q1asm_programs": [
+    {
+      "file": "q1asm/cluster0_module2_seq0.q1asm",
+      "path": [
+        "cluster0",
+        "module2",
+        "seq0"
+      ],
+      "sequencer_id": "cluster0_module2_seq0"
+    },
+    {
+      "file": "q1asm/cluster0_module2_seq1.q1asm",
+      "path": [
+        "cluster0",
+        "module2",
+        "seq1"
+      ],
+      "sequencer_id": "cluster0_module2_seq1"
+    },
+    {
+      "file": "q1asm/cluster0_module4_seq0.q1asm",
+      "path": [
+        "cluster0",
+        "module4",
+        "seq0"
+      ],
+      "sequencer_id": "cluster0_module4_seq0"
+    },
+    {
+      "file": "q1asm/cluster0_module6_seq0.q1asm",
+      "path": [
+        "cluster0",
+        "module6",
+        "seq0"
+      ],
+      "sequencer_id": "cluster0_module6_seq0"
+    },
+    {
+      "file": "q1asm/cluster0_module6_seq1.q1asm",
+      "path": [
+        "cluster0",
+        "module6",
+        "seq1"
+      ],
+      "sequencer_id": "cluster0_module6_seq1"
+    }
+  ],
+  "q1asm_provenance": [
+    {
+      "instruction_roles": [
+        "set_awg_gain",
+        "play"
+      ],
+      "operand_mappings": [
+        {
+          "instruction": "play",
+          "line": 4,
+          "numeric_value": 20,
+          "operand_index": 2,
+          "role": "trigger_duration",
+          "source_expression": "T_X90",
+          "source_value_id": "value:t_x90",
+          "unit": "ns"
+        }
+      ],
+      "q1asm_line_end": 4,
+      "q1asm_line_start": 3,
+      "schedulable_id": "x90_q0",
+      "sequencer_id": "cluster0_module2_seq0",
+      "source_id": "pulse:x90_q0:pulse:0",
+      "source_kind": "pulse"
+    },
+    {
+      "instruction_roles": [
+        "set_awg_gain",
+        "play",
+        "wait"
+      ],
+      "operand_mappings": [
+        {
+          "instruction": "play",
+          "line": 5,
+          "numeric_value": 8,
+          "operand_index": 2,
+          "role": "flux_settle",
+          "unit": "ns"
+        },
+        {
+          "instruction": "wait",
+          "line": 6,
+          "numeric_value": 72,
+          "operand_index": 0,
+          "role": "interaction_duration",
+          "source_expression": "T_CZ - 8 ns setup",
+          "source_value_id": "value:t_cz",
+          "unit": "ns"
+        }
+      ],
+      "q1asm_line_end": 7,
+      "q1asm_line_start": 4,
+      "schedulable_id": "cz_q0_q1",
+      "sequencer_id": "cluster0_module4_seq0",
+      "source_id": "pulse:cz_q0_q1:pulse:0",
+      "source_kind": "pulse"
+    },
+    {
+      "instruction_roles": [
+        "acquire"
+      ],
+      "operand_mappings": [
+        {
+          "instruction": "acquire",
+          "line": 4,
+          "numeric_value": 240,
+          "operand_index": 2,
+          "role": "integration_duration",
+          "source_expression": "READOUT_DURATION",
+          "source_value_id": "value:readout_duration",
+          "unit": "ns"
+        }
+      ],
+      "q1asm_line_end": 4,
+      "q1asm_line_start": 4,
+      "schedulable_id": "measure_q0",
+      "sequencer_id": "cluster0_module6_seq0",
+      "source_id": "acq:measure_q0:acquisition:0",
+      "source_kind": "acquisition"
+    }
+  ],
+  "schedule": {
+    "name": "two-qubit entangling demo"
+  },
+  "status": "ok",
+  "symbolic_pulses": [
+    {
+      "abs_time": 2e-08,
+      "clock": "q0.01",
+      "duration": 2e-08,
+      "duration_value_id": "value:t_x90",
+      "id": "pulse:x90_q0:pulse:0",
+      "kind": "DRAGPulse",
+      "lane": "q0:mw / q0.01",
+      "operation_id": "x90_q0",
+      "parameters": {
+        "amp": 0.21,
+        "phase": 0.0,
+        "sigma": 4e-09
+      },
+      "port": "q0:mw",
+      "role": "pulse",
+      "schedulable_id": "x90_q0"
+    },
+    {
+      "abs_time": 2e-08,
+      "clock": "q1.01",
+      "duration": 2e-08,
+      "duration_value_id": "value:t_x90",
+      "id": "pulse:x90_q1:pulse:0",
+      "kind": "DRAGPulse",
+      "lane": "q1:mw / q1.01",
+      "operation_id": "x90_q1",
+      "parameters": {
+        "amp": 0.19,
+        "phase": 90.0,
+        "sigma": 4e-09
+      },
+      "port": "q1:mw",
+      "role": "pulse",
+      "schedulable_id": "x90_q1"
+    },
+    {
+      "abs_time": 4.8e-08,
+      "clock": "cz",
+      "duration": 8e-08,
+      "duration_value_id": "value:t_cz",
+      "id": "pulse:cz_q0_q1:pulse:0",
+      "kind": "CZFluxPulse",
+      "lane": "q0_q1:flux / cz",
+      "operation_id": "cz_q0_q1",
+      "parameters": {
+        "amp": 0.18,
+        "detuning": -220000000.0,
+        "rise_time": 8e-09
+      },
+      "port": "q0_q1:flux",
+      "role": "pulse",
+      "schedulable_id": "cz_q0_q1"
+    },
+    {
+      "abs_time": 1.32e-07,
+      "clock": "q0.01",
+      "duration": 2e-08,
+      "duration_value_id": "value:t_x90",
+      "id": "pulse:echo_q0:pulse:0",
+      "kind": "DRAGPulse",
+      "lane": "q0:mw / q0.01",
+      "operation_id": "echo_q0",
+      "parameters": {
+        "amp": -0.21,
+        "phase": 180.0,
+        "sigma": 4e-09
+      },
+      "port": "q0:mw",
+      "role": "pulse",
+      "schedulable_id": "echo_q0"
+    },
+    {
+      "abs_time": 1.64e-07,
+      "clock": "q0.ro",
+      "duration": 1.6e-07,
+      "id": "pulse:measure_q0:pulse:0",
+      "kind": "SquarePulse",
+      "lane": "q0:res / q0.ro",
+      "operation_id": "measure_q0",
+      "parameters": {
+        "amp": 0.24
+      },
+      "port": "q0:res",
+      "role": "pulse",
+      "schedulable_id": "measure_q0"
+    },
+    {
+      "abs_time": 3.24e-07,
+      "clock": "q0.ro",
+      "duration": 2.4e-07,
+      "duration_value_id": "value:readout_duration",
+      "id": "acq:measure_q0:acquisition:0",
+      "kind": "SSBIntegrationComplex",
+      "lane": "q0:res / q0.ro",
+      "operation_id": "measure_q0",
+      "parameters": {
+        "acq_channel": 0
+      },
+      "port": "q0:res",
+      "role": "acquisition",
+      "schedulable_id": "measure_q0"
+    },
+    {
+      "abs_time": 1.64e-07,
+      "clock": "q1.ro",
+      "duration": 1.6e-07,
+      "id": "pulse:measure_q1:pulse:0",
+      "kind": "SquarePulse",
+      "lane": "q1:res / q1.ro",
+      "operation_id": "measure_q1",
+      "parameters": {
+        "amp": 0.23
+      },
+      "port": "q1:res",
+      "role": "pulse",
+      "schedulable_id": "measure_q1"
+    },
+    {
+      "abs_time": 3.24e-07,
+      "clock": "q1.ro",
+      "duration": 2.4e-07,
+      "duration_value_id": "value:readout_duration",
+      "id": "acq:measure_q1:acquisition:0",
+      "kind": "SSBIntegrationComplex",
+      "lane": "q1:res / q1.ro",
+      "operation_id": "measure_q1",
+      "parameters": {
+        "acq_channel": 1
+      },
+      "port": "q1:res",
+      "role": "acquisition",
+      "schedulable_id": "measure_q1"
+    }
+  ],
+  "symbolic_values": [
+    {
+      "id": "value:t_x90",
+      "kind": "duration",
+      "label": "T_X90",
+      "unit": "s",
+      "value": 2e-08
+    },
+    {
+      "id": "value:amp_x90",
+      "kind": "amplitude",
+      "label": "AMP_X90",
+      "unit": null,
+      "value": 0.21
+    },
+    {
+      "id": "value:t_cz",
+      "kind": "duration",
+      "label": "T_CZ",
+      "unit": "s",
+      "value": 8e-08
+    },
+    {
+      "id": "value:amp_cz",
+      "kind": "amplitude",
+      "label": "AMP_CZ",
+      "unit": null,
+      "value": 0.18
+    },
+    {
+      "id": "value:readout_duration",
+      "kind": "duration",
+      "label": "READOUT_DURATION",
+      "unit": "s",
+      "value": 2.4e-07
+    }
+  ],
+  "timing_table": [
+    {
+      "abs_time": 0.0,
+      "clock": "q0.01",
+      "duration": 2e-08,
+      "is_acquisition": false,
+      "operation": "Reset(q0)",
+      "port": "q0:mw"
+    },
+    {
+      "abs_time": 0.0,
+      "clock": "q1.01",
+      "duration": 2e-08,
+      "is_acquisition": false,
+      "operation": "Reset(q1)",
+      "port": "q1:mw"
+    },
+    {
+      "abs_time": 2e-08,
+      "clock": "q0.01",
+      "duration": 2e-08,
+      "is_acquisition": false,
+      "operation": "X90(q0)",
+      "port": "q0:mw"
+    },
+    {
+      "abs_time": 2e-08,
+      "clock": "q1.01",
+      "duration": 2e-08,
+      "is_acquisition": false,
+      "operation": "X90(q1)",
+      "port": "q1:mw"
+    },
+    {
+      "abs_time": 4.4e-08,
+      "clock": "cz",
+      "duration": 8.8e-08,
+      "is_acquisition": false,
+      "operation": "CZ(q0,q1)",
+      "port": "q0_q1:flux"
+    },
+    {
+      "abs_time": 1.32e-07,
+      "clock": "q0.01",
+      "duration": 2e-08,
+      "is_acquisition": false,
+      "operation": "X90(q0) echo",
+      "port": "q0:mw"
+    },
+    {
+      "abs_time": 1.64e-07,
+      "clock": "q0.ro",
+      "duration": 4e-07,
+      "is_acquisition": true,
+      "operation": "Measure(q0)",
+      "port": "q0:res"
+    },
+    {
+      "abs_time": 1.64e-07,
+      "clock": "q1.ro",
+      "duration": 4e-07,
+      "is_acquisition": true,
+      "operation": "Measure(q1)",
+      "port": "q1:res"
+    }
+  ],
+  "version": "0.1.0",
+  "warnings": []
+}

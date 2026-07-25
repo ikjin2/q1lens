@@ -1,0 +1,256 @@
+    .DEF SHOT_PERIOD        {SHOT_PERIOD}
+    .DEF START_ALIGN        {START_ALIGN}
+    .DEF TRIGGER_WAIT       {TRIGGER_WAIT}
+    .DEF ACQ_DUR            {ACQ_DUR}
+    .DEF MEAS_DELTA         {MEAS_DELTA}
+    .DEF WAIT_FOR_IQ        {WAIT_FOR_IQ}
+    .DEF FB_CFG_WAIT        {FB_CFG_WAIT}
+    .DEF FB_SEND_WAIT       {FB_SEND_WAIT}
+    .DEF WAIT_CHUNK         {WAIT_CHUNK}
+    .DEF IQ_SHIFT           {IQ_SHIFT}
+    .DEF IQ_ID              {IQ_FEEDBACK_CHANNEL}
+    .DEF CURSOR_CHANNEL     {CURSOR_CHANNEL}
+    .DEF FREQ_CHANNEL       {FREQ_CHANNEL}
+    .DEF CURSOR_GAIN_CHANNEL {CURSOR_GAIN_CHANNEL}
+    .DEF RF_GAIN_CHANNEL    {RF_GAIN_CHANNEL}
+    .DEF EDGE_ACQ           {EDGE_ACQ}
+    .DEF EDGE_ACQ_NUM_BINS  {EDGE_ACQ_NUM_BINS}
+    .DEF TRACKER_INIT_DELAY {TRACKER_INIT_DELAY}
+    .DEF TRACKER_MIN_DELAY  {TRACKER_MIN_DELAY}
+    .DEF TRACKER_MAX_DELAY  {TRACKER_MAX_DELAY}
+    .DEF TRACKER_CENTER_OFFSET {TRACKER_CENTER_OFFSET}
+    .DEF TRACK_STEP         {TRACK_STEP}
+    .DEF SLOPE_DEADBAND     {SLOPE_DEADBAND}
+    .DEF SIGN_BIT           0x80000000
+
+    .DEF ZERO               R0
+    .DEF LEFT_I             R1
+    .DEF RIGHT_I            R2
+    .DEF LEFT_Q             R3
+    .DEF RIGHT_Q            R4
+    .DEF LEFT_MAG           R5
+    .DEF RIGHT_MAG          R6
+    .DEF SLOPE              R7
+    .DEF ABS_SLOPE          R8
+    .DEF MEAS_DELAY         R9
+    .DEF TRACKED_GAIN       R10
+    .DEF POST_WAIT          R11
+    .DEF ALIGN_WAIT         R12
+    .DEF LEFT_BIN           R13
+    .DEF RIGHT_BIN          R14
+    .DEF TRACKED_CENTER     R15
+
+    wait_sync 16
+
+    fb_acq_iq_id $IQ_ID, $FB_CFG_WAIT
+    fb_acq_iq_shift $IQ_SHIFT, $FB_CFG_WAIT
+
+    move 0, $ZERO
+    move $TRACKER_INIT_DELAY, $MEAS_DELAY
+    move 0, $LEFT_I
+    move 0, $RIGHT_I
+    move 0, $LEFT_Q
+    move 0, $RIGHT_Q
+    move 0, $LEFT_BIN
+    move 1, $RIGHT_BIN
+
+    move $START_ALIGN, $ALIGN_WAIT
+    nop
+    sub $ALIGN_WAIT, $FB_CFG_WAIT, $ALIGN_WAIT
+    nop
+    sub $ALIGN_WAIT, $FB_CFG_WAIT, $ALIGN_WAIT
+    nop
+    wait $ALIGN_WAIT
+
+shot_loop:
+    wait_trigger 1, $TRIGGER_WAIT
+
+    move $SHOT_PERIOD, $POST_WAIT
+    nop
+    sub $POST_WAIT, $TRIGGER_WAIT, $POST_WAIT
+    nop
+    sub $POST_WAIT, $MEAS_DELAY, $POST_WAIT
+    nop
+    sub $POST_WAIT, $ACQ_DUR, $POST_WAIT
+    nop
+    sub $POST_WAIT, $MEAS_DELTA, $POST_WAIT
+    nop
+    sub $POST_WAIT, $ACQ_DUR, $POST_WAIT
+    nop
+    sub $POST_WAIT, $WAIT_FOR_IQ, $POST_WAIT
+    nop
+    sub $POST_WAIT, $FB_SEND_WAIT, $POST_WAIT
+    nop
+    sub $POST_WAIT, $FB_SEND_WAIT, $POST_WAIT
+    nop
+    sub $POST_WAIT, $FB_SEND_WAIT, $POST_WAIT
+    nop
+    sub $POST_WAIT, $FB_SEND_WAIT, $POST_WAIT
+    nop
+
+    wait $MEAS_DELAY
+    acquire $EDGE_ACQ, $LEFT_BIN, $ACQ_DUR
+    wait $MEAS_DELTA
+    acquire $EDGE_ACQ, $RIGHT_BIN, $ACQ_DUR
+
+    wait $WAIT_FOR_IQ
+    fb_pop_data $IQ_ID, $LEFT_I
+    fb_pop_data $IQ_ID, $LEFT_Q
+    fb_pop_data $IQ_ID, $RIGHT_I
+    fb_pop_data $IQ_ID, $RIGHT_Q
+
+    jge $LEFT_I, $SIGN_BIT, @left_i_negative
+    nop
+    jmp @left_i_ok
+    nop
+left_i_negative:
+    sub $ZERO, $LEFT_I, $LEFT_I
+    nop
+left_i_ok:
+    jge $LEFT_Q, $SIGN_BIT, @left_q_negative
+    nop
+    jmp @left_q_ok
+    nop
+left_q_negative:
+    sub $ZERO, $LEFT_Q, $LEFT_Q
+    nop
+left_q_ok:
+    jge $RIGHT_I, $SIGN_BIT, @right_i_negative
+    nop
+    jmp @right_i_ok
+    nop
+right_i_negative:
+    sub $ZERO, $RIGHT_I, $RIGHT_I
+    nop
+right_i_ok:
+    jge $RIGHT_Q, $SIGN_BIT, @right_q_negative
+    nop
+    jmp @right_q_ok
+    nop
+right_q_negative:
+    sub $ZERO, $RIGHT_Q, $RIGHT_Q
+    nop
+right_q_ok:
+    add $LEFT_I, $LEFT_Q, $LEFT_MAG
+    nop
+    add $RIGHT_I, $RIGHT_Q, $RIGHT_MAG
+    nop
+    sub $RIGHT_MAG, $LEFT_MAG, $SLOPE
+    nop
+    jge $SLOPE, $SIGN_BIT, @slope_negative
+    nop
+    jlt $SLOPE, $SLOPE_DEADBAND, @delay_hold
+    nop
+    add $MEAS_DELAY, $TRACK_STEP, $MEAS_DELAY
+    jmp @after_track
+    nop
+
+slope_negative:
+    sub $LEFT_MAG, $RIGHT_MAG, $ABS_SLOPE
+    nop
+    jlt $ABS_SLOPE, $SLOPE_DEADBAND, @delay_hold
+    nop
+    sub $MEAS_DELAY, $TRACK_STEP, $TRACKED_GAIN
+    nop
+    jge $TRACKED_GAIN, $SIGN_BIT, @delay_to_min
+    nop
+    move $TRACKED_GAIN, $MEAS_DELAY
+    jmp @after_track
+    nop
+delay_to_min:
+    move $TRACKER_MIN_DELAY, $MEAS_DELAY
+    jmp @after_track
+    nop
+delay_hold:
+    nop
+
+after_track:
+    jlt $MEAS_DELAY, $TRACKER_MIN_DELAY, @clamp_min
+    nop
+    jge $MEAS_DELAY, $TRACKER_MAX_DELAY, @clamp_max
+    nop
+    jmp @delay_ok
+    nop
+clamp_min:
+    move $TRACKER_MIN_DELAY, $MEAS_DELAY
+    jmp @delay_ok
+    nop
+clamp_max:
+    move $TRACKER_MAX_DELAY, $MEAS_DELAY
+    nop
+delay_ok:
+    add $MEAS_DELAY, $TRACKER_CENTER_OFFSET, $TRACKED_CENTER
+    nop
+    add $LEFT_MAG, $RIGHT_MAG, $TRACKED_GAIN
+    nop
+    asr $TRACKED_GAIN, 1, $TRACKED_GAIN
+    nop
+    fb_com_data $CURSOR_CHANNEL, $TRACKED_CENTER, $FB_SEND_WAIT
+    fb_com_data $FREQ_CHANNEL, $TRACKED_CENTER, $FB_SEND_WAIT
+    fb_com_data $CURSOR_GAIN_CHANNEL, $TRACKED_GAIN, $FB_SEND_WAIT
+    fb_com_data $RF_GAIN_CHANNEL, $TRACKED_GAIN, $FB_SEND_WAIT
+    add $LEFT_BIN, 2, $LEFT_BIN
+    nop
+    add $RIGHT_BIN, 2, $RIGHT_BIN
+    nop
+    jge $RIGHT_BIN, $EDGE_ACQ_NUM_BINS, @wrap_edge_bins
+    nop
+    jmp @edge_bins_ok
+    nop
+
+wrap_edge_bins:
+    move 0, $LEFT_BIN
+    move 1, $RIGHT_BIN
+edge_bins_ok:
+
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $WAIT_CHUNK
+    sub $POST_WAIT, $WAIT_CHUNK, $POST_WAIT
+    nop
+    wait $POST_WAIT
+    jmp @shot_loop
+    nop

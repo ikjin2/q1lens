@@ -1,0 +1,11 @@
+{
+  "START_POS": 1,
+  "SEED": 5,
+  "SEED_MUL": 5,
+  "SEED_INC": 1,
+  "FEEDBACK_ADDR": 0,
+  "MIN_POS": 0,
+  "MAX_POS": 3,
+  "MAX_CLAMP": 2,
+  "STEP_WAIT": 64
+}

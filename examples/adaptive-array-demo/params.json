@@ -1,0 +1,18 @@
+{
+  "TRIGGER_INDEX": 1,
+  "TRIGGER_TIMEOUT": 2000,
+  "CH_IQ_Q0": 20,
+  "CH_IQ_Q1": 21,
+  "CH_IQ_Q2": 22,
+  "CH_IQ_Q3": 23,
+  "CH_TRACK_Q0": 30,
+  "CH_TRACK_Q1": 31,
+  "CH_TRACK_Q2": 32,
+  "CH_TRACK_Q3": 33,
+  "CH_GRANT_Q0": 40,
+  "CH_GRANT_Q1": 41,
+  "CH_GRANT_Q2": 42,
+  "CH_GRANT_Q3": 43,
+  "CH_TELEMETRY": 60,
+  "CH_FAULT": 61
+}

@@ -1,0 +1,18 @@
+{
+  "folders": [
+    {
+      "name": "Adaptive Array Demo",
+      "path": "."
+    },
+    {
+      "name": "Q1Lens Extension",
+      "path": "../../vscode-extension"
+    }
+  ],
+  "settings": {
+    "files.associations": {
+      "*.q1asm": "q1asm"
+    },
+    "q1timeline.pythonPath": "python"
+  }
+}

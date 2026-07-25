@@ -1,0 +1,32 @@
+sequencers:
+  - id: q0_drive
+    name: Q0 drive
+    file: q0_drive.q1asm
+    module: QCM0
+  - id: q1_drive
+    name: Q1 drive
+    file: q1_drive.q1asm
+    module: QCM1
+  - id: q0_readout
+    name: Q0 readout
+    file: q0_readout.q1asm
+    module: QRM0
+  - id: q1_readout
+    name: Q1 readout
+    file: q1_readout.q1asm
+    module: QRM1
+
+alignment:
+  mode: first_wait_sync
+
+view:
+  default_mode: debug
+  show_q1_issue: true
+  show_queue: true
+  show_slack: true
+  show_loop_preview: true
+
+analysis:
+  loop_policy: compact_first_iteration
+  branch_policy: assume_fallthrough
+  underflow_policy: confidence_levels

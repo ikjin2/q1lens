@@ -1,0 +1,6 @@
+wait_trigger 1,1000
+wait 80
+acquire_ttl 0,0,1,48
+wait 32
+acquire 1,1,32
+stop

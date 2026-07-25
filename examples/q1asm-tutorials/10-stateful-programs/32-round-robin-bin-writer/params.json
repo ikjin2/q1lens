@@ -1,0 +1,9 @@
+{
+  "START_BIN": 0,
+  "SHOTS": 4,
+  "BIN_COUNT": 3,
+  "INIT_WAIT": 32,
+  "ACQ_DUR": 40,
+  "STEP_GAP": 80,
+  "LOOP_GAP": 80
+}

@@ -1,0 +1,24 @@
+sequencers:
+  - id: qcm_drive
+    name: QCM input stimulus
+    file: qcm_drive.q1asm
+    module: QCM0
+  - id: qrm_threshold_router
+    name: QRM threshold router
+    file: qrm_threshold_router.q1asm
+    module: QRM0
+
+alignment:
+  mode: first_wait_sync
+
+view:
+  default_mode: normal
+  show_q1_issue: false
+  show_queue: false
+  show_slack: true
+  show_loop_preview: true
+
+analysis:
+  loop_policy: compact_first_iteration
+  branch_policy: assume_fallthrough
+  underflow_policy: confidence_levels

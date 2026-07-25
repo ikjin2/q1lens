@@ -1,0 +1,14 @@
+// Open this file and run: Q1Lens: Open Timeline Preview
+// No q1timeline.yml is present; Q1Lens should generate one for this folder.
+
+.DEF T_PRE {T_PRE}
+.DEF T_DRIVE {T_DRIVE}
+
+wait_sync 4
+wait $T_PRE
+set_mrk 1
+upd_param 4
+play 0,1,$T_DRIVE
+set_mrk 0
+upd_param 4
+stop

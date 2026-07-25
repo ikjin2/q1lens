@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+message: "If you use Q1Lens, please cite it as below."
+title: "Q1Lens"
+type: software
+authors:
+  - family-names: "Ik"
+    given-names: "Kyeong Jin"
+version: 0.1.0
+date-released: 2026-07-25
+repository-code: "https://github.com/ikjin2/q1lens"
+url: "https://github.com/ikjin2/q1lens"
+license: Apache-2.0

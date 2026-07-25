@@ -1,0 +1,210 @@
+    .DEF T_TOTAL             {T_TOTAL}
+    .DEF START_ALIGN         {START_ALIGN}
+    .DEF TRIGGER_WAIT        8
+
+    .DEF TRIG_HIGH           20
+    .DEF TRIG_LOW            4
+    .DEF TRIG_MRK_MASK       1
+    .DEF PREP_WAIT           {PREP_WAIT}
+
+    .DEF GAUSS_DUR           {GAUSS_DUR}
+    .DEF GAUSS_W             0
+    .DEF GAUSS_GAIN_PEAK     {GAUSS_GAIN_PEAK}
+
+    .DEF PEAK2_BASE          {PEAK2_BASE}
+    .DEF PEAK3_BASE          {PEAK3_BASE}
+    .DEF P2_INIT_OFFSET      {P2_INIT_OFFSET}
+    .DEF P3_INIT_OFFSET      {P3_INIT_OFFSET}
+    .DEF DRIFT_SPAN          {DRIFT_SPAN}
+    .DEF DRIFT_MAX_OFFSET    {DRIFT_MAX_OFFSET}
+    .DEF P2_DRIFT_UPDATE_SHOTS {P2_DRIFT_UPDATE_SHOTS}
+    .DEF P3_DRIFT_UPDATE_SHOTS {P3_DRIFT_UPDATE_SHOTS}
+    .DEF P2_DRIFT_STEP_MASK  {P2_DRIFT_STEP_MASK}
+    .DEF P3_DRIFT_STEP_MASK  {P3_DRIFT_STEP_MASK}
+    .DEF SIGN_BIT            0x80000000
+
+    .DEF ZERO                R0
+    .DEF P2_OFF              R2
+    .DEF P3_OFF              R3
+    .DEF P2_DELAY            R5
+    .DEF P3_DELAY            R6
+    .DEF WAIT_A              R7
+    .DEF WAIT_B              R8
+    .DEF POST_WAIT           R9
+    .DEF P2_SHOT_COUNT       R10
+    .DEF MAG                 R11
+    .DEF DIR                 R12
+    .DEF TMP                 R13
+    .DEF P3_SHOT_COUNT       R14
+    .DEF SEED2               R21
+    .DEF SEED3               R22
+    .DEF SCR                 R23
+
+    wait_sync 4
+
+    move 0, $ZERO
+    move $P2_INIT_OFFSET, $P2_OFF
+    move $P3_INIT_OFFSET, $P3_OFF
+    move 0, $P2_SHOT_COUNT
+    move 0, $P3_SHOT_COUNT
+    move 24681357, $SEED2
+    move 97531864, $SEED3
+
+    wait $START_ALIGN
+
+    shot_loop:
+        wait_trigger 1, $TRIGGER_WAIT
+
+        set_mrk $TRIG_MRK_MASK
+        upd_param $TRIG_HIGH
+        set_mrk 0
+        upd_param $TRIG_LOW
+        wait $PREP_WAIT
+
+        move $PEAK2_BASE, $P2_DELAY
+        nop
+        add $P2_DELAY, $P2_OFF, $P2_DELAY
+        move $PEAK3_BASE, $P3_DELAY
+        nop
+        add $P3_DELAY, $P3_OFF, $P3_DELAY
+
+        move $P2_DELAY, $WAIT_A
+        nop
+        sub $WAIT_A, $TRIG_HIGH, $WAIT_A
+        nop
+        sub $WAIT_A, $TRIG_LOW, $WAIT_A
+        nop
+        sub $WAIT_A, $PREP_WAIT, $WAIT_A
+
+        move $P3_DELAY, $WAIT_B
+        nop
+        sub $WAIT_B, $P2_DELAY, $WAIT_B
+        nop
+        sub $WAIT_B, $GAUSS_DUR, $WAIT_B
+
+        wait $WAIT_A
+        set_awg_gain $GAUSS_GAIN_PEAK, 0
+        play $GAUSS_W, $GAUSS_W, $GAUSS_DUR
+
+        wait $WAIT_B
+        set_awg_gain 0, $GAUSS_GAIN_PEAK
+        play $GAUSS_W, $GAUSS_W, $GAUSS_DUR
+
+        move $T_TOTAL, $POST_WAIT
+        nop
+        sub $POST_WAIT, $TRIGGER_WAIT, $POST_WAIT
+        nop
+        sub $POST_WAIT, $P3_DELAY, $POST_WAIT
+        nop
+        sub $POST_WAIT, $GAUSS_DUR, $POST_WAIT
+        nop
+        wait $POST_WAIT
+
+        add $P2_SHOT_COUNT, 1, $P2_SHOT_COUNT
+        nop
+        jge $P2_SHOT_COUNT, $P2_DRIFT_UPDATE_SHOTS, @p2_update
+        nop
+        jmp @p3_check
+        nop
+
+    p2_update:
+        move 0, $P2_SHOT_COUNT
+        asl $SEED2, 13, $SCR
+        nop
+        xor $SEED2, $SCR, $SEED2
+        nop
+        asr $SEED2, 17, $SCR
+        nop
+        and $SCR, 0x7FFF, $SCR
+        nop
+        xor $SEED2, $SCR, $SEED2
+        nop
+        asl $SEED2, 5, $SCR
+        nop
+        xor $SEED2, $SCR, $SEED2
+        nop
+        and $SEED2, $P2_DRIFT_STEP_MASK, $MAG
+        nop
+        asr $SEED2, 5, $DIR
+        nop
+        and $DIR, 1, $DIR
+        nop
+        jlt $DIR, 1, @p2_forward
+        nop
+        sub $P2_OFF, $MAG, $TMP
+        nop
+        jge $TMP, $SIGN_BIT, @p2_floor
+        nop
+        move $TMP, $P2_OFF
+        jmp @p2_done
+        nop
+    p2_floor:
+        sub $MAG, $P2_OFF, $P2_OFF
+        jmp @p2_done
+        nop
+    p2_forward:
+        add $P2_OFF, $MAG, $P2_OFF
+        nop
+        jlt $P2_OFF, $DRIFT_SPAN, @p2_done
+        nop
+        sub $P2_OFF, $DRIFT_SPAN, $TMP
+        nop
+        sub $DRIFT_MAX_OFFSET, $TMP, $P2_OFF
+
+    p2_done:
+    p3_check:
+        add $P3_SHOT_COUNT, 1, $P3_SHOT_COUNT
+        nop
+        jge $P3_SHOT_COUNT, $P3_DRIFT_UPDATE_SHOTS, @p3_update
+        nop
+        jmp @shot_loop
+        nop
+
+    p3_update:
+        move 0, $P3_SHOT_COUNT
+        asl $SEED3, 13, $SCR
+        nop
+        xor $SEED3, $SCR, $SEED3
+        nop
+        asr $SEED3, 17, $SCR
+        nop
+        and $SCR, 0x7FFF, $SCR
+        nop
+        xor $SEED3, $SCR, $SEED3
+        nop
+        asl $SEED3, 5, $SCR
+        nop
+        xor $SEED3, $SCR, $SEED3
+        nop
+        and $SEED3, $P3_DRIFT_STEP_MASK, $MAG
+        nop
+        asr $SEED3, 5, $DIR
+        nop
+        and $DIR, 1, $DIR
+        nop
+        jlt $DIR, 1, @p3_forward
+        nop
+        sub $P3_OFF, $MAG, $TMP
+        nop
+        jge $TMP, $SIGN_BIT, @p3_floor
+        nop
+        move $TMP, $P3_OFF
+        jmp @p3_done
+        nop
+    p3_floor:
+        sub $MAG, $P3_OFF, $P3_OFF
+        jmp @p3_done
+        nop
+    p3_forward:
+        add $P3_OFF, $MAG, $P3_OFF
+        nop
+        jlt $P3_OFF, $DRIFT_SPAN, @p3_done
+        nop
+        sub $P3_OFF, $DRIFT_SPAN, $TMP
+        nop
+        sub $DRIFT_MAX_OFFSET, $TMP, $P3_OFF
+    p3_done:
+        jmp @shot_loop
+        nop
+
+    stop

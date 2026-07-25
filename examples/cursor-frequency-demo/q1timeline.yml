@@ -1,0 +1,37 @@
+sequencers:
+  - id: blue_peak
+    name: QCM0 Ch0 blue peak
+    file: blue_peak.q1asm
+    module: QCM0
+  - id: red_cursor
+    name: QRM0 Ch1 red cursor
+    file: red_cursor.q1asm
+    module: QRM0
+  - id: red_tracker
+    name: QRM0 Ch1 tracker
+    file: red_tracker.q1asm
+    module: QRM0
+  - id: orange_drive
+    name: QCM1 Ch0 orange sine retune
+    file: orange_drive.q1asm
+    module: QCM1
+
+params:
+  file: params.json
+
+alignment:
+  mode: first_anchor
+  anchor_kinds:
+    - wait_trigger
+
+view:
+  default_mode: normal
+  show_q1_issue: false
+  show_queue: false
+  show_slack: false
+  show_loop_preview: true
+
+analysis:
+  loop_policy: compact_first_iteration
+  branch_policy: assume_fallthrough
+  underflow_policy: confidence_levels

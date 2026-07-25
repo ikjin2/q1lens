@@ -1,0 +1,4 @@
+wait_trigger 1,1000
+wait 92
+acquire 0,1,72
+stop

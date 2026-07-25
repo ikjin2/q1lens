@@ -1,0 +1,6 @@
+move 3,R0
+loop_start:
+wait 64
+play 0,1,4
+loop R0,@loop_start
+stop

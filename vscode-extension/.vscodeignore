@@ -12,3 +12,5 @@ node_modules/**
 scripts/**
 **/*.map
 tsconfig.json
+playwright.config.js
+out/src/environment.js

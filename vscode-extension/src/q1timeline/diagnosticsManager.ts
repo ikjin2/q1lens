@@ -1,5 +1,6 @@
 // @ts-nocheck
 const { mapAnalyzerDiagnostic } = require("./diagnosticMapper");
+const { clearSuggestedEdits, preserveSuggestedEdit } = require("./q1asmQuickFix");
 
 class DiagnosticsManager {
   constructor(vscodeApi, collection, resolveSourcePath) {
@@ -9,6 +10,7 @@ class DiagnosticsManager {
   }
 
   apply(diagnostics) {
+    clearSuggestedEdits();
     const byUri = new Map();
     for (const item of diagnostics) {
       const mapped = mapAnalyzerDiagnostic(item, (sourceFile) => this.resolveSourcePath(sourceFile));
@@ -16,7 +18,7 @@ class DiagnosticsManager {
         continue;
       }
       const uri = this.vscode.Uri.file(mapped.file);
-      // Highlight the complete instruction line.
+      // Highlight the instruction line without widening the validated suggested edit.
       const range = new this.vscode.Range(
         mapped.range.startLine,
         0,
@@ -26,6 +28,9 @@ class DiagnosticsManager {
       const diagnostic = new this.vscode.Diagnostic(range, mapped.message, this.toSeverity(mapped.severity));
       diagnostic.source = mapped.source;
       diagnostic.code = mapped.code;
+      if (mapped.suggestedEdit) {
+        preserveSuggestedEdit(mapped.file, diagnostic, mapped.suggestedEdit);
+      }
       const relatedInformation = this.toRelatedInformation(mapped);
       if (relatedInformation.length) {
         diagnostic.relatedInformation = relatedInformation;
@@ -42,6 +47,7 @@ class DiagnosticsManager {
   }
 
   applyFallback(projectUri, message) {
+    clearSuggestedEdits();
     if (!projectUri) {
       return;
     }

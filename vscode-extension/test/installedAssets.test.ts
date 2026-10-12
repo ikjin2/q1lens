@@ -44,17 +44,55 @@ describe("installed asset verification", () => {
     const { assetFiles } = verifier();
 
     assert.deepEqual(assetFiles, [
+      "package.json",
+      "dist/extension.js",
       "media/q1lens-icon.png",
       "media/qbs-timeline.svg",
       "out/src/q1timeline/media/timeline.css",
       "out/src/q1timeline/media/timeline.js",
       "out/src/q1timeline/media/timelineAdapter.js",
+      "out/src/q1timeline/media/hardwareState.js",
+      "out/src/q1timeline/media/hardwareView.js",
+      "out/src/q1timeline/media/hardwareView.css",
       "out/src/shared/timeline/renderer.css",
       "out/src/shared/timeline/renderer.js",
       "out/src/qbs/webview/assets/timeline.css",
       "out/src/qbs/webview/assets/timeline.js",
       "out/src/qbs/webview/assets/timelineModel.js",
     ]);
+  });
+
+  it("detects a missing or stale extension bundle even when every webview asset matches", () => {
+    tempDir = mkdtempSync(join(tmpdir(), "q1lens-installed-controller-"));
+    const extensionRoot = join(tempDir, "extension");
+    const installedRoot = join(tempDir, "installed");
+    for (const file of verifier().assetFiles) {
+      const content = file === "package.json" ? '{"name":"q1lens"}' : `fresh ${file}`;
+      writeFixtureFile(extensionRoot, file, content);
+      if (file !== "dist/extension.js") writeFixtureFile(installedRoot, file, content);
+    }
+    assert.deepEqual(verifier().compareInstalledAssets({ extensionRoot, installedRoot }).mismatches,
+      [{ file: "dist/extension.js", reason: "installed-missing" }]);
+    writeFixtureFile(installedRoot, "dist/extension.js", "stale extension bundle");
+    assert.deepEqual(verifier().compareInstalledAssets({ extensionRoot, installedRoot }).mismatches,
+      [{ file: "dist/extension.js", reason: "hash-mismatch" }]);
+  });
+
+  it("compares manifest contents while allowing VS Code installation metadata and formatting", () => {
+    tempDir = mkdtempSync(join(tmpdir(), "q1lens-installed-manifest-"));
+    const extensionRoot = join(tempDir, "extension");
+    const installedRoot = join(tempDir, "installed");
+    const files = ["package.json"];
+    const manifest = { name: "q1lens", version: "0.1.0", contributes: { executionModes: ["analysis", "simulation"] } };
+    writeFixtureFile(extensionRoot, "package.json", JSON.stringify(manifest));
+    writeFixtureFile(installedRoot, "package.json", JSON.stringify({ __metadata: { installedTimestamp: 123 }, ...manifest }, null, "\t"));
+    assert.equal(verifier().compareInstalledAssets({ extensionRoot, installedRoot, files }).ok, true);
+    writeFixtureFile(installedRoot, "package.json", JSON.stringify({ ...manifest, contributes: { executionModes: ["analysis"] } }));
+    assert.deepEqual(verifier().compareInstalledAssets({ extensionRoot, installedRoot, files }).mismatches,
+      [{ file: "package.json", reason: "manifest-mismatch" }]);
+    rmSync(join(installedRoot, "package.json"));
+    assert.deepEqual(verifier().compareInstalledAssets({ extensionRoot, installedRoot, files }).mismatches,
+      [{ file: "package.json", reason: "installed-missing" }]);
   });
 
   it("passes when installed runtime assets match the built extension assets", () => {

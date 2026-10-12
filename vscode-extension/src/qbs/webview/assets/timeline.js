@@ -293,6 +293,7 @@ function renderBlock(block, selectedInspectorId) {
   const visualKind = block.visualKind || block.type;
   const selectionId = block.sourceBlockId || block.id;
   const node = element("div", `timeline-block timeline-block-${visualKind}`);
+  node.dataset.blockId = block.id;
   node.setAttribute("role", "button");
   node.tabIndex = 0;
   node.addEventListener("click", (event) => {
@@ -312,8 +313,20 @@ function renderBlock(block, selectedInspectorId) {
     node.style.setProperty("--timeline-block-accent", block.accentColor);
   }
   node.setAttribute("aria-selected", block.selected ? "true" : "false");
+  if (block.provenanceStatus) {
+    node.dataset.provenance = block.provenanceStatus;
+  }
   node.toggleAttribute("data-related", Boolean(block.relatedSelected));
   node.title = `${block.label} | ${block.startLabel} | ${block.durationLabel}`;
+  node.setAttribute(
+    "aria-label",
+    block.provenanceLabel
+      ? `${block.label}, ${block.provenanceLabel} provenance, starts ${block.startLabel}, duration ${block.durationLabel}`
+      : `${block.label}, starts ${block.startLabel}, duration ${block.durationLabel}`,
+  );
+  if (block.provenanceDescription) {
+    node.title = `${node.title} | Provenance: ${block.provenanceLabel}. ${block.provenanceDescription}`;
+  }
   if (block.q1asmText) {
     node.title = `${block.q1asmText} | ${node.title}`;
   }
@@ -500,6 +513,14 @@ function renderInspector(model) {
     inspector.appendChild(renderInspectorTabs(model.inspector));
   }
   inspector.appendChild(renderInspectorBody(model.inspector));
+  if (model.inspector.provenanceNotice) {
+    const notice = element("div", "inspector-notice");
+    notice.dataset.tone = model.inspector.provenanceNotice.tone || "information";
+    notice.setAttribute("role", "note");
+    notice.appendChild(element("div", "inspector-notice-title", model.inspector.provenanceNotice.title));
+    notice.appendChild(element("p", "", model.inspector.provenanceNotice.message));
+    inspector.appendChild(notice);
+  }
 
   const actions = element("div", "inspector-actions");
   for (const action of model.inspector.actions) {
@@ -508,6 +529,50 @@ function renderInspector(model) {
   actions.appendChild(button("action-button secondary", "Open QBS IR", () => vscode.postMessage({ type: "openIr" })));
   inspector.appendChild(actions);
   return inspector;
+}
+
+function revealProvenance(status) {
+  const target = timelineModel.provenanceSelection(currentIr, status, selectedId);
+  if (!target) {
+    return;
+  }
+  expandedGroups.add(target.groupId);
+  // Reset zoom so a target outside the current window is included in the model.
+  viewport = null;
+  selectionRange = null;
+  activeInspectorTab = "lowering";
+  render(currentIr, target.blockId);
+  const node = Array.from(root.querySelectorAll("[data-block-id]"))
+    .find((candidate) => candidate.dataset.blockId === target.blockId);
+  if (node) {
+    node.scrollIntoView({ block: "nearest", inline: "nearest" });
+    node.focus({ preventScroll: true });
+  }
+}
+
+function renderProvenanceLegend(coverage) {
+  const legend = element("section", "provenance-legend");
+  legend.setAttribute("aria-label", coverage.ariaLabel);
+  legend.appendChild(element("div", "provenance-legend-title", "Provenance coverage"));
+  const items = element("div", "provenance-legend-items");
+  items.setAttribute("role", "list");
+  for (const entry of coverage.entries || []) {
+    const item = element("div", "");
+    item.setAttribute("role", "listitem");
+    const control = button("provenance-legend-item", "", () => revealProvenance(entry.status));
+    control.dataset.provenance = entry.status;
+    control.disabled = !entry.count;
+    control.title = entry.count ? `Locate next ${entry.label.toLowerCase()} symbolic block` : `No ${entry.label.toLowerCase()} symbolic blocks`;
+    control.setAttribute("aria-label", `${entry.label}: ${entry.count}. ${control.title}`);
+    const swatch = element("span", "provenance-swatch");
+    swatch.setAttribute("aria-hidden", "true");
+    control.appendChild(swatch);
+    control.appendChild(element("span", "provenance-legend-label", `${entry.label} ${entry.count}`));
+    item.appendChild(control);
+    items.appendChild(item);
+  }
+  legend.appendChild(items);
+  return legend;
 }
 
 function renderSummary(model) {
@@ -528,6 +593,7 @@ function renderSummary(model) {
     source.appendChild(actions);
     summary.appendChild(source);
   }
+  summary.appendChild(renderProvenanceLegend(model.provenanceCoverage));
   for (const item of model.artifactSummary) {
     const stat = element("div", "summary-item");
     stat.appendChild(element("span", "summary-value", item.value));

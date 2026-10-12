@@ -1,0 +1,32 @@
+{
+  "folders": [{"name": "Q1Lens simulation verification", "path": "."}],
+  "settings": {
+    "q1lens.q1timeline.executionMode": "project",
+    "q1lens.q1timeline.updateMode": "onSave",
+    "q1lens.q1timeline.view.defaultMode": "debug",
+    "q1lens.q1timeline.pythonPath": "python",
+    "python.defaultInterpreterPath": "python"
+  },
+  "tasks": {
+    "version": "2.0.0",
+    "tasks": [{
+      "label": "Q1Lens: Verify all simulation examples",
+      "type": "process",
+      "command": "${config:q1lens.q1timeline.pythonPath}",
+      "args": ["${workspaceFolder}/verify.py"],
+      "problemMatcher": [],
+      "group": {"kind": "test", "isDefault": true}
+    }]
+  },
+  "launch": {
+    "version": "0.2.0",
+    "configurations": [{
+      "name": "Verify Q1Lens simulation examples",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/verify.py",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    }]
+  }
+}

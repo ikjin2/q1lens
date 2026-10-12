@@ -253,6 +253,89 @@ describe("q1timeline internal API", () => {
     assert.equal(diagnostic?.relatedInformation[0].file, "C:\\repo\\schedule.py");
   });
 
+  it("maps analyzer-suggested edits only inside the diagnosed Q1ASM range", () => {
+    const diagnostic = mapAnalyzerDiagnostic(
+      {
+        severity: "warning",
+        category: "future_safe_fix",
+        message: "A future analyzer can offer a safe edit.",
+        source: { file: "seq0.q1asm", line: 4, column: 1 },
+        details: {
+          suggested_edit: {
+            title: "Apply analyzer suggestion",
+            file: "seq0.q1asm",
+            range: {
+              start: { line: 4, column: 1 },
+              end: { line: 4, column: 1 },
+            },
+            new_text: "upd_param 4\n",
+          },
+        },
+      },
+      (file: string) => `C:\\repo\\${file}`,
+    );
+
+    assert.deepEqual(diagnostic?.suggestedEdit, {
+      title: "Apply analyzer suggestion",
+      file: "C:\\repo\\seq0.q1asm",
+      range: { start: { line: 3, column: 0 }, end: { line: 3, column: 0 } },
+      newText: "upd_param 4\n",
+    });
+  });
+
+  it("rejects analyzer-suggested edits targeting another file", () => {
+    const diagnostic = mapAnalyzerDiagnostic(
+      {
+        severity: "warning",
+        category: "future_safe_fix",
+        message: "Do not edit another program.",
+        source: { file: "seq0.q1asm", line: 4, column: 1 },
+        details: {
+          suggested_edit: {
+            title: "Unsafe cross-file edit",
+            file: "seq1.q1asm",
+            range: {
+              start: { line: 4, column: 1 },
+              end: { line: 4, column: 1 },
+            },
+            new_text: "upd_param 4\n",
+          },
+        },
+      },
+      (file: string) => `C:\\repo\\${file}`,
+    );
+
+    assert.equal(diagnostic?.suggestedEdit, undefined);
+  });
+
+  it("rejects malformed and out-of-range analyzer-suggested edits", () => {
+    for (const range of [
+      { start: { line: 0, column: 1 }, end: { line: 0, column: 1 } },
+      { start: { line: 4, column: 3 }, end: { line: 4, column: 3 } },
+      { start: { line: 4, column: 2 }, end: { line: 4, column: 1 } },
+    ]) {
+      const diagnostic = mapAnalyzerDiagnostic(
+        {
+          severity: "warning",
+          category: "future_safe_fix",
+          message: "Reject an invalid edit.",
+          source: { file: "seq0.q1asm", line: 4, column: 1 },
+          details: {
+            suggested_edit: {
+              title: "Invalid edit",
+              file: "seq0.q1asm",
+              range,
+              new_text: "upd_param 4\n",
+            },
+          },
+        },
+        (file: string) => `C:\\repo\\${file}`,
+      );
+
+      assert.equal(diagnostic?.suggestedEdit, undefined);
+    }
+  });
+
   it("rejects stale stored project files outside the current workspace", () => {
     assert.equal(
       usableStoredProjectFile({

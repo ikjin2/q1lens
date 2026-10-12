@@ -1215,6 +1215,10 @@
         ...style,
       };
       const mapping = provenanceForSelection(ir, block);
+      const provenance = provenanceCoverageForMapping(mapping);
+      block.provenanceStatus = provenance.status;
+      block.provenanceLabel = provenance.label;
+      block.provenanceDescription = provenance.description;
       if (mapping?.sequencer) {
         block.q1timelineMessage = q1timelinePreviewMessage(block, mapping);
         block.inlineQ1Preview = inlineQ1PreviewsForBlock(ir, block, mapping);
@@ -1263,6 +1267,7 @@
       id: pulse.id,
       operationId: pulse.operation_id,
     });
+    const provenance = provenanceCoverageForMapping(mapping);
     const symbolicDuration = values.get(pulse.duration_value_id);
     const line = provenanceStartLine(mapping);
     const title = pulse.display_label || pulse.label || pulse.id;
@@ -1276,11 +1281,23 @@
         { label: "Start", value: formatDuration(pulse.abs_time || 0) },
         { label: "Duration", value: formatDuration(pulse.duration || 0) },
         { label: "Symbolic duration", value: symbolicDuration?.label },
+        { label: "Provenance", value: provenance.label },
+        { label: "Evidence", value: provenance.description },
+        { label: "Inference reason", value: provenance.status === "inferred" ? mapping?.inference_reason : "" },
         { label: "Q1ASM", value: mapping ? `${mapping.sequencer}:L${line}` : "" },
       ]),
       actions: [
         { label: "Open Full Q1ASM Timeline", message: { type: "openQ1Timeline", blockId: pulse.id, operationId: pulse.operation_id } },
       ],
+      ...(provenance.status === "unmapped"
+        ? {
+            provenanceNotice: {
+              title: "No Q1ASM provenance",
+              message: provenance.description,
+              tone: "warning",
+            },
+          }
+        : {}),
       selectedId: selectedBlock.id,
     };
   }
@@ -1356,10 +1373,79 @@
   function provenanceForSelection(ir, selectedBlock) {
     const sourceId = selectedBlock?.id;
     const operationId = selectedBlock?.operationId || selectedBlock?.id;
+    const schedulableId = selectedBlock?.schedulableId;
     const rows = ir.q1asm_provenance || [];
-    return rows.find((mapping) => mapping.source_id === sourceId)
-      || rows.find((mapping) => mapping.schedulable_id === sourceId)
+    const exactSource = rows.find((mapping) => mapping.source_id === sourceId);
+    if (exactSource) {
+      return exactSource;
+    }
+    if (selectedBlock?.type === "pulse") {
+      return rows.find((mapping) => (
+        !mapping.source_id
+        && (mapping.schedulable_id === sourceId || mapping.schedulable_id === schedulableId)
+      )) || rows.find((mapping) => !mapping.source_id && mapping.operation_id === operationId);
+    }
+    return rows.find((mapping) => mapping.schedulable_id === sourceId)
       || rows.find((mapping) => mapping.operation_id === operationId);
+  }
+
+  function provenanceCoverageForMapping(mapping) {
+    if (!mapping) {
+      return {
+        status: "unmapped",
+        label: "Unmapped",
+        description: "No Q1ASM provenance row matches this symbolic block. Generated instructions may be unavailable, or lowering inference may have been ambiguous.",
+      };
+    }
+    if (String(mapping.confidence || "").toLowerCase() === "inferred") {
+      return {
+        status: "inferred",
+        label: "Inferred",
+        description: "Q1Lens inferred this symbolic block's link to generated Q1ASM.",
+      };
+    }
+    return {
+      status: "compiler",
+      label: "Compiler",
+      description: "Compiler provenance links this symbolic block to generated Q1ASM.",
+    };
+  }
+
+  function provenanceCoverageSummary(ir) {
+    const counts = { compiler: 0, inferred: 0, unmapped: 0 };
+    const blockIds = { compiler: [], inferred: [], unmapped: [] };
+    for (const pulse of ir.symbolic_pulses || []) {
+      const mapping = provenanceForSelection(ir, {
+        id: pulse.id,
+        type: "pulse",
+        operationId: pulse.operation_id,
+        schedulableId: pulse.schedulable_id,
+      });
+      const status = provenanceCoverageForMapping(mapping).status;
+      counts[status] += 1;
+      blockIds[status].push(pulse.id);
+    }
+    const entries = [
+      { status: "compiler", label: "Compiler", count: counts.compiler, blockIds: blockIds.compiler },
+      { status: "inferred", label: "Inferred", count: counts.inferred, blockIds: blockIds.inferred },
+      { status: "unmapped", label: "Unmapped", count: counts.unmapped, blockIds: blockIds.unmapped },
+    ];
+    return {
+      total: (ir.symbolic_pulses || []).length,
+      entries,
+      ariaLabel: `Provenance coverage: ${counts.compiler} compiler, ${counts.inferred} inferred, ${counts.unmapped} unmapped`,
+    };
+  }
+
+  function provenanceSelection(ir, status, selectedId) {
+    const entry = provenanceCoverageSummary(ir).entries.find((item) => item.status === status);
+    if (!entry?.blockIds.length) {
+      return undefined;
+    }
+    const index = (entry.blockIds.indexOf(selectedId) + 1) % entry.blockIds.length;
+    const blockId = entry.blockIds[index];
+    const pulse = findPulse(ir, blockId);
+    return { blockId, groupId: targetGroupId(targetFromLaneLabel(pulse.lane)) };
   }
 
   function lineRangeLabel(start, end) {
@@ -1463,6 +1549,7 @@
 
   function attachInspectorTabs(ir, inspector, selectedBlock, values) {
     const mapping = provenanceForSelection(ir, selectedBlock);
+    const provenance = selectedBlock?.type === "pulse" ? provenanceCoverageForMapping(mapping) : undefined;
     const line = provenanceStartLine(mapping);
     const endLine = provenanceEndLine(mapping);
     const symbolicValue = mapping?.symbolic_value_id ? values.get(mapping.symbolic_value_id) : undefined;
@@ -1474,6 +1561,9 @@
         { id: "q1asm", label: "Q1ASM Preview" },
       ],
       loweringRows: inspectorRows([
+        { label: "Provenance", value: provenance?.label },
+        { label: "Evidence", value: provenance?.description },
+        { label: "Inference reason", value: provenance?.status === "inferred" ? mapping?.inference_reason : "" },
         { label: "Sequencer", value: mapping?.sequencer },
         { label: "Q1ASM lines", value: mapping ? lineRangeLabel(line, endLine) : "" },
         { label: "Instruction", value: mapping?.instruction },
@@ -1601,6 +1691,7 @@
       ticks: ticks(viewport),
       lanes,
       inspector: attachInspectorTabs(ir, baseInspector, selectedBlock, values),
+      provenanceCoverage: provenanceCoverageSummary(ir),
       source,
       artifactSummary: [
         { label: "Operations", value: String((ir.operations || []).length) },
@@ -1614,6 +1705,7 @@
   return {
     formatDuration,
     panViewport,
+    provenanceSelection,
     buildTimelineModel,
   };
 });

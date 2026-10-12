@@ -24,6 +24,16 @@ function parseWebviewMessage(message) {
     return { valid: true, type: "requestRefresh" };
   }
 
+  if (
+    message.type === "prepareExecutionReplay" &&
+    typeof message.sequencerId === "string" &&
+    message.sequencerId.trim().length > 0 &&
+    (message.scope === undefined || message.scope === "project" || message.scope === "sequencer") &&
+    hasOnlyKeys(message, ["type", "sequencerId", "scope"])
+  ) {
+    return { valid: true, type: "prepareExecutionReplay", sequencerId: message.sequencerId, ...(message.scope === undefined ? {} : { scope: message.scope }) };
+  }
+
   if (message.type === "webviewReady" && hasOnlyKeys(message, ["type"])) {
     return { valid: true, type: "webviewReady" };
   }
@@ -45,9 +55,11 @@ function parseWebviewMessage(message) {
     message.line > 0 &&
     Number.isInteger(message.column) &&
     message.column > 0 &&
-    hasOnlyKeys(message, ["type", "file", "line", "column"])
+    (message.preserveHardwareCursor === undefined || typeof message.preserveHardwareCursor === "boolean") &&
+    hasOnlyKeys(message, ["type", "file", "line", "column", "preserveHardwareCursor"])
   ) {
-    return { valid: true, type: "sourceClick", file: message.file, line: message.line, column: message.column };
+    return { valid: true, type: "sourceClick", file: message.file, line: message.line, column: message.column,
+      ...(typeof message.preserveHardwareCursor === "boolean" ? { preserveHardwareCursor: message.preserveHardwareCursor } : {}) };
   }
 
   if (

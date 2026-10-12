@@ -1,0 +1,4 @@
+# Expected failure: RT consumes its only 4 ns packet while Q1 awaits feedback.
+wait 4
+fb_pop_data 16,R0
+stop

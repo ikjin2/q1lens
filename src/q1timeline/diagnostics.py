@@ -50,6 +50,9 @@ REQUIRED_DIAGNOSTIC_CATEGORIES = {
     "invalid_sequencer",
     "duplicate_sequencer_id",
     "duplicate_sequencer_name",
+    "pending_hardware_state",
+    "scope_without_acquisition",
+    "acquisition_bin_reuse",
 }
 
 

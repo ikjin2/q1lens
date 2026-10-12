@@ -402,6 +402,129 @@ describe("timelineModel", () => {
     assert.equal(pulseLane.blocks[0].widthPercent, 66.667);
   });
 
+  it("classifies symbolic blocks and counts compiler, inferred, and unmapped provenance", () => {
+    const { buildTimelineModel } = loadModel();
+    const payload: any = ir();
+    payload.operations = [
+      { id: "compiler", operation_id: "compiler-op", label: "X(q0)", abs_time: 0, duration: 20e-9 },
+      { id: "inferred", operation_id: "inferred-op", label: "Y(q0)", abs_time: 24e-9, duration: 20e-9 },
+      { id: "unmapped", operation_id: "unmapped-op", label: "Z(q0)", abs_time: 48e-9, duration: 20e-9 },
+    ];
+    payload.symbolic_pulses = [
+      { id: "pulse:compiler", operation_id: "compiler-op", lane: "q0:mw", kind: "pulse", label: "X", abs_time: 0, duration: 20e-9 },
+      { id: "pulse:inferred", operation_id: "inferred-op", lane: "q0:mw", kind: "pulse", label: "Y", abs_time: 24e-9, duration: 20e-9 },
+      { id: "pulse:unmapped", operation_id: "unmapped-op", lane: "q0:mw", kind: "pulse", label: "Z", abs_time: 48e-9, duration: 20e-9 },
+    ];
+    payload.q1asm_provenance = [
+      { source_id: "pulse:compiler", sequencer: "seq0", q1asm_line_start: 1, q1asm_line_end: 1 },
+      {
+        source_id: "pulse:inferred",
+        sequencer: "seq0",
+        q1asm_line_start: 2,
+        q1asm_line_end: 2,
+        confidence: "inferred",
+        inference_reason: "unique timing match",
+      },
+    ];
+
+    const model = buildTimelineModel(payload, "pulse:inferred", undefined, { expandedGroups: ["target:q0"] });
+    const statuses = Object.fromEntries(
+      model.lanes
+        .flatMap((lane: { blocks: any[] }) => lane.blocks)
+        .filter((block: { type: string }) => block.type === "pulse")
+        .map((block: { id: string; provenanceStatus: string }) => [block.id, block.provenanceStatus]),
+    );
+
+    assert.deepEqual(statuses, {
+      "pulse:compiler": "compiler",
+      "pulse:inferred": "inferred",
+      "pulse:unmapped": "unmapped",
+    });
+    assert.deepEqual(model.provenanceCoverage, {
+      total: 3,
+      entries: [
+        { status: "compiler", label: "Compiler", count: 1, blockIds: ["pulse:compiler"] },
+        { status: "inferred", label: "Inferred", count: 1, blockIds: ["pulse:inferred"] },
+        { status: "unmapped", label: "Unmapped", count: 1, blockIds: ["pulse:unmapped"] },
+      ],
+      ariaLabel: "Provenance coverage: 1 compiler, 1 inferred, 1 unmapped",
+    });
+    assert.deepEqual(
+      model.inspector.rows.find((row: { label: string }) => row.label === "Provenance"),
+      { label: "Provenance", value: "Inferred" },
+    );
+    assert.deepEqual(
+      model.inspector.rows.find((row: { label: string }) => row.label === "Inference reason"),
+      { label: "Inference reason", value: "unique timing match" },
+    );
+  });
+
+  it("explains an unmapped symbolic block in the inspector", () => {
+    const { buildTimelineModel } = loadModel();
+    const payload: any = ir();
+    payload.q1asm_provenance = [];
+
+    const model = buildTimelineModel(payload, "pulse:cz", undefined, { expandedGroups: ["target:q0_q1"] });
+    const pulse = model.lanes
+      .flatMap((lane: { blocks: any[] }) => lane.blocks)
+      .find((block: { id: string }) => block.id === "pulse:cz");
+
+    assert.equal(pulse.provenanceStatus, "unmapped");
+    assert.equal(model.inspector.provenanceNotice.title, "No Q1ASM provenance");
+    assert.match(model.inspector.provenanceNotice.message, /No Q1ASM provenance row matches this symbolic block/);
+    assert.match(model.inspector.rows.find((row: any) => row.label === "Evidence").value, /No Q1ASM provenance row/);
+    assert.deepEqual(
+      model.inspector.loweringRows.find((row: { label: string }) => row.label === "Provenance"),
+      { label: "Provenance", value: "Unmapped" },
+    );
+  });
+
+  it("reveals a provenance target outside the current viewport and collapsed groups", () => {
+    const { buildTimelineModel, provenanceSelection } = loadModel();
+    const payload: any = ir();
+    const target = provenanceSelection(payload, "compiler", null);
+    assert.equal(target.blockId, "pulse:cz");
+    assert.equal(target.groupId, "target:q0_q1");
+    assert.equal(provenanceSelection(payload, "unmapped", null), undefined);
+    const model = buildTimelineModel(payload, target.blockId, undefined, { expandedGroups: [target.groupId] });
+    assert.equal(model.inspector.selectedId, "pulse:cz");
+    assert.match(model.inspector.rows.find((row: any) => row.label === "Evidence").value, /Compiler provenance/);
+    assert.equal(model.inspector.q1asmDrilldown.targetLine, 3);
+    payload.symbolic_pulses.push({ ...payload.symbolic_pulses[0], id: "pulse:second" });
+    assert.equal(provenanceSelection(payload, "compiler", "pulse:cz").blockId, "pulse:second");
+    assert.equal(provenanceSelection(payload, "compiler", "pulse:second").blockId, "pulse:cz");
+  });
+
+  it("does not reuse another symbolic block's source-scoped provenance", () => {
+    const { buildTimelineModel } = loadModel();
+    const payload: any = ir();
+    payload.symbolic_pulses.push({
+      id: "pulse:cz:second",
+      operation_id: "cz_q0_q1",
+      lane: "q0_q1:flux / cz",
+      kind: "pulse",
+      label: "Second CZ component",
+      abs_time: 100e-9,
+      duration: 20e-9,
+    });
+    payload.q1asm_provenance = [{
+      source_id: "pulse:cz",
+      operation_id: "cz_q0_q1",
+      sequencer: "seq0",
+      q1asm_line_start: 1,
+      q1asm_line_end: 1,
+    }];
+
+    const model = buildTimelineModel(payload, "pulse:cz:second", undefined, { expandedGroups: ["target:q0_q1"] });
+    const second = model.lanes
+      .flatMap((lane: { blocks: any[] }) => lane.blocks)
+      .find((block: { id: string }) => block.id === "pulse:cz:second");
+
+    assert.equal(second.provenanceStatus, "unmapped");
+    assert.equal(second.q1timelineMessage, undefined);
+    assert.deepEqual(model.provenanceCoverage.entries.map((entry: { count: number }) => entry.count), [1, 0, 1]);
+  });
+
   it("renders only high-level schedule-time lanes in the main timeline", () => {
     const { buildTimelineModel } = loadModel();
     const model = buildTimelineModel(ir(), "pulse:cz", undefined, { expandedGroups: ["target:q0_q1"] });

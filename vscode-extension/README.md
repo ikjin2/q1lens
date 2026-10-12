@@ -113,6 +113,35 @@ Overrides do not modify project files and reset when the project changes or
 VS Code restarts. These controls require the Python CLI from the same checkout,
 including its `--set-param` support.
 
+## Compare runs and inspect execution
+
+**Q1Lens: Save Timeline Comparison Baseline** stores the current successful analysis in
+`.q1timeline/comparison-baseline.json`. Later runs show added, changed, shifted,
+and removed events against that baseline, with before/after details in the
+inspector. The comparison badge identifies the active baseline. Use **Q1Lens:
+Clear Timeline Comparison Baseline** to return to comparison with the previous run.
+
+The Hardware view follows the cursor through register writes, simulated signal
+stages, acquisitions, and feedback. Execution replay can prepare a bounded
+concrete or simulated trace. These views show the declared software model;
+they do not represent measurements from connected hardware.
+
+`q1lens.q1timeline.executionMode` defaults to `project`, which respects the
+project configuration. Choose `analysis`, `concrete`, or `simulation` to override
+it, and set `q1lens.q1timeline.maxSteps` to bound that override.
+
+In the schedule view, the Provenance Coverage legend selects matching pulses
+and exposes Compiler, Inferred, or Unmapped evidence with linked Q1ASM context.
+
+## Diagnostic quick fixes
+
+Set `q1lens.q1timeline.hardwareReadiness` to `true` to enable conservative
+end-state, scope/acquisition, and concrete acquisition-bin checks. Validated
+analyzer suggestions appear as Quick Fixes on file-backed `.q1asm` documents.
+Fixes are offered only for the matching saved instruction; dirty documents,
+stale instructions, and invalid or cross-file edits are ignored. Applying a
+Quick Fix remains an explicit user action.
+
 ## Main commands
 
 - **Q1Lens: Check Python Environment**
@@ -124,6 +153,8 @@ including its `--set-param` support.
 - **Q1Lens: Open Q1ASM Folder**
 - **Q1Lens: Open Q1ASM Timeline**
 - **Q1Lens: Open Timeline Preview**
+- **Q1Lens: Save Timeline Comparison Baseline**
+- **Q1Lens: Clear Timeline Comparison Baseline**
 - **Q1Lens: Set Analysis Parameter...**
 - **Q1Lens: Clear Analysis Parameter Overrides**
 

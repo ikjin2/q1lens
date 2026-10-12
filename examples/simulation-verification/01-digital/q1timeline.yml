@@ -1,0 +1,13 @@
+analysis:
+  execution_mode: simulation
+  max_steps: 1000
+alignment:
+  mode: none
+simulation:
+  queue_capacity: 2
+  startup_delay_ns: 200
+  max_time_ns: 5000
+sequencers:
+  - id: counter
+    module: QCM0
+    file: counter.q1asm

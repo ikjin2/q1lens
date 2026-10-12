@@ -1,0 +1,4 @@
+wait 1000
+fb_pop_data 5,R0
+nop
+stop

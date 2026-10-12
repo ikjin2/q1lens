@@ -6,6 +6,29 @@ describe("q1timeline webview message validation", () => {
     assert.deepEqual(parseWebviewMessage({ type: "webviewReady" }), { valid: true, type: "webviewReady" });
   });
 
+  it("accepts execution replay preparation for a sequencer", () => {
+    const message = { type: "prepareExecutionReplay", sequencerId: "seq0" };
+    assert.deepEqual(parseWebviewMessage(message), { valid: true, ...message });
+    for (const scope of ["project", "sequencer"]) {
+      const scoped = { ...message, scope };
+      assert.deepEqual(parseWebviewMessage(scoped), { valid: true, ...scoped });
+    }
+  });
+
+  it("rejects malformed execution replay preparation requests", () => {
+    for (const message of [
+      { type: "prepareExecutionReplay" },
+      { type: "prepareExecutionReplay", sequencerId: "" },
+      { type: "prepareExecutionReplay", sequencerId: "   " },
+      { type: "prepareExecutionReplay", sequencerId: 0 },
+      { type: "prepareExecutionReplay", sequencerId: "seq0", executionMode: "simulation" },
+      { type: "prepareExecutionReplay", sequencerId: "seq0", scope: "module" },
+      { type: "prepareExecutionReplay", sequencerId: "seq0", scope: false },
+    ]) {
+      assert.equal(parseWebviewMessage(message).valid, false);
+    }
+  });
+
   it("accepts branch assumption updates from timeline chips", () => {
     assert.deepEqual(
       parseWebviewMessage({ type: "setBranchAssumption", branchId: "seq0:branch:main.q1asm:4:jge:target", path: "taken" }),
@@ -69,6 +92,14 @@ describe("q1timeline webview message validation", () => {
     assert.equal(parseWebviewMessage({ type: "sourceClick", file: "q1asm/seq0.q1asm", line: 0, column: 1 }).valid, false);
     assert.equal(parseWebviewMessage({ type: "sourceClick", file: "q1asm/seq0.q1asm", line: 15, column: 0 }).valid, false);
     assert.equal(parseWebviewMessage({ type: "sourceClick", file: "q1asm/seq0.q1asm", line: 15, column: 1, extra: true }).valid, false);
+    assert.equal(parseWebviewMessage({ type: "sourceClick", file: "q1asm/seq0.q1asm", line: 15, column: 1, preserveHardwareCursor: "true" }).valid, false);
+  });
+
+  it("accepts cursor preservation only as a boolean on a source jump", () => {
+    for (const preserveHardwareCursor of [true, false]) {
+      const message = { type: "sourceClick", file: "orange_drive.q1asm", line: 66, column: 5, preserveHardwareCursor };
+      assert.deepEqual(parseWebviewMessage(message), { valid: true, ...message });
+    }
   });
 
   it("accepts loop preview updates from timeline chips", () => {

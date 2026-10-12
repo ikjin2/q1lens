@@ -16,7 +16,7 @@ from q1timeline.ir.serialize import diagnostics_to_json, timeline_ir_from_states
 from q1timeline.project import ConfigLoadError, ProjectConfig, load_project_config
 from q1timeline.q1asm.parser import parse_q1asm_file
 from q1timeline.render.html import render_html
-from q1timeline.sequence import load_sequence_names
+from q1timeline.sequence import load_sequence_data, load_sequence_names
 
 
 @dataclass(frozen=True)
@@ -190,6 +190,9 @@ def run_watch_once(project_file: str | Path, out_dir: str | Path) -> WatchRunRes
             },
             diagnostics=diagnostics,
         )
+        for entry, sequencer in zip(ir["sequencers"], config.sequencers):
+            if sequencer.module:
+                entry["module"] = sequencer.module
         if has_fatal_diagnostics(diagnostics):
             error_diagnostic = next(diagnostic for diagnostic in diagnostics if diagnostic.severity == "error")
             return _write_failed_run(
@@ -259,6 +262,16 @@ def watch_project(
 
 
 def _analyze_config(config: ProjectConfig) -> list[AnalysisState]:
+    if config.analysis.execution_mode == "simulation":
+        from q1timeline.simulation.runtime import simulate_programs
+
+        return simulate_programs(
+            {seq.id: parse_q1asm_file(seq.file) for seq in config.sequencers},
+            params=config.params, max_steps=config.analysis.max_steps,
+            simulation=config.simulation,
+            sequences={seq.id: load_sequence_data(seq.sequence_json)
+                       for seq in config.sequencers if seq.sequence_json},
+        )
     states = []
     for sequencer in config.sequencers:
         sequence_names = load_sequence_names(sequencer.sequence_json) if sequencer.sequence_json else None
@@ -271,6 +284,8 @@ def _analyze_config(config: ProjectConfig) -> list[AnalysisState]:
             waveform_names=sequence_names.waveforms if sequence_names else None,
             acquisition_names=sequence_names.acquisitions if sequence_names else None,
             branch_policy=config.analysis.branch_policy,
+            execution_mode=config.analysis.execution_mode,
+            max_steps=config.analysis.max_steps,
         )
         analyze_underflow(state)
         states.append(state)

@@ -1,0 +1,5 @@
+wait_sync 4
+# Explicit 24 ns scenario route. This is not a hardware latency claim.
+fb_com_data 16,7,4
+wait 800
+stop

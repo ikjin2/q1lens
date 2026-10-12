@@ -1,0 +1,3 @@
+wait_sync 4
+acquire 0,0,8
+stop

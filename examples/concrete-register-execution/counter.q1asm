@@ -1,0 +1,12 @@
+# Each iteration increments R1. The concrete trace records every write.
+wait_sync 4
+move 3,R0
+move 0,R1
+nop
+body: add R1,1,R1
+nop
+wait 100
+loop R0,@body
+move R1,R2
+nop
+stop

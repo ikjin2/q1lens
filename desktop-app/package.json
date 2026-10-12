@@ -1,0 +1,21 @@
+{
+  "name": "q1lens-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Standalone Q1Lens timeline workbench",
+  "main": "main.cjs",
+  "scripts": {
+    "build": "node scripts/build.cjs",
+    "start": "npm run build && electron .",
+    "test": "node --test test/*.test.cjs",
+    "verify": "npm run build && node scripts/verify.cjs"
+  },
+  "dependencies": {
+    "pixi.js": "^8.22.0"
+  },
+  "devDependencies": {
+    "playwright": "^1.63.0",
+    "electron": "^44.5.1",
+    "esbuild": "^0.28.2"
+  }
+}

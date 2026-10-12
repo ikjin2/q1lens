@@ -1,4 +1,6 @@
 // @ts-nocheck
+const { mapAnalyzerSuggestedEdit } = require("./q1asmQuickFix");
+
 function normaliseSeverity(severity) {
   if (severity === "error" || severity === "warning" || severity === "hint") {
     return severity;
@@ -39,14 +41,24 @@ function mapAnalyzerDiagnostic(item, resolveSourcePath) {
   if (!item || !item.source || !item.source.file) {
     return undefined;
   }
+  const file = resolveSourcePath(item.source.file);
+  const range = sourceRange(item.source);
+  const suggestedEdit = mapAnalyzerSuggestedEdit({
+    value: item.details && item.details.suggested_edit,
+    diagnosticFile: file,
+    diagnosticRange: range,
+    diagnosticSourceRaw: item.source.raw,
+    resolveSourcePath,
+  });
   return {
-    file: resolveSourcePath(item.source.file),
-    range: sourceRange(item.source),
+    file,
+    range,
     message: item.message || item.category,
     severity: normaliseSeverity(item.severity),
     source: "q1timeline",
     code: item.confidence ? `${item.category}:${item.confidence}` : item.category,
     relatedInformation: relatedInformation(item, resolveSourcePath),
+    ...(suggestedEdit ? { suggestedEdit } : {}),
   };
 }
 

@@ -4,6 +4,22 @@ body.vscode-dark {
   background-color: #1e1e1e !important;
 }
 
+.shared-timeline-stage .hardware-time-cursor {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  border-left: 2px solid var(--vscode-editorCursor-foreground, #007acc);
+  z-index: 5;
+  pointer-events: none;
+}
+
+.timeline-svg .hardware-time-cursor {
+  stroke: var(--vscode-editorCursor-foreground, #007acc);
+  stroke-width: 2;
+  pointer-events: none;
+}
+
 body.vscode-dark main {
   background: #1e1e1e !important;
   background-color: #1e1e1e !important;
@@ -487,4 +503,23 @@ body.vscode-dark .shared-timeline-stage .timeline-block.kind-loop_iteration_prev
 .diagnostic-badge {
   cursor: help;
   pointer-events: all;
+}
+/* The shared renderer uses HTML blocks rather than the SVG event rectangles. */
+#timeline-root .shared-timeline-stage .timeline-block.diff-added {
+  border: 2px solid var(--vscode-testing-iconPassed, #22863a);
+}
+#timeline-root .shared-timeline-stage .timeline-block.diff-changed {
+  border: 2px solid var(--vscode-editorWarning-foreground, #b57800);
+}
+#timeline-root .shared-timeline-stage .timeline-block.diff-shifted {
+  border: 2px dashed var(--vscode-charts-blue, #2075c7);
+}
+#timeline-root .shared-timeline-stage .timeline-block.diff-removed {
+  border: 2px dotted var(--vscode-errorForeground, #c62828);
+  background-image: repeating-linear-gradient(135deg, transparent, transparent 4px, #8884 4px, #8884 6px);
+}
+.timeline-comparison {
+  flex-basis: 100%;
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
 }

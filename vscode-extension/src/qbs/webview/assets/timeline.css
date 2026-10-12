@@ -46,10 +46,10 @@ button:focus-visible {
 
 .timeline-shell {
   display: grid;
-  grid-template-columns: minmax(620px, 1fr) 320px;
+  grid-template-columns: minmax(0, 1fr) 320px;
   grid-template-rows: minmax(0, 1fr) auto;
   height: calc(100vh - 43px);
-  min-width: 940px;
+  min-width: 0;
 }
 
 .timeline-stage {
@@ -303,6 +303,23 @@ button:disabled {
   color: var(--vscode-editor-foreground);
 }
 
+.timeline-block-pulse[data-provenance="compiler"],
+.timeline-block-acquisition[data-provenance="compiler"] {
+  box-shadow: inset 0 -3px var(--vscode-testing-iconPassed, var(--vscode-charts-green));
+}
+
+.timeline-block-pulse[data-provenance="inferred"],
+.timeline-block-acquisition[data-provenance="inferred"] {
+  border-style: dashed;
+  box-shadow: inset 0 -3px var(--vscode-editorWarning-foreground, var(--vscode-charts-yellow));
+}
+
+.timeline-block-pulse[data-provenance="unmapped"],
+.timeline-block-acquisition[data-provenance="unmapped"] {
+  border-style: dotted;
+  box-shadow: inset 0 -3px var(--vscode-errorForeground, var(--vscode-charts-red));
+}
+
 .timeline-block-provenance {
   top: 7px;
   height: 20px;
@@ -457,6 +474,29 @@ button:disabled {
   border-bottom: 1px solid var(--vscode-panel-border);
 }
 
+.inspector-notice {
+  margin-top: 14px;
+  padding: 9px 10px;
+  border-left: 3px solid var(--vscode-panel-border);
+  background: var(--vscode-textBlockQuote-background);
+  color: var(--vscode-descriptionForeground);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.inspector-notice[data-tone="warning"] {
+  border-left-color: var(--vscode-editorWarning-foreground, var(--vscode-charts-yellow));
+}
+
+.inspector-notice-title {
+  color: var(--vscode-editor-foreground);
+  font-weight: 600;
+}
+
+.inspector-notice p {
+  margin: 4px 0 0;
+}
+
 .inspector-tab {
   padding: 6px 8px;
   color: var(--vscode-descriptionForeground);
@@ -577,15 +617,74 @@ button:disabled {
 
 .summary-strip {
   grid-column: 1 / 3;
-  display: grid;
-  grid-template-columns: minmax(320px, 1.5fr) repeat(6, minmax(120px, 1fr));
+  display: flex;
+  flex-wrap: wrap;
+  min-width: 0;
   border-top: 1px solid var(--vscode-panel-border);
   background: var(--vscode-editor-background);
 }
 
-.source-card {
+.provenance-legend {
+  flex: 1.25 1 280px;
   display: grid;
-  grid-template-columns: 72px minmax(0, 1fr) auto;
+  gap: 6px;
+  align-content: center;
+  padding: 9px 12px;
+  border-right: 1px solid var(--vscode-panel-border);
+}
+
+.provenance-legend-title {
+  color: var(--vscode-descriptionForeground);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.provenance-legend-items {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+}
+
+.provenance-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  white-space: nowrap;
+  color: var(--vscode-foreground);
+  background: transparent;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 3px;
+  padding: 3px 5px;
+  cursor: pointer;
+}
+
+.provenance-legend-item:disabled { opacity: 0.55; cursor: default; }
+.provenance-legend-item:focus-visible { outline: 2px solid var(--vscode-focusBorder); outline-offset: 2px; }
+
+.provenance-swatch {
+  display: inline-block;
+  width: 14px;
+  height: 7px;
+  border-bottom: 3px solid var(--vscode-testing-iconPassed, var(--vscode-charts-green));
+}
+
+.provenance-legend-item[data-provenance="inferred"] .provenance-swatch {
+  border-bottom-style: dashed;
+  border-bottom-color: var(--vscode-editorWarning-foreground, var(--vscode-charts-yellow));
+}
+
+.provenance-legend-item[data-provenance="unmapped"] .provenance-swatch {
+  border-bottom-style: dotted;
+  border-bottom-color: var(--vscode-errorForeground, var(--vscode-charts-red));
+}
+
+.source-card {
+  flex: 1.5 1 320px;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
   gap: 10px;
   align-items: center;
   padding: 10px 12px;
@@ -617,7 +716,9 @@ button:disabled {
 }
 
 .source-actions {
+  grid-column: 1 / -1;
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
 }
 
@@ -626,6 +727,7 @@ button:disabled {
 }
 
 .summary-item {
+  flex: 1 1 120px;
   padding: 10px 12px;
   border-right: 1px solid var(--vscode-panel-border);
 }
@@ -659,6 +761,7 @@ button:disabled {
   }
 
   .summary-strip {
+    display: grid;
     grid-column: 1;
     grid-template-columns: repeat(2, minmax(120px, 1fr));
   }
@@ -666,5 +769,9 @@ button:disabled {
   .source-card {
     grid-column: 1 / 3;
     grid-template-columns: 1fr;
+  }
+
+  .provenance-legend {
+    grid-column: 1 / 3;
   }
 }

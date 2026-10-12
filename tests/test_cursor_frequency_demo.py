@@ -512,11 +512,11 @@ def test_cursor_frequency_demo_notebook_is_qblox_experiment_workflow() -> None:
     assert "from qblox_instruments import Cluster, ClusterType" in source
     assert "cluster_ip" in source
     assert "ROOT = Path.cwd()" in source
-    assert "cluster_ip = \"10.10.200.53\"" in source
-    assert "cluster_name = \"QAS\"" in source
-    assert "qcm_blue_module_index = 4" in source
-    assert "qcm_orange_module_index = 6" in source
-    assert "qrm_module_index = 8" in source
+    assert "cluster_ip = None" in source
+    assert "cluster_name = \"q1lens_demo\"" in source
+    assert "qcm_blue_module_index = 2" in source
+    assert "qcm_orange_module_index = 4" in source
+    assert "qrm_module_index = 6" in source
     assert "qcm_blue_slot = module_slot(qcm_blue_module)" in source
     assert "qcm_orange_slot = module_slot(qcm_orange_module)" in source
     assert "qrm_slot = module_slot(qrm_module)" in source

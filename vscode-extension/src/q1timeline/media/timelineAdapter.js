@@ -327,6 +327,7 @@
       source.file || "",
       source.line || "",
       playMergeTimeKey(event, options),
+      meta.diff_status || "unchanged",
     ].join("|");
   }
 

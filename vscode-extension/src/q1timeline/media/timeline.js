@@ -1303,6 +1303,170 @@
     details.dataset.analysisDetailsPersistence = "true";
   }
 
+  function installParametersPersistence() {
+    const details = document.getElementById("q1timeline-parameters");
+    if (!details || details.dataset.parametersPersistence === "true") {
+      return;
+    }
+    const persistedState = readPersistedWebviewState();
+    if (Object.prototype.hasOwnProperty.call(persistedState, "parametersOpen")) {
+      details.open = Boolean(persistedState.parametersOpen);
+    }
+    const summary = details.querySelector("summary");
+    if (summary) {
+      summary.addEventListener("click", (event) => {
+        if (event && typeof event.stopPropagation === "function") {
+          event.stopPropagation();
+        }
+      });
+    }
+    details.addEventListener("toggle", () => {
+      writePersistedWebviewState({ parametersOpen: Boolean(details.open) });
+    });
+    details.dataset.parametersPersistence = "true";
+  }
+
+  function installParameterEditors() {
+    const details = document.getElementById("q1timeline-parameters");
+    const parameters = timelineIr.analysis && timelineIr.analysis.parameters;
+    if (!details || details.dataset.parameterEditors === "true" || !state.parameterProjectFile || !Array.isArray(parameters)) {
+      return;
+    }
+    const overrideNames = new Set(state.parameterOverrideNames || []);
+    const editors = [];
+    let activeEditor;
+    let pendingEditor;
+
+    function button(label, className) {
+      const node = document.createElement("button");
+      node.type = "button";
+      node.className = className;
+      node.textContent = label;
+      return node;
+    }
+
+    function syncControls() {
+      for (const editor of editors) {
+        editor.edit.disabled = Boolean(activeEditor || pendingEditor);
+        editor.reset.disabled = Boolean(activeEditor || pendingEditor);
+        editor.input.disabled = Boolean(pendingEditor);
+        editor.apply.disabled = Boolean(pendingEditor);
+        editor.cancel.disabled = Boolean(pendingEditor);
+      }
+    }
+
+    function request(editor, type) {
+      if (pendingEditor) {
+        return;
+      }
+      pendingEditor = editor;
+      editor.error.hidden = true;
+      editor.status.textContent = type === "setAnalysisParameter" ? "Applying…" : "Resetting…";
+      syncControls();
+      const message = { type, name: editor.parameter.name, projectFile: state.parameterProjectFile };
+      if (type === "setAnalysisParameter") {
+        message.valueJson = editor.input.value.trim();
+      }
+      vscode.postMessage(message);
+    }
+
+    for (const row of details.querySelectorAll("[data-parameter-index]")) {
+      const parameter = parameters[Number(row.dataset.parameterIndex)];
+      const cell = row.querySelector("td");
+      if (!parameter || typeof parameter.name !== "string" || typeof parameter.value_json !== "string" || !cell) {
+        continue;
+      }
+      if (!parameter.name || parameter.name.trim() !== parameter.name || parameter.name.includes("=")) {
+        continue;
+      }
+      const actions = document.createElement("span");
+      actions.className = "parameter-actions";
+      const edit = button("Edit", "parameter-edit");
+      edit.setAttribute("aria-label", `Edit ${parameter.name}`);
+      const reset = button("Reset", "parameter-reset");
+      reset.setAttribute("aria-label", `Remove temporary override for ${parameter.name}`);
+      reset.hidden = !overrideNames.has(parameter.name);
+      actions.append(edit, reset);
+      const form = document.createElement("form");
+      form.className = "parameter-editor";
+      form.hidden = true;
+      const input = document.createElement("input");
+      input.className = "parameter-input";
+      input.type = "text";
+      input.spellcheck = false;
+      input.autocomplete = "off";
+      input.setAttribute("aria-label", `${parameter.name} JSON value`);
+      const apply = button("Apply", "parameter-apply");
+      apply.type = "submit";
+      const cancel = button("Cancel", "parameter-cancel");
+      form.append(input, apply, cancel);
+      const error = document.createElement("div");
+      error.className = "parameter-error";
+      error.setAttribute("role", "alert");
+      error.hidden = true;
+      const status = document.createElement("div");
+      status.className = "parameter-status";
+      status.setAttribute("role", "status");
+      cell.append(actions, form, error, status);
+      const editor = { parameter, edit, reset, form, input, apply, cancel, error, status };
+      editors.push(editor);
+      edit.addEventListener("click", () => {
+        if (activeEditor || pendingEditor) {
+          return;
+        }
+        activeEditor = editor;
+        input.value = parameter.value_json;
+        form.hidden = false;
+        edit.hidden = true;
+        error.hidden = true;
+        syncControls();
+        input.focus();
+        input.select();
+      });
+      function closeEditor() {
+        if (pendingEditor) {
+          return;
+        }
+        activeEditor = undefined;
+        form.hidden = true;
+        edit.hidden = false;
+        error.hidden = true;
+        syncControls();
+        edit.focus();
+      }
+      cancel.addEventListener("click", closeEditor);
+      input.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          closeEditor();
+        }
+      });
+      form.addEventListener("submit", (event) => {
+        event.preventDefault();
+        if (activeEditor === editor) {
+          request(editor, "setAnalysisParameter");
+        }
+      });
+      reset.addEventListener("click", () => {
+        if (!activeEditor && overrideNames.has(parameter.name)) {
+          request(editor, "resetAnalysisParameter");
+        }
+      });
+    }
+    window.addEventListener("message", (event) => {
+      const message = event.data;
+      if (!message || message.type !== "analysisParameterError" || !pendingEditor || message.name !== pendingEditor.parameter.name) {
+        return;
+      }
+      pendingEditor.status.textContent = "";
+      pendingEditor.error.textContent = message.message;
+      pendingEditor.error.hidden = false;
+      pendingEditor = undefined;
+      syncControls();
+    });
+    details.dataset.parameterEditors = "true";
+  }
+
   function toolbarSvgIcon(name) {
     const icons = {
       refresh: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/></svg>',
@@ -3149,7 +3313,9 @@
   renderSequencerFoldControls();
   renderRelatedBlockSummary([]);
   renderUnsavedChanges(initialUnsavedChanges);
+  installParametersPersistence();
   installAnalysisDetailsPersistence();
+  installParameterEditors();
   const sharedTimelineRendered = renderSharedTimelineIfAvailable(initialViewMode);
   if (!sharedTimelineRendered) {
     restoreTimelineZoom();

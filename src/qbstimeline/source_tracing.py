@@ -220,9 +220,10 @@ def _location_from_frame(frame: FrameType | None, *, label: Any) -> SourceTraceL
     if frame is None:
         return None
     info = inspect.getframeinfo(frame)
+    positions = getattr(info, "positions", None)
     return SourceTraceLocation(
         file=info.filename,
         line=info.lineno,
-        column=0 if info.positions is None else (info.positions.col_offset or 0),
+        column=0 if positions is None else (positions.col_offset or 0),
         label=label if isinstance(label, str) else None,
     )

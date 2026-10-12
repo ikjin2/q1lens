@@ -50,6 +50,19 @@ If `python` does not point to that environment, set `q1lens.pythonPath` to the
 interpreter, for example `.venv/bin/python` on macOS or Linux, or
 `.venv\\Scripts\\python.exe` on Windows.
 
+Run **Q1Lens: Check Python Environment**, also available in the sidebar, to
+inspect Python versions, package locations, and Q1ASM bridge availability.
+**Q1Lens: Select Python Environment** lets you select a workspace `.venv`/`venv`,
+browse for an interpreter, or enter its path. Use the environment that runs
+your schedule. Selecting an existing configured command preserves its launcher
+arguments; browsing or entering a path resets them.
+
+Selection saves shared and Q1ASM Python settings in the workspace, or in user
+settings when no folder is open. Explicit Q1ASM overrides take precedence over
+shared settings. The check imports Q1Lens without executing a schedule; it
+checks schedule dependencies when you analyze the project. A failed timeline
+offers an environment check and a retry.
+
 ## Use a schedule project
 
 Create `qbstimeline.yml`:
@@ -76,6 +89,10 @@ Your `schedule.py` must expose `build_schedule()` and `build_compiler()`. Then:
 
 Generated analysis files are kept in `.qbs_timeline/`.
 
+**Refresh** reanalyzes the currently displayed project and preserves its view.
+Changing the automatic-refresh setting takes effect without restarting VS Code.
+Opening analysis artifacts before a first analysis offers **Analyze and Open**.
+
 ## Inspect standalone Q1ASM
 
 1. Open a `.q1asm` file.
@@ -85,8 +102,21 @@ Generated analysis files are kept in `.qbs_timeline/`.
 Q1Lens uses a nearby `q1timeline.yml` when one exists. Otherwise, it creates a
 project under `.q1timeline/` and includes the sibling `.q1asm` files.
 
+The collapsible **Parameters** panel shows the effective analysis values and
+temporary override count. Use Edit and Apply (or Enter) to try a JSON value,
+Cancel to discard input, and Reset to restore an individual file value.
+Invalid input or failed analysis keeps the previous result and shows the error.
+
+**Q1Lens: Set Analysis Parameter...** and **Q1Lens: Clear Analysis Parameter
+Overrides** provide the same session-only workflow from the Command Palette.
+Overrides do not modify project files and reset when the project changes or
+VS Code restarts. These controls require the Python CLI from the same checkout,
+including its `--set-param` support.
+
 ## Main commands
 
+- **Q1Lens: Check Python Environment**
+- **Q1Lens: Select Python Environment**
 - **Q1Lens: Analyze and Open**
 - **Q1Lens: Refresh**
 - **Q1Lens: Open QBS IR**
@@ -94,6 +124,8 @@ project under `.q1timeline/` and includes the sibling `.q1asm` files.
 - **Q1Lens: Open Q1ASM Folder**
 - **Q1Lens: Open Q1ASM Timeline**
 - **Q1Lens: Open Timeline Preview**
+- **Q1Lens: Set Analysis Parameter...**
+- **Q1Lens: Clear Analysis Parameter Overrides**
 
 ## Project status
 

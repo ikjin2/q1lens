@@ -246,6 +246,39 @@ function stableStringify(value) {
   return `{${keys.map((key) => `${key}:${stableStringify(value[key])}`).join(",")}}`;
 }
 
+function invalidAnalysisParameterValue(value, valuePath = "$") {
+  if (typeof value === "boolean") {
+    return `Boolean JSON values are not valid analysis parameters (${valuePath}).`;
+  }
+  if (typeof value === "number" && !Number.isInteger(value)) {
+    return `Non-integer JSON numbers are not valid analysis parameters (${valuePath}).`;
+  }
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) {
+      const invalid = invalidAnalysisParameterValue(value[index], `${valuePath}[${index}]`);
+      if (invalid) {
+        return invalid;
+      }
+    }
+  } else if (value && typeof value === "object") {
+    for (const [key, child] of Object.entries(value)) {
+      const invalid = invalidAnalysisParameterValue(child, `${valuePath}.${key}`);
+      if (invalid) {
+        return invalid;
+      }
+    }
+  }
+  return undefined;
+}
+
+function analysisParameterJsonError(rawValue) {
+  try {
+    return invalidAnalysisParameterValue(JSON.parse(String(rawValue || "").trim()));
+  } catch (_error) {
+    return "Enter a valid JSON value.";
+  }
+}
+
 function eventStableBase(event) {
   const source = event && event.source && typeof event.source === "object" ? event.source : {};
   if (!source.file || !source.line) {
@@ -667,6 +700,7 @@ export class TimelineController {
     this.currentViewMode = undefined;
     this.branchAssumptionOverrides = new Map();
     this.loopPreviewOverrides = new Map();
+    this.parameterOverrides = new Map();
     this.pendingTarget = undefined;
     this.projectRelatedPaths = new Set();
     this.lastSourceViewColumn = undefined;
@@ -743,6 +777,9 @@ export class TimelineController {
     }
     if (this.loopPreviewOverrides) {
       this.loopPreviewOverrides.clear();
+    }
+    if (this.parameterOverrides) {
+      this.parameterOverrides.clear();
     }
   }
 
@@ -1064,33 +1101,7 @@ export class TimelineController {
   }
 
   checkAnalyzerInstallation() {
-    const configuration = this.config();
-    const pythonPath = configuration.get("pythonPath", "python");
-    const pythonArgs = configuration.get("pythonArgs", []);
-    const timeoutMs = configuration.get("analyzer.timeoutMs", 30000);
-    const extraEnv = this.normaliseAnalyzerEnv(configuration.get("analyzer.env", {}));
-    const args = prependPythonArgs(pythonArgs, ["-m", "q1lens", "q1timeline", "--help"]);
-    this.output.appendLine(`Checking analyzer installation: ${[pythonPath, ...args].join(" ")}`);
-    this.logAnalyzerEnv(extraEnv);
-    return this.execFile(pythonPath, args, timeoutMs, this.workspaceCwd(), extraEnv, "analyzer installation check")
-      .then((result) => {
-        if (result.stderr) {
-          this.output.appendLine(`Analyzer stderr:\n${result.stderr}`);
-        }
-        this.output.appendLine(`Analyzer installation check completed in ${result.elapsedMs} ms.`);
-        vscode.window.showInformationMessage("Q1Lens q1timeline bridge is available.");
-      })
-      .catch((error) => {
-        if (error.stderr) {
-          this.output.appendLine(`Analyzer stderr:\n${error.stderr}`);
-        }
-        this.output.appendLine(`Analyzer installation check failed: ${error.message}`);
-        if (this.isAnalyzerMissingError(error)) {
-          this.showAnalyzerMissingMessage(error);
-        } else {
-          vscode.window.showErrorMessage(`q1timeline analyzer check failed: ${error.message}`);
-        }
-      });
+    return vscode.commands.executeCommand("q1lens.checkEnvironment", "q1timeline.refreshPreview");
   }
 
   config() {
@@ -1112,7 +1123,7 @@ export class TimelineController {
     return this.currentViewMode || this.config().get("view.defaultMode", "normal");
   }
 
-  analyzerOverrideArgs() {
+  analyzerOverrideArgs(extraArgs = []) {
     const args = [];
     for (const [branchId, branchPath] of Array.from(this.branchAssumptionOverrides || []).sort()) {
       args.push("--branch-assumption", `${branchId}=${branchPath}`);
@@ -1120,7 +1131,134 @@ export class TimelineController {
     for (const [loopKey, visibleIterations] of Array.from(this.loopPreviewOverrides || []).sort()) {
       args.push("--loop-preview", `${loopKey}=${visibleIterations}`);
     }
+    args.push(...extraArgs);
+    for (const [name, rawValue] of Array.from(this.parameterOverrides || []).sort()) {
+      args.push("--set-param", `${name}=${rawValue}`);
+    }
     return args;
+  }
+
+  parameterOverrideSummary() {
+    return Array.from(this.parameterOverrides || [])
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([name, rawValue]) => `${name}=${rawValue}`)
+      .join(", ");
+  }
+
+  async setAnalysisParameter() {
+    if (!this.projectUri || !this.outputDir) {
+      vscode.window.showWarningMessage("Open a Q1ASM timeline project before setting analysis parameters.");
+      return;
+    }
+    const rawName = await vscode.window.showInputBox({
+      prompt: "Analysis parameter name",
+      placeHolder: "DRIVE_DURATION",
+      validateInput: (value) => {
+        if (!String(value || "").trim()) {
+          return "Parameter name cannot be blank.";
+        }
+        if (String(value).includes("=")) {
+          return "Parameter name cannot contain '='.";
+        }
+        return undefined;
+      },
+    });
+    if (rawName === undefined) {
+      return;
+    }
+    const name = rawName.trim();
+    if (!name || name.includes("=")) {
+      vscode.window.showErrorMessage("Invalid analysis parameter name.");
+      return;
+    }
+    const rawValue = await vscode.window.showInputBox({
+      prompt: `JSON value for ${name}`,
+      placeHolder: "40",
+      validateInput: analysisParameterJsonError,
+    });
+    if (rawValue === undefined) {
+      return;
+    }
+    const value = rawValue.trim();
+    const error = analysisParameterJsonError(value);
+    if (error) {
+      vscode.window.showErrorMessage(error);
+      return;
+    }
+    this.parameterOverrides.set(name, value);
+    this.lastAnalyzerTimelineIr = undefined;
+    const summary = this.parameterOverrideSummary();
+    this.output.appendLine(`q1timeline analysis parameter overrides: ${summary}`);
+    vscode.window.showInformationMessage(`Q1Lens analysis parameter overrides: ${summary}`);
+    await this.runAnalysis();
+  }
+
+  async clearAnalysisParameterOverrides() {
+    if (!this.parameterOverrides || this.parameterOverrides.size === 0) {
+      vscode.window.showInformationMessage("Q1Lens has no active analysis parameter overrides.");
+      return;
+    }
+    this.parameterOverrides.clear();
+    this.lastAnalyzerTimelineIr = undefined;
+    this.output.appendLine("q1timeline analysis parameter overrides cleared.");
+    vscode.window.showInformationMessage("Q1Lens analysis parameter overrides cleared.");
+    await this.runAnalysis();
+  }
+
+  async updateInlineAnalysisParameter(message) {
+    const reject = (error) => this.postWebviewMessage({
+      type: "analysisParameterError",
+      name: message.name,
+      message: error,
+    });
+    if (!this.projectUri || !this.outputDir || message.projectFile !== this.projectUri.fsPath) {
+      reject("This parameter belongs to a different or closed project. Refresh the timeline and try again.");
+      return;
+    }
+    const parameters = this.timelineIr?.analysis?.parameters;
+    if (!Array.isArray(parameters) || !parameters.some((parameter) => parameter.name === message.name)) {
+      reject("This parameter is no longer available. Refresh the timeline and try again.");
+      return;
+    }
+    if (this.analysisInFlight) {
+      reject("Analysis is still running. Try again when it finishes.");
+      return;
+    }
+    const previousValue = this.parameterOverrides.get(message.name);
+    const previousBaseline = this.lastAnalyzerTimelineIr;
+    if (message.type === "resetAnalysisParameter") {
+      if (!this.parameterOverrides.has(message.name)) {
+        reject("This parameter has no temporary override to reset.");
+        return;
+      }
+      this.parameterOverrides.delete(message.name);
+      this.output.appendLine(`q1timeline analysis parameter override cleared: ${message.name}`);
+    } else {
+      const value = message.valueJson.trim();
+      const error = analysisParameterJsonError(value);
+      if (error) {
+        reject(error);
+        return;
+      }
+      this.parameterOverrides.set(message.name, value);
+      this.output.appendLine(`q1timeline analysis parameter override: ${message.name}=${value}`);
+    }
+    this.lastAnalyzerTimelineIr = undefined;
+    const attemptedValue = this.parameterOverrides.get(message.name);
+    await this.runAnalysis({
+      onFailure: (error) => {
+        if (this.projectUri?.fsPath !== message.projectFile || this.parameterOverrides.get(message.name) !== attemptedValue) {
+          return false;
+        }
+        if (previousValue === undefined) {
+          this.parameterOverrides.delete(message.name);
+        } else {
+          this.parameterOverrides.set(message.name, previousValue);
+        }
+        this.lastAnalyzerTimelineIr = previousBaseline;
+        reject(`Parameter change was not applied: ${error}`);
+      },
+    });
   }
 
   async setBranchAssumption(branchId, path) {
@@ -1171,6 +1309,10 @@ export class TimelineController {
       this.analysisRequestId += 1;
       this.output.appendLine("Analyzer already running; queued refresh for view mode change.");
       this.setAnalysisStatus("stale", "A newer analysis request is queued.");
+      return;
+    }
+    if (this.analysisStatus.status === "error") {
+      await this.runAnalysis();
       return;
     }
     const timelineIrPath = path.join(this.outputDir, "timeline_ir.json");
@@ -1597,7 +1739,7 @@ export class TimelineController {
     this.changeTimer = setTimeout(() => this.runAnalysis(), debounceMs);
   }
 
-  async runAnalysis() {
+  async runAnalysis({ onFailure } = {}) {
     if (!this.projectUri || !this.outputDir) {
       return Promise.resolve();
     }
@@ -1609,6 +1751,7 @@ export class TimelineController {
       return Promise.resolve();
     }
     this.analysisInFlight = true;
+    const analysisProjectFile = this.projectUri.fsPath;
     const analysisRequestId = ++this.analysisRequestId;
     this.setAnalysisStatus("analyzing", "Analyzing q1timeline project.");
     const configuration = this.config();
@@ -1639,16 +1782,22 @@ export class TimelineController {
       "--mode",
       viewMode,
       "--no-render",
-      ...this.analyzerOverrideArgs(),
-      ...extraArgs,
+      ...this.analyzerOverrideArgs(extraArgs),
     ]);
+    const parameterSummary = this.parameterOverrideSummary();
+    if (parameterSummary) {
+      this.output.appendLine(`Active analysis parameter overrides: ${parameterSummary}`);
+    }
     this.output.appendLine(`Analyzer command: ${[pythonPath, ...args].join(" ")}`);
     this.logAnalyzerEnv(extraEnv);
     const cwd = this.projectRootCwd();
     this.output.appendLine(`Analyzer working directory: ${cwd}`);
-    await fsPromises.mkdir(this.outputDir, { recursive: true });
-    await this.clearAnalyzerOutputFiles(timelineIrPath, diagnosticsPath, htmlPath);
-    return this.execFile(pythonPath, args, timeoutMs, cwd, extraEnv, "analyzer")
+    return Promise.resolve()
+      .then(async () => {
+        await fsPromises.mkdir(this.outputDir, { recursive: true });
+        await this.clearAnalyzerOutputFiles(timelineIrPath, diagnosticsPath, htmlPath);
+        return this.execFile(pythonPath, args, timeoutMs, cwd, extraEnv, "analyzer");
+      })
       .then(async (result) => {
         if (!this.isCurrentAnalysis(analysisRequestId)) {
           this.output.appendLine(`Dropping stale analyzer result ${analysisRequestId}; current request is ${this.analysisRequestId}.`);
@@ -1700,7 +1849,9 @@ export class TimelineController {
           this.output.appendLine(`Analyzer structured error: ${structuredError.kind || "error"}: ${structuredError.message || "No message"}`);
         }
         this.setAnalysisStatus("error", "Analyzer failed.");
-        this.clearPreviewAfterAnalyzerFailure("q1timeline analyzer failed.");
+        if (!onFailure || onFailure(structuredError?.message || failureDiagnostics[0]?.message || error.message) === false) {
+          this.clearPreviewAfterAnalyzerFailure("q1timeline analyzer failed.");
+        }
         const hasDiagnostics = failureDiagnostics.length > 0 || await this.hasAnalyzerDiagnostics();
         if (this.isAnalyzerTimeoutError(error)) {
           this.showSubprocessTimeoutMessage(timeoutMs, error.stage);
@@ -1721,7 +1872,7 @@ export class TimelineController {
         this.analysisInFlight = false;
         if (this.analysisQueued) {
           this.analysisQueued = false;
-          this.runAnalysis();
+          this.runAnalysis({ onFailure: this.projectUri?.fsPath === analysisProjectFile ? onFailure : undefined });
         }
       });
   }
@@ -1817,9 +1968,14 @@ export class TimelineController {
   }
 
   showAnalyzerMissingMessage(error) {
-    vscode.window.showErrorMessage(
-      `Q1Lens q1timeline bridge is unavailable. Check q1lens.pythonPath points to a Python environment with q1lens, or set QBSTIMELINE_Q1TIMELINE_PATH to the working q1timeline source checkout. ${error.message}`
-    );
+    const pythonPath = this.config().get("pythonPath", "python");
+    return vscode.window.showErrorMessage(
+      `Q1Lens is unavailable in the selected Python environment (${pythonPath}). ${error.message}`,
+      "Check Python Environment"
+    ).then((action) => {
+      if (action === "Check Python Environment") return this.checkAnalyzerInstallation();
+      return undefined;
+    });
   }
 
   isUnsupportedAnalyzerSchemaError(error) {
@@ -2058,6 +2214,10 @@ export class TimelineController {
       await this.setLoopPreview(parsedMessage.loopKey, parsedMessage.visibleIterations);
       return;
     }
+    if (parsedMessage.type === "setAnalysisParameter" || parsedMessage.type === "resetAnalysisParameter") {
+      await this.updateInlineAnalysisParameter(parsedMessage);
+      return;
+    }
   }
 
   isValidEventClickMessage(message) {
@@ -2278,6 +2438,8 @@ export class TimelineController {
       viewMode: this.viewMode(),
       alignmentPolicy: this.alignmentPolicy(),
       singleFileMode: this.singleFileMode,
+      parameterProjectFile: this.projectUri?.fsPath,
+      parameterOverrideNames: Array.from(this.parameterOverrides.keys()),
     };
   }
 

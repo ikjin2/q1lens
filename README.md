@@ -74,6 +74,11 @@ to the correct environment, set `q1lens.pythonPath` to its interpreter:
 
 On Windows, use `.venv\\Scripts\\python.exe`.
 
+Run **Q1Lens: Check Python Environment** to inspect the configured Python,
+package locations, and Q1ASM bridge. **Q1Lens: Select Python Environment**
+selects a workspace virtual environment or interpreter for both timeline views.
+Explicit Q1ASM Python settings take precedence over shared settings.
+
 ## Quick start
 
 Create `qbstimeline.yml` in your schedule project:
@@ -127,6 +132,14 @@ Q1Lens writes generated files under `.qbs_timeline/`:
 The same flow is available from the command line:
 
 ```console
+uv run q1lens build --project examples/basic-transmon/qbstimeline.yml
+```
+
+`build` writes the IR, rendered HTML, and Q1ASM under the configured output
+directory. Use `--out-dir` to override it relative to the project file, or
+`--open` to open the HTML. The individual stages are also available:
+
+```console
 uv run q1lens analyze --project examples/basic-transmon/qbstimeline.yml --out examples/basic-transmon/.qbs_timeline/qbs_ir.json
 
 uv run q1lens render --ir examples/basic-transmon/.qbs_timeline/qbs_ir.json --out examples/basic-transmon/.qbs_timeline/index.html
@@ -134,7 +147,20 @@ uv run q1lens render --ir examples/basic-transmon/.qbs_timeline/qbs_ir.json --ou
 
 When using pip, replace `uv run q1lens` with `python -m q1lens`.
 
+For automated checks, `analyze --strict` returns exit code 1 for warnings or
+IR diagnostics. `diagnose --strict` returns 1 for findings or provenance
+coverage gaps. Requested artifacts are still written; usage and runtime
+failures return 2. Missing provenance is reported separately from scheduler
+bug candidates.
+
 ## Standalone Q1ASM
+
+Use **Q1Lens: Set Analysis Parameter...** or the timeline's **Parameters**
+panel to try a temporary JSON parameter value. Edit, Apply, Cancel, and Reset
+keep the project files unchanged. Overrides are scoped to the current project
+and session; **Q1Lens: Clear Analysis Parameter Overrides** restores file values.
+The CLI equivalent is `q1timeline analyze --project q1timeline.yml --set-param NAME=123`;
+repeat `--set-param` for multiple parameters.
 
 You can inspect Q1ASM without a schedule project:
 

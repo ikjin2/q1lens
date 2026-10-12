@@ -23,6 +23,95 @@ import {
 
 const QBS_SUBPROCESS_TIMEOUT_MS = 30000;
 export const QBS_AUTO_REFRESH_GLOB = "**/{qbstimeline.yml,qbstimeline.yaml,*.py,*.ipynb}";
+export const QBS_AUTO_REFRESH_CONFIGURATION_KEYS = [
+  "q1lens.qbs.autoRefresh",
+  "qbloxTimeline.qbs.autoRefresh",
+  "qbsTimeline.autoRefresh",
+] as const;
+export const QBS_ANALYSIS_REQUIRED_MESSAGE = "Run Q1Lens: Analyze and Open first.";
+export const QBS_ANALYZE_AND_OPEN_ACTION = "Analyze and Open";
+
+interface AutoRefreshConfigurationEvent {
+  affectsConfiguration(section: string): boolean;
+}
+
+interface AutoRefreshWatcher {
+  onDidChange(listener: (uri: vscodeTypes.Uri) => void): vscodeTypes.Disposable;
+  onDidCreate(listener: (uri: vscodeTypes.Uri) => void): vscodeTypes.Disposable;
+  onDidDelete(listener: (uri: vscodeTypes.Uri) => void): vscodeTypes.Disposable;
+  dispose(): void;
+}
+
+export interface RegisterQbsAutoRefreshDeps {
+  readEnabled: () => boolean;
+  createWatcher: () => AutoRefreshWatcher;
+  onDidChangeConfiguration: (
+    listener: (event: AutoRefreshConfigurationEvent) => void,
+  ) => vscodeTypes.Disposable;
+  shouldRefresh: (uri: vscodeTypes.Uri) => boolean;
+  run: () => Promise<void>;
+  delayMs: number;
+}
+
+export function registerQbsAutoRefresh(deps: RegisterQbsAutoRefreshDeps): vscodeTypes.Disposable {
+  let active: vscodeTypes.Disposable | undefined;
+  let disposed = false;
+  const stopWatching = () => {
+    active?.dispose();
+    active = undefined;
+  };
+  const syncWatcher = () => {
+    stopWatching();
+    if (disposed || !deps.readEnabled()) {
+      return;
+    }
+    const queue = new DebouncedRefreshQueue(deps.delayMs, deps.run);
+    const watcher = deps.createWatcher();
+    const requestIfCurrentProject = (uri: vscodeTypes.Uri) => {
+      if (deps.shouldRefresh(uri)) {
+        queue.request();
+      }
+    };
+    watcher.onDidChange(requestIfCurrentProject);
+    watcher.onDidCreate(requestIfCurrentProject);
+    watcher.onDidDelete(requestIfCurrentProject);
+    active = {
+      dispose: () => {
+        queue.dispose();
+        watcher.dispose();
+      },
+    };
+  };
+  syncWatcher();
+  const configurationChanges = deps.onDidChangeConfiguration((event) => {
+    if (QBS_AUTO_REFRESH_CONFIGURATION_KEYS.some((key) => event.affectsConfiguration(key))) {
+      syncWatcher();
+    }
+  });
+  return {
+    dispose: () => {
+      disposed = true;
+      configurationChanges.dispose();
+      stopWatching();
+    },
+  };
+}
+
+export async function ensureQbsAnalysisAvailable(input: {
+  isAvailable: () => boolean;
+  analyze: () => Promise<void>;
+  prompt: (message: string, action: string) => Promise<string | undefined>;
+}): Promise<boolean> {
+  if (input.isAvailable()) {
+    return true;
+  }
+  const action = await input.prompt(QBS_ANALYSIS_REQUIRED_MESSAGE, QBS_ANALYZE_AND_OPEN_ACTION);
+  if (action !== QBS_ANALYZE_AND_OPEN_ACTION) {
+    return false;
+  }
+  await input.analyze();
+  return input.isAvailable();
+}
 
 export interface AnalyzeAndOpenDeps {
   resolveProject: () => Promise<string | undefined>;
@@ -418,14 +507,19 @@ export function registerCommands(context: vscodeTypes.ExtensionContext, deps: Re
   const diagnostics = vscode.languages.createDiagnosticCollection("qbsTimeline");
   let lastPaths: OutputPaths | undefined;
   let lastIr: QbsIr | undefined;
-  let handler: () => Promise<void>;
+  let analyzeHandler: () => Promise<void>;
+  let refreshHandler: () => Promise<void>;
+  const ensureAnalysis = () => ensureQbsAnalysisAvailable({
+    isAvailable: () => Boolean(lastPaths && lastIr),
+    analyze: () => analyzeHandler(),
+    prompt: async (message, action) => vscode.window.showWarningMessage(message, action),
+  });
   const openQ1TimelineSelection = async (selection: Q1TimelineSelection) => {
-    if (!lastPaths || !lastIr) {
-      await vscode.window.showWarningMessage("Run Q1Lens: Analyze and Open before opening the Q1ASM timeline.");
+    if (!(await ensureAnalysis())) {
       return;
     }
     try {
-      const target = resolveQbsSelectionToQ1TimelineTarget({ ir: lastIr, selection, outputDir: lastPaths.outputDir });
+      const target = resolveQbsSelectionToQ1TimelineTarget({ ir: lastIr!, selection, outputDir: lastPaths!.outputDir });
       await deps.openQ1TimelineTarget(target);
     } catch (error) {
       output.appendLine(`q1timeline target failed: ${String(error)}`);
@@ -434,7 +528,7 @@ export function registerCommands(context: vscodeTypes.ExtensionContext, deps: Re
   };
   const panel = new TimelinePanel(context.extensionUri, {
     onRefresh: async () => {
-      await handler();
+      await refreshHandler();
     },
     onOpenQ1Timeline: async (message) => {
       await openQ1TimelineSelection(message);
@@ -536,18 +630,31 @@ export function registerCommands(context: vscodeTypes.ExtensionContext, deps: Re
         });
       },
       showPanel: (ir, paths) => {
+        panel.show(ir, paths);
         lastPaths = paths;
         lastIr = ir;
-        panel.show(ir, paths);
       },
       readSettings,
       showOutput: () => output.show(true),
     });
   const runAnalyzeAndOpenForProject = async (projectFile?: string) => {
     const runner = createHandler(projectFile ? async () => projectFile : resolveProjectWithVscode);
-    await runner();
+    try {
+      await runner();
+    } catch (error) {
+      const processError = error as NodeJS.ErrnoException;
+      const missingPython = processError.code === "ENOENT" && processError.syscall?.startsWith("spawn");
+      if (!missingPython && !/No module named ['"]?(q1lens|qbstimeline|q1timeline)\b/.test(String(error))) throw error;
+      output.appendLine(String(error));
+      const action = await vscode.window.showErrorMessage(
+        `Q1Lens is unavailable in the selected Python environment (${readSettings().pythonPath}).`,
+        "Check Python Environment",
+      );
+      if (action === "Check Python Environment") await vscode.commands.executeCommand("q1lens.checkEnvironment", "qbsTimeline.analyzeAndOpen");
+    }
   };
-  handler = () => runAnalyzeAndOpenForProject();
+  analyzeHandler = () => runAnalyzeAndOpenForProject();
+  refreshHandler = () => runAnalyzeAndOpenForProject(lastPaths?.projectFile);
 
   const openNotebookTimelineFromCell = async (cellArg?: unknown) => {
     const notebookContext = resolveNotebookCellContext(vscode, cellArg);
@@ -616,27 +723,30 @@ export function registerCommands(context: vscodeTypes.ExtensionContext, deps: Re
   };
 
   context.subscriptions.push(output, diagnostics);
-  context.subscriptions.push(vscode.commands.registerCommand("qbsTimeline.analyzeAndOpen", handler));
-  context.subscriptions.push(vscode.commands.registerCommand("qbsTimeline.refresh", handler));
+  context.subscriptions.push(vscode.commands.registerCommand("qbsTimeline.analyzeAndOpen", analyzeHandler));
+  context.subscriptions.push(vscode.commands.registerCommand("qbsTimeline.refresh", refreshHandler));
   context.subscriptions.push(
     vscode.commands.registerCommand("qbsTimeline.openIr", async () => {
-      if (lastPaths) {
-        await openFileAtLine(lastPaths.irPath, 1);
+      if (!(await ensureAnalysis())) {
+        return;
       }
+      await openFileAtLine(lastPaths!.irPath, 1);
     }),
   );
   context.subscriptions.push(
     vscode.commands.registerCommand("qbsTimeline.openRenderedHtml", async () => {
-      if (lastPaths) {
-        await vscode.env.openExternal(vscode.Uri.file(lastPaths.htmlPath));
+      if (!(await ensureAnalysis())) {
+        return;
       }
+      await vscode.env.openExternal(vscode.Uri.file(lastPaths!.htmlPath));
     }),
   );
   context.subscriptions.push(
     vscode.commands.registerCommand("qbsTimeline.openQ1asmFolder", async () => {
-      if (lastPaths) {
-        await vscode.commands.executeCommand("revealFileInOS", vscode.Uri.file(lastPaths.q1asmDir));
+      if (!(await ensureAnalysis())) {
+        return;
       }
+      await vscode.commands.executeCommand("revealFileInOS", vscode.Uri.file(lastPaths!.q1asmDir));
     }),
   );
   context.subscriptions.push(vscode.commands.registerCommand("qbsTimeline.openQ1Timeline", async () => openQ1TimelineSelection({})));
@@ -667,17 +777,18 @@ export function registerCommands(context: vscodeTypes.ExtensionContext, deps: Re
     )),
   );
 
-  if (readSettings().autoRefresh) {
-    const queue = new DebouncedRefreshQueue(750, handler);
-    const watcher = vscode.workspace.createFileSystemWatcher(QBS_AUTO_REFRESH_GLOB);
-    const requestIfCurrentProject = (uri: vscodeTypes.Uri) => {
-      if (lastPaths && isWatchedPathForCurrentProject({ changedFile: uri.fsPath, projectDir: lastPaths.projectDir })) {
-        queue.request();
-      }
-    };
-    watcher.onDidChange(requestIfCurrentProject);
-    watcher.onDidCreate(requestIfCurrentProject);
-    watcher.onDidDelete(requestIfCurrentProject);
-    context.subscriptions.push(watcher, { dispose: () => queue.dispose() });
-  }
+  const onDidChangeConfiguration = typeof vscode.workspace.onDidChangeConfiguration === "function"
+    ? (listener: (event: AutoRefreshConfigurationEvent) => void) => vscode.workspace.onDidChangeConfiguration(listener)
+    : () => ({ dispose: () => undefined });
+  context.subscriptions.push(registerQbsAutoRefresh({
+    readEnabled: () => readSettings().autoRefresh,
+    createWatcher: () => vscode.workspace.createFileSystemWatcher(QBS_AUTO_REFRESH_GLOB),
+    onDidChangeConfiguration,
+    shouldRefresh: (uri) => Boolean(
+      lastPaths
+      && isWatchedPathForCurrentProject({ changedFile: uri.fsPath, projectDir: lastPaths.projectDir }),
+    ),
+    run: refreshHandler,
+    delayMs: 750,
+  }));
 }

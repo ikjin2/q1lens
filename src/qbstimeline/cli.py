@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import webbrowser
 import zipfile
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 
 from qbstimeline.compile_worker import analyze_project
@@ -25,14 +27,20 @@ def main(argv: Sequence[str] | None = None, *, prog: str = "qbstimeline") -> int
     parser = _build_parser(prog=prog)
     args = parser.parse_args(raw_argv)
     args.prog = prog
-    if args.command == "analyze":
-        return _analyze_command(args)
-    if args.command == "render":
-        return _render_command(args)
-    if args.command == "diagnose":
-        return _diagnose_command(args)
-    if args.command == "q1timeline":
-        return run_q1timeline_cli(args.q1timeline_args)
+    try:
+        if args.command == "analyze":
+            return _analyze_command(args)
+        if args.command == "build":
+            return _build_command(args)
+        if args.command == "render":
+            return _render_command(args)
+        if args.command == "diagnose":
+            return _diagnose_command(args)
+        if args.command == "q1timeline":
+            return run_q1timeline_cli(args.q1timeline_args)
+    except Exception as exc:
+        print(f"{prog} {args.command}: {exc}", file=sys.stderr)
+        return 2
     parser.print_help()
     return 2
 
@@ -44,6 +52,12 @@ def _build_parser(*, prog: str = "qbstimeline") -> argparse.ArgumentParser:
     analyze = subparsers.add_parser("analyze", help="Compile a qbstimeline project into QBS IR")
     analyze.add_argument("--project", required=True, help="Path to qbstimeline.yml")
     analyze.add_argument("--out", required=True, help="Output QBS IR JSON path")
+    analyze.add_argument("--strict", action="store_true", help="Return exit code 1 for analysis warnings")
+
+    build = subparsers.add_parser("build", help="Analyze and render a qbstimeline project")
+    build.add_argument("--project", required=True, help="Path to qbstimeline.yml")
+    build.add_argument("--out-dir", type=Path, help="Override the configured output directory")
+    build.add_argument("--open", action="store_true", help="Open the rendered HTML in the default browser")
 
     render = subparsers.add_parser("render", help="Render QBS IR to static HTML")
     render.add_argument("--ir", required=True, help="Input QBS IR JSON path")
@@ -55,6 +69,7 @@ def _build_parser(*, prog: str = "qbstimeline") -> argparse.ArgumentParser:
     diagnose.add_argument("--out", help="Output diagnostics report JSON path")
     diagnose.add_argument("--bundle", help="Output artifact bundle ZIP path")
     diagnose.add_argument("--schedule", help="Optional schedule source file to include in the bundle")
+    diagnose.add_argument("--strict", action="store_true", help="Return exit code 1 for diagnostic findings")
 
     q1timeline = subparsers.add_parser(
         "q1timeline",
@@ -76,6 +91,44 @@ def _analyze_command(args: argparse.Namespace) -> int:
 
     print(f"Wrote QBS IR: {args.out}")
     print(f"Wrote {len(result.q1asm_programs)} Q1ASM program(s): {config.output_dir / 'q1asm'}")
+    warnings = result.ir.get("warnings") or []
+    ir_diagnostics = result.ir.get("ir_diagnostics") or []
+    if args.strict and (warnings or ir_diagnostics):
+        print(
+            f"{args.prog} analyze: strict mode found "
+            f"{len(warnings)} warning(s) and {len(ir_diagnostics)} IR diagnostic(s)",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+def _build_command(args: argparse.Namespace) -> int:
+    try:
+        config = load_project_config(args.project)
+        output_dir = config.output_dir
+        if args.out_dir is not None:
+            output_dir = args.out_dir.expanduser()
+            if not output_dir.is_absolute():
+                output_dir = config.root / output_dir
+            output_dir = output_dir.resolve()
+            config = replace(config, output_dir=output_dir)
+
+        ir_path = output_dir / "qbs_ir.json"
+        html_path = output_dir / "index.html"
+        result = analyze_project(config)
+        write_qbs_ir(result.ir, ir_path)
+        render_ir_path(ir_path, html_path)
+    except (ConfigLoadError, RuntimeError, OSError, RenderError, json.JSONDecodeError) as exc:
+        print(f"{args.prog} build: {exc}", file=sys.stderr)
+        return 2
+
+    print(f"Wrote QBS IR: {ir_path}")
+    print(f"Wrote {len(result.q1asm_programs)} Q1ASM program(s): {output_dir / 'q1asm'}")
+    print(f"Wrote HTML view: {html_path}")
+    if args.open and not webbrowser.open(html_path.resolve().as_uri()):
+        print(f"{args.prog} build: could not open the default browser", file=sys.stderr)
+        return 2
     return 0
 
 
@@ -120,6 +173,15 @@ def _diagnose_command(args: argparse.Namespace) -> int:
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         print(f"{args.prog} diagnose: {exc}", file=sys.stderr)
         return 2
+    findings = report.get("findings") or []
+    coverage_gaps = report.get("coverage_gaps") or []
+    if args.strict and (findings or coverage_gaps):
+        print(
+            f"{args.prog} diagnose: strict mode found "
+            f"{len(findings)} finding(s) and {len(coverage_gaps)} coverage gap(s)",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

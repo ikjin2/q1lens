@@ -270,6 +270,7 @@ def render_html(
     <section id="timeline-root" class="timeline" aria-label="Timeline">
       {''.join(svg_parts)}
     </section>
+    {_parameters_panel(ir.get("analysis", {}))}
     <details id="q1timeline-analysis-details" class="analysis-details">
       <summary>Analysis details</summary>
       <div id="q1timeline-analysis-details-body">
@@ -1068,6 +1069,43 @@ def _control_flow_connector_svgs(
             f'marker-end="url(#control-flow-arrow)" aria-label="{label}"><title>{label}</title></path>'
         )
     return parts
+
+
+def _parameters_panel(analysis: dict[str, Any]) -> str:
+    parameters = analysis.get("parameters")
+    if not isinstance(parameters, list):
+        return ""
+    override_count = sum(bool(parameter.get("overridden")) for parameter in parameters)
+    summary = f"Parameters · {len(parameters)}"
+    if override_count:
+        summary += f" · {override_count} overridden"
+    rows = []
+    for index, parameter in enumerate(parameters):
+        annotation = ""
+        if parameter.get("overridden"):
+            base = parameter.get("base_value_json")
+            origin = f"← base {base}" if base is not None else "added for this analysis"
+            annotation = (
+                '<span class="parameter-override">override</span>'
+                f'<span class="parameter-base">{escape(origin)}</span>'
+            )
+        rows.append(
+            f'<tr data-parameter-index="{index}"><th scope="row"><code>{escape(parameter["name"])}</code></th>'
+            f'<td><code>{escape(parameter["value_json"])}</code>{annotation}</td></tr>'
+        )
+    content = (
+        '<div class="parameters-table-scroll" tabindex="0" role="region" aria-label="Analysis parameter values">'
+        '<table><thead><tr><th scope="col">Parameter</th><th scope="col">Current value</th></tr></thead>'
+        f'<tbody>{"".join(rows)}</tbody></table></div>'
+        if rows else '<p>No parameters configured for this analysis.</p>'
+    )
+    return (
+        '<details id="q1timeline-parameters" class="analysis-parameters">'
+        f'<summary>{summary}</summary>'
+        '<p class="parameters-help">Values used for this timeline analysis, not live hardware or register values. '
+        'Overrides do not change the parameter file.</p>'
+        f'{content}</details>'
+    )
 
 
 def _diagnostics_panel(diagnostics: list[dict[str, Any]], event_dom_ids: dict[str, str]) -> str:
@@ -2348,6 +2386,25 @@ body.vscode-dark button { background: var(--vscode-button-secondaryBackground, #
 button[aria-pressed="true"] { background: #17202a; color: #fff; }
 .analysis-details { margin: 0 16px 16px; }
 .analysis-details > summary { cursor: pointer; padding: 8px 0; font-weight: 700; }
+.analysis-parameters { margin: 0 16px 8px; font-size: 12px; }
+.analysis-parameters > summary { cursor: pointer; padding: 8px 0; font-size: 14px; font-weight: 700; }
+.parameters-help { margin: 0 0 8px; color: var(--vscode-descriptionForeground, #4b5563); }
+.parameters-table-scroll { max-height: 240px; overflow: auto; }
+.analysis-parameters table { width: 100%; border-collapse: collapse; text-align: left; }
+.analysis-parameters th, .analysis-parameters td { padding: 6px 10px; border-bottom: 1px solid var(--vscode-panel-border, #d8dee6); vertical-align: top; overflow-wrap: anywhere; }
+.analysis-parameters th[scope="row"] { font-weight: normal; }
+.analysis-parameters code { font-family: var(--vscode-editor-font-family, monospace); white-space: pre-wrap; }
+.parameter-override { display: inline-block; margin-left: 8px; padding: 0 4px; border: 1px solid var(--vscode-panel-border, #d8dee6); border-radius: 3px; font-size: 11px; }
+.parameter-base { display: block; margin-top: 2px; color: var(--vscode-descriptionForeground, #4b5563); white-space: pre-wrap; }
+.parameter-actions { display: inline-flex; gap: 6px; margin-left: 8px; }
+.analysis-parameters button { padding: 2px 6px; font: inherit; color: var(--vscode-button-secondaryForeground, #17202a); background: var(--vscode-button-secondaryBackground, #f3f4f6); border-color: var(--vscode-panel-border, #9aa7b4); }
+.analysis-parameters button:disabled { opacity: 0.5; cursor: default; }
+.parameter-editor { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 6px; }
+.parameter-editor[hidden] { display: none; }
+.parameter-input { flex: 1; width: 20ch; min-width: 0; max-width: 28rem; padding: 4px 6px; font-family: var(--vscode-editor-font-family, monospace); color: var(--vscode-input-foreground, #17202a); background: var(--vscode-input-background, #fff); border: 1px solid var(--vscode-input-border, #9aa7b4); border-radius: 3px; }
+.parameter-input:focus-visible, .analysis-parameters button:focus-visible { outline: 1px solid var(--vscode-focusBorder, #007acc); outline-offset: 2px; }
+.parameter-error { flex-basis: 100%; color: var(--vscode-errorForeground, #c72c2c); }
+.parameter-status { display: block; color: var(--vscode-descriptionForeground, #4b5563); }
 .diagnostics { margin: 16px 16px 0; padding: 10px 12px; border: 1px solid var(--vscode-panel-border, #d8dee6); }
 .diagnostics ol { margin: 8px 0 0; padding-left: 20px; }
 .diagnostics-secondary { margin-top: 8px; }

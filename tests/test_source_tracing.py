@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import inspect
 import sysconfig
 from pathlib import Path
 from types import SimpleNamespace
 
 from qbstimeline.source_tracing import (
     SourceTraceLocation,
+    _location_from_frame,
     _should_replace_location,
     traced_schedule_adds,
 )
@@ -85,3 +87,15 @@ def test_trace_locations_prefer_user_code_over_stdlib_frames() -> None:
 
     assert _should_replace_location(stdlib_location, user_location) is True
     assert _should_replace_location(user_location, stdlib_location) is False
+
+
+def test_location_from_frame_supports_python_310_frame_info(monkeypatch) -> None:
+    monkeypatch.setattr(
+        inspect,
+        "getframeinfo",
+        lambda frame: SimpleNamespace(filename="schedule.py", lineno=12),
+    )
+
+    location = _location_from_frame(inspect.currentframe(), label="readout")
+
+    assert location == SourceTraceLocation(file="schedule.py", line=12, column=0, label="readout")

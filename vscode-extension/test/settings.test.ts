@@ -1,6 +1,24 @@
 import assert from "node:assert/strict";
 import { readMergedSetting } from "../src/settings";
 import { q1timelineConfigValue } from "../src/q1timeline/settings";
+import { explicitConfigValue, readSharedPythonSettings } from "../src/qbs/settingsCore";
+
+function config(values: Record<string, unknown>, defaults: Record<string, unknown> = {}) {
+  return {
+    get<T>(key: string, fallback: T): T {
+      if (Object.prototype.hasOwnProperty.call(values, key)) {
+        return values[key] as T;
+      }
+      return Object.prototype.hasOwnProperty.call(defaults, key) ? (defaults[key] as T) : fallback;
+    },
+    inspect<T>(key: string) {
+      return { defaultValue: defaults[key] as T | undefined, workspaceValue: values[key] as T | undefined };
+    },
+  };
+}
+
+const pythonDefaults = { pythonPath: "python", pythonArgs: [] };
+const q1lensDefaults = { ...pythonDefaults, "q1timeline.pythonPath": "python", "q1timeline.pythonArgs": [] };
 
 describe("merged settings", () => {
   it("prefers q1lens settings over qbloxTimeline and legacy settings", () => {
@@ -45,14 +63,6 @@ describe("merged settings", () => {
 });
 
 describe("q1timeline settings bridge", () => {
-  function config(values: Record<string, unknown>) {
-    return {
-      get<T>(key: string, fallback: T): T {
-        return Object.prototype.hasOwnProperty.call(values, key) ? (values[key] as T) : fallback;
-      },
-    };
-  }
-
   it("preserves legacy q1timeline Python path before the shared fallback", () => {
     const value = q1timelineConfigValue(
       config({ pythonPath: "py-qblox" }),
@@ -96,5 +106,76 @@ describe("q1timeline settings bridge", () => {
     );
 
     assert.equal(value, "py-q1lens-integrated");
+  });
+
+  it("uses shared Python settings despite registered Q1ASM and legacy defaults", () => {
+    const primary = config({ pythonPath: "py-shared", pythonArgs: ["-3.12"] }, q1lensDefaults);
+    const qblox = config({}, pythonDefaults);
+    const legacy = config({}, pythonDefaults);
+
+    assert.equal(q1timelineConfigValue(qblox, legacy, "pythonPath", "python", primary), "py-shared");
+    assert.deepEqual(q1timelineConfigValue(qblox, legacy, "pythonArgs", [], primary), ["-3.12"]);
+  });
+
+  it("honors an explicit Q1ASM override even when it equals its registered default", () => {
+    const primary = config({
+      pythonPath: "py-shared",
+      pythonArgs: ["-3.12"],
+      "q1timeline.pythonPath": "python",
+      "q1timeline.pythonArgs": [],
+    }, q1lensDefaults);
+
+    assert.equal(q1timelineConfigValue(config({}), config({}), "pythonPath", "python", primary), "python");
+    assert.deepEqual(q1timelineConfigValue(config({}), config({}), "pythonArgs", [], primary), []);
+  });
+
+  it("preserves explicit legacy overrides ahead of shared settings despite registered defaults", () => {
+    const primary = config({ pythonPath: "py-shared", pythonArgs: ["-3.12"] }, q1lensDefaults);
+    const legacy = config({ pythonPath: "py-legacy", pythonArgs: ["-3.11"] }, pythonDefaults);
+
+    assert.equal(q1timelineConfigValue(config({}, pythonDefaults), legacy, "pythonPath", "python", primary), "py-legacy");
+    assert.deepEqual(q1timelineConfigValue(config({}, pythonDefaults), legacy, "pythonArgs", [], primary), ["-3.11"]);
+  });
+});
+
+describe("shared Python settings", () => {
+  it("does not let registered defaults hide explicit legacy settings", () => {
+    assert.deepEqual(readSharedPythonSettings(
+      config({}, pythonDefaults),
+      config({}, pythonDefaults),
+      config({ pythonPath: "py-legacy", pythonArgs: ["-3.11"] }, pythonDefaults),
+    ), { pythonPath: "py-legacy", pythonArgs: ["-3.11"] });
+  });
+
+  it("prefers explicit primary settings, including empty launcher arguments", () => {
+    assert.deepEqual(readSharedPythonSettings(
+      config({ pythonPath: "python", pythonArgs: [] }, pythonDefaults),
+      config({ pythonPath: "py-qblox", pythonArgs: ["-3.12"] }, pythonDefaults),
+      config({ pythonPath: "py-legacy", pythonArgs: ["-3.11"] }, pythonDefaults),
+    ), { pythonPath: "python", pythonArgs: [] });
+  });
+
+  it("prefers explicit qblox settings to qbs legacy settings", () => {
+    assert.deepEqual(readSharedPythonSettings(
+      config({}, pythonDefaults),
+      config({ pythonPath: "py-qblox", pythonArgs: ["-3.12"] }, pythonDefaults),
+      config({ pythonPath: "py-legacy", pythonArgs: ["-3.11"] }, pythonDefaults),
+    ), { pythonPath: "py-qblox", pythonArgs: ["-3.12"] });
+  });
+
+  it("uses registered defaults when nothing is configured", () => {
+    assert.deepEqual(readSharedPythonSettings(
+      config({}, pythonDefaults), config({}, pythonDefaults), config({}, pythonDefaults),
+    ), { pythonPath: "python", pythonArgs: [] });
+  });
+
+  it("recognizes user and workspace folder values as explicit", () => {
+    for (const scope of ["globalValue", "workspaceFolderValue", "globalLanguageValue", "workspaceLanguageValue", "workspaceFolderLanguageValue"]) {
+      const scopedConfig = {
+        get<T>(_key: string, _fallback: T): T { return "py-scoped" as T; },
+        inspect<T>(_key: string) { return { [scope]: "py-scoped" as T }; },
+      };
+      assert.equal(explicitConfigValue(scopedConfig, "pythonPath"), "py-scoped", scope);
+    }
   });
 });

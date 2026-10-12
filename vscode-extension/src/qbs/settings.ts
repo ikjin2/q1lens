@@ -1,5 +1,6 @@
 import type * as vscodeTypes from "vscode";
 import { readMergedSetting } from "../settings";
+import { readSharedPythonSettings } from "./settingsCore";
 
 export interface QbsTimelineSettings {
   pythonPath: string;
@@ -17,8 +18,6 @@ export function readSettings(): QbsTimelineSettings {
   const qbsConfig = vscode.workspace.getConfiguration("qbsTimeline");
   const settings = {
     q1lens: {
-      pythonPath: q1lensConfig.get<string | undefined>("pythonPath"),
-      pythonArgs: q1lensConfig.get<string[] | undefined>("pythonArgs"),
       revealOutputChannel: q1lensConfig.get<boolean | undefined>("revealOutputChannel"),
       q1timelineCommand: q1lensConfig.get<string | null | undefined>("q1timelineCommand"),
       qbs: {
@@ -27,16 +26,12 @@ export function readSettings(): QbsTimelineSettings {
       },
     },
     qbloxTimeline: {
-      pythonPath: qbloxConfig.get<string | undefined>("pythonPath"),
-      pythonArgs: qbloxConfig.get<string[] | undefined>("pythonArgs"),
       qbs: {
         autoRefresh: qbloxConfig.get<boolean | undefined>("qbs.autoRefresh"),
         outputDirOverride: qbloxConfig.get<string | null | undefined>("qbs.outputDirOverride"),
       },
     },
     qbsTimeline: {
-      pythonPath: qbsConfig.get<string | undefined>("pythonPath"),
-      pythonArgs: qbsConfig.get<string[] | undefined>("pythonArgs"),
       autoRefresh: qbsConfig.get<boolean | undefined>("autoRefresh"),
       outputDirOverride: qbsConfig.get<string | null | undefined>("outputDirOverride"),
       revealOutputChannel: qbsConfig.get<boolean | undefined>("revealOutputChannel"),
@@ -44,8 +39,7 @@ export function readSettings(): QbsTimelineSettings {
     },
   };
   return {
-    pythonPath: readMergedSetting(settings, ["pythonPath"], "python"),
-    pythonArgs: readMergedSetting(settings, ["pythonArgs"], []),
+    ...readSharedPythonSettings(q1lensConfig, qbloxConfig, qbsConfig),
     autoRefresh: readMergedSetting(settings, ["qbs", "autoRefresh"], false),
     outputDirOverride: readMergedSetting(settings, ["qbs", "outputDirOverride"], null),
     revealOutputChannel: readMergedSetting(settings, ["revealOutputChannel"], true),

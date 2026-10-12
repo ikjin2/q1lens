@@ -39,6 +39,7 @@ function createMockVscode() {
       showWarningMessage: async () => undefined,
       showInformationMessage: async () => undefined,
       showErrorMessage: async () => undefined,
+      showInputBox: async () => undefined,
       showQuickPick: async (items: any[]) => items[0],
       createWebviewPanel: () => ({
         webview: {
@@ -140,6 +141,23 @@ async function withMockedVscode(vscode: any, callback: (controllerModule: any) =
 }
 
 describe("q1timeline controller", () => {
+  it("offers a Python environment check with a retry when the analyzer is missing", async () => {
+    const vscode = createMockVscode();
+    const calls: any[] = [];
+    vscode.commands.executeCommand = async (...args: any[]) => calls.push(args);
+    vscode.window.showErrorMessage = async (message: string, action: string) => {
+      assert.match(message, /Q1Lens is unavailable/);
+      assert.equal(action, "Check Python Environment");
+      return action;
+    };
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      await controller.showAnalyzerMissingMessage(new Error("No module named q1lens"));
+      assert.deepEqual(calls, [["q1lens.checkEnvironment", "q1timeline.refreshPreview"]]);
+      controller.dispose();
+    });
+  });
+
   it("cache-busts q1timeline webview assets when injecting them", async () => {
     const vscode = createMockVscode();
 
@@ -1401,6 +1419,407 @@ describe("q1timeline controller", () => {
     });
   });
 
+  it("sets, replaces, displays, and clears analysis parameter overrides", async () => {
+    const vscode = createMockVscode();
+    const inputs = ["scenario.duration", "24", "scenario.duration", "32"];
+    const notifications: string[] = [];
+    const outputLines: string[] = [];
+    vscode.window.showInputBox = async () => inputs.shift();
+    vscode.window.showInformationMessage = async (message: string) => {
+      notifications.push(message);
+    };
+    vscode.window.createOutputChannel = () => ({
+      appendLine: (message: string) => outputLines.push(message),
+      show: () => {},
+      dispose: () => {},
+    });
+
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      controller.projectUri = vscode.Uri.file("C:\\repo\\q1timeline.yml");
+      controller.outputDir = "C:\\repo\\.q1timeline";
+      controller.branchAssumptionOverrides.set("branch", "taken");
+      controller.loopPreviewOverrides.set("loop", 2);
+      let runCount = 0;
+      controller.runAnalysis = async () => {
+        runCount += 1;
+      };
+
+      await controller.setAnalysisParameter();
+      await controller.setAnalysisParameter();
+
+      assert.equal(runCount, 2);
+      assert.deepEqual(controller.analyzerOverrideArgs(), [
+        "--branch-assumption",
+        "branch=taken",
+        "--loop-preview",
+        "loop=2",
+        "--set-param",
+        "scenario.duration=32",
+      ]);
+      assert.ok(notifications.at(-1)?.includes("scenario.duration=32"));
+      assert.ok(outputLines.some((line) => line.includes("scenario.duration=32")));
+
+      await controller.clearAnalysisParameterOverrides();
+
+      assert.equal(runCount, 3);
+      assert.equal(controller.analyzerOverrideArgs().includes("--set-param"), false);
+      assert.ok(notifications.at(-1)?.includes("cleared"));
+      controller.dispose();
+    });
+  });
+
+  it("does not rerun analysis for cancelled or invalid parameter input", async () => {
+    const vscode = createMockVscode();
+    const errors: string[] = [];
+    vscode.window.showErrorMessage = async (message: string) => {
+      errors.push(message);
+    };
+
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      controller.projectUri = vscode.Uri.file("C:\\repo\\q1timeline.yml");
+      controller.outputDir = "C:\\repo\\.q1timeline";
+      let runCount = 0;
+      controller.runAnalysis = async () => {
+        runCount += 1;
+      };
+
+      vscode.window.showInputBox = async () => undefined;
+      await controller.setAnalysisParameter();
+
+      const invalidInputs = ["DURATION", "true"];
+      vscode.window.showInputBox = async () => invalidInputs.shift();
+      await controller.setAnalysisParameter();
+
+      assert.equal(runCount, 0);
+      assert.deepEqual(controller.analyzerOverrideArgs(), []);
+      assert.ok(errors.at(-1)?.includes("Boolean JSON values"));
+      controller.dispose();
+    });
+  });
+
+  it("applies exact inline JSON parameter values and exposes session ownership to the webview", async () => {
+    const vscode = createMockVscode();
+    vscode.window.showInputBox = async () => assert.fail("Inline edits must not open an input box");
+
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      const projectFile = "C:\\repo\\q1timeline.yml";
+      controller.projectUri = vscode.Uri.file(projectFile);
+      controller.outputDir = "C:\\repo\\.q1timeline";
+      controller.timelineIr = { analysis: { parameters: [{ name: "DURATION" }] } };
+      controller.branchAssumptionOverrides.set("branch", "taken");
+      controller.loopPreviewOverrides.set("loop", 2);
+      const baselinesDuringRun: any[] = [];
+      controller.runAnalysis = async () => baselinesDuringRun.push(controller.lastAnalyzerTimelineIr);
+
+      for (const valueJson of [" 128 ", "9007199254740993", "null", '{"nested":[4,"text",null,{"large":9007199254740993}]}']) {
+        controller.lastAnalyzerTimelineIr = { events: [] };
+        await controller.handleWebviewMessage({ type: "setAnalysisParameter", name: "DURATION", valueJson, projectFile });
+        assert.equal(controller.parameterOverrides.get("DURATION"), valueJson.trim());
+      }
+
+      assert.deepEqual(baselinesDuringRun, [undefined, undefined, undefined, undefined]);
+      assert.equal(controller.parameterOverrides.size, 1);
+      assert.equal(controller.branchAssumptionOverrides.get("branch"), "taken");
+      assert.equal(controller.loopPreviewOverrides.get("loop"), 2);
+      const state = controller.webviewInitialState();
+      assert.equal(state.parameterProjectFile, projectFile);
+      assert.deepEqual(state.parameterOverrideNames, ["DURATION"]);
+      assert.deepEqual(controller.analyzerOverrideArgs().slice(-2), [
+        "--set-param", 'DURATION={"nested":[4,"text",null,{"large":9007199254740993}]}',
+      ]);
+      controller.dispose();
+    });
+  });
+
+  it("reports invalid inline JSON without mutating overrides or rerunning analysis", async () => {
+    const vscode = createMockVscode();
+
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      const projectFile = "C:\\repo\\q1timeline.yml";
+      controller.projectUri = vscode.Uri.file(projectFile);
+      controller.outputDir = "C:\\repo\\.q1timeline";
+      controller.timelineIr = { analysis: { parameters: [{ name: "DURATION" }] } };
+      controller.parameterOverrides.set("DURATION", "128");
+      const messages: any[] = [];
+      controller.postWebviewMessage = (message: any) => messages.push(message);
+      controller.runAnalysis = async () => assert.fail("Invalid edits must not rerun analysis");
+
+      for (const valueJson of ["", " ", "1.5", "true", "false", '{"nested":[false]}', "[1,2.5]", "broken", "NaN", "Infinity"]) {
+        await controller.handleWebviewMessage({ type: "setAnalysisParameter", name: "DURATION", valueJson, projectFile });
+        assert.equal(controller.parameterOverrides.get("DURATION"), "128");
+        assert.equal(messages.at(-1).type, "analysisParameterError");
+        assert.equal(messages.at(-1).name, "DURATION");
+        assert.ok(messages.at(-1).message);
+      }
+      assert.equal(messages.length, 10);
+      controller.dispose();
+    });
+  });
+
+  it("rejects stale projects, unavailable outputs, and unknown inline parameter names", async () => {
+    const vscode = createMockVscode();
+
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      const projectFile = "C:\\repo\\project-b\\q1timeline.yml";
+      controller.projectUri = vscode.Uri.file(projectFile);
+      controller.outputDir = "C:\\repo\\project-b\\.q1timeline";
+      controller.timelineIr = { analysis: { parameters: [{ name: "DURATION" }] } };
+      controller.parameterOverrides.set("DURATION", "128");
+      const messages: any[] = [];
+      controller.postWebviewMessage = (message: any) => messages.push(message);
+      controller.runAnalysis = async () => assert.fail("Stale edits must not rerun analysis");
+      const edit = { type: "setAnalysisParameter", name: "DURATION", valueJson: "64", projectFile };
+
+      await controller.handleWebviewMessage({ ...edit, projectFile: "C:\\repo\\project-a\\q1timeline.yml" });
+      await controller.handleWebviewMessage({ type: "resetAnalysisParameter", name: "DURATION", projectFile: "C:\\repo\\project-a\\q1timeline.yml" });
+      await controller.handleWebviewMessage({ ...edit, name: "UNKNOWN" });
+      controller.outputDir = undefined;
+      await controller.handleWebviewMessage(edit);
+      controller.projectUri = undefined;
+      await controller.handleWebviewMessage(edit);
+
+      assert.deepEqual(Array.from(controller.parameterOverrides), [["DURATION", "128"]]);
+      assert.equal(messages.length, 5);
+      assert.ok(messages.every((message) => message.type === "analysisParameterError"));
+      assert.equal(controller.webviewInitialState().parameterProjectFile, undefined);
+      controller.dispose();
+    });
+  });
+
+  it("resets only the selected session override and rejects resets of configured values", async () => {
+    const vscode = createMockVscode();
+
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      const projectFile = "C:\\repo\\q1timeline.yml";
+      controller.projectUri = vscode.Uri.file(projectFile);
+      controller.outputDir = "C:\\repo\\.q1timeline";
+      controller.timelineIr = { analysis: { parameters: [{ name: "DURATION" }, { name: "WAIT" }] } };
+      controller.parameterOverrides.set("DURATION", "128");
+      controller.parameterOverrides.set("WAIT", "96");
+      controller.branchAssumptionOverrides.set("branch", "taken");
+      controller.loopPreviewOverrides.set("loop", 2);
+      controller.lastAnalyzerTimelineIr = { events: [] };
+      let runCount = 0;
+      controller.runAnalysis = async () => { runCount += 1; };
+      const messages: any[] = [];
+      controller.postWebviewMessage = (message: any) => messages.push(message);
+      const reset = { type: "resetAnalysisParameter", name: "DURATION", projectFile };
+
+      await controller.handleWebviewMessage(reset);
+      assert.equal(runCount, 1);
+      assert.equal(controller.lastAnalyzerTimelineIr, undefined);
+      assert.deepEqual(Array.from(controller.parameterOverrides), [["WAIT", "96"]]);
+      assert.equal(controller.branchAssumptionOverrides.get("branch"), "taken");
+      assert.equal(controller.loopPreviewOverrides.get("loop"), 2);
+      assert.deepEqual(controller.webviewInitialState().parameterOverrideNames, ["WAIT"]);
+      await controller.handleWebviewMessage(reset);
+      assert.equal(runCount, 1);
+      assert.equal(messages.at(-1).type, "analysisParameterError");
+      assert.match(messages.at(-1).message, /no temporary override/);
+      controller.dispose();
+    });
+  });
+
+  it("emits session parameter edits after configured analyzer overrides", async () => {
+    const vscode = createMockVscode();
+    const outputDir = mkdtempSync(join(tmpdir(), "q1-inline-param-"));
+    let capturedArgs: string[] = [];
+
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      const projectFile = join(outputDir, "q1timeline.yml");
+      controller.projectUri = vscode.Uri.file(projectFile);
+      controller.outputDir = outputDir;
+      controller.timelineIr = { analysis: { parameters: [{ name: "DURATION" }] } };
+      controller.branchAssumptionOverrides.set("branch", "taken");
+      controller.loopPreviewOverrides.set("loop", 2);
+      controller.config = () => ({
+        get: (key: string, fallback: any) => key === "analyzer.extraArgs" ? ["--set-param", "DURATION=64", "--strict"] : fallback,
+      });
+      controller.execFile = async (_pythonPath: string, args: string[]) => {
+        capturedArgs = args;
+        return { stdout: "{}", stderr: "", exitCode: 0, elapsedMs: 1 };
+      };
+      controller.runRender = async () => ({ stdout: "", stderr: "", exitCode: 0, elapsedMs: 1 });
+      controller.refreshWebview = async () => undefined;
+
+      await controller.handleWebviewMessage({ type: "setAnalysisParameter", name: "DURATION", valueJson: "128", projectFile });
+
+      assert.deepEqual(capturedArgs.slice(capturedArgs.indexOf("--branch-assumption")), [
+        "--branch-assumption", "branch=taken", "--loop-preview", "loop=2",
+        "--set-param", "DURATION=64", "--strict", "--set-param", "DURATION=128",
+      ]);
+      controller.dispose();
+    });
+  });
+
+  it("rejects inline parameter edits while an analysis is already running", async () => {
+    const vscode = createMockVscode();
+
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      const projectFile = "C:\\repo\\q1timeline.yml";
+      controller.projectUri = vscode.Uri.file(projectFile);
+      controller.outputDir = "C:\\repo\\.q1timeline";
+      controller.timelineIr = { analysis: { parameters: [{ name: "DURATION" }] } };
+      controller.analysisInFlight = true;
+      controller.parameterOverrides.set("DURATION", "128");
+      const messages: any[] = [];
+      controller.postWebviewMessage = (message: any) => messages.push(message);
+      controller.runAnalysis = async () => assert.fail("Busy edits must not queue analysis");
+
+      await controller.handleWebviewMessage({ type: "setAnalysisParameter", name: "DURATION", valueJson: "256", projectFile });
+      await controller.handleWebviewMessage({ type: "resetAnalysisParameter", name: "DURATION", projectFile });
+
+      assert.equal(controller.parameterOverrides.get("DURATION"), "128");
+      assert.equal(controller.analysisQueued, false);
+      assert.equal(messages.length, 2);
+      assert.ok(messages.every((message) => message.type === "analysisParameterError" && /still running/.test(message.message)));
+      controller.dispose();
+    });
+  });
+
+  it("rolls back analyzer-rejected inline values while preserving a usable preview for retry", async () => {
+    const vscode = createMockVscode();
+    const outputDir = mkdtempSync(join(tmpdir(), "q1-inline-failure-"));
+
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      const projectFile = join(outputDir, "q1timeline.yml");
+      controller.projectUri = vscode.Uri.file(projectFile);
+      controller.outputDir = outputDir;
+      const previousIr = { analysis: { parameters: [{ name: "DURATION" }] }, events: [{ id: "previous" }] };
+      controller.timelineIr = previousIr;
+      controller.lastAnalyzerTimelineIr = previousIr;
+      controller.lastPreviewHtml = "<html>previous timeline and editable parameters</html>";
+      const messages: any[] = [];
+      const webview = { html: controller.lastPreviewHtml, postMessage: (message: any) => messages.push(message) };
+      controller.panel = { webview, dispose: () => {} };
+      controller.parameterOverrides.set("WAIT", "96");
+      controller.execFile = async () => {
+        writeFileSync(join(outputDir, "timeline_ir.json"), '{"events":[{"id":"rejected"}]}');
+        throw Object.assign(new Error("Analyzer exited with code 2"), {
+          exitCode: 2,
+          stdout: JSON.stringify({
+            error: { kind: "invalid_argument_value", message: "play duration must be non-negative" },
+            diagnostics: [{ severity: "error", code: "invalid_argument_value", message: "play duration must be non-negative" }],
+          }),
+        });
+      };
+
+      for (const previousValue of [undefined, "128"]) {
+        if (previousValue !== undefined) {
+          controller.parameterOverrides.set("DURATION", previousValue);
+        }
+        await controller.handleWebviewMessage({ type: "setAnalysisParameter", name: "DURATION", valueJson: "-1", projectFile });
+
+        assert.equal(controller.parameterOverrides.get("DURATION"), previousValue);
+        assert.equal(controller.parameterOverrides.get("WAIT"), "96");
+        assert.equal(controller.timelineIr, previousIr);
+        assert.equal(controller.lastAnalyzerTimelineIr, previousIr);
+        assert.equal(webview.html, "<html>previous timeline and editable parameters</html>");
+        assert.equal(controller.lastPreviewHtml, webview.html);
+        assert.equal(controller.analysisStatus.status, "error");
+        assert.match(messages.filter((message) => message.type === "analysisParameterError").at(-1).message, /play duration must be non-negative/);
+      }
+
+      let analysisCount = 0;
+      controller.runAnalysis = async () => { analysisCount += 1; };
+      controller.runRender = async () => assert.fail("A rejected on-disk IR must not be rendered");
+      await controller.rerenderCurrentTimelineMode("debug");
+      assert.equal(analysisCount, 1);
+      await controller.handleWebviewMessage({ type: "setAnalysisParameter", name: "DURATION", valueJson: "256", projectFile });
+      assert.equal(controller.parameterOverrides.get("DURATION"), "256");
+      assert.equal(analysisCount, 2);
+      await controller.handleWebviewMessage({ type: "resetAnalysisParameter", name: "DURATION", projectFile });
+      assert.equal(controller.parameterOverrides.has("DURATION"), false);
+      assert.equal(analysisCount, 3);
+      controller.dispose();
+    });
+  });
+
+  it("keeps inline failure recovery across a queued refresh", async () => {
+    const vscode = createMockVscode();
+    const outputDir = mkdtempSync(join(tmpdir(), "q1-inline-queued-"));
+
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      const projectFile = join(outputDir, "q1timeline.yml");
+      controller.projectUri = vscode.Uri.file(projectFile);
+      controller.outputDir = outputDir;
+      const previousIr = { analysis: { parameters: [{ name: "DURATION" }] }, events: [] };
+      controller.timelineIr = previousIr;
+      controller.lastAnalyzerTimelineIr = previousIr;
+      const error = Object.assign(new Error("play duration must be non-negative"), {
+        stdout: JSON.stringify({ diagnostics: [{ severity: "error", message: "play duration must be non-negative" }] }),
+      });
+      let rejectFirst: (error: Error) => void;
+      let started: () => void;
+      const firstStarted = new Promise<void>((resolve) => { started = resolve; });
+      let errorReceived: () => void;
+      const inlineErrorReceived = new Promise<void>((resolve) => { errorReceived = resolve; });
+      const webview = {
+        html: "previous timeline",
+        postMessage: (message: any) => {
+          if (message.type === "analysisParameterError") errorReceived();
+        },
+      };
+      controller.panel = { webview, dispose: () => {} };
+      let runCount = 0;
+      controller.execFile = async () => {
+        runCount += 1;
+        if (runCount === 1) {
+          return new Promise((_resolve, reject) => { rejectFirst = reject; started(); });
+        }
+        throw error;
+      };
+
+      const firstRun = controller.handleWebviewMessage({ type: "setAnalysisParameter", name: "DURATION", valueJson: "-1", projectFile });
+      await firstStarted;
+      await controller.runAnalysis();
+      assert.equal(controller.analysisQueued, true);
+      rejectFirst(error);
+      await firstRun;
+      await inlineErrorReceived;
+
+      assert.equal(runCount, 2);
+      assert.equal(controller.parameterOverrides.has("DURATION"), false);
+      assert.equal(controller.timelineIr, previousIr);
+      assert.equal(controller.lastAnalyzerTimelineIr, previousIr);
+      assert.equal(webview.html, "previous timeline");
+      controller.dispose();
+    });
+  });
+
+  it("rolls back inline changes when preparing analyzer outputs fails", async () => {
+    const vscode = createMockVscode();
+    const outputDir = mkdtempSync(join(tmpdir(), "q1-inline-output-failure-"));
+
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      const projectFile = join(outputDir, "q1timeline.yml");
+      controller.projectUri = vscode.Uri.file(projectFile);
+      controller.outputDir = outputDir;
+      controller.timelineIr = { analysis: { parameters: [{ name: "DURATION" }] } };
+      const messages: any[] = [];
+      controller.postWebviewMessage = (message: any) => messages.push(message);
+      controller.clearAnalyzerOutputFiles = async () => { throw new Error("Unable to clear output"); };
+
+      await controller.handleWebviewMessage({ type: "setAnalysisParameter", name: "DURATION", valueJson: "128", projectFile });
+
+      assert.equal(controller.parameterOverrides.has("DURATION"), false);
+      assert.equal(controller.analysisInFlight, false);
+      assert.match(messages.find((message) => message.type === "analysisParameterError").message, /Unable to clear output/);
+      controller.dispose();
+    });
+  });
+
   it("opens direct source locations from timeline control messages", async () => {
     const vscode = createMockVscode();
 
@@ -1477,6 +1896,7 @@ describe("q1timeline controller", () => {
         loopKey: "seq0:loop:a.q1asm:2-8",
         visibleIterations: 2,
       });
+      controller.parameterOverrides.set("DURATION", "40");
 
       assert.notDeepEqual(controller.analyzerOverrideArgs(), []);
       controller.setProjectUri(vscode.Uri.file("C:\\repo\\project-b\\q1timeline.yml"));

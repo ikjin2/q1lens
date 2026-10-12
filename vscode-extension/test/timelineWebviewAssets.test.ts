@@ -1096,6 +1096,248 @@ describe("timeline webview assets", () => {
     assert.match(script, /vscode\.postMessage\(\{ type: "webviewReady" \}\)/);
   });
 
+  it("remembers the parameters disclosure without replacing other webview state", () => {
+    const script = readFileSync(join(__dirname, "..", "src", "q1timeline", "media", "timeline.js"), "utf-8");
+    const sources = ["readPersistedWebviewState", "writePersistedWebviewState", "installParametersPersistence"]
+      .map((name) => {
+        const source = extractFunctionSource(script, name);
+        assert.ok(source);
+        return source;
+      });
+    const load = Function("document", "vscode", `${sources.join("\n")}\nreturn installParametersPersistence;`);
+    assert.match(script, /installParametersPersistence\(\);\s*installAnalysisDetailsPersistence\(\);/);
+
+    for (const rememberedOpen of [undefined, true, false]) {
+      let state: Record<string, unknown> = { analysisDetailsOpen: true, timelineTimeBasis: "local" };
+      if (rememberedOpen !== undefined) {
+        state.parametersOpen = rememberedOpen;
+      }
+      const listeners: Record<string, () => void> = {};
+      const details = {
+        open: false,
+        dataset: {} as Record<string, string>,
+        querySelector: () => ({ addEventListener: () => {} }),
+        addEventListener: (name: string, listener: () => void) => { listeners[name] = listener; },
+      };
+      const install = load(
+        { getElementById: (id: string) => id === "q1timeline-parameters" ? details : null },
+        { getState: () => state, setState: (nextState: Record<string, unknown>) => { state = nextState; } },
+      );
+
+      install();
+      assert.equal(details.open, rememberedOpen ?? false);
+      const toggleListener = listeners.toggle;
+      install();
+      assert.equal(listeners.toggle, toggleListener);
+      details.open = !details.open;
+      listeners.toggle();
+      assert.deepEqual(state, {
+        analysisDetailsOpen: true,
+        timelineTimeBasis: "local",
+        parametersOpen: details.open,
+      });
+    }
+
+    const installWithoutDetails = load({ getElementById: () => null }, {});
+    assert.doesNotThrow(() => installWithoutDetails());
+  });
+
+  describe("inline analysis parameter editing", () => {
+    class Node {
+      dataset: Record<string, string> = {};
+      attributes: Record<string, string> = {};
+      listeners: Record<string, (event: any) => void> = {};
+      children: Node[] = [];
+      className = "";
+      textContent = "";
+      type = "";
+      value = "";
+      hidden = false;
+      disabled = false;
+      focused = false;
+      selected = false;
+      constructor(readonly tag: string) {}
+      append(...nodes: Node[]) { this.children.push(...nodes); }
+      setAttribute(name: string, value: string) { this.attributes[name] = value; }
+      addEventListener(name: string, listener: (event: any) => void) { this.listeners[name] = listener; }
+      focus() { this.focused = true; }
+      select() { this.selected = true; }
+      emit(name: string, extra: Record<string, unknown> = {}) {
+        let prevented = false;
+        this.listeners[name]?.({ preventDefault: () => { prevented = true; }, ...extra });
+        return prevented;
+      }
+      querySelectorAll(selector: string): Node[] {
+        return this.children.flatMap((child) => [
+          ...(selector === "[data-parameter-index]" ? child.dataset.parameterIndex !== undefined
+            : selector.startsWith(".") ? child.className === selector.slice(1)
+              : child.tag === selector) ? [child] : [],
+          ...child.querySelectorAll(selector),
+        ]);
+      }
+      querySelector(selector: string) { return this.querySelectorAll(selector)[0]; }
+    }
+
+    function setup(options: { parameters?: any[]; projectFile?: string; overrideNames?: string[]; oldIr?: boolean } = {}) {
+      const script = readFileSync(join(__dirname, "..", "src", "q1timeline", "media", "timeline.js"), "utf-8");
+      const source = extractFunctionSource(script, "installParameterEditors");
+      assert.ok(source);
+      assert.match(script, /installAnalysisDetailsPersistence\(\);\s*installParameterEditors\(\);/);
+      const parameters = options.parameters || [
+        { name: "DRIVE_DURATION", value_json: "128", base_value_json: "64", overridden: true },
+        { name: "FREQ_HZ", value_json: "50000000", overridden: false },
+      ];
+      const snapshot = { analysis: options.oldIr ? {} : { parameters } };
+      const initialSnapshot = JSON.stringify(snapshot);
+      const details = new Node("details");
+      for (const [index, parameter] of parameters.entries()) {
+        const row = new Node("tr");
+        row.dataset.parameterIndex = String(index);
+        const cell = new Node("td");
+        const value = new Node("code");
+        value.textContent = parameter.value_json;
+        const annotation = new Node("span");
+        annotation.className = "parameter-base";
+        annotation.textContent = parameter.base_value_json ? ` ← base ${parameter.base_value_json}` : "";
+        cell.append(value, annotation);
+        row.append(cell);
+        details.append(row);
+      }
+      const messages: any[] = [];
+      const listeners: Record<string, (event: any) => void> = {};
+      const install = Function("document", "window", "vscode", "timelineIr", "state", `${source}\nreturn installParameterEditors;`)(
+        { getElementById: () => details, createElement: (tag: string) => new Node(tag) },
+        { addEventListener: (type: string, listener: (event: any) => void) => { listeners[type] = listener; } },
+        { postMessage: (message: unknown) => { messages.push(message); } },
+        snapshot,
+        { parameterProjectFile: options.projectFile ?? "C:/project/q1timeline.yml", parameterOverrideNames: options.overrideNames ?? ["DRIVE_DURATION"] },
+      );
+      install();
+      return {
+        details, messages, snapshot, initialSnapshot, install,
+        row: (index = 0) => details.children[index],
+        error: (name: string, message: string) => listeners.message({ data: { type: "analysisParameterError", name, message } }),
+      };
+    }
+
+    it("opens a focused editor and cancels without changing analyzed values or source annotations", () => {
+      const test = setup();
+      const row = test.row();
+      row.querySelector(".parameter-edit").emit("click");
+      const input = row.querySelector(".parameter-input");
+      assert.equal(input.value, "128");
+      assert.equal(input.type, "text");
+      assert.equal(input.attributes["aria-label"], "DRIVE_DURATION JSON value");
+      assert.equal(input.focused && input.selected, true);
+      assert.equal(row.querySelector(".parameter-editor").hidden, false);
+      assert.equal(test.row(1).querySelector(".parameter-edit").disabled, true);
+      input.value = "256";
+      test.row(1).querySelector(".parameter-edit").emit("click");
+      assert.equal(test.row(1).querySelector(".parameter-editor").hidden, true);
+      row.querySelector(".parameter-cancel").emit("click");
+      assert.equal(row.querySelector(".parameter-editor").hidden, true);
+      assert.equal(test.row(1).querySelector(".parameter-edit").disabled, false);
+      assert.equal(row.querySelector("code").textContent, "128");
+      assert.equal(row.querySelector(".parameter-base").textContent, " ← base 64");
+      assert.deepEqual(test.messages, []);
+      assert.equal(JSON.stringify(test.snapshot), test.initialSnapshot);
+      row.querySelector(".parameter-edit").emit("click");
+      assert.equal(input.value, "128");
+      assert.equal(input.emit("keydown", { key: "Escape" }), true);
+      assert.equal(row.querySelector(".parameter-editor").hidden, true);
+    });
+
+    it("submits the Apply/Enter form without navigation and preserves exact raw JSON", () => {
+      for (const raw of ["9007199254740993", '"0016"', '{"expr":"4 * 64"}']) {
+        const test = setup();
+        const row = test.row();
+        row.querySelector(".parameter-edit").emit("click");
+        row.querySelector(".parameter-input").value = `  ${raw}  `;
+        assert.equal(row.querySelector(".parameter-apply").type, "submit");
+        assert.equal(row.querySelector(".parameter-editor").emit("submit"), true);
+        assert.deepEqual(test.messages, [{
+          type: "setAnalysisParameter", name: "DRIVE_DURATION", valueJson: raw, projectFile: "C:/project/q1timeline.yml",
+        }]);
+        assert.equal(row.querySelector(".parameter-status").textContent, "Applying…");
+        assert.equal(row.querySelector(".parameter-input").disabled, true);
+        assert.equal(row.querySelector(".parameter-cancel").disabled, true);
+        assert.equal(test.row(1).querySelector(".parameter-edit").disabled, true);
+        row.querySelector(".parameter-editor").emit("submit");
+        assert.equal(test.messages.length, 1);
+        assert.equal(row.querySelector("code").textContent, "128");
+        assert.equal(JSON.stringify(test.snapshot), test.initialSnapshot);
+      }
+    });
+
+    it("shows validation errors inline and permits retry without losing the draft or applied value", () => {
+      const test = setup();
+      const row = test.row();
+      row.querySelector(".parameter-edit").emit("click");
+      const input = row.querySelector(".parameter-input");
+      input.value = "invalid json";
+      row.querySelector(".parameter-editor").emit("submit");
+      test.error("FREQ_HZ", "Unrelated error");
+      assert.equal(input.disabled, true);
+      test.error("DRIVE_DURATION", "Enter a valid JSON value.");
+      assert.equal(input.disabled, false);
+      assert.equal(input.value, "invalid json");
+      assert.equal(row.querySelector(".parameter-apply").disabled, false);
+      assert.equal(row.querySelector(".parameter-error").attributes.role, "alert");
+      assert.equal(row.querySelector(".parameter-error").textContent, "Enter a valid JSON value.");
+      assert.equal(row.querySelector(".parameter-error").hidden, false);
+      assert.equal(row.querySelector(".parameter-status").textContent, "");
+      assert.equal(row.querySelector("code").textContent, "128");
+      assert.equal(test.row(1).querySelector(".parameter-edit").disabled, true);
+      input.value = "-1";
+      row.querySelector(".parameter-editor").emit("submit");
+      assert.equal(test.messages[1].valueJson, "-1");
+      assert.equal(row.querySelector(".parameter-error").hidden, true);
+      test.error("DRIVE_DURATION", "Duration must not be negative.");
+      assert.equal(input.value, "-1");
+      assert.equal(row.querySelector(".parameter-apply").disabled, false);
+      assert.equal(row.querySelector("code").textContent, "128");
+      input.value = "256";
+      row.querySelector(".parameter-editor").emit("submit");
+      assert.equal(test.messages[2].valueJson, "256");
+    });
+
+    it("resets only session overrides and restores controls after a reset failure", () => {
+      const test = setup();
+      const row = test.row();
+      assert.equal(row.querySelector(".parameter-reset").hidden, false);
+      assert.equal(test.row(1).querySelector(".parameter-reset").hidden, true);
+      test.row(1).querySelector(".parameter-reset").emit("click");
+      assert.equal(test.messages.length, 0);
+      row.querySelector(".parameter-reset").emit("click");
+      assert.deepEqual(test.messages, [{ type: "resetAnalysisParameter", name: "DRIVE_DURATION", projectFile: "C:/project/q1timeline.yml" }]);
+      assert.equal(row.querySelector(".parameter-status").textContent, "Resetting…");
+      assert.equal(row.querySelector(".parameter-edit").disabled, true);
+      test.error("DRIVE_DURATION", "Analysis failed.");
+      assert.equal(row.querySelector(".parameter-edit").disabled, false);
+      assert.equal(row.querySelector(".parameter-reset").disabled, false);
+      assert.equal(row.querySelector(".parameter-error").hidden, false);
+      assert.equal(row.querySelector(".parameter-editor").hidden, true);
+      assert.equal(row.querySelector("code").textContent, "128");
+      assert.equal(JSON.stringify(test.snapshot), test.initialSnapshot);
+    });
+
+    it("stays read-only for old snapshots, missing projects, and unsupported parameter names", () => {
+      for (const options of [
+        { oldIr: true }, { projectFile: "" },
+        { parameters: ["", " spaced", "trailing ", "name=value"].map((name) => ({ name, value_json: "4" })) },
+      ]) {
+        const test = setup(options);
+        assert.equal(test.details.querySelectorAll(".parameter-edit").length, 0);
+        assert.deepEqual(test.messages, []);
+      }
+      const test = setup({ overrideNames: [] });
+      assert.equal(test.row().querySelector(".parameter-reset").hidden, true);
+      const editorCount = test.details.querySelectorAll(".parameter-edit").length;
+      test.install();
+      assert.equal(test.details.querySelectorAll(".parameter-edit").length, editorCount);
+    });
+  });
+
   it("opens branch action popovers with source-line labels and loop action popovers from lanes", () => {
     const script = readFileSync(join(__dirname, "..", "src", "q1timeline", "media", "timeline.js"), "utf-8");
     const css = readFileSync(join(__dirname, "..", "src", "q1timeline", "media", "timeline.css"), "utf-8");

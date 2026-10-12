@@ -4,8 +4,10 @@ import { QbsTimelineTaskProvider } from "./qbs/taskProvider";
 import { parseProjectConfigLite } from "./qbs/projectDiscovery";
 import { registerSidebar } from "./qbs/sidebar";
 import { registerQ1Timeline } from "./q1timeline/register";
+import { registerEnvironmentCommands } from "./environment";
 
 export function activate(context: vscode.ExtensionContext): void {
+  registerEnvironmentCommands(context);
   const q1timeline = registerQ1Timeline(context);
   registerCommands(context, { openQ1TimelineTarget: q1timeline.openTarget });
   registerSidebar(context);

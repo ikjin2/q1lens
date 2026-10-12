@@ -9,6 +9,11 @@ export interface SidebarItemDefinition {
 export function buildSidebarItems(): SidebarItemDefinition[] {
   return [
     {
+      label: "Check Python Environment",
+      command: "q1lens.checkEnvironment",
+      description: "Check Python and Q1Lens installation, or select another environment.",
+    },
+    {
       label: "Analyze and Open",
       command: "qbsTimeline.analyzeAndOpen",
       description: "Run Q1Lens analysis and show the timeline webview.",

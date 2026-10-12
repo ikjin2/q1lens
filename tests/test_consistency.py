@@ -165,6 +165,120 @@ def test_report_includes_mapping_confidence_and_coverage_metrics() -> None:
     assert q1asm_coverage["orphan_timed_instruction_lines"] == [2, 3, 9]
 
 
+def test_report_exposes_coverage_gaps_without_attributing_them_as_bugs() -> None:
+    report = build_consistency_report(_qbs_ir(), _q1timeline_ir(drift=False))
+
+    assert report["coverage_gaps"] == [
+        {
+            "kind": "unmapped_symbolic_block",
+            "source_id": "acq:measure:acquisition:0",
+            "operation_id": "measure_q0",
+            "schedulable_id": "measure",
+            "symbolic_block_kind": "acquisition",
+            "qbs_span_ns": {"start": 220.0, "end": 520.0, "duration": 300.0},
+        },
+        {
+            "kind": "orphan_timed_instruction",
+            "sequencer_id": "seq0",
+            "line": 2,
+            "instruction": "upd_param",
+        },
+        {
+            "kind": "orphan_timed_instruction",
+            "sequencer_id": "seq0",
+            "line": 3,
+            "instruction": "wait",
+        },
+        {
+            "kind": "orphan_timed_instruction",
+            "sequencer_id": "seq0",
+            "line": 9,
+            "instruction": "acquire",
+        },
+    ]
+    assert report["summary"]["coverage_gap_count"] == 4
+    assert report["findings"] == []
+    assert report["scheduler_bug_candidates"] == []
+
+
+def test_coverage_gaps_are_deterministic_and_deduplicated() -> None:
+    block_a = {
+        "id": "pulse:a:pulse:0",
+        "operation_id": "a",
+        "schedulable_id": "a",
+        "kind": "pulse",
+        "abs_time": 20e-9,
+        "duration": 4e-9,
+    }
+    block_z = {
+        "id": "pulse:z:pulse:0",
+        "operation_id": "z",
+        "schedulable_id": "z",
+        "kind": "pulse",
+        "abs_time": 40e-9,
+        "duration": 4e-9,
+    }
+    qbs_ir = {
+        "schedule": {"name": "dedup"},
+        "symbolic_pulses": [block_z, block_a, dict(block_z)],
+        "q1asm_by_sequencer": {
+            "seq1": "wait 4\nstop\n",
+            "seq0": "wait 4\nstop\n",
+        },
+        "q1asm_provenance": [],
+    }
+    reversed_qbs_ir = {
+        **qbs_ir,
+        "symbolic_pulses": list(reversed(qbs_ir["symbolic_pulses"])),
+        "q1asm_by_sequencer": dict(reversed(list(qbs_ir["q1asm_by_sequencer"].items()))),
+    }
+
+    gaps = build_consistency_report(qbs_ir, {})["coverage_gaps"]
+    reversed_gaps = build_consistency_report(reversed_qbs_ir, {})["coverage_gaps"]
+
+    assert gaps == reversed_gaps
+    assert [(gap["kind"], gap.get("source_id"), gap.get("sequencer_id")) for gap in gaps] == [
+        ("unmapped_symbolic_block", "pulse:a:pulse:0", None),
+        ("unmapped_symbolic_block", "pulse:z:pulse:0", None),
+        ("orphan_timed_instruction", None, "seq0"),
+        ("orphan_timed_instruction", None, "seq1"),
+    ]
+
+
+def test_coverage_gaps_sort_missing_symbolic_spans_deterministically() -> None:
+    valid_block = {
+        "id": "pulse:x:pulse:0",
+        "operation_id": "x",
+        "schedulable_id": "x",
+        "kind": "pulse",
+        "abs_time": 20e-9,
+        "duration": 4e-9,
+    }
+    missing_span_block = {
+        "id": "pulse:x:pulse:0",
+        "operation_id": "x",
+        "schedulable_id": "x",
+        "kind": "pulse",
+    }
+    qbs_ir = {
+        "symbolic_pulses": [missing_span_block, valid_block],
+        "q1asm_provenance": [],
+    }
+    reversed_qbs_ir = {
+        **qbs_ir,
+        "symbolic_pulses": list(reversed(qbs_ir["symbolic_pulses"])),
+    }
+
+    gaps = build_consistency_report(qbs_ir, {})["coverage_gaps"]
+    reversed_gaps = build_consistency_report(reversed_qbs_ir, {})["coverage_gaps"]
+
+    assert gaps == reversed_gaps
+    assert [gap["qbs_span_ns"] for gap in gaps] == [
+        {"start": 20.0, "end": 24.0, "duration": 4.0},
+        None,
+    ]
+
+
 def test_report_projects_span_drifts_to_scheduler_bug_candidates() -> None:
     report = build_consistency_report(_qbs_ir(), _q1timeline_ir(drift=True))
 

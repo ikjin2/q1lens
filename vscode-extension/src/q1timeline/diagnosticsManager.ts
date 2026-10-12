@@ -16,11 +16,12 @@ class DiagnosticsManager {
         continue;
       }
       const uri = this.vscode.Uri.file(mapped.file);
+      // Highlight the complete instruction line.
       const range = new this.vscode.Range(
         mapped.range.startLine,
-        mapped.range.startColumn,
+        0,
         mapped.range.endLine,
-        mapped.range.endColumn
+        Number.MAX_SAFE_INTEGER
       );
       const diagnostic = new this.vscode.Diagnostic(range, mapped.message, this.toSeverity(mapped.severity));
       diagnostic.source = mapped.source;
@@ -45,7 +46,7 @@ class DiagnosticsManager {
       return;
     }
     const diagnostic = new this.vscode.Diagnostic(
-      new this.vscode.Range(0, 0, 0, 1),
+      new this.vscode.Range(0, 0, 0, Number.MAX_SAFE_INTEGER),
       message,
       this.vscode.DiagnosticSeverity.Error
     );

@@ -8,7 +8,7 @@
 | --- | --- | --- | --- |
 | Python | Windows, Python 3.10 and 3.12 | All regular `tests/`; cursor-frequency project baseline | pytest log, JUnit XML with failures/skips, project baseline report |
 | Independent wheel | Ubuntu 24.04, Python 3.10 | Build a wheel, install it in a separate clean environment, run the five API/CLI simulation fixtures | wheel, installation/provenance report, scenario results |
-| Extension unit | Windows, Node 24 | Compile and run the extension unit suite | Mocha log and xUnit XML |
+| Extension unit | Windows, Node 24, Python 3.12 | Compile and run the extension unit suite, including real Python environment probes | Mocha log and xUnit XML |
 | Extension host | Windows, Node 24, Python 3.12, VS Code 1.90.0 and stable | Run the registered extension commands and file/settings lifecycle tests | host log and fixture evidence |
 | Browser DOM | Ubuntu 24.04, Node 24, Python 3.12, Chromium | Generate fresh CLI IR and exercise the hardware view in a real browser | browser report, failing screenshots/traces and fixture-generation evidence |
 
@@ -23,6 +23,8 @@ The complete Python and extension suites run on Windows, including Windows path 
 Python jobs install `.[dev]`: PyYAML plus build, pytest and the Python 3.10 tomli fallback. The core simulation and wheel jobs do not require q1simulator, Qblox drivers, a scheduler installation or hardware. The wheel verifier checks that q1simulator is absent and that package imports resolve to the isolated installation.
 
 Node jobs use `npm ci` and the committed lockfile. Node 24 satisfies the current `@vscode/vsce` and transitive package engine requirements. Browser dependencies are installed by `npx playwright install --with-deps chromium` on the disposable runner. Python 3.12 is the current project validation version; Python 3.10 and VS Code 1.90.0 exercise the declared compatibility floors. The stable VS Code job deliberately follows current stable releases.
+
+The extension unit job also installs the Python package and its runtime dependencies. Its environment-probe tests invoke a real Python interpreter and import the CLI, so Node dependencies alone are insufficient on a clean runner.
 
 The GitHub actions are pinned to full commit SHAs. The initial pins were resolved from the official [checkout v7.0.1](https://github.com/actions/checkout/releases/tag/v7.0.1), [setup-python v7.0.0](https://github.com/actions/setup-python/releases/tag/v7.0.0), [setup-node v7.0.0](https://github.com/actions/setup-node/releases/tag/v7.0.0) and [upload-artifact v7.0.1](https://github.com/actions/upload-artifact/releases/tag/v7.0.1) releases. When updating a pin, verify the official release and update its adjacent version comment. These runner actions and the project's Node runtime are separate version choices.
 

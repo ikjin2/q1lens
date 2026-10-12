@@ -110,8 +110,7 @@ Invalid input or failed analysis keeps the previous result and shows the error.
 **Q1Lens: Set Analysis Parameter...** and **Q1Lens: Clear Analysis Parameter
 Overrides** provide the same session-only workflow from the Command Palette.
 Overrides do not modify project files and reset when the project changes or
-VS Code restarts. These controls require the Python CLI from the same checkout,
-including its `--set-param` support.
+VS Code restarts. These controls require the matching Q1Lens 0.2.0 Python package.
 
 ## Compare runs and inspect execution
 

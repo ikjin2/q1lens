@@ -220,8 +220,9 @@ artifacts:
 
 ### Review and execution workflows
 
-The following workflows are available from the source checkout. Published Python
-and VS Code packages are updated separately.
+The following workflows are available in the Q1Lens 0.2.0 Python package and
+VS Code extension. The Desktop workbench is a development app run from the
+source checkout; this release does not include a Desktop installer.
 
 Run a read-only project preflight before executing a schedule:
 

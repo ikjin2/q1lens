@@ -4,6 +4,6 @@ from __future__ import annotations
 
 from qbstimeline.symbols import SymbolicValue, annotate, sym
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 __all__ = ["SymbolicValue", "annotate", "sym"]

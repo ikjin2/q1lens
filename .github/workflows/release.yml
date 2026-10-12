@@ -17,23 +17,28 @@ jobs:
           python-version: "3.12"
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
           cache: npm
           cache-dependency-path: vscode-extension/package-lock.json
       - name: Install Python development dependencies
         run: python -m pip install --upgrade build twine .[dev]
       - name: Test Python package
-        run: python -m pytest -q
-      - name: Build and check Python distributions
-        run: |
-          python -m build
-          python -m twine check dist/*
-      - name: Test and package VS Code extension
+        run: python -m pytest -q tests
+      - name: Build Python distributions
+        run: python -m build
+      - name: Check Python distributions
+        run: python -m twine check dist/*
+      - name: Verify the installed Python wheel
+        run: python tools/verify_simulation_wheel.py --wheel 'dist/q1lens-*.whl' --out output/release/wheel
+      - name: Install VS Code extension dependencies
         working-directory: vscode-extension
-        run: |
-          npm ci
-          npm test
-          npm run package
+        run: npm ci
+      - name: Test VS Code extension
+        working-directory: vscode-extension
+        run: npm test
+      - name: Package VS Code extension
+        working-directory: vscode-extension
+        run: npm run package
       - uses: actions/upload-artifact@v4
         with:
           name: python-package

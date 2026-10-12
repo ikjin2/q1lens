@@ -141,6 +141,22 @@ async function withMockedVscode(vscode: any, callback: (controllerModule: any) =
 }
 
 describe("q1timeline controller", () => {
+  it("does not warn for supported legacy and current analyzer releases", async () => {
+    const vscode = createMockVscode();
+    const warnings: string[] = [];
+    vscode.window.showWarningMessage = async (message: string) => warnings.push(message);
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      controller.showIncompatibleCoreVersionWarning({ core_version: "0.1.1" });
+      controller.showIncompatibleCoreVersionWarning({ core_version: "0.2.0" });
+      assert.deepEqual(warnings, []);
+      controller.showIncompatibleCoreVersionWarning({ core_version: "0.3.0" });
+      assert.equal(warnings.length, 1);
+      assert.match(warnings[0], /Supported range: 0\.1\.x or 0\.2\.x/);
+      controller.dispose();
+    });
+  });
+
   it("declares hardware readiness as an opt-in Q1Lens setting", () => {
     const manifest = JSON.parse(readFileSync(join(__dirname, "../../../package.json"), "utf8"));
     const setting = manifest.contributes.configuration.properties["q1lens.q1timeline.hardwareReadiness"];

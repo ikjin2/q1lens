@@ -5,6 +5,8 @@
   let sharedTimelineActive = false;
   let selectedTimelineEventId = undefined;
   let activeTimelineControlChip = undefined;
+  let hardwareView;
+  let hardwarePersistTimer;
 
   function toggleClass(node, className, enabled) {
     if (!node) {
@@ -93,6 +95,34 @@
     fields.push(`<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(displayed)}</dd>`);
   }
 
+  function appendDiffInspectorFields(fields, event) {
+    const status = event.meta && event.meta.diff_status;
+    if (!status) {
+      return;
+    }
+    addInspectorField(fields, "Comparison", status.charAt(0).toUpperCase() + status.slice(1));
+    const before = status === "removed" ? event : event.meta.diff_before;
+    const after = status === "removed" ? undefined : event;
+    for (const [prefix, snapshot] of [["Before", before], ["After", after]]) {
+      if (!snapshot) {
+        addInspectorField(fields, prefix, "Absent");
+        continue;
+      }
+      const scalar = (value) => value && typeof value === "object" ? value.display ?? value.value ?? value : value;
+      addInspectorField(fields, `${prefix} label`, snapshot.label || snapshot.kind);
+      addInspectorField(fields, `${prefix} lane`, snapshot.lane);
+      addInspectorField(fields, `${prefix} start (ns)`, scalar(snapshot.t0 ?? snapshot.t0_ns));
+      addInspectorField(fields, `${prefix} end (ns)`, scalar(snapshot.t1 ?? snapshot.t1_ns));
+      addInspectorField(fields, `${prefix} duration (ns)`, scalar(snapshot.duration ?? snapshot.duration_ns));
+      addInspectorField(fields, `${prefix} instruction`, snapshot.source && snapshot.source.raw);
+      const args = snapshot.meta?.resolved_args || snapshot.resolved_args || snapshot.resolvedArgs;
+      addInspectorField(fields, `${prefix} operands`, Array.isArray(args)
+        ? args.map((arg) => `${arg.raw ?? arg.index}: ${displayInspectorValue(scalar(arg.value))}`).join(", ")
+        : snapshot.operands || snapshot.args);
+      addInspectorField(fields, `${prefix} state`, snapshot.meta?.applied_state ?? snapshot.meta?.value);
+    }
+  }
+
   function currentTimelineMode() {
     const mode = document.body && document.body.dataset ? document.body.dataset.mode : undefined;
     if (mode === "debug" || mode === "normal") {
@@ -133,6 +163,7 @@
     const meta = event.meta || {};
     const source = event.source || {};
     const fields = [];
+    appendDiffInspectorFields(fields, event);
     addInspectorField(fields, "Label", event.label || event.kind);
     addInspectorField(fields, "Sequencer", event.sequencer_id);
     addInspectorField(fields, "Lane", event.lane);
@@ -162,6 +193,9 @@
     eventNode.setAttribute("aria-selected", "true");
     const eventId = eventNode.dataset.eventId;
     selectedTimelineEventId = eventId;
+    if (hardwareView && options.syncHardware !== false) {
+      hardwareView.selectEvent(eventId);
+    }
     syncSharedAnnotationSelection(eventId);
     renderSharedEventInspector(eventId);
     syncTimelineZoomActionState();
@@ -831,7 +865,7 @@
     }
     const selectedNode = selectedTimelineEventId ? findVisibleEventNodeByIds([selectedTimelineEventId]) : undefined;
     if (selectedNode) {
-      selectEventNode(selectedNode, { notify: false });
+      selectEventNode(selectedNode, { notify: false, syncHardware: false });
       return;
     }
     renderSharedEventInspector(null);
@@ -892,6 +926,7 @@
     installTimelineControlChips();
     installTimelineMouseInteractions();
     applySharedSelection(options);
+    renderHardwareCursor();
     return true;
   }
 
@@ -1010,6 +1045,7 @@
       const meta = event.meta || {};
       const source = event.source || {};
       const fields = [];
+      appendDiffInspectorFields(fields, event);
       addInspectorField(fields, "Label", event.label || event.kind);
       addInspectorField(fields, "Sequencer", event.sequencer_id);
       addInspectorField(fields, "Lane", event.lane);
@@ -1080,6 +1116,9 @@
       eventNode.classList.add("is-selected");
       const eventId = eventNode.dataset.eventId;
       selectedTimelineEventId = eventId;
+      if (hardwareView && options.syncHardware !== false) {
+        hardwareView.selectEvent(eventId);
+      }
       renderInspector(eventId);
       syncTimelineZoomActionState();
       if (options.notify !== false) {
@@ -1806,6 +1845,7 @@
     applyTimelineScale();
     updateLaneDependentVisibility();
     syncSequencerFoldControls();
+    renderHardwareCursor();
     syncSharedSequencerFoldControls();
   }
 
@@ -2311,6 +2351,7 @@
     suppressOverlappingOverlayLabels(svg);
     updateTimelineTicks(svg, window, geometry);
     syncSequencerFoldControls();
+    renderHardwareCursor();
   }
 
   function applySharedTimelineScale() {
@@ -3016,6 +3057,9 @@
       return;
     }
     timelineTimeBasis = basis;
+    if (hardwareView) {
+      hardwareView.setTimeBasis(basis);
+    }
     writePersistedWebviewState({ timelineTimeBasis: basis });
     resetTimelineZoom();
   }
@@ -3261,6 +3305,10 @@
 
   function handleTimelinePointerEnd(event) {
     const container = timelineContainer();
+    if (hardwareView && timelineDrag && !timelineDrag.moved && event && event.type !== "pointercancel") {
+      const svg = timelineSvg();
+      hardwareView.setTime(timelineTimeFromPointer(event, svg, svg ? timelineGeometry(svg) : undefined));
+    }
     if (container) {
       if (typeof container.releasePointerCapture === "function" && event && event.pointerId !== undefined) {
         container.releasePointerCapture(event.pointerId);
@@ -3281,7 +3329,7 @@
     container.dataset.timelineMouseInteractions = "true";
     container.style.cursor = "grab";
     container.style.touchAction = "none";
-    container.title = "Wheel zooms the X-axis. Drag pans the zoomed timeline. Shift-drag selects a range. Use Reset to restore the full range.";
+    container.title = "Click to inspect hardware at a time. Wheel zooms the X-axis. Drag pans the zoomed timeline. Shift-drag selects a range. Use Reset to restore the full range.";
     container.addEventListener("wheel", handleTimelineWheel, { passive: false });
     container.addEventListener("pointerdown", handleTimelinePointerDown);
   }
@@ -3306,7 +3354,112 @@
     node.textContent = "Unsaved changes are not reflected in the current analysis.";
   }
 
+  function renderHardwareCursor(state = hardwareView && hardwareView.getState()) {
+    if (!state || !Number.isFinite(state.time)) {
+      return;
+    }
+    const current = currentTimelineWindow();
+    const ratio = (state.time - current.min) / Math.max(1, current.max - current.min);
+    const visible = ratio >= 0 && ratio <= 1;
+    for (const track of document.querySelectorAll(".shared-timeline-stage .lane-track, .shared-timeline-stage .ruler")) {
+      let cursor = track.querySelector(".hardware-time-cursor");
+      if (!cursor) {
+        cursor = document.createElement("span");
+        cursor.className = "hardware-time-cursor";
+        cursor.setAttribute("aria-hidden", "true");
+        track.appendChild(cursor);
+      }
+      cursor.hidden = !visible;
+      cursor.style.left = `${ratio * 100}%`;
+    }
+    const svg = timelineSvg();
+    if (svg) {
+      let cursor = svg.querySelector(".hardware-time-cursor");
+      if (!cursor) {
+        cursor = document.createElementNS("http://www.w3.org/2000/svg", "line");
+        cursor.setAttribute("class", "hardware-time-cursor");
+        cursor.setAttribute("aria-hidden", "true");
+        svg.appendChild(cursor);
+      }
+      const geometry = timelineGeometry(svg);
+      const x = geometry.left + ratio * (geometry.right - geometry.left);
+      const hoverCursor = document.getElementById("time-cursor");
+      cursor.setAttribute("x1", String(x));
+      cursor.setAttribute("x2", String(x));
+      cursor.setAttribute("y1", "40");
+      cursor.setAttribute("y2", hoverCursor ? hoverCursor.getAttribute("y2") : "100%");
+      cursor.style.display = visible ? "" : "none";
+    }
+  }
+
+  function initializeHardwareView() {
+    const timelineRoot = document.getElementById("timeline-root");
+    if (!timelineRoot || !window.q1lensHardwareView) {
+      return;
+    }
+    const root = document.createElement("section");
+    root.id = "q1timeline-hardware";
+    root.setAttribute("aria-label", "Sequencer hardware state");
+    timelineRoot.before(root);
+    hardwareView = window.q1lensHardwareView.mount(root, timelineIr, {
+      initialState: { ...readPersistedWebviewState().hardwareState, basis: timelineTimeBasis },
+      onStateChange(state) {
+        renderHardwareCursor(state);
+        clearTimeout(hardwarePersistTimer);
+        hardwarePersistTimer = setTimeout(() => writePersistedWebviewState({ hardwareState: state }), 120);
+      },
+      onPrepareReplay(sequencerId, scope) {
+        setTimelineTimeBasis("local");
+        clearTimeout(hardwarePersistTimer);
+        writePersistedWebviewState({ hardwareState: hardwareView.getState() });
+        vscode.postMessage({ type: "prepareExecutionReplay", sequencerId, ...(scope === "project" ? { scope } : {}) });
+      },
+      onReplayScopeChange(scope) {
+        if (scope === "project") setTimelineTimeBasis("local");
+      },
+      onSelectEvent(eventId, selectionOptions = {}) {
+        const event = timelineEventsById.get(String(eventId));
+        if (!selectionOptions.replay) zoomTimelineToHighlightedEvent(event);
+        const node = findVisibleEventNodeByIds([eventId]);
+        if (node) {
+          selectEventNode(node, { notify: false, syncHardware: false });
+        } else {
+          selectedTimelineEventId = eventId;
+          renderSharedEventInspector(eventId);
+        }
+      },
+      onSourceClick(source) {
+        if (source && source.file) {
+          vscode.postMessage({ type: "sourceClick", file: source.file, line: source.line || 1, column: source.column || 1, preserveHardwareCursor: true });
+        }
+      },
+    });
+    const hardwareState = hardwareView.getState();
+    if (hardwareState.replayOpen && hardwareState.replayScope === "project") setTimelineTimeBasis("local");
+    renderHardwareCursor();
+  }
+
+  function renderComparisonStatus(comparison) {
+    let node = document.getElementById("q1timeline-comparison");
+    if (!node) {
+      node = document.createElement("div");
+      node.id = "q1timeline-comparison";
+      node.className = "timeline-comparison";
+      node.setAttribute("role", "status");
+      ensureToolbarNode().append(node);
+    }
+    const mode = comparison && comparison.mode;
+    const labels = { saved: "saved baseline", previous: "previous analysis", none: "none" };
+    let text = `Current comparison: ${labels[mode] || labels.none}.`;
+    if (comparison && comparison.pending) {
+      text += ` Next analysis: ${labels[comparison.nextMode]}. Reanalyze to update highlights.`;
+    }
+    node.textContent = text;
+    node.title = "Added: green solid border; changed: amber solid border; shifted: blue dashed border; removed: red dotted border. Select a block for before/after values.";
+  }
+
   ensureToolbarNode();
+  renderComparisonStatus(state.comparison);
   renderAlignmentPolicy(initialAlignmentPolicy);
   renderTimeBasisToggle();
   renderModeToggle(initialViewMode);
@@ -3321,6 +3474,7 @@
     restoreTimelineZoom();
     installTimelineMouseInteractions();
   }
+  initializeHardwareView();
   vscode.postMessage({ type: "webviewReady" });
 
   window.addEventListener("q1timeline:eventClick", (event) => {
@@ -3346,6 +3500,10 @@
   });
 
   window.addEventListener("message", (event) => {
+    if (event.data && event.data.type === "setComparison") {
+      renderComparisonStatus(event.data.comparison);
+      return;
+    }
     if (event.data && event.data.type === "setViewMode") {
       renderModeToggle(event.data.mode);
       renderSharedTimelineIfAvailable(event.data.mode);
@@ -3371,6 +3529,9 @@
       document.querySelectorAll("[data-event-id]").forEach((node) => {
         node.classList.toggle("is-selected", ids.has(node.dataset.eventId));
       });
+      if (hardwareView && highlightedEvent) {
+        hardwareView.selectEvent(highlightedEvent.id);
+      }
     }
     renderRelatedBlockSummary(highlightEventIds);
   });

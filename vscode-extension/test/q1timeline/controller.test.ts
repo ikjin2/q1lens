@@ -141,21 +141,14 @@ async function withMockedVscode(vscode: any, callback: (controllerModule: any) =
 }
 
 describe("q1timeline controller", () => {
-  it("offers a Python environment check with a retry when the analyzer is missing", async () => {
-    const vscode = createMockVscode();
-    const calls: any[] = [];
-    vscode.commands.executeCommand = async (...args: any[]) => calls.push(args);
-    vscode.window.showErrorMessage = async (message: string, action: string) => {
-      assert.match(message, /Q1Lens is unavailable/);
-      assert.equal(action, "Check Python Environment");
-      return action;
-    };
-    await withMockedVscode(vscode, async ({ TimelineController }) => {
-      const controller = new TimelineController(createContext());
-      await controller.showAnalyzerMissingMessage(new Error("No module named q1lens"));
-      assert.deepEqual(calls, [["q1lens.checkEnvironment", "q1timeline.refreshPreview"]]);
-      controller.dispose();
-    });
+  it("declares hardware readiness as an opt-in Q1Lens setting", () => {
+    const manifest = JSON.parse(readFileSync(join(__dirname, "../../../package.json"), "utf8"));
+    const setting = manifest.contributes.configuration.properties["q1lens.q1timeline.hardwareReadiness"];
+
+    assert.deepEqual(
+      { type: setting.type, default: setting.default },
+      { type: "boolean", default: false },
+    );
   });
 
   it("cache-busts q1timeline webview assets when injecting them", async () => {
@@ -178,10 +171,15 @@ describe("q1timeline controller", () => {
       assert.match(html, /timeline\.css\?v=abc123/);
       assert.match(html, /renderer\.js\?v=abc123/);
       assert.match(html, /timelineAdapter\.js\?v=abc123/);
+      assert.match(html, /hardwareView\.css\?v=abc123/);
+      assert.match(html, /hardwareState\.js\?v=abc123/);
+      assert.match(html, /hardwareView\.js\?v=abc123/);
       assert.match(html, /timeline\.js\?v=abc123/);
       assert.ok(html.indexOf("renderer.css?v=abc123") < html.indexOf("timeline.css?v=abc123"));
       assert.ok(html.indexOf("renderer.js?v=abc123") < html.indexOf("timelineAdapter.js?v=abc123"));
-      assert.ok(html.indexOf("timelineAdapter.js?v=abc123") < html.indexOf("timeline.js?v=abc123"));
+      assert.ok(html.indexOf("timelineAdapter.js?v=abc123") < html.indexOf("hardwareState.js?v=abc123"));
+      assert.ok(html.indexOf("hardwareState.js?v=abc123") < html.indexOf("hardwareView.js?v=abc123"));
+      assert.ok(html.indexOf("hardwareView.js?v=abc123") < html.indexOf("timeline.js?v=abc123"));
     });
   });
 
@@ -1369,7 +1367,7 @@ describe("q1timeline controller", () => {
     });
   });
 
-  it("adds branch and loop timeline chip overrides to analyzer args", async () => {
+  it("adds hardware readiness plus branch and loop overrides to analyzer args", async () => {
     const vscode = createMockVscode();
     const outputDir = mkdtempSync(join(tmpdir(), "q1-control-overrides-"));
     const capturedArgs: string[][] = [];
@@ -1382,6 +1380,9 @@ describe("q1timeline controller", () => {
         get: (key: string, fallback: any) => {
           if (key === "analyzer.extraArgs") {
             return ["--strict"];
+          }
+          if (key === "hardwareReadiness") {
+            return true;
           }
           return fallback;
         },
@@ -1406,6 +1407,8 @@ describe("q1timeline controller", () => {
 
       const latestArgs = capturedArgs[capturedArgs.length - 1];
       assert.ok(latestArgs);
+      assert.ok(latestArgs.includes("--hardware-readiness"));
+      assert.ok(latestArgs.indexOf("--hardware-readiness") < latestArgs.indexOf("--branch-assumption"));
       assert.deepEqual(
         latestArgs.slice(latestArgs.indexOf("--branch-assumption"), latestArgs.indexOf("--strict")),
         [
@@ -1934,6 +1937,207 @@ describe("q1timeline controller", () => {
     });
   });
 
+  it("saves a raw comparison baseline only after a successful analysis", async () => {
+    const vscode = createMockVscode();
+    const root = mkdtempSync(join(tmpdir(), "q1-saved-baseline-"));
+    const outputDir = join(root, ".q1timeline");
+    mkdirSync(outputDir);
+    const baselinePath = join(outputDir, "comparison-baseline.json");
+    const warnings: string[] = [];
+    const notices: string[] = [];
+    vscode.window.showWarningMessage = async (message: string) => warnings.push(message);
+    vscode.window.showInformationMessage = async (message: string) => notices.push(message);
+
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      controller.setProjectUri(vscode.Uri.file(join(root, "q1timeline.yml")));
+      controller.outputDir = outputDir;
+
+      await controller.saveComparisonBaseline();
+
+      assert.equal(existsSync(baselinePath), false);
+      assert.match(warnings[0], /successful Q1ASM timeline analysis/);
+
+      const rawTimelineIr = {
+        schema_version: "1.0",
+        events: [
+          {
+            id: "seq0:e1",
+            sequencer_id: "seq0",
+            kind: "set_mrk",
+            lane: "rt.path0",
+            source: { file: "seq0.q1asm", line: 1, raw: "set_mrk 1" },
+          },
+        ],
+      };
+      controller.lastAnalyzerTimelineIr = rawTimelineIr;
+      await controller.saveComparisonBaseline();
+
+      assert.deepEqual(JSON.parse(readFileSync(baselinePath, "utf8")), rawTimelineIr);
+      assert.equal(existsSync(join(root, "comparison-baseline.json")), false);
+      assert.match(notices[0], /baseline saved/);
+      assert.equal(controller.webviewInitialState().comparison.nextMode, "saved");
+      controller.dispose();
+    });
+  });
+
+  it("keeps a saved comparison baseline stable across controller instances and projects", async () => {
+    const vscode = createMockVscode();
+    const root = mkdtempSync(join(tmpdir(), "q1-persistent-baseline-"));
+    const projectA = join(root, "project-a");
+    const projectB = join(root, "project-b");
+    const outputA = join(projectA, ".q1timeline");
+    const outputB = join(projectB, ".q1timeline");
+    mkdirSync(outputA, { recursive: true });
+    mkdirSync(outputB, { recursive: true });
+    const baselineIr = {
+      events: [
+        {
+          id: "seq0:old",
+          sequencer_id: "seq0",
+          kind: "set_mrk",
+          lane: "rt.path0",
+          source: { file: "seq0.q1asm", line: 4, raw: "set_mrk 1" },
+          t0: { value: 20 },
+          t1: { value: 20 },
+          duration: { value: 0 },
+        },
+      ],
+    };
+    const changedIr = {
+      events: [
+        {
+          id: "seq0:new",
+          sequencer_id: "seq0",
+          kind: "set_mrk",
+          lane: "rt.path0",
+          source: { file: "seq0.q1asm", line: 4, raw: "set_mrk 2" },
+          t0: { value: 20 },
+          t1: { value: 20 },
+          duration: { value: 0 },
+        },
+      ],
+    };
+
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const firstController = new TimelineController(createContext());
+      firstController.setProjectUri(vscode.Uri.file(join(projectA, "q1timeline.yml")));
+      firstController.outputDir = outputA;
+      firstController.lastAnalyzerTimelineIr = baselineIr;
+      await firstController.saveComparisonBaseline();
+      firstController.dispose();
+
+      const secondController = new TimelineController(createContext());
+      secondController.setProjectUri(vscode.Uri.file(join(projectA, "q1timeline.yml")));
+      secondController.outputDir = outputA;
+      const timelineAPath = join(outputA, "timeline_ir.json");
+
+      writeFileSync(timelineAPath, JSON.stringify(changedIr), "utf8");
+      await secondController.prepareTimelineIrForRender(timelineAPath);
+      let annotated = JSON.parse(readFileSync(timelineAPath, "utf8"));
+      assert.equal(annotated.events[0].meta.diff_status, "changed");
+
+      writeFileSync(timelineAPath, JSON.stringify(changedIr), "utf8");
+      assert.equal(secondController.webviewInitialState().comparison.mode, "saved");
+      await secondController.prepareTimelineIrForRender(timelineAPath);
+      annotated = JSON.parse(readFileSync(timelineAPath, "utf8"));
+      assert.equal(annotated.events[0].meta.diff_status, "changed");
+
+      secondController.setProjectUri(vscode.Uri.file(join(projectB, "q1timeline.yml")));
+      secondController.outputDir = outputB;
+      const timelineBPath = join(outputB, "timeline_ir.json");
+      writeFileSync(timelineBPath, JSON.stringify(changedIr), "utf8");
+      await secondController.prepareTimelineIrForRender(timelineBPath);
+      annotated = JSON.parse(readFileSync(timelineBPath, "utf8"));
+      assert.equal(annotated.events[0].meta?.diff_status, undefined);
+      secondController.dispose();
+    });
+  });
+
+  it("warns about a malformed saved baseline and falls back to the previous run", async () => {
+    const vscode = createMockVscode();
+    const root = mkdtempSync(join(tmpdir(), "q1-malformed-baseline-"));
+    const outputDir = join(root, ".q1timeline");
+    mkdirSync(outputDir);
+    writeFileSync(join(outputDir, "comparison-baseline.json"), '{"events":"invalid"}', "utf8");
+    const warnings: string[] = [];
+    vscode.window.showWarningMessage = async (message: string) => warnings.push(message);
+    const currentIr = {
+      events: [
+        {
+          id: "seq0:e1",
+          sequencer_id: "seq0",
+          kind: "wait",
+          lane: "rt.wait",
+          source: { file: "seq0.q1asm", line: 2 },
+          t0: { value: 0 },
+          t1: { value: 4 },
+          duration: { value: 4 },
+        },
+      ],
+    };
+    const timelinePath = join(outputDir, "timeline_ir.json");
+    writeFileSync(timelinePath, JSON.stringify(currentIr), "utf8");
+
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      controller.setProjectUri(vscode.Uri.file(join(root, "q1timeline.yml")));
+      controller.outputDir = outputDir;
+      controller.lastAnalyzerTimelineIr = currentIr;
+
+      await controller.prepareTimelineIrForRender(timelinePath);
+
+      const annotated = JSON.parse(readFileSync(timelinePath, "utf8"));
+      assert.equal(annotated.events[0].meta?.diff_status, undefined);
+      assert.equal(warnings.length, 1);
+      assert.match(warnings[0], /invalid and was ignored/);
+      controller.dispose();
+    });
+  });
+
+  it("returns to previous-run comparison after clearing a saved baseline", async () => {
+    const vscode = createMockVscode();
+    const root = mkdtempSync(join(tmpdir(), "q1-clear-baseline-"));
+    const outputDir = join(root, ".q1timeline");
+    mkdirSync(outputDir);
+    const baselinePath = join(outputDir, "comparison-baseline.json");
+    writeFileSync(baselinePath, JSON.stringify({ events: [] }), "utf8");
+    const currentIr = {
+      events: [
+        {
+          id: "seq0:e1",
+          sequencer_id: "seq0",
+          kind: "wait",
+          lane: "rt.wait",
+          source: { file: "seq0.q1asm", line: 2 },
+          t0: { value: 0 },
+          t1: { value: 4 },
+          duration: { value: 4 },
+        },
+      ],
+    };
+    const timelinePath = join(outputDir, "timeline_ir.json");
+    writeFileSync(timelinePath, JSON.stringify(currentIr), "utf8");
+
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      controller.setProjectUri(vscode.Uri.file(join(root, "q1timeline.yml")));
+      controller.outputDir = outputDir;
+      controller.lastAnalyzerTimelineIr = currentIr;
+
+      await controller.clearComparisonBaseline();
+      assert.equal(controller.webviewInitialState().comparison.nextMode, "previous");
+      assert.equal(controller.webviewInitialState().comparison.pending, true);
+      await controller.prepareTimelineIrForRender(timelinePath);
+
+      const annotated = JSON.parse(readFileSync(timelinePath, "utf8"));
+      assert.equal(existsSync(baselinePath), false);
+      assert.deepEqual(controller.webviewInitialState().comparison, { mode: "previous" });
+      assert.equal(annotated.events[0].meta?.diff_status, undefined);
+      controller.dispose();
+    });
+  });
+
   it("marks same-line raw Q1ASM event changes as changed", async () => {
     const vscode = createMockVscode();
     const outputDir = mkdtempSync(join(tmpdir(), "q1-diff-change-"));
@@ -1979,6 +2183,36 @@ describe("q1timeline controller", () => {
 
       const annotated = JSON.parse(require("node:fs").readFileSync(timelinePath, "utf8"));
       assert.equal(annotated.events[0].meta.diff_status, "changed");
+      assert.equal(annotated.events[0].meta.diff_before.source.raw, "set_mrk 1");
+      assert.equal(controller.webviewInitialState().comparison.mode, "previous");
+      controller.dispose();
+    });
+  });
+
+  it("marks events added against an empty baseline and parameter-only value changes", async () => {
+    const vscode = createMockVscode();
+    const outputDir = mkdtempSync(join(tmpdir(), "q1-diff-values-"));
+    const timelinePath = join(outputDir, "timeline_ir.json");
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      controller.outputDir = outputDir;
+      const event = {
+        id: "seq0:e1", kind: "set_awg_gain", lane: "rt.path0",
+        source: { file: "seq0.q1asm", line: 1, raw: "set_awg_gain {GAIN},0" },
+        t0: { value: 0 }, t1: { value: 0 },
+        meta: { resolved_args: [{ index: 0, raw: "{GAIN}", value: { value: 100 } }] },
+      };
+      controller.lastAnalyzerTimelineIr = { events: [] };
+      writeFileSync(timelinePath, JSON.stringify({ events: [event] }), "utf8");
+      await controller.prepareTimelineIrForRender(timelinePath);
+      assert.equal(JSON.parse(readFileSync(timelinePath, "utf8")).events[0].meta.diff_status, "added");
+      event.meta.resolved_args[0].value.value = 200;
+      writeFileSync(timelinePath, JSON.stringify({ events: [event] }), "utf8");
+      await controller.prepareTimelineIrForRender(timelinePath);
+      const changed = JSON.parse(readFileSync(timelinePath, "utf8")).events[0];
+      assert.equal(changed.meta.diff_status, "changed");
+      assert.equal(changed.meta.diff_before.meta.resolved_args[0].value.value, 100);
+      assert.equal(changed.meta.resolved_args[0].value.value, 200);
       controller.dispose();
     });
   });
@@ -2015,6 +2249,358 @@ describe("q1timeline controller", () => {
       const ids = annotated.events.map((event: { id: string }) => event.id);
       assert.equal(new Set(ids).size, ids.length);
       assert.equal(annotated.events.some((event: { id: string; meta?: { diff_status?: string } }) => event.id !== "seq0:e1" && event.meta?.diff_status === "removed"), true);
+      controller.dispose();
+    });
+  });
+
+  it("passes execution settings to the analyzer and lets project mode keep YAML defaults", async () => {
+    const vscode = createMockVscode();
+    const outputDir = mkdtempSync(join(tmpdir(), "q1-execution-mode-"));
+    const capturedArgs: string[][] = [];
+
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      controller.projectUri = vscode.Uri.file(join(outputDir, "q1timeline.yml"));
+      controller.outputDir = outputDir;
+      let mode = "concrete";
+      controller.config = () => ({ get: (key: string, fallback: any) => key === "executionMode" ? mode : key === "maxSteps" ? 250 : fallback });
+      controller.execFile = async (_pythonPath: string, args: string[]) => {
+        capturedArgs.push(args);
+        return { stdout: JSON.stringify({ schema_version: "0.2.0", status: "ok" }), stderr: "", exitCode: 0, elapsedMs: 1 };
+      };
+      controller.runRender = async () => ({ stdout: "", stderr: "", exitCode: 0, elapsedMs: 1 });
+      controller.refreshWebview = async () => undefined;
+
+      await controller.runAnalysis();
+      let args = capturedArgs[capturedArgs.length - 1];
+      assert.deepEqual(args.slice(args.indexOf("--execution-mode"), args.indexOf("--execution-mode") + 4), ["--execution-mode", "concrete", "--max-steps", "250"]);
+      mode = "analysis";
+      await controller.runAnalysis();
+      args = capturedArgs[capturedArgs.length - 1];
+      assert.equal(args[args.indexOf("--execution-mode") + 1], "analysis");
+      mode = "simulation";
+      await controller.runAnalysis();
+      args = capturedArgs[capturedArgs.length - 1];
+      assert.deepEqual(args.slice(args.indexOf("--execution-mode"), args.indexOf("--execution-mode") + 4), ["--execution-mode", "simulation", "--max-steps", "250"]);
+      mode = "project";
+      await controller.runAnalysis();
+      args = capturedArgs[capturedArgs.length - 1];
+      assert.equal(args.includes("--execution-mode"), false);
+      assert.equal(args.includes("--max-steps"), false);
+      controller.dispose();
+    });
+  });
+
+  it("prepares bounded simulation replay for the current preview without changing settings or source", async () => {
+    const vscode = createMockVscode();
+    const outputDir = mkdtempSync(join(tmpdir(), "q1-prepare-replay-"));
+    const projectPath = join(outputDir, "q1timeline.yml");
+    const projectYaml = "sequencers:\n  - id: seq0\n    file: seq0.q1asm\n";
+    writeFileSync(projectPath, projectYaml, "utf8");
+    const sourceUri = vscode.Uri.file(join(outputDir, "seq0.q1asm"));
+    vscode.window.activeTextEditor = { document: { uri: vscode.Uri.file(join(outputDir, "other-project", "other.q1asm")) } };
+    const context = createContext();
+    let settingsWrites = 0;
+    context.workspaceState.update = async () => { settingsWrites++; };
+
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(context);
+      controller.projectUri = vscode.Uri.file(projectPath);
+      controller.singleFileUri = sourceUri;
+      controller.singleFileMode = true;
+      controller.outputDir = outputDir;
+      controller.panel = { webview: { postMessage: () => {} }, dispose: () => {} };
+      controller.timelineIr = { sequencers: [{ id: "seq0" }], events: [] };
+      controller.lastAnalyzerTimelineIr = { events: [{ id: "static-event" }] };
+      controller.config = () => ({
+        get: (key: string, fallback: any) => key === "maxSteps" ? 250 : fallback,
+        update: async () => { settingsWrites++; },
+      });
+      const calls: any[] = [];
+      controller.execFile = async (_pythonPath: string, args: string[], _timeoutMs: number, cwd: string) => {
+        calls.push({ args, cwd, baseline: controller.lastAnalyzerTimelineIr });
+        return { stdout: JSON.stringify({ schema_version: "0.2.0", status: "ok" }), stderr: "", exitCode: 0, elapsedMs: 1 };
+      };
+      controller.runRender = async () => ({ stdout: "", stderr: "", exitCode: 0, elapsedMs: 1 });
+      controller.refreshWebview = async () => undefined;
+
+      await controller.handleWebviewMessage({ type: "prepareExecutionReplay", sequencerId: "seq0" });
+      await controller.refreshPreview();
+
+      assert.equal(calls.length, 2);
+      for (const { args, cwd, baseline } of calls) {
+        assert.deepEqual(args.slice(args.indexOf("--execution-mode"), args.indexOf("--execution-mode") + 4),
+          ["--execution-mode", "simulation", "--max-steps", "250"]);
+        assert.equal(args[args.indexOf("--project") + 1], projectPath);
+        assert.equal(cwd, outputDir);
+        assert.equal(baseline, undefined);
+      }
+      assert.equal(controller.projectUri.fsPath, projectPath);
+      assert.equal(controller.singleFileUri, sourceUri);
+      assert.equal(controller.singleFileMode, true);
+      assert.equal(settingsWrites, 0);
+      assert.equal(readFileSync(projectPath, "utf8"), projectYaml);
+
+      controller.singleFileUri = vscode.Uri.file(join(outputDir, "different.q1asm"));
+      assert.deepEqual(controller.executionArgs(), []);
+      controller.singleFileUri = sourceUri;
+      controller.setProjectUri(vscode.Uri.file(join(outputDir, "other-project", "q1timeline.yml")));
+      assert.deepEqual(controller.executionArgs(), []);
+      controller.setProjectUri(vscode.Uri.file(projectPath));
+      assert.deepEqual(controller.executionArgs(), []);
+      controller.dispose();
+    });
+  });
+
+  it("preserves selected runtime modes when preparing replay from an older trace", async () => {
+    const vscode = createMockVscode();
+    const outputDir = mkdtempSync(join(tmpdir(), "q1-replay-runtime-mode-"));
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      controller.projectUri = vscode.Uri.file(join(outputDir, "q1timeline.yml"));
+      controller.outputDir = outputDir;
+      controller.panel = { webview: { postMessage: () => {} }, dispose: () => {} };
+      let configuredMode = "project";
+      let analyzerArgs: string[] = [];
+      controller.config = () => ({ get: (key: string, fallback: any) => key === "executionMode" ? configuredMode : fallback });
+      controller.execFile = async (_pythonPath: string, args: string[]) => {
+        analyzerArgs = args;
+        return { stdout: JSON.stringify({ schema_version: "0.2.0", status: "ok" }), stderr: "", exitCode: 0, elapsedMs: 1 };
+      };
+      controller.runRender = async () => ({ stdout: "", stderr: "", exitCode: 0, elapsedMs: 1 });
+      controller.refreshWebview = async () => undefined;
+      for (const [configured, recorded, expected] of [
+        ["project", "simulation", "simulation"],
+        ["analysis", "simulation", "simulation"],
+        ["concrete", "simulation", "concrete"],
+        ["simulation", "concrete", "simulation"],
+        ["project", "concrete", "concrete"],
+        ["analysis", "concrete", "concrete"],
+        ["analysis", "analysis", "simulation"],
+      ]) {
+        configuredMode = configured;
+        controller.timelineIr = { execution: { seq0: { mode: recorded } } };
+        await controller.handleWebviewMessage({ type: "prepareExecutionReplay", sequencerId: "seq0" });
+        assert.deepEqual(analyzerArgs.slice(analyzerArgs.indexOf("--execution-mode"), analyzerArgs.indexOf("--execution-mode") + 4),
+          ["--execution-mode", expected, "--max-steps", "10000"]);
+      }
+      configuredMode = "concrete";
+      controller.timelineIr = { execution: { seq0: { mode: "concrete" } } };
+      await controller.handleWebviewMessage({ type: "prepareExecutionReplay", sequencerId: "seq0", scope: "project" });
+      assert.deepEqual(analyzerArgs.slice(analyzerArgs.indexOf("--execution-mode"), analyzerArgs.indexOf("--execution-mode") + 4),
+        ["--execution-mode", "simulation", "--max-steps", "10000"]);
+      await controller.refreshPreview();
+      assert.equal(analyzerArgs[analyzerArgs.indexOf("--execution-mode") + 1], "simulation");
+      controller.setProjectUri(vscode.Uri.file(join(outputDir, "other-project", "q1timeline.yml")));
+      assert.deepEqual(controller.executionArgs(), ["--execution-mode", "concrete", "--max-steps", "10000"]);
+      controller.dispose();
+    });
+  });
+
+  it("ignores malformed, stale, and closed-preview replay requests", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      let refreshed = 0;
+      controller.projectUri = vscode.Uri.file("C:\\repo\\q1timeline.yml");
+      controller.outputDir = "C:\\repo\\.q1timeline";
+      controller.timelineIr = { sequencers: [{ id: "seq0" }] };
+      controller.panel = { webview: { postMessage: () => {} }, dispose: () => {} };
+      controller.refreshPreview = async () => { refreshed++; };
+      await controller.handleWebviewMessage({ type: "prepareExecutionReplay", sequencerId: "seq0", extra: true });
+      await controller.handleWebviewMessage({ type: "prepareExecutionReplay", sequencerId: " " });
+      await controller.handleWebviewMessage({ type: "prepareExecutionReplay", sequencerId: "other-sequencer" });
+      controller.setProjectUri(vscode.Uri.file("C:\\other-repo\\q1timeline.yml"));
+      await controller.handleWebviewMessage({ type: "prepareExecutionReplay", sequencerId: "seq0" });
+      controller.timelineIr = { sequencers: [{ id: "seq0" }] };
+      controller.panel = undefined;
+      await controller.handleWebviewMessage({ type: "prepareExecutionReplay", sequencerId: "seq0" });
+      assert.equal(refreshed, 0);
+      assert.equal(controller.executionReplayOverride, undefined);
+      controller.dispose();
+    });
+  });
+
+  it("renders a new partial simulation error trace while preserving failure handling for other modes", async () => {
+    const vscode = createMockVscode();
+    const outputDir = mkdtempSync(join(tmpdir(), "q1-simulation-error-"));
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      controller.projectUri = vscode.Uri.file(join(outputDir, "q1timeline.yml"));
+      controller.outputDir = outputDir;
+      let mode = "simulation";
+      let rendered = 0;
+      let refreshed = 0;
+      let cleared = 0;
+      controller.execFile = async () => {
+        writeFileSync(join(outputDir, "timeline_ir.json"), JSON.stringify({
+          events: [{ id: "underflow", kind: "underflow_warning" }],
+          execution: { seq0: { mode, status: "error", reason: "RT queue empty" } },
+        }));
+        writeFileSync(join(outputDir, "diagnostics.json"), "[]");
+        throw Object.assign(new Error("simulation error"), { stage: "analyzer", exitCode: 1, elapsedMs: 1,
+          stdout: JSON.stringify({ schema_version: "0.2.0", status: "error", ok: false }), stderr: "" });
+      };
+      controller.runRender = async () => { rendered++; return { stdout: "", stderr: "", exitCode: 0, elapsedMs: 1 }; };
+      controller.refreshWebview = async () => { refreshed++; };
+      controller.clearPreviewAfterAnalyzerFailure = () => { cleared++; };
+      controller.recordAnalyzerFailure = () => {};
+      await controller.runAnalysis();
+      assert.equal(rendered, 1);
+      assert.equal(refreshed, 1);
+      assert.equal(cleared, 0);
+      mode = "analysis";
+      await controller.runAnalysis();
+      assert.equal(rendered, 1);
+      assert.equal(refreshed, 1);
+      assert.equal(cleared, 1);
+      controller.dispose();
+    });
+  });
+
+  it("adds branch and loop timeline chip overrides to analyzer args", async () => {
+    const vscode = createMockVscode();
+    const outputDir = mkdtempSync(join(tmpdir(), "q1-control-overrides-"));
+    const capturedArgs: string[][] = [];
+
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      controller.projectUri = vscode.Uri.file(join(outputDir, "q1timeline.yml"));
+      controller.outputDir = outputDir;
+      controller.config = () => ({
+        get: (key: string, fallback: any) => {
+          if (key === "analyzer.extraArgs") {
+            return ["--strict"];
+          }
+          return fallback;
+        },
+      });
+      controller.execFile = async (_pythonPath: string, args: string[]) => {
+        capturedArgs.push(args);
+        return { stdout: "{}", stderr: "", exitCode: 0, elapsedMs: 1 };
+      };
+      controller.runRender = async () => ({ stdout: "", stderr: "", exitCode: 0, elapsedMs: 1 });
+      controller.refreshWebview = async () => undefined;
+
+      await controller.handleWebviewMessage({
+        type: "setBranchAssumption",
+        branchId: "seq0:branch:main.q1asm:4:jge:target",
+        path: "both",
+      });
+      await controller.handleWebviewMessage({
+        type: "setLoopPreview",
+        loopKey: "seq0:loop:main.q1asm:2-8",
+        visibleIterations: 3,
+      });
+
+      const latestArgs = capturedArgs[capturedArgs.length - 1];
+      assert.ok(latestArgs);
+      assert.deepEqual(
+        latestArgs.slice(latestArgs.indexOf("--branch-assumption"), latestArgs.indexOf("--strict")),
+        [
+          "--branch-assumption",
+          "seq0:branch:main.q1asm:4:jge:target=both",
+          "--loop-preview",
+          "seq0:loop:main.q1asm:2-8=3",
+        ],
+      );
+      controller.dispose();
+    });
+  });
+
+  it("preserves a hardware source reveal while allowing subsequent manual source-follow", async () => {
+    const vscode = createMockVscode();
+    vscode.TextEditorSelectionChangeKind = { Keyboard: 1, Mouse: 2, Command: 3 };
+    const posted: any[] = [];
+    let selectionHandler: any;
+    let activeHandler: any;
+    vscode.window.onDidChangeTextEditorSelection = (handler: any) => { selectionHandler = handler; return { dispose() {} }; };
+    vscode.window.onDidChangeActiveTextEditor = (handler: any) => { activeHandler = handler; return { dispose() {} }; };
+    const sourcePath = "C:\\repo\\orange_drive.q1asm";
+    const document = { uri: vscode.Uri.file(sourcePath) };
+    let selection: any = { active: { line: 63, character: 4 } };
+    const editor = {
+      document, viewColumn: 2, setDecorations() {}, revealRange() {},
+      get selection() { return selection; },
+      set selection(value) { selection = value; selectionHandler({ textEditor: editor }); },
+    };
+    vscode.workspace.openTextDocument = async () => document;
+    vscode.window.showTextDocument = async () => { activeHandler(editor); return editor; };
+
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      controller.projectUri = vscode.Uri.file("C:\\repo\\q1timeline.yml");
+      controller.projectRelatedPaths = new Set([sourcePath]);
+      controller.panel = { webview: { postMessage: (message: any) => posted.push(message) }, dispose() {} };
+      controller.timelineIr = {
+        source_map: { by_source: { [`${sourcePath}:64`]: ["orange_drive:e63"], [`${sourcePath}:66`]: ["orange_drive:e65"] } },
+        events: [{ id: "orange_drive:e63" }, { id: "orange_drive:e65" }],
+      };
+
+      await controller.openSourceLocation({ file: sourcePath, line: 66, column: 5 }, { preserveHardwareCursor: true });
+      assert.equal(editor.selection.active.line, 65);
+      assert.equal(editor.selection.active.character, 4);
+      assert.deepEqual(posted, [], "opening the source must not echo a highlight that rewinds the hardware cursor");
+      activeHandler(editor);
+      selectionHandler({ textEditor: editor, kind: vscode.TextEditorSelectionChangeKind.Command });
+      selectionHandler({ textEditor: editor });
+      assert.deepEqual(posted, [], "delayed automatic events at the revealed position must also be ignored");
+
+      controller.highlightActiveSourceLine(editor);
+      assert.deepEqual(posted.pop(), { type: "highlightEventIds", highlightEventIds: ["orange_drive:e65"] }, "explicit reveal remains available");
+      selectionHandler({ textEditor: editor, kind: vscode.TextEditorSelectionChangeKind.Mouse });
+      assert.deepEqual(posted.pop(), { type: "highlightEventIds", highlightEventIds: ["orange_drive:e65"] }, "manual click at the same position restores source-follow");
+      editor.selection = { active: { line: 63, character: 4 } };
+      assert.deepEqual(posted.pop(), { type: "highlightEventIds", highlightEventIds: ["orange_drive:e63"] });
+
+      await controller.openSourceLocation({ file: sourcePath, line: 66, column: 5 }, { preserveHardwareCursor: true });
+      assert.deepEqual(posted, []);
+      editor.selection = { active: { line: 63, character: 4 } };
+      assert.deepEqual(posted.pop(), { type: "highlightEventIds", highlightEventIds: ["orange_drive:e63"] }, "a different position without a change kind is not an echo");
+      controller.dispose();
+    });
+  });
+
+  it("clears hardware reveal suppression when source opening fails", async () => {
+    const vscode = createMockVscode();
+    let selectionHandler: any;
+    vscode.window.onDidChangeTextEditorSelection = (handler: any) => { selectionHandler = handler; return { dispose() {} }; };
+    vscode.workspace.openTextDocument = async () => { throw new Error("cannot open source"); };
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      let followed = false;
+      controller.highlightActiveSourceLine = () => { followed = true; };
+      await assert.rejects(controller.openSourceLocation({ file: "C:\\repo\\source.q1asm", line: 66, column: 5 }, { preserveHardwareCursor: true }), /cannot open source/);
+      selectionHandler({ textEditor: { document: { uri: vscode.Uri.file("C:\\repo\\source.q1asm") }, selection: { active: { line: 65, character: 4 } } } });
+      assert.equal(followed, true);
+      controller.dispose();
+    });
+  });
+
+  it("passes hardware source cursor preservation through the validated message", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      let opened: any;
+      controller.openSourceLocation = async (...args: any[]) => { opened = args; };
+      await controller.handleWebviewMessage({ type: "sourceClick", file: "orange_drive.q1asm", line: 66, column: 5, preserveHardwareCursor: true });
+      assert.deepEqual(opened, [{ file: "orange_drive.q1asm", line: 66, column: 5 }, { preserveHardwareCursor: true }]);
+      controller.dispose();
+    });
+  });
+  it("offers a Python environment check with a retry when the analyzer is missing", async () => {
+    const vscode = createMockVscode();
+    const calls: any[] = [];
+    vscode.commands.executeCommand = async (...args: any[]) => calls.push(args);
+    vscode.window.showErrorMessage = async (message: string, action: string) => {
+      assert.match(message, /Q1Lens is unavailable/);
+      assert.equal(action, "Check Python Environment");
+      return action;
+    };
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      await controller.showAnalyzerMissingMessage(new Error("No module named q1lens"));
+      assert.deepEqual(calls, [["q1lens.checkEnvironment", "q1timeline.refreshPreview"]]);
       controller.dispose();
     });
   });

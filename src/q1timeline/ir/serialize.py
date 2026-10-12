@@ -5,7 +5,9 @@ from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any
 
+from q1timeline.analysis.critical_path import critical_path_from_timeline
 from q1timeline.analysis.interpreter import AnalysisState, TimelineEvent
+from q1timeline.analysis.hardware_readiness import hardware_readiness_summary
 from q1timeline.analysis.values import value_to_json
 from q1timeline.diagnostics import Diagnostic
 from q1timeline.ir.control_flow_graph import control_flow_graph_from_states
@@ -97,8 +99,13 @@ def timeline_ir_from_states(
         else [diagnostic for state in states for diagnostic in state.diagnostics]
     )
     source_map = _source_map(events)
-    feedback_flows = _feedback_flows(events)
+    simulated = bool(states) and all("simulation" in state.metadata for state in states)
+    feedback_flows = _simulation_feedback_flows(events) if simulated else _feedback_flows(events)
     feedback_balance = _feedback_balance(events, feedback_flows)
+    alignment = {
+        state.sequencer_id: _jsonable(state.metadata.get("alignment", {}))
+        for state in states
+    }
     feedback_route_diagnostics = _feedback_route_mismatch_diagnostics(events, feedback_flows)
     feedback_latency_diagnostics = _feedback_latency_diagnostics(events, feedback_flows)
     feedback_balance_diagnostics = _feedback_balance_diagnostics(feedback_balance)
@@ -107,13 +114,24 @@ def timeline_ir_from_states(
         *feedback_latency_diagnostics,
         *feedback_balance_diagnostics,
     ]
+    # Event-driven simulation already resolves actual arrivals and blocking.
+    # Analytical latency/balance heuristics must not contradict that trace.
+    if simulated:
+        generated_diagnostics = []
+        feedback_balance = {"status": "simulated", "channels": {}}
     if diagnostics is not None:
         diagnostics.extend(generated_diagnostics)
     serialized_diagnostics = [
         _diagnostic_to_dict(diagnostic)
         for diagnostic in [*input_diagnostics, *generated_diagnostics]
     ]
-    return {
+    critical_path = critical_path_from_timeline(
+        events,
+        feedback_flows,
+        alignment=alignment,
+        diagnostics=serialized_diagnostics,
+    )
+    ir = {
         "version": TIMELINE_IR_SCHEMA_VERSION,
         "project": _jsonable(project or {}),
         "analysis": {
@@ -121,17 +139,68 @@ def timeline_ir_from_states(
         },
         "sequencers": [{"id": state.sequencer_id} for state in states],
         "events": events,
+        "register_history": [
+            {
+                "sequencer_id": write.sequencer_id,
+                "register": write.register,
+                "time": value_to_json(write.time),
+                "value": value_to_json(write.value),
+                "source": _source_to_dict(write.source),
+                "event_id": write.event_id,
+                "confidence": write.confidence,
+                "meta": _jsonable(write.meta),
+            }
+            for state in states
+            for write in state.register_history
+        ],
         "diagnostics": serialized_diagnostics,
         "source_map": source_map,
         "feedback_flows": feedback_flows,
         "feedback_balance": feedback_balance,
+        "critical_path": critical_path,
         "control_flow_graph": control_flow_graph_from_states(states),
-        "alignment": {
-            state.sequencer_id: _jsonable(state.metadata.get("alignment", {}))
-            for state in states
-        },
+        "alignment": alignment,
         "assumptions": _assumptions(states),
     }
+    execution = {
+        state.sequencer_id: _jsonable(state.metadata["execution"])
+        for state in states
+        if "execution" in state.metadata
+    }
+    if execution:
+        ir["execution"] = execution
+    simulation = {
+        state.sequencer_id: _jsonable(state.metadata["simulation"])
+        for state in states
+        if "simulation" in state.metadata
+    }
+    if simulation:
+        ir["simulation"] = simulation
+    readiness = hardware_readiness_summary(states)
+    if readiness is not None:
+        ir["hardware_readiness"] = readiness
+    return ir
+
+
+def _simulation_feedback_flows(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_id = {event["id"]: event for event in events}
+    flows = []
+    for event in events:
+        if event["kind"] not in {"feedback_receive", "trigger_receive"}:
+            continue
+        meta = event.get("meta", {})
+        source = by_id.get(meta.get("source_event_id"))
+        if source is None:
+            continue
+        channel = str(meta.get("id", meta.get("address", "")))
+        flows.append({
+            "id": f"simulation-flow-{len(flows)}",
+            "from_event_id": source["id"], "to_event_id": event["id"],
+            "channel": channel, "source": source["sequencer_id"], "target": event["sequencer_id"],
+            "label": f"Simulated {event['kind']}: {source['sequencer_id']} -> {event['sequencer_id']}",
+            "timing_model": "event_driven",
+        })
+    return flows
 
 
 def _validate_unique_sequencer_ids(states: list[AnalysisState]) -> None:

@@ -1,0 +1,5 @@
+set_awg_gain 16384,16384
+wait_sync 4
+play 0,1,160
+wait 40
+stop

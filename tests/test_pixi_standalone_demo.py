@@ -119,7 +119,7 @@ def test_normal_mode_is_one_compact_row_per_sequencer_with_loop_brackets() -> No
     assert "isCompactMode(mode) ? event.sequencerId : laneKey(event)" in source
     assert "function drawLoopBrackets" in source
     assert "function isLoopOverlayEvent" in source
-    assert "drawLoopBrackets(PIXI, root, g)" in source
+    assert "drawLoopBrackets(PIXI, eventsLayer, eventsGraphics)" in source
     assert "if (isCompactMode(state.layout.mode) && isLoopOverlayEvent(event))" in source
 
 
@@ -179,11 +179,49 @@ def test_feedback_packets_depart_on_playhead_emit_and_fly_in_short_window() -> N
     assert "feedbackFlightProgress" not in source
 
 
-def test_playhead_moves_fast_enough_for_feedback_demo() -> None:
-    source = (DEMO_DIR / "pixi-standalone-demo.js").read_text(encoding="utf-8")
+def test_playback_covers_any_project_in_fifteen_seconds_at_normal_speed() -> None:
+    run_standalone_demo_node(
+        """
+for (const extent of [{ minNs: -12, maxNs: 100 }, { minNs: 0, maxNs: 1200000 }]) {
+  const start = extent.minNs;
+  const midpoint = (extent.minNs + extent.maxNs) / 2;
+  if (Math.abs(hooks.advancePlayhead(start, 7500, extent, 1) - midpoint) > 0.00001) {
+    throw new Error("playback must reach the midpoint after 7.5 seconds for any duration");
+  }
+  if (hooks.advancePlayhead(start, 15000, extent, 1) !== start) {
+    throw new Error("playback must loop after fifteen seconds");
+  }
+  if (hooks.advancePlayhead(start, 3750, extent, 2) !== hooks.advancePlayhead(start, 7500, extent, 1)) {
+    throw new Error("2x playback must advance twice as fast");
+  }
+  if (hooks.advancePlayhead(midpoint, 0, extent, 1) !== midpoint) {
+    throw new Error("resuming playback must preserve a seeked position");
+  }
+}
+"""
+    )
 
-    assert "const PLAYHEAD_NS_PER_MS = 1.5;" in source
-    assert "state.sceneTimeMs * PLAYHEAD_NS_PER_MS" in source
+
+def test_desktop_api_is_available_before_dom_ready_and_layout_fits_narrow_stage() -> None:
+    run_standalone_demo_node(
+        """
+const api = window.q1lensTimeline;
+for (const method of ["load", "setMode", "togglePlayback", "fit", "getSnapshot"]) {
+  if (typeof api?.[method] !== "function") {
+    throw new Error(`desktop API ${method} must exist before DOM readiness`);
+  }
+}
+if (!(api.ready instanceof Promise) || api.getSnapshot().ready) {
+  throw new Error("the API must expose readiness without requiring a loaded document");
+}
+const layout = hooks.computeTimelineLayout({ events: [
+  { id: "pulse", kind: "play", sequencer_id: "qcm0", t0: { value: 0 }, t1: { value: 100 } }
+] }, { mode: "normal", width: 720 });
+if (layout.width !== 720 || layout.timeScale.plotRight >= 720) {
+  throw new Error("the timeline must fit inside a narrow desktop viewport");
+}
+"""
+    )
 
 
 def test_compact_event_labels_are_suppressed_when_they_overlap() -> None:

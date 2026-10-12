@@ -1,0 +1,13 @@
+# Deliberately small model queue: inspect the Q1 stall events.
+move 3,R0
+move 0,R1
+nop
+wait_sync 4
+body: add R1,1,R1
+nop
+set_awg_gain R1,R1
+upd_param 100
+loop R0,@body
+move R1,R2
+nop
+stop

@@ -298,8 +298,9 @@ def test_diagnose_cli_writes_artifact_bundle(tmp_path: Path) -> None:
             "q1timeline_ir.json",
             "diagnostics_report.json",
             "q1asm/seq0.q1asm",
-            "schedule.py",
+            "schedule/schedule.py",
             "versions.json",
+            "manifest.json",
         }.issubset(names)
         report = json.loads(bundle.read("diagnostics_report.json"))
         assert report["summary"]["scheduler_bug_candidate_count"] == 1

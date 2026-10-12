@@ -1,0 +1,21 @@
+{
+  "folders": [{ "name": "Cursor frequency validation", "path": "." }],
+  "settings": {
+    "q1lens.q1timeline.executionMode": "project",
+    "q1lens.q1timeline.updateMode": "manual",
+    "q1lens.q1timeline.view.defaultMode": "debug",
+    "q1lens.q1timeline.pythonPath": "python"
+  },
+  "tasks": {
+    "version": "2.0.0",
+    "tasks": [{
+      "label": "Q1Lens: Verify cursor frequency profiles",
+      "type": "process",
+      "command": "${config:q1lens.q1timeline.pythonPath}",
+      "args": ["${workspaceFolder}/verify.py"],
+      "options": { "cwd": "${workspaceFolder}/../../.." },
+      "problemMatcher": [],
+      "group": { "kind": "test", "isDefault": true }
+    }]
+  }
+}

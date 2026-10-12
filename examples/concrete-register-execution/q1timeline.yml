@@ -1,0 +1,7 @@
+analysis:
+  execution_mode: concrete
+  max_steps: 1000
+sequencers:
+  - id: counter
+    module: QCM0
+    file: counter.q1asm

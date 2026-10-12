@@ -1,0 +1,17 @@
+analysis:
+  execution_mode: simulation
+alignment:
+  mode: none
+simulation:
+  startup_delay_ns: 200
+  max_time_ns: 5000
+  feedback_queue_capacity: 2
+  inputs:
+    feedback:
+      - {target: seq, time_ns: 400, id: 5, value: 11}
+      - {target: seq, time_ns: 400, id: 5, value: 22}
+      - {target: seq, time_ns: 400, id: 5, value: 33}
+sequencers:
+  - id: seq
+    module: QCM0
+    file: program.q1asm

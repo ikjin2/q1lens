@@ -7,11 +7,13 @@ from pathlib import Path
 from typing import Any
 
 from q1timeline.analysis.alignment import align_timelines
+from q1timeline.analysis.hardware_readiness import analyze_hardware_readiness
 from q1timeline.analysis.interpreter import AnalysisState, interpret_program
 from q1timeline.analysis.underflow import analyze_underflow
 from q1timeline.ir.serialize import timeline_ir_from_states
 from q1timeline.project import is_valid_alignment_mode, is_valid_branch_policy, validate_params_json_mapping
 from q1timeline.q1asm.parser import parse_q1asm
+from q1timeline.simulation.config import validate_simulation
 
 
 def analyze_text(
@@ -24,9 +26,15 @@ def analyze_text(
     alignment_anchor_kinds: list[str] | tuple[str, ...] | None = None,
     branch_policy: str = "collapse_unresolved",
     branch_assumptions: Mapping[str, str] | None = None,
+    execution_mode: str = "analysis",
+    max_steps: int = 10000,
+    simulation: dict[str, Any] | None = None,
+    sequence: dict[str, Any] | None = None,
+    hardware_readiness: bool = False,
 ) -> dict[str, Any]:
     validated_text, validated_file, sequencer = _validate_analyze_text_inputs(text, file, sequencer_id)
     _validate_branch_policy(branch_policy)
+    _validate_execution_options(execution_mode, max_steps)
     anchor_kinds = _validate_alignment_options(alignment_mode, alignment_anchor_kinds)
     _validate_params(params)
     state = _analyze_program_text(
@@ -36,7 +44,13 @@ def analyze_text(
         params=params,
         branch_policy=branch_policy,
         branch_assumptions=branch_assumptions,
+        execution_mode=execution_mode,
+        max_steps=max_steps,
+        simulation=simulation,
+        sequence=sequence,
     )
+    if hardware_readiness:
+        analyze_hardware_readiness(state)
     align_timelines([state], mode=alignment_mode, anchor_kinds=anchor_kinds)
     return timeline_ir_from_states(
         [state],
@@ -57,23 +71,43 @@ def analyze_documents(
     alignment_anchor_kinds: list[str] | tuple[str, ...] | None = None,
     branch_policy: str = "collapse_unresolved",
     branch_assumptions: Mapping[str, str] | None = None,
+    execution_mode: str = "analysis",
+    max_steps: int = 10000,
+    simulation: dict[str, Any] | None = None,
+    sequences: dict[str, dict[str, Any]] | None = None,
+    hardware_readiness: bool = False,
 ) -> dict[str, Any]:
     _validate_branch_policy(branch_policy)
+    _validate_execution_options(execution_mode, max_steps)
     anchor_kinds = _validate_alignment_options(alignment_mode, alignment_anchor_kinds)
     _validate_params(params)
     validated_documents = _validate_documents(documents)
     sequencer_ids = _unique_sequencer_ids(validated_documents.keys())
-    states = [
-        _analyze_program_text(
-            text,
-            file=file,
-            sequencer_id=sequencer_ids[file],
-            params=params,
-            branch_policy=branch_policy,
-            branch_assumptions=branch_assumptions,
-        )
-        for file, text in validated_documents.items()
-    ]
+    if execution_mode == "simulation":
+        from q1timeline.simulation.runtime import simulate_programs
+
+        programs = {sequencer_ids[file]: parse_q1asm(text, file=file)
+                    for file, text in validated_documents.items()}
+        scenario = validate_simulation(simulation, programs)
+        states = simulate_programs(programs, params=params, max_steps=max_steps,
+                                   simulation=scenario, sequences=sequences)
+    else:
+        states = [
+            _analyze_program_text(
+                text,
+                file=file,
+                sequencer_id=sequencer_ids[file],
+                params=params,
+                branch_policy=branch_policy,
+                branch_assumptions=branch_assumptions,
+                execution_mode=execution_mode,
+                max_steps=max_steps,
+            )
+            for file, text in validated_documents.items()
+        ]
+    if hardware_readiness:
+        for state in states:
+            analyze_hardware_readiness(state)
     align_timelines(states, mode=alignment_mode, anchor_kinds=anchor_kinds)
     return timeline_ir_from_states(
         states,
@@ -94,13 +128,27 @@ def _analyze_program_text(
     params: dict[str, Any] | None,
     branch_policy: str,
     branch_assumptions: Mapping[str, str] | None,
+    execution_mode: str,
+    max_steps: int,
+    simulation: dict[str, Any] | None = None,
+    sequence: dict[str, Any] | None = None,
 ) -> AnalysisState:
+    if execution_mode == "simulation":
+        from q1timeline.simulation.runtime import simulate_programs
+
+        return simulate_programs(
+            {sequencer_id: parse_q1asm(text, file=file)}, params=params, max_steps=max_steps,
+            simulation=validate_simulation(simulation, [sequencer_id]),
+            sequences={sequencer_id: sequence} if sequence is not None else None,
+        )[0]
     state = interpret_program(
         parse_q1asm(text, file=file),
         sequencer_id=sequencer_id,
         params=params,
         branch_policy=branch_policy,
         branch_assumptions=branch_assumptions,
+        execution_mode=execution_mode,
+        max_steps=max_steps,
     )
     analyze_underflow(state)
     return state
@@ -129,6 +177,13 @@ def _validate_analyze_text_inputs(text: Any, file: Any, sequencer_id: Any) -> tu
 def _validate_branch_policy(branch_policy: str) -> None:
     if not is_valid_branch_policy(branch_policy):
         raise ValueError(f"Invalid branch policy: {branch_policy}")
+
+
+def _validate_execution_options(execution_mode: str, max_steps: int) -> None:
+    if execution_mode not in ("analysis", "concrete", "simulation"):
+        raise ValueError(f"Invalid execution mode: {execution_mode}")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps < 1:
+        raise ValueError("Invalid max_steps: expected a positive integer")
 
 
 def _validate_params(params: Any) -> None:

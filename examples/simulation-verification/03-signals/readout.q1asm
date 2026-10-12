@@ -1,0 +1,5 @@
+wait_sync 4
+fb_acq_tb_id 5,4
+acquire 0,0,80
+wait 160
+stop

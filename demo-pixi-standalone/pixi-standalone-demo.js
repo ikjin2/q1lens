@@ -10,9 +10,14 @@
     layout: null,
     viewMode: "showcase",
     playing: true,
+    playbackSpeed: 1,
+    name: "",
+    dirty: true,
+    layoutPending: false,
+    suppressClick: false,
+    lastStateUpdateMs: 0,
     animationFrame: 0,
     lastAnimationMs: 0,
-    sceneTimeMs: 0,
     playheadNs: 0,
     fullTimeExtent: null,
     timeWindow: null,
@@ -77,24 +82,50 @@
     "debug.slack",
   ];
 
-  const PLAYHEAD_NS_PER_MS = 1.5;
+  const PLAYBACK_DURATION_MS = 15000;
   const FEEDBACK_PACKET_FLIGHT_NS = 220;
   const FEEDBACK_POP_PULSE_NS = 140;
 
   const els = {};
 
-  window.addEventListener("DOMContentLoaded", () => {
-    cacheElements();
-    bindControls();
-    window.__threePeakTimelineDebug = () => ({
-      fullTimeExtent: state.fullTimeExtent ? { ...state.fullTimeExtent } : null,
-      timeWindow: state.timeWindow ? { ...state.timeWindow } : null,
-      ticks: state.layout && state.layout.timeScale ? [...state.layout.timeScale.majorTicks] : [],
-      rootScaleX: state.root ? state.root.scale.x : null,
-      rootScaleY: state.root ? state.root.scale.y : null,
-    });
-    startDemo().catch((error) => renderFatal(error));
+  const ready = new Promise((resolve, reject) => {
+    const boot = async () => {
+      try {
+        cacheElements();
+        bindControls();
+        if (window.q1lensDesktop) {
+          state.viewMode = "normal";
+          state.playing = false;
+        }
+        if (!window.PIXI) {
+          throw new Error("PixiJS could not be loaded.");
+        }
+        await mountPixiApp(window.PIXI);
+        syncPlaybackControls();
+        startAnimationLoop();
+        resolve();
+      } catch (error) {
+        reject(error);
+      }
+    };
+    if (typeof document !== "undefined" && document.readyState !== "loading") {
+      boot();
+    } else {
+      window.addEventListener("DOMContentLoaded", boot, { once: true });
+    }
   });
+  window.q1lensTimeline = { ready, load: loadTimeline, setMode, togglePlayback, fit: fitToAll, getSnapshot };
+  window.__threePeakTimelineDebug = () => ({
+    ...getSnapshot(),
+    ticks: state.layout && state.layout.timeScale ? [...state.layout.timeScale.majorTicks] : [],
+    rootScaleX: state.root ? state.root.scale.x : null,
+    rootScaleY: state.root ? state.root.scale.y : null,
+  });
+  ready.then(() => {
+    if (!window.q1lensDesktop) {
+      return startDemo();
+    }
+  }).catch(renderFatal);
 
   function cacheElements() {
     els.stage = document.getElementById("pixi-stage");
@@ -111,6 +142,10 @@
     els.metricEvents = document.getElementById("metric-events");
     els.metricFeedback = document.getElementById("metric-feedback");
     els.metricSequencers = document.getElementById("metric-sequencers");
+    els.scrubber = document.getElementById("timeline-scrubber");
+    els.playheadTime = document.getElementById("playhead-time");
+    els.playbackSpeed = document.getElementById("playback-speed");
+    els.selectionTitle = document.getElementById("selection-title");
   }
 
   function bindControls() {
@@ -119,41 +154,76 @@
     els.showcaseMode.addEventListener("click", () => setMode("showcase"));
     els.playbackToggle.addEventListener("click", togglePlayback);
     els.fitAll.addEventListener("click", fitToAll);
-    els.resetView.addEventListener("click", () => {
-      state.camera = { y: 0 };
-      state.timeWindow = state.fullTimeExtent ? { ...state.fullTimeExtent } : null;
-      applyLayout({ preserveCamera: false });
+    els.resetView.addEventListener("click", resetView);
+    els.scrubber?.addEventListener("input", () => {
+      if (state.fullTimeExtent) {
+        const { minNs, maxNs } = state.fullTimeExtent;
+        seek(minNs + (Number(els.scrubber.value) / 1000) * (maxNs - minNs));
+      }
     });
-    window.addEventListener("resize", () => {
-      resizeApp();
-      applyLayout({ preserveCamera: true });
+    els.playbackSpeed?.addEventListener("change", () => {
+      const speed = Number(els.playbackSpeed.value);
+      if ([0.25, 0.5, 1, 2].includes(speed)) {
+        state.playbackSpeed = speed;
+        emitState();
+      }
+    });
+    window.addEventListener("keydown", (event) => {
+      if (event.ctrlKey || event.metaKey || event.altKey || event.repeat ||
+          event.target?.closest?.("input, select, textarea, button, [contenteditable=true]")) {
+        return;
+      }
+      if (event.code === "Space") {
+        event.preventDefault();
+        togglePlayback();
+      } else if (event.key.toLowerCase() === "f") {
+        fitToAll();
+      } else if (event.key === "Home") {
+        event.preventDefault();
+        resetView();
+      }
     });
   }
 
   async function startDemo() {
-    if (!window.PIXI) {
-      throw new Error("PixiJS failed to load from the CDN.");
-    }
     const response = await fetch("../examples/three-peak-demo1/.q1timeline/timeline_ir.json");
     if (!response.ok) {
       throw new Error(`TimelineIR load failed: HTTP ${response.status}`);
     }
-    state.ir = await response.json();
-    await mountPixiApp(window.PIXI);
+    await loadTimeline(await response.json(), { name: "Three Peak Demo 1" });
+  }
+
+  async function loadTimeline(ir, options = {}) {
+    await ready;
+    if (!isRecord(ir) || !Array.isArray(ir.events)) {
+      throw new Error("TimelineIR must contain an events array.");
+    }
+    state.ir = ir;
+    state.name = options.name || "Timeline";
+    state.selected = null;
+    state.hovered = null;
+    state.layoutPending = false;
+    renderTooltip(null);
     applyLayout();
     updateMetrics();
-    els.loadStatus.textContent = `IR: Three Peak Demo 1 timeline_ir.json | ${state.ir.events.length} events`;
-    startAnimationLoop();
+    renderInspector(null);
+    syncPlaybackControls();
+    els.loadStatus.textContent = `${state.name} · ${ir.events.length} events`;
+    emitSelection();
+    emitState();
+    return getSnapshot();
   }
 
   async function mountPixiApp(PIXI) {
     const app = new PIXI.Application();
     await app.init({
       antialias: true,
+      autoStart: false,
       autoDensity: true,
       backgroundAlpha: 0,
       resolution: window.devicePixelRatio || 1,
-      resizeTo: els.stage,
+      width: Math.max(1, els.stage.clientWidth),
+      height: Math.max(1, els.stage.clientHeight),
     });
     state.app = app;
     state.root = new PIXI.Container();
@@ -165,26 +235,111 @@
     state.root.addChild(state.staticLayer, state.dynamicLayer);
     app.stage.addChild(state.root);
     els.stage.appendChild(app.canvas);
+    app.canvas.style.touchAction = "none";
+    app.canvas.style.cursor = "grab";
+    const resizeObserver = new ResizeObserver(() => {
+      if (resizeApp()) {
+        state.layoutPending = true;
+      }
+    });
+    resizeObserver.observe(els.stage);
 
     app.canvas.addEventListener("pointerdown", beginDrag);
     app.canvas.addEventListener("pointermove", handlePointerMove);
     window.addEventListener("pointerup", endDrag);
+    app.canvas.addEventListener("pointercancel", endDrag);
+    app.canvas.addEventListener("pointerleave", () => {
+      if (!state.drag) {
+        state.hovered = null;
+        renderTooltip(null);
+        state.dirty = true;
+      }
+    });
     app.canvas.addEventListener("click", handleClick);
     app.canvas.addEventListener("wheel", handleWheel, { passive: false });
   }
 
   function setMode(mode) {
+    if (!["normal", "debug", "showcase"].includes(mode)) {
+      return;
+    }
     state.viewMode = mode;
     for (const button of [els.normalMode, els.debugMode, els.showcaseMode]) {
-      button.setAttribute("aria-pressed", String(button.id === `${mode}-mode`));
+      button?.setAttribute("aria-pressed", String(button.id === `${mode}-mode`));
     }
-    applyLayout({ preserveCamera: false });
+    applyLayout({ preserveCamera: true, preservePlayhead: true });
+    emitState();
   }
 
   function togglePlayback() {
+    if (!state.ir) {
+      return;
+    }
     state.playing = !state.playing;
+    syncPlaybackControls();
+    emitState();
+  }
+
+  function syncPlaybackControls() {
     els.playbackToggle.textContent = state.playing ? "Pause" : "Play";
     els.playbackToggle.setAttribute("aria-pressed", String(state.playing));
+    if (els.playheadTime) {
+      els.playheadTime.textContent = `${formatNumber(state.playheadNs)} ns`;
+    }
+    if (els.scrubber && state.fullTimeExtent) {
+      const { minNs, maxNs } = state.fullTimeExtent;
+      els.scrubber.min = "0";
+      els.scrubber.max = "1000";
+      els.scrubber.value = String(((state.playheadNs - minNs) / (maxNs - minNs)) * 1000);
+      els.scrubber.setAttribute("aria-valuetext", `${numberText(state.playheadNs)} nanoseconds`);
+    }
+  }
+
+  function getSnapshot() {
+    return {
+      ready: Boolean(state.ir),
+      name: state.name,
+      viewMode: state.viewMode,
+      playing: state.playing,
+      playbackSpeed: state.playbackSpeed,
+      playheadNs: state.playheadNs,
+      fullTimeExtent: state.fullTimeExtent ? { ...state.fullTimeExtent } : null,
+      timeWindow: state.timeWindow ? { ...state.timeWindow } : null,
+      eventCount: records(state.ir?.events).length,
+      feedbackCount: records(state.ir?.feedback_flows).length,
+      sequencerCount: state.ir ? sequencerIds(state.ir).length : 0,
+      selected: state.selected,
+    };
+  }
+
+  function emitState() {
+    window.dispatchEvent(new CustomEvent("q1lens:state", { detail: getSnapshot() }));
+  }
+
+  function emitSelection() {
+    const event = state.selected?.event || state.selected?.annotation?.event;
+    if (els.selectionTitle) {
+      els.selectionTitle.textContent = event?.label || state.selected?.flow?.label || "Event inspector";
+    }
+    window.dispatchEvent(new CustomEvent("q1lens:selection", { detail: state.selected }));
+  }
+
+  function seek(timeNs) {
+    if (!state.fullTimeExtent) {
+      return;
+    }
+    state.playheadNs = clamp(timeNs, state.fullTimeExtent.minNs, state.fullTimeExtent.maxNs);
+    state.playing = false;
+    state.dirty = true;
+    syncPlaybackControls();
+    emitState();
+  }
+
+  function resetView() {
+    fitToAll();
+    if (state.fullTimeExtent) {
+      seek(state.fullTimeExtent.minNs);
+    }
   }
 
   function applyLayout(options = {}) {
@@ -193,7 +348,7 @@
     }
     const previousCamera = { ...state.camera };
     const mode = state.viewMode === "debug" ? "debug" : "normal";
-    const width = Math.max(900, Math.floor(els.stage.getBoundingClientRect().width));
+    const width = Math.max(480, Math.floor(els.stage.getBoundingClientRect().width));
     state.fullTimeExtent = computeFullTimeExtent(state.ir, mode);
     if (!options.preserveCamera || !state.timeWindow) {
       state.timeWindow = { ...state.fullTimeExtent };
@@ -208,6 +363,8 @@
     state.feedbackFlows = createFeedbackFlows(state.ir, state.layout);
     if (!options.preservePlayhead) {
       state.playheadNs = state.layout.timeScale.tMinNs;
+    } else {
+      state.playheadNs = clamp(state.playheadNs, state.fullTimeExtent.minNs, state.fullTimeExtent.maxNs);
     }
     if (options.preserveCamera) {
       state.camera = previousCamera;
@@ -221,7 +378,7 @@
 
   function computeTimelineLayout(ir, options) {
     const mode = options.mode || "normal";
-    const width = Math.max(1200, options.width || 1400);
+    const width = Math.max(480, options.width || 1400);
     const plotLeft = 196;
     const plotRight = width - 34;
     const top = isCompactMode(mode) ? 68 : 78;
@@ -432,23 +589,38 @@
     drawGrid(PIXI, root, g);
     drawSequencerPanels(PIXI, root, g);
     drawLanes(PIXI, root, g);
-    drawLoopBrackets(PIXI, root, g);
-    drawEvents(PIXI, root, g);
-    drawDiagnostics(PIXI, root, g);
+    const eventsLayer = new PIXI.Container();
+    const eventsGraphics = new PIXI.Graphics();
+    const mask = new PIXI.Graphics();
+    const scale = state.layout.timeScale;
+    mask.rect(scale.plotLeft, 0, scale.plotRight - scale.plotLeft, state.layout.height).fill(0xffffff);
+    eventsLayer.addChild(eventsGraphics);
+    eventsLayer.mask = mask;
+    root.addChild(eventsLayer, mask);
+    drawLoopBrackets(PIXI, eventsLayer, eventsGraphics);
+    drawEvents(PIXI, eventsLayer, eventsGraphics);
+    drawDiagnostics(PIXI, eventsLayer, eventsGraphics);
     applyCamera();
     updateDebugDataset();
     drawDynamicScene();
+    state.dirty = true;
   }
 
   function drawGrid(PIXI, root, g) {
     const scale = state.layout.timeScale;
+    let previousLabelRight = -Infinity;
     for (const tick of scale.majorTicks) {
       const x = scaleTime(tick, scale.tMinNs, scale.tMaxNs, scale.plotLeft, scale.plotRight);
       line(g, x, 46, x, state.layout.height - 34, colors.grid, 1, 0.72);
-      const label = makeText(PIXI, `${tick} ns`, 11, colors.muted, 500);
+      const text = `${tick} ns`;
+      if (x < previousLabelRight + 12 || x + measureLabelWidth(text) > scale.plotRight) {
+        continue;
+      }
+      const label = makeText(PIXI, text, 11, colors.muted, 500);
       label.x = x + 4;
       label.y = 47;
       root.addChild(label);
+      previousLabelRight = x + measureLabelWidth(text);
     }
   }
 
@@ -530,8 +702,7 @@
       const fill = eventFill(event);
       const alpha = event.kind === "loop_block" || event.kind === "branch_region" ? 0.25 : 0.94;
       roundedRect(g, event.x, event.y + 5, event.width, event.height, 5, fill, alpha);
-      const stroke = selectedId() === event.id ? colors.cursor : state.hovered && state.hovered.id === event.id ? colors.text : 0x0b1020;
-      strokeRect(g, event.x, event.y + 5, event.width, event.height, 5, stroke, selectedId() === event.id ? 2 : 1, 0.95);
+      strokeRect(g, event.x, event.y + 5, event.width, event.height, 5, 0x0b1020, 1, 0.95);
       if (event.labelLayout.visible) {
         const label = makeText(PIXI, event.labelLayout.text, 10, 0x07111f, 650);
         label.x = event.labelLayout.x;
@@ -575,19 +746,43 @@
     const root = state.dynamicLayer;
     const g = state.dynamicGraphics;
     g.clear();
+    drawSelectionEffects(g);
     drawPlayhead(PIXI, root, g);
     drawFeedbackExchange(PIXI, root, g);
+  }
+
+  function drawSelectionEffects(g) {
+    const selected = selectedId();
+    const hoverId = state.hovered?.event?.id || state.hovered?.annotation?.event?.id;
+    const scale = state.layout.timeScale;
+    for (const event of state.layout.events) {
+      if (event.id !== selected && event.id !== hoverId) {
+        continue;
+      }
+      const left = Math.max(scale.plotLeft, event.x - 3);
+      const right = Math.min(scale.plotRight, event.x + event.width + 3);
+      if (right <= left) {
+        continue;
+      }
+      const color = event.id === selected ? colors.cursor : colors.text;
+      strokeRect(g, left, event.y + 2, right - left, event.height + 6, 6, color, 7, 0.1);
+      strokeRect(g, left, event.y + 2, right - left, event.height + 6, 6, color, 1.5, 0.98);
+    }
   }
 
   function drawPlayhead(PIXI, root, g) {
     const scale = state.layout.timeScale;
     const x = scaleTime(state.playheadNs, scale.tMinNs, scale.tMaxNs, scale.plotLeft, scale.plotRight);
+    state.playheadText.visible = x >= scale.plotLeft && x <= scale.plotRight;
+    if (!state.playheadText.visible) {
+      return;
+    }
+    line(g, x, 42, x, state.layout.height - 28, colors.cursor, 10, 0.07);
     line(g, x, 42, x, state.layout.height - 28, colors.cursor, 2, 0.95);
     circle(g, x, 42, 5, colors.cursor, 0.95);
     state.playheadText.text = `${Math.round(state.playheadNs)} ns`;
     state.playheadText.x = x + 8;
     state.playheadText.y = 26;
-    state.playheadText.visible = true;
     if (els.stage) {
       els.stage.dataset.playheadNs = String(Math.round(state.playheadNs));
     }
@@ -599,14 +794,20 @@
       const flow = state.feedbackFlows[index];
       const from = eventCenter(flow.from);
       const to = eventCenter(flow.to);
+      const scale = state.layout.timeScale;
+      if (from.x < scale.plotLeft || from.x > scale.plotRight || to.x < scale.plotLeft || to.x > scale.plotRight) {
+        continue;
+      }
       const lift = Math.min(92, Math.max(34, Math.abs(to.y - from.y) * 0.4 + 28));
       const mid = {
         x: (from.x + to.x) / 2,
         y: Math.min(from.y, to.y) - lift - (index % 3) * 9,
       };
       const color = feedbackColor(flow.channel, index);
-      line(g, from.x, from.y, mid.x, mid.y, color, 1.25, 0.22);
-      line(g, mid.x, mid.y, to.x, to.y, color, 1.25, 0.22);
+      const highlighted = state.selected?.flow?.id === flow.id || state.hovered?.flow?.id === flow.id;
+      const pathAlpha = highlighted ? 0.85 : state.viewMode === "showcase" ? 0.3 : 0.12;
+      line(g, from.x, from.y, mid.x, mid.y, color, 1.25, pathAlpha);
+      line(g, mid.x, mid.y, to.x, to.y, color, 1.25, pathAlpha);
       const phase = feedbackPacketProgress(flow);
       if (phase !== null) {
         activeCount += 1;
@@ -660,17 +861,35 @@
     const tick = (now) => {
       const delta = state.lastAnimationMs ? Math.min(48, now - state.lastAnimationMs) : 16;
       state.lastAnimationMs = now;
+      if (state.layoutPending) {
+        state.layoutPending = false;
+        applyLayout({ preserveCamera: true, preservePlayhead: true });
+        emitState();
+      }
       if (state.playing && state.layout) {
-        state.sceneTimeMs += delta;
-        const scale = state.layout.timeScale;
-        const span = Math.max(1, scale.tMaxNs - scale.tMinNs);
-        state.playheadNs = scale.tMinNs + ((state.sceneTimeMs * PLAYHEAD_NS_PER_MS) % span);
+        state.playheadNs = advancePlayhead(state.playheadNs, delta, state.fullTimeExtent, state.playbackSpeed);
+        state.dirty = true;
       }
       updateFps(now);
-      drawDynamicScene();
+      if (state.dirty) {
+        drawDynamicScene();
+        state.app.render();
+        state.dirty = false;
+        syncPlaybackControls();
+      }
+      if (state.playing && state.layout && now - state.lastStateUpdateMs >= 100) {
+        state.lastStateUpdateMs = now;
+        emitState();
+      }
       state.animationFrame = requestAnimationFrame(tick);
     };
     state.animationFrame = requestAnimationFrame(tick);
+  }
+
+  function advancePlayhead(playheadNs, deltaMs, extent, speed) {
+    const span = Math.max(1, extent.maxNs - extent.minNs);
+    const advance = (deltaMs / PLAYBACK_DURATION_MS) * span * speed;
+    return extent.minNs + ((playheadNs - extent.minNs + advance) % span);
   }
 
   function updateFps(now) {
@@ -685,9 +904,17 @@
   }
 
   function resizeApp() {
-    if (state.app && state.app.renderer) {
-      state.app.renderer.resize(els.stage.clientWidth, els.stage.clientHeight);
+    if (!state.app || !state.app.renderer) {
+      return false;
     }
+    const width = els.stage.clientWidth;
+    const height = els.stage.clientHeight;
+    if (width <= 0 || height <= 0 || (state.app.screen.width === width && state.app.screen.height === height)) {
+      return false;
+    }
+    state.app.renderer.resize(width, height);
+    state.dirty = true;
+    return true;
   }
 
   function fitToAll() {
@@ -699,7 +926,8 @@
     }
     state.camera.y = 0;
     fitVerticalToAll();
-    applyLayout({ preserveCamera: true });
+    applyLayout({ preserveCamera: true, preservePlayhead: true });
+    emitState();
   }
 
   function fitVerticalToAll() {
@@ -716,9 +944,16 @@
     clampCamera();
     state.root.scale.set(1, 1);
     state.root.position.set(0, -state.camera.y);
+    state.dirty = true;
   }
 
   function beginDrag(event) {
+    if (event.button !== 0 || !state.layout) {
+      return;
+    }
+    state.suppressClick = false;
+    const point = screenToWorld(event);
+    const scrubbing = point.x >= state.layout.timeScale.plotLeft && point.y >= 24 && point.y <= 62;
     state.drag = {
       pointerId: event.pointerId,
       x: event.clientX,
@@ -726,63 +961,97 @@
       cameraY: state.camera.y,
       timeWindow: state.timeWindow ? { ...state.timeWindow } : null,
       moved: false,
+      scrubbing,
     };
+    state.app.canvas.setPointerCapture(event.pointerId);
+    if (scrubbing) {
+      seek(point.timeNs);
+    }
+    renderTooltip(null);
   }
 
   function handlePointerMove(event) {
     if (state.drag && state.drag.pointerId === event.pointerId) {
+      if (state.drag.scrubbing) {
+        state.drag.moved = true;
+        seek(screenToWorld(event).timeNs);
+        return;
+      }
       const dx = event.clientX - state.drag.x;
       const dy = event.clientY - state.drag.y;
-      if (Math.abs(dx) + Math.abs(dy) > 2) {
+      if (Math.abs(dx) + Math.abs(dy) > 4) {
         state.drag.moved = true;
+      }
+      if (!state.drag.moved) {
+        return;
       }
       if (state.drag.timeWindow) {
         state.timeWindow = panTimeWindowByPixels(state.drag.timeWindow, -dx);
       }
       state.camera.y = state.drag.cameraY - dy;
-      applyLayout({ preserveCamera: true, preservePlayhead: true });
+      state.layoutPending = true;
+      state.app.canvas.style.cursor = "grabbing";
       return;
     }
     const hit = hitTest(screenToWorld(event));
     if (!sameSelection(hit, state.hovered)) {
       state.hovered = hit;
       renderTooltip(hit, event);
-      drawTimelineScene();
+      state.dirty = true;
     } else if (hit) {
       renderTooltip(hit, event);
     } else {
       renderTooltip(null);
     }
+    state.app.canvas.style.cursor = hit ? "pointer" : "grab";
   }
 
-  function endDrag() {
+  function endDrag(event) {
+    if (!state.drag || state.drag.pointerId !== event.pointerId) {
+      return;
+    }
+    state.suppressClick = state.drag.moved || state.drag.scrubbing;
+    if (state.app.canvas.hasPointerCapture(event.pointerId)) {
+      state.app.canvas.releasePointerCapture(event.pointerId);
+    }
     state.drag = null;
+    state.app.canvas.style.cursor = "grab";
   }
 
   function handleClick(event) {
-    if (state.drag && state.drag.moved) {
+    if (state.suppressClick) {
+      state.suppressClick = false;
       return;
     }
     const hit = hitTest(screenToWorld(event));
     state.selected = hit;
-    drawTimelineScene();
+    state.dirty = true;
     renderInspector(hit);
+    emitSelection();
+    emitState();
   }
 
   function handleWheel(event) {
     event.preventDefault();
+    if (!state.layout) {
+      return;
+    }
     const before = screenToWorld(event);
     if (event.shiftKey) {
       state.camera.y += event.deltaY;
       applyCamera();
     } else {
-      const factor = event.deltaY < 0 ? 0.76 : 1 / 0.76;
+      const deltaPixels = event.deltaY * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? els.stage.clientHeight : 1);
+      const factor = Math.exp(clamp(deltaPixels, -240, 240) * 0.0025);
       zoomTimeWindowAt(before.timeNs, factor);
-      applyLayout({ preserveCamera: true, preservePlayhead: true });
+      state.layoutPending = true;
     }
   }
 
   function hitTest(point) {
+    if (!state.layout || point.x < state.layout.timeScale.plotLeft || point.x > state.layout.timeScale.plotRight) {
+      return null;
+    }
     const playhead = hitTestPlayheadBadge(point, state.layout, state.playheadNs);
     if (playhead) {
       return { type: "playhead", playhead };
@@ -870,6 +1139,10 @@
       }
       const from = eventCenter(flow.from);
       const to = eventCenter(flow.to);
+      const scale = state.layout.timeScale;
+      if (from.x < scale.plotLeft || from.x > scale.plotRight || to.x < scale.plotLeft || to.x > scale.plotRight) {
+        continue;
+      }
       const lift = Math.min(92, Math.max(34, Math.abs(to.y - from.y) * 0.4 + 28));
       const mid = {
         x: (from.x + to.x) / 2,
@@ -927,8 +1200,11 @@
     }
     els.tooltip.innerHTML = lines.map((line) => `<div>${escapeHtml(line)}</div>`).join("");
     els.tooltip.hidden = false;
-    const x = Math.min(window.innerWidth - 24, pointerEvent.clientX + 14);
-    const y = Math.min(window.innerHeight - 24, pointerEvent.clientY + 14);
+    els.tooltip.style.left = "0px";
+    els.tooltip.style.top = "0px";
+    const tooltipRect = els.tooltip.getBoundingClientRect();
+    const x = Math.max(12, Math.min(window.innerWidth - tooltipRect.width - 12, pointerEvent.clientX + 14));
+    const y = Math.max(12, Math.min(window.innerHeight - tooltipRect.height - 12, pointerEvent.clientY + 14));
     els.tooltip.style.left = `${x}px`;
     els.tooltip.style.top = `${y}px`;
   }
@@ -1009,7 +1285,7 @@
   }
 
   function selectedId() {
-    return state.selected && state.selected.type === "event" ? state.selected.id : null;
+    return state.selected?.event?.id || state.selected?.annotation?.event?.id || null;
   }
 
   function sameSelection(a, b) {
@@ -1093,8 +1369,8 @@
       return null;
     }
     const scale = state.layout.timeScale;
-    const minNs = Number(scale.tMinNs);
-    const maxNs = Number(scale.tMaxNs);
+    const minNs = Number(state.fullTimeExtent?.minNs ?? scale.tMinNs);
+    const maxNs = Number(state.fullTimeExtent?.maxNs ?? scale.tMaxNs);
     const currentNs = Number(state.playheadNs);
     const eventNs = Number(anchorNs);
     if (
@@ -1592,6 +1868,8 @@
       hitTestAnnotations,
       hitTestPlayheadBadge,
       measureLabelWidth,
+      advancePlayhead,
+      computeTimelineLayout,
     };
   }
 })();

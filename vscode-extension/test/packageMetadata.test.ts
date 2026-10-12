@@ -45,6 +45,8 @@ describe("package metadata", () => {
     for (const command of [
       "q1lens.checkEnvironment",
       "q1lens.selectPythonEnvironment",
+      "q1timeline.saveComparisonBaseline",
+      "q1timeline.clearComparisonBaseline",
       "q1timeline.setAnalysisParameter",
       "q1timeline.clearAnalysisParameterOverrides",
     ]) {

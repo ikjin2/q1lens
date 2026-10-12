@@ -1,0 +1,41 @@
+{
+  "folders": [
+    { "name": "Cursor boundary checks", "path": "../cursor-frequency-demo/verification" },
+    { "name": "Input fault scenarios", "path": "faults" },
+    { "name": "Validation results", "path": "../../output/extended-simulation-validation" }
+  ],
+  "settings": {
+    "q1lens.q1timeline.executionMode": "project",
+    "q1lens.q1timeline.updateMode": "manual",
+    "q1lens.q1timeline.view.defaultMode": "debug",
+    "q1lens.q1timeline.pythonPath": "python"
+  },
+  "tasks": {
+    "version": "2.0.0",
+    "tasks": [
+      {
+        "label": "Q1Lens: Verify long runs and boundaries",
+        "type": "process",
+        "command": "${config:q1lens.q1timeline.pythonPath}",
+        "args": ["${workspaceFolder:Cursor boundary checks}/verify_boundaries.py"],
+        "options": { "cwd": "${workspaceFolder:Cursor boundary checks}/../../.." },
+        "problemMatcher": []
+      },
+      {
+        "label": "Q1Lens: Verify input faults",
+        "type": "process",
+        "command": "${config:q1lens.q1timeline.pythonPath}",
+        "args": ["${workspaceFolder:Input fault scenarios}/verify.py"],
+        "options": { "cwd": "${workspaceFolder:Input fault scenarios}/../../.." },
+        "problemMatcher": []
+      },
+      {
+        "label": "Q1Lens: Verify steps 1 and 2",
+        "dependsOn": ["Q1Lens: Verify long runs and boundaries", "Q1Lens: Verify input faults"],
+        "dependsOrder": "sequence",
+        "problemMatcher": [],
+        "group": { "kind": "test", "isDefault": true }
+      }
+    ]
+  }
+}

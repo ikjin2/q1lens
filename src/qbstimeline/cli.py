@@ -4,13 +4,15 @@ import argparse
 import json
 import sys
 import webbrowser
-import zipfile
 from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 
 from qbstimeline.compile_worker import analyze_project
-from qbstimeline.consistency import build_consistency_report, versions_payload
+from qbstimeline.consistency import build_consistency_report
+from qbstimeline.diagnostic_bundle import verify_diagnostics_bundle, write_diagnostics_bundle
+from qbstimeline.doctor import format_report as format_doctor_report
+from qbstimeline.doctor import inspect_project
 from qbstimeline.ir.serialize import write_qbs_ir
 from qbstimeline.project import ConfigLoadError, load_project_config
 from qbstimeline.q1timeline_bridge import run_q1timeline_cli
@@ -36,6 +38,10 @@ def main(argv: Sequence[str] | None = None, *, prog: str = "qbstimeline") -> int
             return _render_command(args)
         if args.command == "diagnose":
             return _diagnose_command(args)
+        if args.command == "verify-bundle":
+            return _verify_bundle_command(args)
+        if args.command == "doctor":
+            return _doctor_command(args)
         if args.command == "q1timeline":
             return run_q1timeline_cli(args.q1timeline_args)
     except Exception as exc:
@@ -70,6 +76,16 @@ def _build_parser(*, prog: str = "qbstimeline") -> argparse.ArgumentParser:
     diagnose.add_argument("--bundle", help="Output artifact bundle ZIP path")
     diagnose.add_argument("--schedule", help="Optional schedule source file to include in the bundle")
     diagnose.add_argument("--strict", action="store_true", help="Return exit code 1 for diagnostic findings")
+
+    verify_bundle = subparsers.add_parser(
+        "verify-bundle",
+        help="Verify a diagnostics bundle manifest and payloads",
+    )
+    verify_bundle.add_argument("--bundle", required=True, help="Diagnostics bundle ZIP path")
+
+    doctor = subparsers.add_parser("doctor", help="Check a project without executing user code")
+    doctor.add_argument("--project", required=True, help="Path to qbstimeline.yml")
+    doctor.add_argument("--json", action="store_true", help="Print a machine-readable JSON report")
 
     q1timeline = subparsers.add_parser(
         "q1timeline",
@@ -144,8 +160,12 @@ def _render_command(args: argparse.Namespace) -> int:
 
 def _diagnose_command(args: argparse.Namespace) -> int:
     try:
+        _validate_diagnostic_output_paths(args)
         qbs_ir_path = Path(args.ir)
         qbs_ir = json.loads(qbs_ir_path.read_text(encoding="utf-8"))
+        schedule_path = Path(args.schedule) if args.schedule else None
+        if schedule_path is not None and not schedule_path.is_file():
+            raise ValueError(f"--schedule must name an existing file: {schedule_path}")
         q1timeline_ir = None
         q1timeline_ir_path = Path(args.q1timeline_ir) if args.q1timeline_ir else None
         if q1timeline_ir_path is not None:
@@ -158,14 +178,12 @@ def _diagnose_command(args: argparse.Namespace) -> int:
             out_path.write_text(report_json, encoding="utf-8")
             print(f"Wrote diagnostics report: {out_path}")
         if args.bundle:
-            _write_diagnostics_bundle(
+            write_diagnostics_bundle(
                 bundle_path=Path(args.bundle),
                 qbs_ir=qbs_ir,
-                qbs_ir_path=qbs_ir_path,
                 q1timeline_ir=q1timeline_ir,
-                q1timeline_ir_path=q1timeline_ir_path,
-                report_json=report_json,
-                schedule_path=Path(args.schedule) if args.schedule else None,
+                report=report,
+                schedule_path=schedule_path,
             )
             print(f"Wrote diagnostics bundle: {args.bundle}")
         if not args.out and not args.bundle:
@@ -185,46 +203,54 @@ def _diagnose_command(args: argparse.Namespace) -> int:
     return 0
 
 
-def _write_diagnostics_bundle(
-    *,
-    bundle_path: Path,
-    qbs_ir: dict,
-    qbs_ir_path: Path,
-    q1timeline_ir: dict | None,
-    q1timeline_ir_path: Path | None,
-    report_json: str,
-    schedule_path: Path | None,
-) -> None:
-    bundle_path.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
-        bundle.write(qbs_ir_path, "qbs_ir.json")
-        if q1timeline_ir is not None and q1timeline_ir_path is not None:
-            bundle.write(q1timeline_ir_path, "q1timeline_ir.json")
-        if schedule_path is not None and schedule_path.is_file():
-            bundle.write(schedule_path, "schedule.py")
-        bundle.writestr("diagnostics_report.json", report_json)
-        bundle.writestr("versions.json", _json_payload(versions_payload()))
-        for sequencer_id, text in _embedded_q1asm(qbs_ir).items():
-            bundle.writestr(f"q1asm/{sequencer_id}.q1asm", text)
+def _validate_diagnostic_output_paths(args: argparse.Namespace) -> None:
+    protected_paths = [
+        (option, Path(value).resolve())
+        for option, value in (
+            ("--ir", args.ir),
+            ("--q1timeline-ir", args.q1timeline_ir),
+            ("--schedule", args.schedule),
+        )
+        if value
+    ]
+    for option, value in (("--out", args.out), ("--bundle", args.bundle)):
+        if not value:
+            continue
+        path = Path(value).resolve()
+        for other_option, other_path in protected_paths:
+            if path == other_path or (
+                path.exists() and other_path.exists() and path.samefile(other_path)
+            ):
+                raise ValueError(f"{option} and {other_option} must name different files: {path}")
+        protected_paths.append((option, path))
 
 
-def _embedded_q1asm(qbs_ir: dict) -> dict[str, str]:
-    result: dict[str, str] = {}
-    q1asm_by_sequencer = qbs_ir.get("q1asm_by_sequencer")
-    if isinstance(q1asm_by_sequencer, dict):
-        for key, value in q1asm_by_sequencer.items():
-            if isinstance(key, str) and isinstance(value, str):
-                result[key] = value
-    q1asm_programs = qbs_ir.get("q1asm_programs")
-    if isinstance(q1asm_programs, list):
-        for program in q1asm_programs:
-            if not isinstance(program, dict):
-                continue
-            sequencer = program.get("sequencer_id") or program.get("sequencer")
-            text = program.get("text")
-            if isinstance(sequencer, str) and isinstance(text, str):
-                result.setdefault(sequencer, text)
-    return result
+def _verify_bundle_command(args: argparse.Namespace) -> int:
+    bundle_path = Path(args.bundle)
+    try:
+        errors = verify_diagnostics_bundle(bundle_path)
+    except OSError as exc:
+        print(f"{args.prog} verify-bundle: {exc}", file=sys.stderr)
+        return 2
+    if errors:
+        for error in errors:
+            print(f"{args.prog} verify-bundle: {error}", file=sys.stderr)
+        return 1
+    print(f"Verified diagnostics bundle: {bundle_path}")
+    return 0
+
+
+def _doctor_command(args: argparse.Namespace) -> int:
+    try:
+        report = inspect_project(args.project)
+        if args.json:
+            print(_json_payload(report), end="")
+        else:
+            print(format_doctor_report(report, prog=args.prog), end="")
+    except Exception as exc:
+        print(f"{args.prog} doctor: {exc}", file=sys.stderr)
+        return 2
+    return 0 if report["status"] == "pass" else 1
 
 
 def _json_payload(value: object) -> str:

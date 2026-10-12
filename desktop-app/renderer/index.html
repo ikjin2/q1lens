@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'none'; worker-src 'self' blob:; object-src 'none'; base-uri 'none'">
+  <title>Q1Lens · Signal workspace</title>
+  <link rel="stylesheet" href="app.css">
+  <script defer src="../dist/renderer.js"></script>
+</head>
+<body>
+  <main class="app">
+    <header class="app-header">
+      <div class="brand">
+        <svg class="brand-mark" viewBox="0 0 32 32" fill="none" aria-hidden="true"><rect x="1" y="1" width="30" height="30" rx="9" stroke="currentColor"/><path d="M6 17h5l3-9 4 16 3-7h5" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+        <span>Q1Lens<span class="brand-caption">SIGNAL WORKSPACE</span></span>
+      </div>
+      <div class="project-heading"><span class="project-indicator"></span><span id="project-name">Opening workspace…</span><span class="local-badge">LOCAL</span></div>
+      <div class="app-actions">
+        <button id="open-demo" class="quiet" type="button">Demo</button>
+        <button id="reanalyze" class="quiet" type="button" disabled title="Analyze the current project again">↻ <span>Reanalyze</span></button>
+        <button id="open-project" class="primary" type="button"><span aria-hidden="true">＋</span> Open project</button>
+      </div>
+    </header>
+
+    <div id="error-banner" class="error-banner" role="alert" hidden><div><strong>Couldn't complete that action</strong><pre id="error-message"></pre></div><button id="dismiss-error" type="button" aria-label="Dismiss error">×</button></div>
+
+    <div class="workspace">
+      <section class="timeline-panel" aria-label="Signal timeline">
+        <header class="panel-header">
+          <div><div class="eyebrow">SEQUENCER TIMELINE</div><h1>See the whole sequence.</h1></div>
+          <div class="mode-switch" role="group" aria-label="Timeline view">
+            <button id="normal-mode" type="button" aria-pressed="true" title="One compact row per sequencer">Overview</button>
+            <button id="showcase-mode" type="button" aria-pressed="false" title="Emphasize feedback routes and signal exchanges">Flow</button>
+            <button id="debug-mode" type="button" aria-pressed="false" title="Include instruction issue, queue and slack lanes">Debug</button>
+          </div>
+        </header>
+        <div class="timeline-legend" aria-label="Event colors">
+          <span><i class="dot pulse"></i>Pulse</span><span><i class="dot acquire"></i>Acquisition</span><span><i class="dot feedback"></i>Feedback</span><span><i class="dot timing"></i>Uncertain timing</span>
+          <span class="legend-hint">Scroll to zoom · Drag to pan</span>
+        </div>
+        <div class="stage-shell">
+          <div id="pixi-stage" tabindex="0" aria-label="Interactive timeline. Space to play or pause, F to fit, Home to reset. Scroll to zoom; shift-scroll to move vertically."></div>
+          <div id="loading-overlay" class="loading-overlay"><div class="loading-orbit"></div><strong id="loading-label">Preparing your workspace</strong><span>Reading the sequence and connecting the lanes.</span></div>
+        </div>
+        <div class="transport" aria-label="Playback controls">
+          <button id="playback-toggle" class="play-button" type="button" aria-pressed="false" disabled>Play</button>
+          <div class="scrubber-wrap"><div class="time-labels"><output id="playhead-time">0 ns</output><span id="time-extent">—</span></div><input id="timeline-scrubber" type="range" min="0" max="1000" step="1" value="0" aria-label="Timeline position" disabled></div>
+          <label class="speed-control"><span class="sr-only">Playback speed</span><select id="playback-speed" aria-label="Playback speed"><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option></select></label>
+          <span class="transport-divider"></span>
+          <button id="fit-all" class="quiet" type="button" title="Fit time range (F)">Fit <kbd>F</kbd></button>
+          <button id="reset-view" class="icon-button" type="button" title="Reset view and playhead (Home)" aria-label="Reset view">↺</button>
+        </div>
+      </section>
+
+      <aside class="side-panel" aria-label="Timeline inspector">
+        <section class="run-overview">
+          <div class="section-heading"><h2>Run overview</h2><span id="run-status" class="status-pill">LOADING</span></div>
+          <div class="metric-grid"><div><strong id="metric-sequencers">—</strong><span>Sequencers</span></div><div><strong id="metric-events">—</strong><span>Events</span></div><div><strong id="metric-feedback">—</strong><span>Routes</span></div></div>
+          <div class="project-file" id="project-path">Loading demo project</div>
+        </section>
+        <section class="selection-panel">
+          <div class="section-heading"><h2>Inspector</h2><span class="eyebrow">SELECTION</span></div>
+          <h3 id="selection-title">Explore a signal</h3>
+          <div id="selection-empty" class="selection-empty"><svg viewBox="0 0 200 70" fill="none" aria-hidden="true"><path d="M0 35h200" stroke="#263140" stroke-dasharray="3 5"/><path d="M20 35h30V19h45v16h20v16h40V35h25" stroke="#55d6f4" stroke-width="2"/><circle cx="95" cy="19" r="5" fill="#55d6f4"/><circle cx="95" cy="19" r="12" stroke="#55d6f4" opacity=".2"/></svg><p>Select a pulse or feedback route to inspect its timing and source.</p></div>
+          <div id="inspector-details" aria-live="polite"></div>
+        </section>
+        <section class="diagnostics-panel"><div class="section-heading"><h2>Analysis notes</h2><span id="diagnostic-count" class="note-count">0</span></div><div id="diagnostic-summary">Waiting for analysis.</div></section>
+        <div class="keyboard-hints"><span><kbd>Space</kbd> Play / pause</span><span><kbd>Shift</kbd> + scroll to move vertically</span></div>
+      </aside>
+    </div>
+
+    <footer class="status-bar"><span class="status-light"></span><span id="load-status" role="status">Starting Q1Lens</span><span id="fps-meter">FPS —</span><button id="select-python" class="python-button" type="button" title="Choose the Python interpreter for analysis"><span class="python-dot"></span><span id="python-label">Python</span><span aria-hidden="true">⌄</span></button></footer>
+  </main>
+  <div id="pixi-tooltip" role="tooltip" hidden></div>
+</body>
+</html>

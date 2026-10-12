@@ -11,6 +11,12 @@ class _SafeFormatDict(UserDict):
 
 
 DIAGNOSTIC_PRESENTATIONS: dict[str, dict[str, str]] = {
+    "acquisition_bin_reuse": {
+        "group": "Hardware Readiness",
+        "title": "Concrete acquisition bin is reused",
+        "summary": "{message}",
+        "fix": "Confirm that repeated writes or accumulation into this acquisition bin are intentional.",
+    },
     "alignment_missing": {
         "group": "Alignment",
         "title": "Alignment anchor was not found",
@@ -185,6 +191,12 @@ DIAGNOSTIC_PRESENTATIONS: dict[str, dict[str, str]] = {
         "summary": "The RT queue slack is {slack_ns} ns after a sync or trigger, so underflow depends on runtime alignment.",
         "fix": "Increase the wait gap or inspect the sync/trigger relationship around this packet.",
     },
+    "pending_hardware_state": {
+        "group": "Hardware Readiness",
+        "title": "Hardware state is left pending",
+        "summary": "{message}",
+        "fix": "Apply the pending state with an RT instruction before the program ends.",
+    },
     "q1asm_read_error": {
         "group": "Project Config",
         "title": "Could not read Q1ASM file",
@@ -202,6 +214,12 @@ DIAGNOSTIC_PRESENTATIONS: dict[str, dict[str, str]] = {
         "title": "Timing depends on runtime data",
         "summary": "{message}",
         "fix": "Inspect the runtime-dependent branch or value and validate timing on hardware if needed.",
+    },
+    "scope_without_acquisition": {
+        "group": "Hardware Readiness",
+        "title": "Scope is enabled without a later acquisition",
+        "summary": "{message}",
+        "fix": "Add the intended acquisition or disable scope acquisition before program end.",
     },
     "symbolic_duration": {
         "group": "Timing",

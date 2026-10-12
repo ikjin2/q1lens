@@ -1,0 +1,11 @@
+analysis:
+  execution_mode: simulation
+alignment:
+  mode: none
+simulation:
+  startup_delay_ns: 20
+  max_time_ns: 1000
+sequencers:
+  - id: starved
+    module: QCM0
+    file: starved.q1asm

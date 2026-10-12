@@ -294,6 +294,22 @@ describe("diagnosticsCore", () => {
     }
   });
 
+  it("normalizes local timestamps for after_first_wait_sync without applying display metadata twice", () => {
+    const ir = syncAlignedIr(8, 200);
+    const timeline: any = ir.q1timeline_ir;
+    timeline.alignment.seq0.mode = "after_first_wait_sync";
+    timeline.alignment.seq0.offset = -208;
+    for (const item of timeline.events) {
+      item.meta = { aligned_t0: item.t0.value - 208, aligned_t1: item.t1.value - 208 };
+    }
+    const before = JSON.stringify(timeline);
+    assert.deepEqual(crossLayerWarnings(ir), []);
+    assert.equal(JSON.stringify(timeline), before);
+    timeline.events[timeline.events.length - 1].t0.value += 4;
+    timeline.events[timeline.events.length - 1].t1.value += 4;
+    assert.match(crossLayerWarnings(ir)[0].message, /QBS 20-40 ns, q1timeline 24-44 ns/);
+  });
+
   it("continues to report an extra 4 ns wait after synchronization", () => {
     const diagnostics = crossLayerWarnings(syncAlignedIr(8, 200, 24));
     assert.equal(diagnostics.length, 1);

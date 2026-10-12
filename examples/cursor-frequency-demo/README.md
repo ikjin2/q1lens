@@ -1,6 +1,8 @@
 # Cursor Frequency Demo
 
-For an implementation-level explanation of the hardware topology, timing equations, tracking law, gain and frequency mappings, and acquisition semantics, see [`TECHNICAL_GUIDE.md`](./TECHNICAL_GUIDE.md).
+For offline simulation profiles, expected values and an editor walkthrough, see
+the [verification workspace](./verification/README.md). These checks use synthetic
+inputs and do not connect to hardware.
 
 This q1asm demo shows one feedback loop as a compact oscilloscope story:
 

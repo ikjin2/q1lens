@@ -48,7 +48,9 @@
     "workspaceContains:**/*.q1asm",
     "workspaceContains:**/*.ipynb",
     "workspaceContains:**/q1timeline.yml",
-    "onView:qbsTimeline.sidebar"
+    "onView:qbsTimeline.sidebar",
+    "onCommand:q1timeline.saveComparisonBaseline",
+    "onCommand:q1timeline.clearComparisonBaseline"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -140,6 +142,14 @@
       {
         "command": "q1timeline.revealCurrentLineInTimeline",
         "title": "Q1Lens: Reveal Current Line in Timeline"
+      },
+      {
+        "command": "q1timeline.saveComparisonBaseline",
+        "title": "Q1Lens: Save Timeline Comparison Baseline"
+      },
+      {
+        "command": "q1timeline.clearComparisonBaseline",
+        "title": "Q1Lens: Clear Timeline Comparison Baseline"
       }
     ],
     "languages": [
@@ -492,6 +502,28 @@
           "default": 10000,
           "minimum": 1,
           "description": "Legacy event count threshold for q1timeline simplification warnings."
+        },
+        "q1lens.q1timeline.executionMode": {
+          "type": "string",
+          "enum": [
+            "project",
+            "analysis",
+            "concrete",
+            "simulation"
+          ],
+          "default": "project",
+          "description": "Execution mode for Q1ASM previews. Project uses q1timeline.yml. Analysis provides compact previews; concrete executes bounded loops with analytical timing; simulation models RT queues, input events and configured signals. Refresh the preview after changing this setting."
+        },
+        "q1lens.q1timeline.maxSteps": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 10000,
+          "description": "Maximum instructions per sequencer when executionMode overrides the project. Project mode uses analysis.max_steps from q1timeline.yml."
+        },
+        "q1lens.q1timeline.hardwareReadiness": {
+          "type": "boolean",
+          "default": false,
+          "description": "Run conservative hardware-readiness checks during Q1ASM timeline analysis."
         }
       }
     },
@@ -528,7 +560,8 @@
     "test:extension": "npm run compile && npm run bundle && node ./out/test/runTest.js",
     "package": "vsce package",
     "verify:installed": "node ./scripts/verify-installed-assets.js",
-    "reinstall:local": "npm run package && code --install-extension q1lens-0.1.2.vsix --force && npm run verify:installed"
+    "reinstall:local": "npm run package && code --install-extension q1lens-0.1.2.vsix --force && npm run verify:installed",
+    "test:browser": "playwright test"
   },
   "dependencies": {
     "yaml": "^2.5.0"
@@ -544,6 +577,7 @@
     "@vscode/vsce": "^3.9.2",
     "esbuild": "^0.28.1",
     "mocha": "^11.7.6",
-    "typescript": "^5.5.4"
+    "typescript": "^5.5.4",
+    "@playwright/test": "1.63.0"
   }
 }

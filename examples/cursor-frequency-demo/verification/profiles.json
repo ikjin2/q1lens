@@ -1,0 +1,12 @@
+{
+  "two-shot-feedback": {
+    "description": "Synthetic IQ: move the tracker right in shot 1 and left in shot 2; observe shot 1 feedback on shot 2 outputs.",
+    "trigger_times_ns": [1000, 40000],
+    "iq_after_shift": [[6000, -1000], [8000, -1000], [9000, -1000], [5000, -1000]]
+  },
+  "deadband-hold": {
+    "description": "Synthetic IQ: positive and negative slopes remain inside the configured deadband; the tracker holds position.",
+    "trigger_times_ns": [1000, 40000],
+    "iq_after_shift": [[6000, -1000], [6032, -1000], [6032, -1000], [6000, -1000]]
+  }
+}

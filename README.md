@@ -218,13 +218,76 @@ artifacts:
 
 ## Development
 
+### Review and execution workflows
+
+The following workflows are available from the source checkout. Published Python
+and VS Code packages are updated separately.
+
+Run a read-only project preflight before executing a schedule:
+
+```console
+q1lens doctor --project qbstimeline.yml
+q1lens doctor --project qbstimeline.yml --json
+```
+
+Doctor checks configuration, source entrypoints or notebook prerequisites, and
+the configured output location without importing or executing project code.
+It returns `0` when the required checks pass, `1` for failed checks, and `2` for
+usage or runtime errors.
+
+To collect an existing diagnosis, pass `--bundle diagnostics.zip` to
+`q1lens diagnose`, then run `q1lens verify-bundle --bundle diagnostics.zip`.
+Bundles can include source files, IR, generated Q1ASM and environment details.
+Inspect the contents before sharing. Manifest hashes detect corruption;
+they do not authenticate the origin of a bundle.
+
+In the timeline, **Save Comparison Baseline** retains a reference across analyses.
+Changed blocks show before/after values, and the comparison status identifies
+the active baseline. Provenance coverage buttons locate Compiler, Inferred and
+Unmapped blocks, with their mapping evidence and Q1ASM preview. Available Q1ASM
+Quick Fixes check that the saved source still matches the diagnostic.
+
+For bounded register, loop and branch execution, configure a Q1ASM project:
+
+```yaml
+analysis:
+  execution_mode: concrete
+  max_steps: 10000
+```
+
+Use `--execution-mode concrete --max-steps 10000` to override those values on the
+CLI. In VS Code, `q1lens.q1timeline.executionMode: project` follows the project
+configuration; explicit execution modes use `q1lens.q1timeline.maxSteps`.
+Concrete mode executes sequencers independently. Missing inputs produce
+`blocked` and long-running programs produce `step_limit`, retaining a partial trace.
+
+Use `execution_mode: simulation` for shared Q1/RT timing, finite queues,
+synchronization and configured feedback inputs. Optional numerical signal models
+calculate waveform stages and acquisition results. The Hardware view exposes
+register history, pending/applied parameters, queues, signals, bins and recorded
+execution replay. See the [simulation reference](docs/simulation.md),
+[concrete register example](examples/concrete-register-execution/README.md), and
+[simulation examples](examples/simulation-verification/README.md).
+
+TimelineIR includes a `critical_path` result. Add `--hardware-readiness` when
+analyzing Q1ASM to include conservative hardware-readiness checks as well.
+Incomplete or invalid inputs remain explicit. A completed execution or exact
+critical path describes the selected analysis model, not a hardware measurement.
+
+The [desktop workbench](desktop-app/README.md) provides a local Electron/Pixi
+timeline using the same Python analysis. For reproducible checks, see
+[continuous validation](docs/ci-validation.md) and the
+[cursor-frequency verification guide](examples/cursor-frequency-demo/verification/README.md).
+
+### Build and test
+
 Python:
 
 ```console
 git clone https://github.com/ikjin2/q1lens.git
 cd q1lens
 uv sync --extra dev
-uv run pytest -q
+uv run pytest -q tests
 uv build
 ```
 

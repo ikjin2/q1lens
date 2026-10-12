@@ -115,6 +115,92 @@ function loadQ1TimelineLoopPreviewFunctions(script: string): Q1TimelineLoopPrevi
 }
 
 describe("timeline webview assets", () => {
+  it("shows readable before/after values and a textual status for changed events", () => {
+    const script = readFileSync(join(__dirname, "..", "src", "q1timeline", "media", "timeline.js"), "utf-8");
+    const sources = ["escapeHtml", "displayInspectorValue", "addInspectorField", "appendDiffInspectorFields"]
+      .map((name) => extractFunctionSource(script, name));
+    assert.ok(sources.every(Boolean));
+    const append = Function(`${sources.join("\n")}\nreturn appendDiffInspectorFields;`)();
+    const before = { label: "wait", t0: { value: 20 }, t1: { value: 100 }, duration: { value: 80 }, source: { raw: "wait 80" } };
+    const event = { ...before, t1: { value: 60 }, duration: { value: 40 }, source: { raw: "wait <40>" }, meta: { diff_status: "shifted", diff_before: before } };
+    const fields: string[] = [];
+    append(fields, event);
+    const html = fields.join("");
+    assert.match(html, /Shifted/);
+    assert.match(html, /Before duration \(ns\)<\/dt><dd>80/);
+    assert.match(html, /After duration \(ns\)<\/dt><dd>40/);
+    assert.match(html, /wait &lt;40&gt;/);
+    assert.doesNotMatch(html, /wait <40>/);
+    const removed: string[] = [];
+    append(removed, { ...before, meta: { diff_status: "removed" } });
+    assert.match(removed.join(""), /After<\/dt><dd>Absent/);
+    const unchanged: string[] = [];
+    append(unchanged, before);
+    assert.deepEqual(unchanged, []);
+    const css = readFileSync(join(__dirname, "..", "src", "q1timeline", "media", "timeline.css"), "utf-8");
+    for (const status of ["added", "removed", "changed", "shifted"]) {
+      assert.ok(css.includes(`.timeline-block.diff-${status}`));
+    }
+  });
+
+  it("makes nonempty provenance legend categories keyboard-accessible navigation buttons", () => {
+    const script = readFileSync(join(__dirname, "..", "src", "qbs", "webview", "assets", "timeline.js"), "utf-8");
+    const source = extractFunctionSource(script, "renderProvenanceLegend");
+    const targets: string[] = [];
+    const element = (tag: string, className: string, text?: string): any => ({
+      tag, className, text, dataset: {}, children: [], attributes: {},
+      setAttribute(name: string, value: string) { this.attributes[name] = value; },
+      appendChild(child: any) { this.children.push(child); },
+    });
+    const render = Function("element", "button", "revealProvenance", `${source}\nreturn renderProvenanceLegend;`)(
+      element, (className: string, text: string, click: () => void) => ({ ...element("button", className, text), click }),
+      (status: string) => targets.push(status),
+    );
+    const legend = render({ ariaLabel: "coverage", entries: [
+      { status: "compiler", label: "Compiler", count: 2 },
+      { status: "unmapped", label: "Unmapped", count: 0 },
+    ] });
+    const items = legend.children[1].children;
+    const first = items[0].children[0];
+    assert.equal(first.tag, "button");
+    first.click();
+    assert.deepEqual(targets, ["compiler"]);
+    assert.equal(items[1].children[0].disabled, true);
+  });
+
+  it("reveals and focuses provenance targets after clearing an unrelated viewport", () => {
+    const script = readFileSync(join(__dirname, "..", "src", "qbs", "webview", "assets", "timeline.js"), "utf-8");
+    const source = extractFunctionSource(script, "revealProvenance");
+    const target = { dataset: { blockId: "pulse:test" }, focus: () => { focused = true; }, scrollIntoView: () => { scrolled = true; } };
+    let focused = false;
+    let scrolled = false;
+    const reveal = Function("root", "timelineModel", `${source}
+      let currentIr = {}, selectedId = null, viewport = { start: 0, end: 1 }, selectionRange = {}, activeInspectorTab = "summary";
+      const expandedGroups = new Set();
+      let renderedId;
+      const render = (_ir, id) => { renderedId = id; };
+      revealProvenance("inferred");
+      return { viewport, selectionRange, activeInspectorTab, expandedGroups: [...expandedGroups], renderedId };`)(
+      { querySelectorAll: () => [target] },
+      { provenanceSelection: () => ({ blockId: "pulse:test", groupId: "target:q0" }) },
+    );
+    assert.deepEqual(reveal, { viewport: null, selectionRange: null, activeInspectorTab: "lowering", expandedGroups: ["target:q0"], renderedId: "pulse:test" });
+    assert.ok(focused && scrolled);
+    assert.match(extractFunctionSource(script, "renderBlock") || "", /node\.dataset\.blockId = block\.id/);
+  });
+
+  it("distinguishes the displayed baseline from a pending save or clear", () => {
+    const script = readFileSync(join(__dirname, "..", "src", "q1timeline", "media", "timeline.js"), "utf-8");
+    const source = extractFunctionSource(script, "renderComparisonStatus");
+    const node = { textContent: "", title: "" };
+    const render = Function("document", `${source}\nreturn renderComparisonStatus;`)({ getElementById: () => node });
+    render({ mode: "saved", nextMode: "previous", pending: true });
+    assert.match(node.textContent, /Current comparison: saved baseline/);
+    assert.match(node.textContent, /Next analysis: previous analysis. Reanalyze/);
+    render({ mode: "previous" });
+    assert.equal(node.textContent, "Current comparison: previous analysis.");
+  });
+
   it("defines the shared renderer asset contract", () => {
     const sharedRenderer = readFileSync(join(__dirname, "..", "src", "shared", "timeline", "renderer.js"), "utf-8");
     const sharedCss = readFileSync(join(__dirname, "..", "src", "shared", "timeline", "renderer.css"), "utf-8");
@@ -505,6 +591,21 @@ describe("timeline webview assets", () => {
     assert.equal(playBlocks[0].eventId, "seq0:play:p0");
     assert.deepEqual(playBlocks[0].eventIds, ["seq0:play:p0", "seq0:play:p1"]);
     assert.deepEqual(playBlocks[0].domain.meta.play_paths.map((path: any) => path.label), ["wf0", "wf1"]);
+  });
+
+  it("keeps changed and removed play paths independently selectable from unchanged paths", () => {
+    const adapter = require(join(__dirname, "..", "src", "q1timeline", "media", "timelineAdapter.js"));
+    const makeEvent = (path: number, status?: string) => ({
+      id: `seq0:p${path}`, sequencer_id: "seq0", lane: `rt.path${path}`, kind: "play",
+      t0: { value: 0 }, t1: { value: 40 }, duration: { value: 40 },
+      source: { file: "seq0.q1asm", line: 1 }, meta: { path, rt_packet_id: "packet", diff_status: status },
+    });
+    for (const status of ["changed", "removed"]) {
+      const model = adapter.buildQ1TimelineSharedModel({ events: [makeEvent(0), makeEvent(1, status)] }, { mode: "normal" });
+      const blocks = model.lanes.flatMap((lane: any) => lane.blocks);
+      assert.equal(blocks.length, 2);
+      assert.ok(blocks.find((block: any) => block.eventId === "seq0:p1").classNames.includes(`diff-${status}`));
+    }
   });
 
   it("falls back to q1timeline play path lanes when a path event cannot be merged", () => {
@@ -935,6 +1036,22 @@ describe("timeline webview assets", () => {
     assert.match(css, /\.timeline-block-q1\s*{[^}]*border-color:\s*var\(--timeline-block-accent, var\(--vscode-charts-green\)\);/s);
   });
 
+  it("renders an accessible provenance overlay, legend, and unmapped notice", () => {
+    const renderer = readFileSync(join(__dirname, "..", "src", "qbs", "webview", "assets", "timeline.js"), "utf-8");
+    const css = readFileSync(join(__dirname, "..", "src", "qbs", "webview", "assets", "timeline.css"), "utf-8");
+
+    assert.match(renderer, /node\.dataset\.provenance = block\.provenanceStatus/);
+    assert.match(renderer, /node\.setAttribute\(\s*"aria-label"/s);
+    assert.match(renderer, /function renderProvenanceLegend\(coverage\)/);
+    assert.match(renderer, /legend\.setAttribute\("aria-label", coverage\.ariaLabel\)/);
+    assert.match(renderer, /items\.setAttribute\("role", "list"\)/);
+    assert.match(renderer, /notice\.setAttribute\("role", "note"\)/);
+    assert.match(css, /\.timeline-block-pulse\[data-provenance="compiler"\]/);
+    assert.match(css, /\.timeline-block-pulse\[data-provenance="inferred"\]/);
+    assert.match(css, /\.timeline-block-pulse\[data-provenance="unmapped"\]/);
+    assert.match(css, /\.provenance-legend-item\[data-provenance="unmapped"\] \.provenance-swatch/);
+  });
+
   it("keeps zoomed-out shared micro blocks from looking overlapped", () => {
     const sharedRenderer = readFileSync(join(__dirname, "..", "src", "shared", "timeline", "renderer.js"), "utf-8");
     const sharedCss = readFileSync(join(__dirname, "..", "src", "shared", "timeline", "renderer.css"), "utf-8");
@@ -970,6 +1087,94 @@ describe("timeline webview assets", () => {
     assert.match(script, /function selectEventNode\(eventNode, options = \{\}\)/);
     assert.match(script, /options\.notify !== false/);
     assert.match(script, /selectEventNode\(target, \{ notify: false \}\)/);
+  });
+
+  it("marks hardware source jumps to preserve the readable-time cursor", () => {
+    const script = readFileSync(join(__dirname, "..", "src", "q1timeline", "media", "timeline.js"), "utf-8");
+    const hardwareInitialization = extractFunctionSource(script, "initializeHardwareView");
+    assert.match(hardwareInitialization || "", /type: "sourceClick"[^\n]+preserveHardwareCursor: true/);
+  });
+
+  it("persists local replay detail before requesting its execution trace", () => {
+    const script = readFileSync(join(__dirname, "..", "src", "q1timeline", "media", "timeline.js"), "utf-8");
+    const sources = [
+      "readPersistedWebviewState", "writePersistedWebviewState", "hasAlignedTimelineTimes",
+      "initialTimelineTimeBasis", "setTimelineTimeBasis", "initializeHardwareView",
+    ].map((name) => {
+      const source = extractFunctionSource(script, name);
+      assert.ok(source, `Missing ${name}`);
+      return source;
+    });
+    let savedState: any = {
+      timelineTimeBasis: "aligned", analysisDetailsOpen: true,
+      hardwareState: { sequencerId: "seq0", basis: "aligned", level: "modules", replayOpen: false, time: 104 },
+    };
+    let hardwareState: any;
+    let mountOptions: any;
+    const calls: any[] = [];
+    const timers = new Map<number, () => void>();
+    let nextTimer = 1;
+    const vscode = {
+      getState: () => savedState,
+      setState(state: any) {
+        savedState = JSON.parse(JSON.stringify(state));
+        calls.push({ type: "state" });
+      },
+      postMessage(message: any) {
+        calls.push({ type: "post", message, state: JSON.parse(JSON.stringify(savedState)) });
+      },
+    };
+    const window = { q1lensHardwareView: { mount(_root: any, _ir: any, options: any) {
+      mountOptions = options;
+      hardwareState = { ...options.initialState };
+      return {
+        getState: () => ({ ...hardwareState }),
+        setTimeBasis(basis: string) {
+          hardwareState.basis = basis;
+          options.onStateChange({ ...hardwareState });
+        },
+      };
+    } } };
+    const document = {
+      getElementById: () => ({ before: () => {} }),
+      createElement: () => ({ setAttribute: () => {} }),
+    };
+    const functions = Function("vscode", "window", "document", "setTimeout", "clearTimeout", `
+      const timelineIr = { events: [{ id: "q1", meta: { aligned_t0: 100, aligned_t1: 104 } }] };
+      const timelineEventsById = new Map(timelineIr.events.map(event => [event.id, event]));
+      let hardwareView, hardwarePersistTimer;
+      function renderHardwareCursor() {}
+      function renderTimeBasisToggle() {}
+      function resetTimelineZoom() {}
+      ${sources.join("\n")}
+      let timelineTimeBasis = initialTimelineTimeBasis();
+      return { initializeHardwareView, timeBasis: () => timelineTimeBasis };
+    `)(vscode, window, document,
+      (callback: () => void) => { const id = nextTimer++; timers.set(id, callback); return id; },
+      (id: number) => timers.delete(id));
+
+    assert.equal(functions.timeBasis(), "aligned");
+    functions.initializeHardwareView();
+    hardwareState = { ...hardwareState, level: "detail", replayOpen: true, sequencerId: "seq0" };
+    mountOptions.onStateChange({ ...hardwareState });
+    assert.equal(timers.size, 1);
+    mountOptions.onPrepareReplay("seq0");
+
+    assert.equal(functions.timeBasis(), "local");
+    assert.equal(timers.size, 0);
+    assert.deepEqual(calls.map((call) => call.type), ["state", "state", "post"]);
+    assert.deepEqual(calls[2].message, { type: "prepareExecutionReplay", sequencerId: "seq0" });
+    assert.deepEqual(calls[2].state, {
+      timelineTimeBasis: "local", analysisDetailsOpen: true,
+      hardwareState: { sequencerId: "seq0", basis: "local", level: "detail", replayOpen: true, time: 104 },
+    });
+    hardwareState.replayScope = "project";
+    mountOptions.onPrepareReplay("seq0", "project");
+    const projectRequest = calls[calls.length - 1];
+    assert.deepEqual(projectRequest.message, { type: "prepareExecutionReplay", sequencerId: "seq0", scope: "project" });
+    assert.equal(projectRequest.state.timelineTimeBasis, "local");
+    assert.equal(projectRequest.state.hardwareState.replayScope, "project");
+    assert.equal(projectRequest.state.hardwareState.replayOpen, true);
   });
 
   it("chooses a visible q1timeline event for programmatic highlights", () => {

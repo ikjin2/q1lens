@@ -3,6 +3,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 from qbstimeline.cli import main
 
 
@@ -10,6 +12,19 @@ def _clear_q1timeline_modules() -> None:
     for name in list(sys.modules):
         if name == "q1timeline" or name.startswith("q1timeline."):
             sys.modules.pop(name, None)
+
+
+@pytest.fixture(autouse=True)
+def _restore_q1timeline_modules():
+    # These import-isolation tests must not leave later lazy imports with a
+    # second copy of Value/Program classes already imported during collection.
+    original = {name: module for name, module in sys.modules.items()
+                if name == "q1timeline" or name.startswith("q1timeline.")}
+    try:
+        yield
+    finally:
+        _clear_q1timeline_modules()
+        sys.modules.update(original)
 
 
 def test_q1timeline_subcommand_uses_bundled_cli_before_configured_path(

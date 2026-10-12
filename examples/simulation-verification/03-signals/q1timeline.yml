@@ -1,0 +1,48 @@
+analysis:
+  execution_mode: simulation
+alignment:
+  mode: none
+simulation:
+  startup_delay_ns: 200
+  max_time_ns: 5000
+  routes:
+    - source: readout
+      target: controller
+      id: 5
+      latency_ns: 20
+  physical:
+    sample_period_ns: 1
+    max_samples: 5000
+    max_export_samples: 2000
+    seed: 1234
+    sequencers:
+      drive:
+        dac_bits: 16
+        fir: [0.5, 0.5]
+        iir:
+          b: [0.5]
+          a: [1, -0.5]
+        lo_frequency_hz: 5000000000
+      readout:
+        adc_bits: 12
+        integration_length_ns: 64
+        # Integral threshold: 0.25 full scale * 64 ns.
+        threshold: 16
+        input:
+          kind: loopback
+          sequencer: drive
+          delay_ns: 0
+          gain: 1
+          noise_std: 0
+sequencers:
+  - id: drive
+    module: QCM_RF0
+    file: drive.q1asm
+    sequence_json: drive.sequence.json
+  - id: readout
+    module: QRM_RF0
+    file: readout.q1asm
+    sequence_json: readout.sequence.json
+  - id: controller
+    module: QCM0
+    file: controller.q1asm

@@ -1,0 +1,8 @@
+wait_sync 4
+wait 800
+fb_pop_data 5,R0
+nop
+# Threshold packet: bit 1 is valid, bit 0 is the threshold result.
+and R0,1,R1
+nop
+stop

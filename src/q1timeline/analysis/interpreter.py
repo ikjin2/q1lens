@@ -47,6 +47,12 @@ _CLASSICAL_REGISTER_MASK = 0xFFFFFFFF
 _REGISTER_MAX_INDEX = 63
 _RT_DURATION_MAX = 65535
 _WRAPPING_CLASSICAL_OPS = {"add", "sub", "and", "or", "xor", "asl", "asr", "lsl", "lsr"}
+_CONCRETE_OPS = {
+    "nop", "stop", "move", "not", "cmp", "test", *_WRAPPING_CLASSICAL_OPS,
+    "jmp", "jlt", "jge", "loop", *STATUS_BRANCH_OPS,
+    "set_mrk", "set_freq", "reset_ph", "set_ph", "set_ph_delta", "set_awg_gain", "set_awg_offs",
+    "set_digital", "set_scope_en", "wait", "wait_sync", "upd_param", "play", "acquire",
+}
 
 
 @dataclass(frozen=True)
@@ -80,12 +86,26 @@ class RtPacket:
 
 
 @dataclass(frozen=True)
+class RegisterWrite:
+    sequencer_id: str
+    register: str
+    time: Value
+    value: Value
+    source: SourceLocation
+    event_id: str | None
+    confidence: Confidence
+    meta: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class PendingRegisterWrite:
     register: str
     value: Value
     provenance: dict[str, Any]
     source: SourceLocation
     available_issue_index: int
+    event_id: str
+    meta: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -120,6 +140,7 @@ class AnalysisState:
     symbol_origins: dict[str, Any] = field(default_factory=dict)
     register_provenance: dict[str, dict[str, Any]] = field(default_factory=dict)
     pending_register_writes: list[PendingRegisterWrite] = field(default_factory=list)
+    register_history: list[RegisterWrite] = field(default_factory=list)
     current_resolved_args: list[dict[str, Any]] = field(default_factory=list)
     feedback_acq_channel: str | None = None
     feedback_acq_data_type: str | None = None
@@ -135,6 +156,8 @@ class AnalysisState:
     branch_explore_depth: int = 0
     loop_preview_counts: dict[str, int] = field(default_factory=dict)
     strict_q1asm: bool = False
+    execution_mode: Literal["analysis", "concrete"] = "analysis"
+    has_expanded_instructions: bool = False
 
 
 def interpret_program(
@@ -148,7 +171,13 @@ def interpret_program(
     branch_assumptions: Mapping[str, str] | None = None,
     loop_preview_counts: Mapping[str, int] | None = None,
     strict_q1asm: bool = False,
+    execution_mode: Literal["analysis", "concrete"] = "analysis",
+    max_steps: int = 10000,
 ) -> AnalysisState:
+    if not isinstance(execution_mode, str) or execution_mode not in {"analysis", "concrete"}:
+        raise ValueError(f"Invalid execution mode: {execution_mode}")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps < 1:
+        raise ValueError("max_steps must be a positive integer")
     register_aliases = _register_aliases(program.defs)
     state = AnalysisState(
         sequencer_id=sequencer_id,
@@ -159,6 +188,7 @@ def interpret_program(
         branch_assumptions=_normalise_branch_assumptions(branch_assumptions),
         loop_preview_counts=_normalise_loop_preview_counts(loop_preview_counts),
         strict_q1asm=strict_q1asm,
+        execution_mode=execution_mode,
     )
     state.diagnostics.extend(program.diagnostics)
     if strict_q1asm:
@@ -172,10 +202,160 @@ def interpret_program(
     symbols.update(resolved_defs)
 
     state.pc = 0
-    _run_program_loop(state, symbols, waveform_names or {}, acquisition_names or {})
-    _flush_pending_register_writes(state)
-    _diagnose_static_register_read_hazards(state, program)
+    if execution_mode == "concrete":
+        _run_concrete_program(state, symbols, waveform_names or {}, acquisition_names or {}, max_steps)
+        _apply_ready_register_writes(state)
+    else:
+        _run_program_loop(state, symbols, waveform_names or {}, acquisition_names or {})
+        _flush_pending_register_writes(state)
+        _diagnose_static_register_read_hazards(state, program)
     return state
+
+
+def _end_concrete_execution(state: AnalysisState, status: str, reason: str, instruction: Instr | None = None) -> None:
+    state.metadata["execution"].update(status=status, reason=reason, pc=state.pc)
+    state.stopped = True
+    source = instruction.source if instruction is not None else None
+    if source is not None:
+        state.metadata["execution"]["source"] = _source_to_json(source)
+    state.diagnostics.append(Diagnostic(
+        severity="error" if status == "error" else "warning",
+        category="analysis_incomplete" if status != "error" else "invalid_argument_value",
+        message=f"{state.metadata['execution']['mode'].capitalize()} execution {status}: {reason}",
+        source=source,
+        details={"execution_status": status, "pc": state.pc},
+    ))
+
+
+def _run_concrete_program(
+    state: AnalysisState,
+    symbols: SymbolTable,
+    waveform_names: dict[int, str],
+    acquisition_names: dict[int, str],
+    max_steps: int,
+) -> None:
+    execution = state.metadata["execution"] = {
+        "mode": "concrete", "status": "completed", "steps": 0, "max_steps": max_steps,
+        "timing_model": "analytical", "address_model": "source_instruction_index",
+        "assumptions": [
+            "Sequencers execute independently; wait_sync uses a local timing origin.",
+            "Q1/RT timing is analytical; queue backpressure and external feedback are not simulated.",
+            "PC values index source instructions; assembler instruction expansion is not modeled.",
+        ],
+    }
+    state.has_expanded_instructions = any(
+        instruction.op in {"loop", "jlt"} or (instruction.op == "jge" and len(instruction.args) == 3)
+        for instruction in state.instructions_by_pc.values()
+    )
+    errors = [diagnostic for diagnostic in state.diagnostics if diagnostic.severity == "error" and diagnostic.category != "unresolved_symbol"]
+    if errors:
+        _end_concrete_execution(state, "error", errors[0].message)
+        return
+    while not state.stopped:
+        _apply_ready_register_writes(state)
+        instruction = state.instructions_by_pc.get(state.pc)
+        if instruction is None:
+            _end_concrete_execution(state, "error", "Execution reached a PC without an instruction or stop.")
+            break
+        if execution["steps"] >= max_steps:
+            _end_concrete_execution(state, "step_limit", f"Reached the {max_steps} instruction limit.", instruction)
+            break
+        state.next_pc = state.pc + 1
+        scope = _scope(symbols, state)
+        reads = {
+            register: value_to_json(resolve_arg_value(Arg("reg", register, register), scope))
+            for _, register in _register_read_operands(instruction, state)
+        }
+        flags_before = dict(state.alu_flags) if state.alu_flags is not None else None
+        event_start = len(state.events)
+        state.current_resolved_args = _resolved_args_for_instruction(instruction, scope, state)
+        try:
+            _execute_instruction(state, instruction, symbols, waveform_names, acquisition_names)
+        finally:
+            state.current_resolved_args = []
+        if execution["status"] != "completed":
+            break
+        for event in state.events[event_start:]:
+            if event.kind == "q1_issue":
+                event.meta.update(
+                    source_pc=instruction.pc, execution_index=execution["steps"], register_reads=reads,
+                    flags_before=flags_before,
+                    flags_after=dict(state.alu_flags) if state.alu_flags is not None else None,
+                )
+        state.executed_pcs.add(state.pc)
+        state.q1_issue_index += 1
+        execution["steps"] += 1
+        state.pc = state.next_pc
+
+
+def _concrete_instruction_ready(
+    state: AnalysisState, instruction: Instr, symbols: SymbolTable,
+    spec: InstructionSpec, has_invalid_arguments: bool, diagnostic_start: int,
+    *, supported_ops: set[str] | None = None,
+) -> bool:
+    diagnostics = state.diagnostics[diagnostic_start:]
+    errors = [item for item in diagnostics if (item.severity == "error" and item.category != "unresolved_symbol") or item.category == "register_not_ready"]
+    if errors:
+        reason = errors[0].message
+        _end_concrete_execution(state, "error", reason, instruction)
+        return False
+    if instruction.op not in (_CONCRETE_OPS if supported_ops is None else supported_ops):
+        status = "error" if spec.category == "unknown" or instruction.op == "illegal" else "blocked"
+        _end_concrete_execution(state, status, f"{instruction.op} has no supported concrete execution semantics.", instruction)
+        return False
+    target_index = (1 if instruction.op == "loop" else 2 if len(instruction.args) == 3 else 0) if spec.category == "branch" else None
+    if state.has_expanded_instructions:
+        uses_numeric_target = target_index is not None and instruction.args[target_index].kind != "label"
+        uses_label_value = any(arg.kind == "label" and index != target_index for index, arg in enumerate(instruction.args))
+        if uses_numeric_target or uses_label_value:
+            _end_concrete_execution(
+                state, "blocked",
+                "Compiled instruction-address mapping is unsupported for numeric/register branch targets "
+                "or label values in programs containing expanded loop/jlt/jge instructions.", instruction,
+            )
+            return False
+    scope = _scope(symbols, state)
+    destinations = _register_destination_argument_indexes(instruction.op)
+    for index, arg in enumerate(instruction.args):
+        if index in destinations:
+            continue
+        value = resolve_arg_value(arg, scope)
+        if not isinstance(value, Concrete):
+            status = "error" if arg.kind == "label" else "blocked"
+            _end_concrete_execution(state, status, f"Operand {arg.raw} is unresolved: {value}.", instruction)
+            return False
+    if has_invalid_arguments:
+        _end_concrete_execution(state, "error", "Invalid instruction operands.", instruction)
+        return False
+    if spec.category == "latched":
+        for index, role, lower, upper in _official_operand_ranges(instruction.op):
+            arg = instruction.args[index]
+            if _register_name(arg, state) is None:
+                continue
+            value = _latched_operand_value(instruction.op, arg, scope, state)
+            if not lower <= value.value <= upper:
+                _end_concrete_execution(
+                    state, "blocked",
+                    f"{instruction.op} register {arg.raw} decodes to {value.value}, outside the supported "
+                    f"{role} range {lower}..{upper}; truncation or wrapping is not modeled.", instruction,
+                )
+                return False
+    if spec.category == "branch":
+        target = resolve_arg_value(instruction.args[target_index], scope)
+        if target.value not in state.instructions_by_pc:
+            _end_concrete_execution(state, "error", f"Branch target PC {target.value} has no instruction.", instruction)
+            return False
+    if instruction.op in STATUS_BRANCH_OPS or (instruction.op == "jge" and len(instruction.args) == 1):
+        if state.alu_flags is None:
+            _end_concrete_execution(state, "blocked", "Branch status flags are unknown.", instruction)
+            return False
+    if instruction.op in {"asl", "asr", "lsl", "lsr"}:
+        _, shift_arg = _docs_ordered_binary_args(instruction, state)
+        shift = resolve_arg_value(shift_arg, scope)
+        if not 0 <= shift.value <= 32:
+            _end_concrete_execution(state, "blocked", "Shift count is outside the supported range 0..32.", instruction)
+            return False
+    return True
 
 
 def _run_program_loop(
@@ -289,13 +469,11 @@ def _arg_symbol_lookup_names(arg: Arg) -> list[str]:
     return [name]
 
 
-def _execute_instruction(
+def _validate_instruction(
     state: AnalysisState,
     instruction: Instr,
     symbols: SymbolTable,
-    waveform_names: dict[int, str],
-    acquisition_names: dict[int, str],
-) -> None:
+) -> tuple[InstructionSpec, bool, int]:
     spec = get_instruction_spec(instruction.op)
     diagnostic_start = len(state.diagnostics)
     validation_diagnostics = spec.validate(instruction)
@@ -338,6 +516,23 @@ def _execute_instruction(
         instruction,
         symbols,
     ) or has_invalid_arguments
+
+    return spec, has_invalid_arguments, diagnostic_start
+
+
+def _execute_instruction(
+    state: AnalysisState,
+    instruction: Instr,
+    symbols: SymbolTable,
+    waveform_names: dict[int, str],
+    acquisition_names: dict[int, str],
+) -> None:
+    spec, has_invalid_arguments, diagnostic_start = _validate_instruction(state, instruction, symbols)
+
+    if state.execution_mode == "concrete" and not _concrete_instruction_ready(
+        state, instruction, symbols, spec, has_invalid_arguments, diagnostic_start,
+    ):
+        return
 
     q1_t0 = state.q1_time_ns
     q1_duration = Concrete(spec.q1_time_model(_instruction_for_q1_timing(instruction, state, symbols)))
@@ -402,7 +597,20 @@ def _execute_instruction(
     q1_issue_event = _emit_q1_issue(state, instruction, q1_t0, q1_t1, rt_packet_id)
 
     if spec.category == "branch":
+        if state.execution_mode == "concrete":
+            _execute_concrete_branch(state, instruction, q1_issue_event, symbols)
+            return
         _execute_branch(state, instruction, q1_issue_event, symbols, waveform_names, acquisition_names)
+        if state.stopped:
+            _flush_pending_register_writes(state, completed_issue_index=state.q1_issue_index + 1)
+            _invalidate_register_history(
+                state,
+                set(state.registers),
+                source=instruction.source,
+                event_id=q1_issue_event.id,
+                reason="register state after unresolved branch",
+                meta={"branch_id": q1_issue_event.meta.get("branch_id")},
+            )
         return
 
     if spec.category in {"rt", "sync"}:
@@ -895,17 +1103,89 @@ def _apply_ready_register_writes(state: AnalysisState) -> None:
     state.pending_register_writes = remaining
 
 
-def _flush_pending_register_writes(state: AnalysisState) -> None:
+def _flush_pending_register_writes(
+    state: AnalysisState,
+    *,
+    completed_issue_index: int | None = None,
+) -> None:
     if not state.pending_register_writes:
         return
     for pending in sorted(state.pending_register_writes, key=lambda item: item.available_issue_index):
-        _apply_register_write(state, pending)
+        completed = state.q1_issue_index if completed_issue_index is None else completed_issue_index
+        time = state.q1_time_ns if pending.available_issue_index <= completed else Unknown(
+            "register write availability follows an instruction outside the analyzed trace"
+        )
+        _apply_register_write(state, pending, time=time)
     state.pending_register_writes = []
 
 
-def _apply_register_write(state: AnalysisState, pending: PendingRegisterWrite) -> None:
+def _apply_register_write(state: AnalysisState, pending: PendingRegisterWrite, *, time: Value | None = None) -> None:
+    meta = pending.meta
+    if state.execution_mode == "concrete":
+        meta = {
+            **meta,
+            "previous_value": value_to_json(state.registers.get(pending.register, Unknown(pending.register))),
+            "provenance": pending.provenance,
+        }
     state.registers[pending.register] = pending.value
     state.register_provenance[pending.register] = pending.provenance
+    _record_register_write(
+        state,
+        pending.register,
+        pending.value,
+        source=pending.source,
+        event_id=pending.event_id,
+        time=time,
+        meta=meta,
+    )
+
+
+def _record_register_write(
+    state: AnalysisState,
+    register: str,
+    value: Value,
+    *,
+    source: SourceLocation,
+    event_id: str | None,
+    time: Value | None = None,
+    meta: dict[str, Any] | None = None,
+) -> None:
+    write_time = state.q1_time_ns if time is None else time
+    write_meta = dict(meta or {})
+    write_meta.setdefault("branch_assumptions", _register_branch_assumptions(state))
+    confidence = _confidence_for_value((value, write_time))
+    if confidence == "exact" and write_meta.get("branch_assumptions"):
+        confidence = "assumed"
+    state.register_history.append(
+        RegisterWrite(state.sequencer_id, register, write_time, value, source, event_id, confidence, write_meta)
+    )
+
+
+def _register_branch_assumptions(state: AnalysisState) -> list[dict[str, str]]:
+    return [
+        {"branch_id": entry["branch_id"], "assumed_branch_path": entry["assumed_branch_path"]}
+        for entry in state.metadata.get("branches", {}).get("assumptions", [])
+    ]
+
+
+def _invalidate_register_history(
+    state: AnalysisState,
+    registers: set[str],
+    *,
+    source: SourceLocation,
+    event_id: str,
+    reason: str,
+    meta: dict[str, Any] | None = None,
+) -> None:
+    for register in sorted(registers):
+        _record_register_write(
+            state,
+            register,
+            Unknown(reason),
+            source=source,
+            event_id=event_id,
+            meta={**(meta or {}), "invalidated": True, "reason": reason},
+        )
 
 
 def _schedule_register_write(
@@ -915,6 +1195,9 @@ def _schedule_register_write(
     value: Value,
     provenance: dict[str, Any],
 ) -> None:
+    event_id = f"{state.sequencer_id}:e{len(state.events)}"
+    if state.execution_mode == "concrete":
+        provenance = _concrete_write_provenance(state, instruction, provenance, event_id)
     state.pending_register_writes.append(
         PendingRegisterWrite(
             register=register,
@@ -922,8 +1205,30 @@ def _schedule_register_write(
             provenance=provenance,
             source=instruction.source,
             available_issue_index=state.q1_issue_index + 2,
+            event_id=event_id,
+            meta={
+                "op": instruction.op,
+                "branch_assumptions": _register_branch_assumptions(state),
+            },
         )
     )
+
+
+def _concrete_write_provenance(
+    state: AnalysisState, instruction: Instr, provenance: dict[str, Any], event_id: str,
+) -> dict[str, Any]:
+    return {
+        **provenance,
+        "event_id": event_id,
+        "execution_index": state.q1_issue_index,
+        "inputs": {
+            register: {
+                "value": value_to_json(state.registers.get(register, Unknown(register))),
+                "event_id": state.register_provenance.get(register, {}).get("event_id"),
+            }
+            for _, register in _register_read_operands(instruction, state)
+        },
+    }
 
 
 def _diagnose_negative_rt_duration_operand(
@@ -1056,7 +1361,7 @@ def _diagnose_official_operand_ranges(
         return False
     emitted = False
     scope = _scope(symbols, state)
-    for argument_index, operand_role, lower, upper in _official_operand_ranges(instruction.op):
+    for argument_index, operand_role, lower, upper in _official_operand_ranges(instruction.op, len(instruction.args)):
         if argument_index >= len(instruction.args):
             continue
         arg = instruction.args[argument_index]
@@ -1119,7 +1424,7 @@ def _range_lower_bound_is_validated_elsewhere(op: str, operand_role: str) -> boo
     }
 
 
-def _official_operand_ranges(op: str) -> list[tuple[int, str, int, int]]:
+def _official_operand_ranges(op: str, argument_count: int = 1) -> list[tuple[int, str, int, int]]:
     signed_16 = (-32768, 32767)
     signed_32 = (-2147483648, 2147483647)
     classical_imm = (-2147483648, 0xFFFFFFFF)
@@ -1199,11 +1504,10 @@ def _official_operand_ranges(op: str) -> list[tuple[int, str, int, int]]:
         return [(0, "shift_count", 0, 63)]
     if op == "fb_acq_tb_mock":
         return [(0, "enable_flag", 0, 1), (1, "valid_bit", 0, 1), (2, "mock_data", 0, 1)]
-    if op == "jmp":
+    if op == "jmp" or (op == "jge" and argument_count == 1):
         return [(0, "branch_target", 0, 16383)]
     if op in {"jge", "jlt"}:
         return [
-            (0, "branch_target", 0, 16383),
             (1, "branch_compare_immediate", *classical_imm),
             (2, "branch_target", 0, 16383),
         ]
@@ -1390,6 +1694,50 @@ def _branch_target_arg(arg: Arg, state: AnalysisState, symbols: SymbolTable) -> 
         return _resolved_branch_target_arg(register_arg, resolve_arg_value(register_arg, scope)) or register_arg
     value = resolve_arg_value(arg, scope)
     return _resolved_branch_target_arg(arg, value) or arg
+
+
+def _execute_concrete_branch(
+    state: AnalysisState, instruction: Instr, q1_issue_event: TimelineEvent, symbols: SymbolTable,
+    *, defer_register_write: bool = False,
+) -> None:
+    scope = _scope(symbols, state)
+    target_index = 1 if instruction.op == "loop" else 2 if len(instruction.args) == 3 else 0
+    target_pc = resolve_arg_value(instruction.args[target_index], scope).value
+    counter_write = None
+    if instruction.op == "loop":
+        register = _register_name(instruction.args[0], state)
+        previous = state.registers[register]
+        value = Concrete((previous.value - 1) & _CLASSICAL_REGISTER_MASK)
+        decision = value.value != 0
+        _set_alu_flags(state, instruction, _sub_flags(previous.value, 1))
+        provenance = _register_provenance(
+            state, register, expression=f"{register} - 1", value=value,
+            steps=[_provenance_step(instruction, f"{register} - 1", value)],
+        )
+        counter_write = PendingRegisterWrite(
+            register, value, _concrete_write_provenance(state, instruction, provenance, q1_issue_event.id),
+            instruction.source, state.q1_issue_index + 1, q1_issue_event.id, {"op": "loop"},
+        )
+    elif len(instruction.args) == 3:
+        left = resolve_arg_value(instruction.args[0], scope).value & _CLASSICAL_REGISTER_MASK
+        right = resolve_arg_value(instruction.args[1], scope).value & _CLASSICAL_REGISTER_MASK
+        decision = left >= right if instruction.op == "jge" else left < right
+        _set_alu_flags(state, instruction, _sub_flags(left, right))
+    else:
+        decision = True if instruction.op == "jmp" else _status_branch_decision(instruction.op, state.alu_flags)
+    duration = 24 if instruction.op in {"loop", "jlt", "jge"} else 16
+    duration = duration if decision else 4
+    q1_t1 = add_values(q1_issue_event.t0, Concrete(duration))
+    state.events[-1] = replace(q1_issue_event, t1=q1_t1, duration=Concrete(duration))
+    state.q1_time_ns = q1_t1
+    q1_issue_event.meta.update(branch_decision="concrete", branch_taken=decision, target_pc=target_pc)
+    if counter_write is not None:
+        if defer_register_write:
+            state.pending_register_writes.append(counter_write)
+        else:
+            _apply_register_write(state, counter_write)
+    if decision:
+        state.next_pc = target_pc
 
 
 def _execute_branch(
@@ -2574,6 +2922,7 @@ def _explore_conditional_branch_both_paths(
     snapshot_event_count = len(state.events)
     snapshot_diagnostic_count = len(state.diagnostics)
     snapshot_packet_count = len(state.rt_packets)
+    snapshot_register_count = len(state.register_history)
     base_path_state = deepcopy(state)
     comparison_packets: list[RtPacket] = []
     comparison_events: list[TimelineEvent] = []
@@ -2588,6 +2937,20 @@ def _explore_conditional_branch_both_paths(
         path_state.branch_explore_depth = state.branch_explore_depth + 1
         _run_program_loop(path_state, symbols, waveform_names, acquisition_names)
         _flush_pending_register_writes(path_state)
+        path_event_ids = {event.id for event in path_state.events[snapshot_event_count:]}
+        state.register_history.extend(
+            replace(
+                write,
+                event_id=f"{write.event_id}:branch-{path}" if write.event_id in path_event_ids else write.event_id,
+                confidence="assumed" if write.confidence == "exact" else write.confidence,
+                meta={
+                    **write.meta,
+                    "branch_comparison_branch_id": branch_id,
+                    "branch_comparison_path": path,
+                },
+            )
+            for write in path_state.register_history[snapshot_register_count:]
+        )
         comparison_packets.extend(
             _branch_comparison_packets(
                 path_state.rt_packets[snapshot_packet_count:],
@@ -2970,6 +3333,31 @@ def _emit_compact_loop(
             },
         )
     loop_block.meta["preview_iteration_event_ids"] = preview_iteration_event_ids
+    # Only the first iteration is interpreted; later previews copy events without
+    # executing their arithmetic. Do not expose those copies as register writes.
+    _flush_pending_register_writes(state, completed_issue_index=state.q1_issue_index + 1)
+    has_hidden_iterations = forever or not isinstance(count, Concrete) or count.value > 1
+    if has_hidden_iterations:
+        written_registers: set[str] = set()
+        for pc in range(start_pc, instruction.pc + 1):
+            body_instruction = state.instructions_by_pc[pc]
+            written_registers.update(_register_write_operands(body_instruction, state))
+            if body_instruction.op == "loop" and body_instruction.args:
+                body_counter = _register_name(body_instruction.args[0], state)
+                if body_counter is not None:
+                    written_registers.add(body_counter)
+        reason = f"register writes in compact loop {loop_id} are not expanded"
+        _invalidate_register_history(
+            state,
+            written_registers,
+            source=instruction.source,
+            event_id=q1_issue_event.id,
+            reason=reason,
+            meta={"loop_id": loop_id},
+        )
+        for register in written_registers:
+            state.registers[register] = Unknown(reason)
+            state.register_provenance.pop(register, None)
     if not forever:
         _advance_compact_loop_fallthrough_state(
             state,
@@ -2981,6 +3369,15 @@ def _emit_compact_loop(
             loop_q1_jump_runtime_ns=loop_q1_jump_runtime_ns,
             loop_q1_continue_runtime_ns=loop_q1_continue_runtime_ns,
         )
+        if counter_reg is not None:
+            _record_register_write(
+                state,
+                counter_reg,
+                state.registers[counter_reg],
+                source=instruction.source,
+                event_id=q1_issue_event.id,
+                meta={"op": "loop", "loop_id": loop_id, "loop_complete": True},
+            )
     return True
 
 
@@ -3370,6 +3767,20 @@ def _binary_provenance(
     )
 
 
+def _latched_operand_value(op: str, arg: Arg, scope: SymbolTable, state: AnalysisState) -> Value:
+    value = resolve_arg_value(arg, scope)
+    if state.execution_mode != "concrete" or _register_name(arg, state) is None or not isinstance(value, Concrete):
+        return value
+    # Q1ASM latched fields have instruction-specific signedness. Keep the raw
+    # 32-bit pattern in register traces; decode only the value sent to the latch.
+    # https://docs.qblox.com/en/main/products/qblox_instruments/q1/index.html#latched-instructions
+    if op in {"set_freq", "set_awg_gain", "set_awg_offs"}:
+        return Concrete(_signed_32_bit_register_value(value.value))
+    if op == "set_mrk":
+        return Concrete(value.value & 0xF)
+    return value
+
+
 def _execute_latched(state: AnalysisState, instruction: Instr, symbols: SymbolTable) -> None:
     scope = _scope(symbols, state)
     field_name: str | None = None
@@ -3377,25 +3788,25 @@ def _execute_latched(state: AnalysisState, instruction: Instr, symbols: SymbolTa
 
     if instruction.op == "set_mrk" and instruction.args:
         field_name = "marker"
-        value = resolve_arg_value(instruction.args[0], scope)
+        value = _latched_operand_value(instruction.op, instruction.args[0], scope, state)
         state.latched_state.marker = value
     elif instruction.op == "set_awg_gain" and len(instruction.args) >= 2:
         field_name = "awg_gain"
         value = (
-            resolve_arg_value(instruction.args[0], scope),
-            resolve_arg_value(instruction.args[1], scope),
+            _latched_operand_value(instruction.op, instruction.args[0], scope, state),
+            _latched_operand_value(instruction.op, instruction.args[1], scope, state),
         )
         state.latched_state.awg_gain = value
     elif instruction.op == "set_awg_offs" and len(instruction.args) >= 2:
         field_name = "awg_offset"
         value = (
-            resolve_arg_value(instruction.args[0], scope),
-            resolve_arg_value(instruction.args[1], scope),
+            _latched_operand_value(instruction.op, instruction.args[0], scope, state),
+            _latched_operand_value(instruction.op, instruction.args[1], scope, state),
         )
         state.latched_state.awg_offset = value
     elif instruction.op == "set_freq" and instruction.args:
         field_name = "frequency"
-        value = resolve_arg_value(instruction.args[0], scope)
+        value = _latched_operand_value(instruction.op, instruction.args[0], scope, state)
         state.latched_state.frequency = value
     elif instruction.op in {"set_ph", "reset_ph"}:
         field_name = "phase"
@@ -4005,6 +4416,10 @@ def _consume_applied_state(state: AnalysisState) -> dict[str, Any]:
 def _scope(symbols: SymbolTable, state: AnalysisState) -> SymbolTable:
     label_symbols = {f"@{label}": Concrete(pc) for label, pc in state.labels.items()}
     scope = {**symbols, **label_symbols, **state.registers}
+    if state.execution_mode == "concrete":
+        for name in symbols:
+            if _is_valid_register_arg(Arg("reg", name, name)):
+                scope[name] = state.registers.get(name, Unknown(name))
     for alias, register in state.register_aliases.items():
         scope[alias] = state.registers.get(register, Unknown(register))
     return scope
@@ -4025,6 +4440,8 @@ def _arg_register_provenance(arg: Arg, state: AnalysisState) -> dict[str, Any] |
     register = _register_name(arg, state)
     if register is None:
         return None
+    if state.execution_mode == "concrete":
+        return {"register": register, "expression": register, "steps": []}
     return state.register_provenance.get(register)
 
 

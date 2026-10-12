@@ -209,12 +209,12 @@ function timelineScheduleOrigins(ir: QbsIr, events: Record<string, unknown>[]): 
   }
   const byId = new Map(events.map((event) => [event.id, event]));
   for (const [sequencer, entry] of Object.entries(alignment)) {
-    if (!isRecord(entry) || entry.mode !== "first_wait_sync") {
+    if (!isRecord(entry) || (entry.mode !== "first_wait_sync" && entry.mode !== "after_first_wait_sync")) {
       continue;
     }
     const anchor = byId.get(entry.anchor_event_id);
     // QBS schedule time begins after the declared synchronization prelude.
-    // Display alignment uses its start; this comparison uses its completion.
+    // Both display alignment modes retain local event timestamps; compare from completion.
     // Keep the original event times and any subsequent waits unchanged.
     const span = anchor && anchor.kind === "wait_sync" && timelineEventSequencer(anchor) === sequencer
       ? timelineEventSpan(anchor) : undefined;

@@ -34,6 +34,8 @@ const updatePolicy = require("./updatePolicy");
 const { parseWebviewMessage } = require("./webviewMessageValidation");
 const { q1timelineProjectOutputDir } = require("./register");
 
+const COMPARISON_BASELINE_FILENAME = "comparison-baseline.json";
+
 function webviewLocalResourceRoots(context) {
   if (context.extensionUri && vscode.Uri.joinPath) {
     return [
@@ -50,6 +52,20 @@ function webviewLocalResourceRoots(context) {
 
 function isQ1asmPath(filePath) {
   return path.extname(String(filePath || "")).toLowerCase() === ".q1asm";
+}
+
+function isTimelineIr(value) {
+  return Boolean(
+    value &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    Array.isArray(value.events) &&
+    value.events.every((event) => event && typeof event === "object" && !Array.isArray(event))
+  );
+}
+
+export function hardwareReadinessAnalyzerArgs(enabled) {
+  return enabled ? ["--hardware-readiness"] : [];
 }
 
 function q1asmTemplatePlaceholders(text) {
@@ -137,12 +153,17 @@ export function injectWebviewAssetTags(html, webview, context, nonce) {
   const cssUri = versionedWebviewAssetUri(webviewAssetUri(webview, context, "src", "q1timeline", "media", "timeline.css"), nonce);
   const sharedJsUri = versionedWebviewAssetUri(webviewAssetUri(webview, context, "src", "shared", "timeline", "renderer.js"), nonce);
   const adapterJsUri = versionedWebviewAssetUri(webviewAssetUri(webview, context, "src", "q1timeline", "media", "timelineAdapter.js"), nonce);
+  const hardwareCssUri = versionedWebviewAssetUri(webviewAssetUri(webview, context, "src", "q1timeline", "media", "hardwareView.css"), nonce);
+  const hardwareStateUri = versionedWebviewAssetUri(webviewAssetUri(webview, context, "src", "q1timeline", "media", "hardwareState.js"), nonce);
+  const hardwareViewUri = versionedWebviewAssetUri(webviewAssetUri(webview, context, "src", "q1timeline", "media", "hardwareView.js"), nonce);
   const jsUri = versionedWebviewAssetUri(webviewAssetUri(webview, context, "src", "q1timeline", "media", "timeline.js"), nonce);
-  const linkTag = `<link rel="stylesheet" href="${sharedCssUri}">\n<link rel="stylesheet" href="${cssUri}">`;
+  const linkTag = `<link rel="stylesheet" href="${sharedCssUri}">\n<link rel="stylesheet" href="${cssUri}">\n<link rel="stylesheet" href="${hardwareCssUri}">`;
   const nonceAttribute = nonce ? ` nonce="${nonce}"` : "";
   const scriptTag = [
     `<script${nonceAttribute} src="${sharedJsUri}"></script>`,
     `<script${nonceAttribute} src="${adapterJsUri}"></script>`,
+    `<script${nonceAttribute} src="${hardwareStateUri}"></script>`,
+    `<script${nonceAttribute} src="${hardwareViewUri}"></script>`,
     `<script${nonceAttribute} src="${jsUri}"></script>`,
   ].join("\n");
   html = clearSharedTimelineRoot(html);
@@ -230,6 +251,9 @@ function eventContentSignature(event) {
     stableStringify(event.source && event.source.raw),
     stableStringify(event.label),
     stableStringify(event.resolved_args || event.resolvedArgs),
+    stableStringify(event.meta && event.meta.resolved_args),
+    stableStringify(event.meta && event.meta.applied_state),
+    stableStringify(event.meta && event.meta.value),
     stableStringify(event.operands),
     stableStringify(event.args),
   ].join("|");
@@ -328,12 +352,15 @@ function withStableId(event, stableId) {
   return copy;
 }
 
-function withDiffStatus(event, status) {
+function withDiffStatus(event, status, previousEvent) {
   const copy = cloneJson(event);
   const meta = copy.meta && typeof copy.meta === "object" && !Array.isArray(copy.meta)
     ? { ...copy.meta }
     : {};
   meta.diff_status = status;
+  if (previousEvent) {
+    meta.diff_before = cloneJson(previousEvent);
+  }
   copy.meta = meta;
   return copy;
 }
@@ -401,7 +428,7 @@ function annotateTimelineDiff(previousIr, nextIr) {
   const nextEvents = Array.isArray(output.events) ? output.events : [];
   output.events = nextEvents;
   const previousEvents = previousIr && Array.isArray(previousIr.events) ? previousIr.events : [];
-  if (!previousEvents.length) {
+  if (!previousIr || !Array.isArray(previousIr.events)) {
     return output;
   }
 
@@ -424,10 +451,10 @@ function annotateTimelineDiff(previousIr, nextIr) {
       return withDiffStatus(eventWithStableId, "added");
     }
     if (eventPositionSignature(previousEntry.event) !== eventPositionSignature(event)) {
-      return withDiffStatus(eventWithStableId, "shifted");
+      return withDiffStatus(eventWithStableId, "shifted", previousEntry.event);
     }
     if (eventContentSignature(previousEntry.event) !== eventContentSignature(event)) {
-      return withDiffStatus(eventWithStableId, "changed");
+      return withDiffStatus(eventWithStableId, "changed", previousEntry.event);
     }
     return eventWithStableId;
   });
@@ -687,6 +714,8 @@ export class TimelineController {
     this.outputDir = undefined;
     this.timelineIr = undefined;
     this.lastAnalyzerTimelineIr = undefined;
+    this.comparisonBaselineWarningPath = undefined;
+    this.comparison = { mode: "none" };
     this.analyzerResult = undefined;
     this.lastPreviewHtml = undefined;
     this.changeTimer = undefined;
@@ -700,6 +729,7 @@ export class TimelineController {
     this.currentViewMode = undefined;
     this.branchAssumptionOverrides = new Map();
     this.loopPreviewOverrides = new Map();
+    this.executionReplayOverride = undefined;
     this.parameterOverrides = new Map();
     this.pendingTarget = undefined;
     this.projectRelatedPaths = new Set();
@@ -718,6 +748,7 @@ export class TimelineController {
         })
       : undefined;
     this.activeSourceDecorationEditor = undefined;
+    this.hardwareSourceReveal = undefined;
     this.output.appendLine("Q1ASM Timeline extension activated.");
     context.subscriptions.push(this.output);
     context.subscriptions.push(this.diagnostics);
@@ -747,14 +778,14 @@ export class TimelineController {
     context.subscriptions.push(
       vscode.window.onDidChangeTextEditorSelection((event) => {
         this.rememberSourceViewColumn(event.textEditor);
-        this.highlightActiveSourceLine(event.textEditor);
+        this.followSourceEditor(event.textEditor, event.kind);
       })
     );
     if (typeof vscode.window.onDidChangeActiveTextEditor === "function") {
       context.subscriptions.push(
         vscode.window.onDidChangeActiveTextEditor((editor) => {
           this.rememberSourceViewColumn(editor);
-          this.highlightActiveSourceLine(editor);
+          this.followSourceEditor(editor);
         })
       );
     }
@@ -764,6 +795,8 @@ export class TimelineController {
   setProjectUri(uri) {
     if (!this.projectUri || this.projectUri.fsPath !== uri.fsPath) {
       this.lastAnalyzerTimelineIr = undefined;
+      this.comparisonBaselineWarningPath = undefined;
+      this.comparison = { mode: "none" };
       this.lastPreviewHtml = undefined;
       this.timelineIr = undefined;
       this.clearAnalyzerOverrides();
@@ -772,6 +805,7 @@ export class TimelineController {
   }
 
   clearAnalyzerOverrides() {
+    this.executionReplayOverride = undefined;
     if (this.branchAssumptionOverrides) {
       this.branchAssumptionOverrides.clear();
     }
@@ -781,6 +815,105 @@ export class TimelineController {
     if (this.parameterOverrides) {
       this.parameterOverrides.clear();
     }
+  }
+
+  comparisonBaselinePath() {
+    if (!this.outputDir || path.basename(path.resolve(this.outputDir)).toLowerCase() !== ".q1timeline") {
+      return undefined;
+    }
+    return path.join(this.outputDir, COMPARISON_BASELINE_FILENAME);
+  }
+
+  async saveComparisonBaseline() {
+    if (!isTimelineIr(this.lastAnalyzerTimelineIr)) {
+      vscode.window.showWarningMessage(
+        "Run a successful Q1ASM timeline analysis before saving a comparison baseline."
+      );
+      return;
+    }
+    const baselinePath = this.comparisonBaselinePath();
+    if (!this.projectUri || !baselinePath) {
+      vscode.window.showWarningMessage(
+        "Open a q1timeline project before saving a comparison baseline."
+      );
+      return;
+    }
+    try {
+      await fsPromises.mkdir(this.outputDir, { recursive: true });
+      await fsPromises.writeFile(
+        baselinePath,
+        `${JSON.stringify(this.lastAnalyzerTimelineIr, null, 2)}\n`,
+        "utf-8"
+      );
+      this.comparisonBaselineWarningPath = undefined;
+      this.output.appendLine(`Saved timeline comparison baseline: ${baselinePath}`);
+      this.comparison = { ...this.comparison, nextMode: "saved", pending: true };
+      this.postWebviewMessage({ type: "setComparison", comparison: this.comparison });
+      vscode.window.showInformationMessage(
+        `Timeline comparison baseline saved for ${path.basename(this.projectUri.fsPath)}.`
+      );
+    } catch (error) {
+      this.output.appendLine(`Unable to save timeline comparison baseline: ${error.message}`);
+      vscode.window.showErrorMessage(`Unable to save timeline comparison baseline: ${error.message}`);
+    }
+  }
+
+  async clearComparisonBaseline() {
+    const baselinePath = this.comparisonBaselinePath();
+    if (!this.projectUri || !baselinePath) {
+      vscode.window.showWarningMessage(
+        "Open a q1timeline project before clearing its comparison baseline."
+      );
+      return;
+    }
+    try {
+      await fsPromises.rm(baselinePath, { force: true });
+      this.comparisonBaselineWarningPath = undefined;
+      this.output.appendLine(`Cleared timeline comparison baseline: ${baselinePath}`);
+      this.comparison = { ...this.comparison, nextMode: "previous", pending: true };
+      this.postWebviewMessage({ type: "setComparison", comparison: this.comparison });
+      vscode.window.showInformationMessage(
+        "Timeline comparison baseline cleared. Future runs will compare with the previous run."
+      );
+    } catch (error) {
+      this.output.appendLine(`Unable to clear timeline comparison baseline: ${error.message}`);
+      vscode.window.showErrorMessage(`Unable to clear timeline comparison baseline: ${error.message}`);
+    }
+  }
+
+  async loadComparisonBaseline() {
+    const baselinePath = this.comparisonBaselinePath();
+    if (!baselinePath) {
+      return undefined;
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(await fsPromises.readFile(baselinePath, "utf-8"));
+    } catch (error) {
+      if (error && error.code === "ENOENT") {
+        return undefined;
+      }
+      this.warnInvalidComparisonBaseline(baselinePath, error.message);
+      return undefined;
+    }
+    if (!isTimelineIr(parsed)) {
+      this.warnInvalidComparisonBaseline(baselinePath, "expected an object with an events array");
+      return undefined;
+    }
+    this.comparisonBaselineWarningPath = undefined;
+    this.output.appendLine(`Using saved timeline comparison baseline: ${baselinePath}`);
+    return parsed;
+  }
+
+  warnInvalidComparisonBaseline(baselinePath, reason) {
+    this.output.appendLine(`Ignoring invalid timeline comparison baseline ${baselinePath}: ${reason}`);
+    if (this.comparisonBaselineWarningPath === baselinePath) {
+      return;
+    }
+    this.comparisonBaselineWarningPath = baselinePath;
+    vscode.window.showWarningMessage(
+      "The saved timeline comparison baseline is invalid and was ignored; comparing with the previous run instead."
+    );
   }
 
   async openTarget(target) {
@@ -1136,6 +1269,51 @@ export class TimelineController {
       args.push("--set-param", `${name}=${rawValue}`);
     }
     return args;
+  }
+
+  executionArgs() {
+    const configuration = this.config();
+    let mode = configuration.get("executionMode", "project");
+    const replayOverride = this.executionReplayOverride;
+    if (
+      replayOverride && (replayOverride.scope === "project" || mode !== "concrete" && mode !== "simulation") &&
+      this.projectUri && replayOverride.projectPath === normalizedFsPath(this.projectUri.fsPath) &&
+      replayOverride.sourcePath === (this.singleFileUri ? normalizedFsPath(this.singleFileUri.fsPath) : undefined)
+    ) {
+      mode = replayOverride.mode;
+    }
+    if (mode === "project") {
+      return [];
+    }
+    return ["--execution-mode", mode, "--max-steps", String(configuration.get("maxSteps", 10000))];
+  }
+
+  async prepareExecutionReplay(sequencerId, scope = "sequencer") {
+    if (!this.panel || !this.projectUri || !this.outputDir) {
+      return;
+    }
+    const ir = this.timelineIr;
+    if (!ir || !(
+      (ir.sequencers || []).some((sequencer) => String(sequencer.id) === sequencerId) ||
+      (ir.events || []).some((event) => String(event.sequencer_id) === sequencerId) ||
+      Object.prototype.hasOwnProperty.call(ir.execution || {}, sequencerId)
+    )) {
+      return;
+    }
+    const configuredMode = this.config().get("executionMode", "project");
+    const recordedMode = ir.execution && ir.execution[sequencerId]?.mode;
+    const mode = scope === "project" ? "simulation" : configuredMode === "concrete" || configuredMode === "simulation"
+      ? configuredMode
+      : recordedMode === "concrete" || recordedMode === "simulation" ? recordedMode : "simulation";
+    this.executionReplayOverride = {
+      projectPath: normalizedFsPath(this.projectUri.fsPath),
+      sourcePath: this.singleFileUri ? normalizedFsPath(this.singleFileUri.fsPath) : undefined,
+      mode,
+      scope,
+    };
+    this.lastAnalyzerTimelineIr = undefined;
+    this.output.appendLine(`q1timeline execution replay: ${sequencerId} (${mode}).`);
+    await this.refreshPreview();
   }
 
   parameterOverrideSummary() {
@@ -1782,6 +1960,8 @@ export class TimelineController {
       "--mode",
       viewMode,
       "--no-render",
+      ...this.executionArgs(),
+      ...hardwareReadinessAnalyzerArgs(configuration.get("hardwareReadiness", false)),
       ...this.analyzerOverrideArgs(extraArgs),
     ]);
     const parameterSummary = this.parameterOverrideSummary();
@@ -1797,6 +1977,17 @@ export class TimelineController {
         await fsPromises.mkdir(this.outputDir, { recursive: true });
         await this.clearAnalyzerOutputFiles(timelineIrPath, diagnosticsPath, htmlPath);
         return this.execFile(pythonPath, args, timeoutMs, cwd, extraEnv, "analyzer");
+      })
+      .catch(async (error) => {
+        // Runtime failures can still produce a valid partial simulation trace.
+        // Outputs were cleared above, so this cannot recover a stale trace.
+        if (!this.isCurrentAnalysis(analysisRequestId) || this.isAnalyzerTimeoutError(error)) throw error;
+        let partial;
+        try { partial = JSON.parse(await fsPromises.readFile(timelineIrPath, "utf-8")); } catch { throw error; }
+        if (!Array.isArray(partial.events) || !partial.events.length || !Object.values(partial.execution || {}).some((entry) => entry.mode === "simulation" && entry.status === "error")) throw error;
+        try { parseAnalyzerResult(error.stdout); } catch { throw error; }
+        this.output.appendLine("Simulation stopped with an error; rendering the partial execution trace and its diagnostics.");
+        return { stdout: error.stdout, stderr: error.stderr, elapsedMs: error.elapsedMs, exitCode: error.exitCode };
       })
       .then(async (result) => {
         if (!this.isCurrentAnalysis(analysisRequestId)) {
@@ -1911,7 +2102,10 @@ export class TimelineController {
       this.output.appendLine(`Unable to prepare TimelineIR diff highlights: ${error.message}`);
       return;
     }
-    const annotatedTimelineIr = annotateTimelineDiff(this.lastAnalyzerTimelineIr, nextTimelineIr);
+    const savedComparisonBaseline = await this.loadComparisonBaseline();
+    const diffBaseline = savedComparisonBaseline || this.lastAnalyzerTimelineIr;
+    const annotatedTimelineIr = annotateTimelineDiff(diffBaseline, nextTimelineIr);
+    this.comparison = { mode: savedComparisonBaseline ? "saved" : isTimelineIr(diffBaseline) ? "previous" : "none" };
     this.lastAnalyzerTimelineIr = cloneJson(nextTimelineIr);
     await fsPromises.writeFile(timelineIrPath, JSON.stringify(annotatedTimelineIr, null, 2));
   }
@@ -2186,6 +2380,10 @@ export class TimelineController {
       this.refreshPreview();
       return;
     }
+    if (parsedMessage.type === "prepareExecutionReplay") {
+      await this.prepareExecutionReplay(parsedMessage.sequencerId, parsedMessage.scope);
+      return;
+    }
     if (parsedMessage.type === "webviewReady") {
       this.output.appendLine("q1timeline webview script ready.");
       return;
@@ -2199,7 +2397,7 @@ export class TimelineController {
         file: parsedMessage.file,
         line: parsedMessage.line,
         column: parsedMessage.column,
-      });
+      }, { preserveHardwareCursor: parsedMessage.preserveHardwareCursor });
       return;
     }
     if (parsedMessage.type === "setViewMode") {
@@ -2281,18 +2479,29 @@ export class TimelineController {
     return this.openSourceLocation(item.source);
   }
 
-  async openSourceLocation(source) {
+  async openSourceLocation(source, options = {}) {
     const sourcePath = this.resolveSourcePath(source.file);
-    const existingDocument = workspaceTextDocumentForPath(sourcePath, vscode.workspace.textDocuments);
-    const document = existingDocument || await vscode.workspace.openTextDocument(vscode.Uri.file(sourcePath));
-    const options = await this.sourceShowTextDocumentOptions(sourcePath, Boolean(existingDocument));
-    const editor = await vscode.window.showTextDocument(document, options);
-    this.rememberSourceViewColumn(editor);
     const line = Math.max(0, Number(source.line || 1) - 1);
     const position = new vscode.Position(line, Math.max(0, Number(source.column || 1) - 1));
-    editor.selection = new vscode.Selection(position, position);
-    this.applySourceDecoration(editor, line);
-    editor.revealRange(new vscode.Range(position, position), vscode.TextEditorRevealType.InCenter);
+    const reveal = options.preserveHardwareCursor ? { path: normalizedFsPath(sourcePath), position, opening: true } : undefined;
+    this.hardwareSourceReveal = reveal;
+    try {
+      const existingDocument = workspaceTextDocumentForPath(sourcePath, vscode.workspace.textDocuments);
+      const document = existingDocument || await vscode.workspace.openTextDocument(vscode.Uri.file(sourcePath));
+      const showOptions = await this.sourceShowTextDocumentOptions(sourcePath, Boolean(existingDocument));
+      const editor = await vscode.window.showTextDocument(document, showOptions);
+      this.rememberSourceViewColumn(editor);
+      editor.selection = new vscode.Selection(position, position);
+      this.applySourceDecoration(editor, line);
+      editor.revealRange(new vscode.Range(position, position), vscode.TextEditorRevealType.InCenter);
+      if (reveal) {
+        reveal.position = editor.selection.active;
+        reveal.opening = false;
+      }
+    } catch (error) {
+      if (this.hardwareSourceReveal === reveal) this.hardwareSourceReveal = undefined;
+      throw error;
+    }
   }
 
   async sourceShowTextDocumentOptions(sourcePath, documentAlreadyOpen) {
@@ -2360,6 +2569,21 @@ export class TimelineController {
       this.activeSourceDecorationEditor.setDecorations(this.sourceSelectionDecoration, []);
     }
     this.activeSourceDecorationEditor = undefined;
+  }
+
+  followSourceEditor(editor, kind) {
+    if (!editor) return;
+    const reveal = this.hardwareSourceReveal;
+    if (reveal) {
+      const manual = kind !== undefined && (kind === vscode.TextEditorSelectionChangeKind?.Keyboard || kind === vscode.TextEditorSelectionChangeKind?.Mouse);
+      const position = editor.selection?.active;
+      const sameTarget = normalizedFsPath(editor.document?.uri?.fsPath) === reveal.path && position?.line === reveal.position.line && position?.character === reveal.position.character;
+      // showTextDocument and assigning selection can echo after the await returns.
+      // Keep a hardware value's readable time until the user navigates the source.
+      if (!manual && (reveal.opening || sameTarget)) return;
+      this.hardwareSourceReveal = undefined;
+    }
+    this.highlightActiveSourceLine(editor);
   }
 
   highlightActiveSourceLine(editor) {
@@ -2440,6 +2664,7 @@ export class TimelineController {
       singleFileMode: this.singleFileMode,
       parameterProjectFile: this.projectUri?.fsPath,
       parameterOverrideNames: Array.from(this.parameterOverrides.keys()),
+      comparison: this.comparison,
     };
   }
 

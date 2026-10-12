@@ -1,6 +1,5 @@
 import { execFileSync } from "node:child_process";
 import { cpSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { basename, delimiter, join, resolve } from "node:path";
 import { runTests } from "@vscode/test-electron";
 
@@ -10,17 +9,22 @@ async function main(): Promise<void> {
   const repositoryPath = resolve(__dirname, "..", "..", "..");
   const pythonSourcePath = resolve(repositoryPath, "src");
   process.env.PYTHONPATH = process.env.PYTHONPATH ? `${pythonSourcePath}${delimiter}${process.env.PYTHONPATH}` : pythonSourcePath;
-  const testRoot = mkdtempSync(join(tmpdir(), "q1lens-extension-test-"));
-  const workspacePath = join(testRoot, "workspace");
-  const userDataPath = join(testRoot, "profile");
-  cpSync(join(repositoryPath, "examples", "two-qubit-entangling"), join(workspacePath, "examples", "two-qubit-entangling"), {
-    recursive: true,
-    filter: (source) => ![".q1timeline", ".qbs_timeline", "__pycache__"].includes(basename(source)),
-  });
+  const outputPath = resolve(process.env.Q1LENS_EXTENSION_HOST_OUTPUT ?? join(repositoryPath, "output", "ci", "extension-host"));
+  process.env.Q1LENS_EXTENSION_HOST_OUTPUT = outputPath;
+  mkdirSync(outputPath, { recursive: true });
+  const workspacePath = mkdtempSync(join(outputPath, "workspace-"));
+  const userDataPath = mkdtempSync(join(outputPath, "profile-"));
+  for (const example of ["two-qubit-entangling", "simulation-verification"]) {
+    cpSync(join(repositoryPath, "examples", example), join(workspacePath, "examples", example), {
+      recursive: true,
+      filter: (source) => ![".q1timeline", ".qbs_timeline", ".verification", "__pycache__"].includes(basename(source)),
+    });
+  }
   const python = execFileSync(process.env.PYTHON ?? "python", ["-c", "import sys; print(sys.executable)"], { encoding: "utf8", windowsHide: true }).trim();
   mkdirSync(join(workspacePath, ".vscode"));
   writeFileSync(join(workspacePath, ".vscode", "settings.json"), JSON.stringify({
     "q1lens.pythonPath": python,
+    "q1lens.q1timeline.pythonPath": python,
   }, null, 2));
 
   await runTests({

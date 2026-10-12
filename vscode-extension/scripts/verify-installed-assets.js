@@ -2,13 +2,19 @@ const { createHash } = require("node:crypto");
 const { existsSync, readFileSync } = require("node:fs");
 const { homedir } = require("node:os");
 const { join } = require("node:path");
+const { isDeepStrictEqual } = require("node:util");
 
 const assetFiles = [
+  "package.json",
+  "dist/extension.js",
   "media/q1lens-icon.png",
   "media/qbs-timeline.svg",
   "out/src/q1timeline/media/timeline.css",
   "out/src/q1timeline/media/timeline.js",
   "out/src/q1timeline/media/timelineAdapter.js",
+  "out/src/q1timeline/media/hardwareState.js",
+  "out/src/q1timeline/media/hardwareView.js",
+  "out/src/q1timeline/media/hardwareView.css",
   "out/src/shared/timeline/renderer.css",
   "out/src/shared/timeline/renderer.js",
   "out/src/qbs/webview/assets/timeline.css",
@@ -37,7 +43,14 @@ function compareInstalledAssets({ extensionRoot, installedRoot, files = assetFil
       continue;
     }
 
-    if (sha256(sourcePath) !== sha256(installedPath)) {
+    if (file === "package.json") {
+      const source = readManifest(extensionRoot);
+      const installed = readManifest(installedRoot);
+      // VS Code adds installation metadata and reformats the packaged manifest.
+      delete source.__metadata;
+      delete installed.__metadata;
+      if (!isDeepStrictEqual(source, installed)) mismatches.push({ file, reason: "manifest-mismatch" });
+    } else if (sha256(sourcePath) !== sha256(installedPath)) {
       mismatches.push({ file, reason: "hash-mismatch" });
     }
   }

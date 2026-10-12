@@ -11,6 +11,7 @@ import yaml
 
 from q1timeline.diagnostics import Diagnostic
 from q1timeline.q1asm.ast import SourceLocation
+from q1timeline.simulation.config import validate_simulation
 
 
 VALID_BRANCH_POLICIES = frozenset(
@@ -47,6 +48,8 @@ class AnalysisConfig:
     loop_policy: str = "compact_first_iteration"
     branch_policy: str = "collapse_unresolved"
     underflow_policy: str = "confidence_levels"
+    execution_mode: str = "analysis"
+    max_steps: int = 10_000
 
 
 @dataclass(frozen=True)
@@ -62,6 +65,7 @@ class ProjectConfig:
     params: dict[str, Any] = field(default_factory=dict)
     display: dict[str, Any] = field(default_factory=dict)
     diagnostics: list[Diagnostic] = field(default_factory=list)
+    simulation: dict[str, Any] = field(default_factory=dict)
 
 
 class ConfigLoadError(Exception):
@@ -153,6 +157,26 @@ def load_project_config(project_file: str | Path) -> ProjectConfig:
     alignment_anchor_kinds = _load_alignment_anchor_kinds(data.get("alignment"), project_path, errors)
     view_config = _load_view_config(data.get("view"), project_path, errors)
     analysis_config = _load_analysis_config(data.get("analysis"))
+    if analysis_config.execution_mode not in {"analysis", "concrete", "simulation"}:
+        errors.append(
+            Diagnostic(
+                severity="error",
+                category="invalid_argument_value",
+                message="analysis.execution_mode must be analysis, concrete or simulation.",
+                source=_source_for_yaml_key(project_path, "execution_mode"),
+                details={"field": "analysis.execution_mode"},
+            )
+        )
+    if type(analysis_config.max_steps) is not int or analysis_config.max_steps < 1:
+        errors.append(
+            Diagnostic(
+                severity="error",
+                category="invalid_argument_value",
+                message="analysis.max_steps must be a positive integer.",
+                source=_source_for_yaml_key(project_path, "max_steps"),
+                details={"field": "analysis.max_steps"},
+            )
+        )
     if not _is_valid_alignment_mode(alignment_mode):
         errors.append(
             Diagnostic(
@@ -214,6 +238,15 @@ def load_project_config(project_file: str | Path) -> ProjectConfig:
             )
         )
 
+    simulation: dict[str, Any] = {}
+    try:
+        simulation = validate_simulation(data.get("simulation", {}), (seq.id for seq in sequencers))
+    except ValueError as exc:
+        errors.append(Diagnostic(
+            severity="error", category="invalid_simulation_config", message=str(exc),
+            source=_source_for_yaml_key(project_path, "simulation"),
+        ))
+
     if errors:
         raise ConfigLoadError("Project configuration contains errors", errors)
 
@@ -229,6 +262,7 @@ def load_project_config(project_file: str | Path) -> ProjectConfig:
         params=params,
         display=display,
         diagnostics=diagnostics,
+        simulation=simulation,
     )
 
 
@@ -413,6 +447,8 @@ def _load_analysis_config(data: Any) -> AnalysisConfig:
         loop_policy=str(data.get("loop_policy", "compact_first_iteration")),
         branch_policy=str(data.get("branch_policy", "collapse_unresolved")),
         underflow_policy=str(data.get("underflow_policy", "confidence_levels")),
+        execution_mode=str(data.get("execution_mode", "analysis")),
+        max_steps=data.get("max_steps", 10_000),
     )
 
 

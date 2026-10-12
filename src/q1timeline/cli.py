@@ -14,6 +14,7 @@ import yaml
 
 from q1timeline import __version__
 from q1timeline.analysis.alignment import align_timelines
+from q1timeline.analysis.hardware_readiness import analyze_hardware_readiness
 from q1timeline.analysis.interpreter import LOOP_PREVIEW_MAX_VISIBLE_ITERATIONS, interpret_program
 from q1timeline.analysis.underflow import analyze_underflow
 from q1timeline.diagnostics import (
@@ -35,7 +36,7 @@ from q1timeline.project import (
 from q1timeline.q1asm.ast import SourceLocation
 from q1timeline.q1asm.parser import parse_q1asm_file
 from q1timeline.render.html import RenderError, render_ir_file
-from q1timeline.sequence import load_sequence_names
+from q1timeline.sequence import load_sequence_data, load_sequence_names
 from q1timeline.watch.watcher import run_watch_once, watch_project
 
 
@@ -269,6 +270,7 @@ def _vscode_analyzer_payload(
             "event_count": len(ir["events"]) if ir else 0,
             "sequencer_count": len(states),
         },
+        "execution": ir.get("execution", {}) if ir else {},
     }
     if not args.summary_only:
         payload.update(
@@ -334,6 +336,7 @@ def _normalize_alignment_anchor_kinds(raw_anchor_kinds: Any) -> tuple[tuple[str,
 def _is_valid_alignment_mode(mode: str) -> bool:
     if mode in {
         "first_wait_sync",
+        "after_first_wait_sync",
         "first_wait_trigger",
         "first_anchor",
         "first_marker_rise",
@@ -542,6 +545,15 @@ def _analyze_command(args: argparse.Namespace) -> int:
         return 2
 
     diagnostics = list(config.diagnostics)
+    execution_mode = args.execution_mode or config.analysis.execution_mode
+    max_steps = args.max_steps if args.max_steps is not None else config.analysis.max_steps
+    if max_steps < 1:
+        message = "--max-steps must be a positive integer"
+        if args.format == "vscode-json":
+            _print_vscode_payload(_vscode_error_payload("usage_error", message))
+        else:
+            print(f"q1timeline analyze: {message}", file=sys.stderr)
+        return 2
     alignment_mode = args.align or config.alignment_mode
     alignment_anchor_kinds, invalid_alignment_anchor_items = _alignment_anchor_kinds_with_invalids(args, config)
     if not _is_valid_alignment_mode(alignment_mode):
@@ -595,6 +607,8 @@ def _analyze_command(args: argparse.Namespace) -> int:
     if args.format != "vscode-json":
         print(f"Loaded project metadata: {len(config.sequencers)} sequencer(s)")
     states = []
+    simulation_programs = {}
+    simulation_sequences = {}
     ir = None
     for sequencer in config.sequencers:
         sequence_names = load_sequence_names(sequencer.sequence_json) if sequencer.sequence_json else None
@@ -616,6 +630,19 @@ def _analyze_command(args: argparse.Namespace) -> int:
                 return 2
             print(format_diagnostic(diagnostic), file=sys.stderr)
             return 2
+        if execution_mode == "simulation":
+            simulation_programs[sequencer.id] = program
+            if sequencer.sequence_json:
+                try:
+                    simulation_sequences[sequencer.id] = load_sequence_data(sequencer.sequence_json)
+                except (OSError, UnicodeDecodeError, ValueError) as exc:
+                    message = f"Could not load simulation sequence {sequencer.sequence_json}: {exc}"
+                    if args.format == "vscode-json":
+                        _print_vscode_payload(_vscode_error_payload("config_error", message, diagnostics))
+                    else:
+                        print(f"q1timeline analyze: {message}", file=sys.stderr)
+                    return 2
+            continue
         state = interpret_program(
             program,
             sequencer_id=sequencer.id,
@@ -626,9 +653,29 @@ def _analyze_command(args: argparse.Namespace) -> int:
             branch_assumptions=branch_assumptions,
             loop_preview_counts=loop_preview_counts,
             strict_q1asm=args.q1asm_strict,
+            execution_mode=execution_mode,
+            max_steps=max_steps,
         )
         analyze_underflow(state)
         states.append(state)
+    if execution_mode == "simulation":
+        from q1timeline.simulation.runtime import simulate_programs
+
+        try:
+            states = simulate_programs(
+                simulation_programs, params=params, max_steps=max_steps,
+                simulation=config.simulation, sequences=simulation_sequences,
+                strict_q1asm=args.q1asm_strict,
+            )
+        except ValueError as exc:
+            if args.format == "vscode-json":
+                _print_vscode_payload(_vscode_error_payload("config_error", str(exc), diagnostics))
+            else:
+                print(f"q1timeline analyze: {exc}", file=sys.stderr)
+            return 2
+    if args.hardware_readiness:
+        for state in states:
+            analyze_hardware_readiness(state)
     align_timelines(states, mode=alignment_mode, anchor_kinds=alignment_anchor_kinds)
     diagnostics.extend(diagnostic for state in states for diagnostic in state.diagnostics)
     ir = timeline_ir_from_states(
@@ -642,6 +689,9 @@ def _analyze_command(args: argparse.Namespace) -> int:
         },
         diagnostics=diagnostics,
     )
+    for entry, sequencer in zip(ir["sequencers"], config.sequencers):
+        if sequencer.module:
+            entry["module"] = sequencer.module
     output_target: Path | None = None
     try:
         ir["analysis"]["parameters"] = []
@@ -733,6 +783,13 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument("--no-render", action="store_false", dest="render", help="do not render HTML from analyze")
     analyze.add_argument("--strict", action="store_true", help="return nonzero when warnings are present")
     analyze.add_argument("--q1asm-strict", action="store_true", help="reject unresolved symbolic operands like q1asm_windows.exe")
+    analyze.add_argument("--execution-mode", choices=("analysis", "concrete", "simulation"), help="override project execution mode (default: analysis)")
+    analyze.add_argument("--max-steps", type=int, help="maximum executed instructions per sequencer in concrete mode (default: 10000)")
+    analyze.add_argument(
+        "--hardware-readiness",
+        action="store_true",
+        help="run conservative hardware-readiness checks and include their summary",
+    )
     analyze.add_argument("--align", help="override alignment mode")
     analyze.add_argument(
         "--align-anchor-kind",

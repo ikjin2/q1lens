@@ -16,6 +16,18 @@ class SequenceNames:
     diagnostics: list[Diagnostic] = field(default_factory=list)
 
 
+def load_sequence_data(path: str | Path) -> dict[str, Any]:
+    """Load the samples as well as names for numerical simulation."""
+    loaded = json.loads(
+        Path(path).read_text(encoding="utf-8-sig"),
+        parse_constant=_reject_non_finite_json_constant,
+        parse_float=_parse_finite_json_float,
+    )
+    if not isinstance(loaded, dict):
+        raise ValueError(f"Sequence JSON must be an object: {path}")
+    return loaded
+
+
 def load_sequence_names(path: str | Path) -> SequenceNames:
     sequence_path = Path(path)
     if not sequence_path.exists():

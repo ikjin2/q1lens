@@ -11,11 +11,21 @@ function createUri(fsPath: string) {
   };
 }
 
+function quickFixApi() {
+  return {
+    CodeActionKind: { QuickFix: "quickfix" },
+    languages: {
+      registerCodeActionsProvider: () => ({ dispose: () => undefined }),
+    },
+  };
+}
+
 describe("q1timeline registration", () => {
   it("passes a selected Q1ASM URI from the open preview command to the controller", async () => {
     const registeredCommands = new Map<string, (...args: any[]) => any>();
     const previewCalls: any[] = [];
     const vscode = {
+      ...quickFixApi(),
       commands: {
         registerCommand: (name: string, callback: (...args: any[]) => any) => {
           registeredCommands.set(name, callback);
@@ -66,6 +76,7 @@ describe("q1timeline registration", () => {
     const registeredCommands = new Map<string, (...args: any[]) => any>();
     const selectionCalls: any[] = [];
     const vscode = {
+      ...quickFixApi(),
       commands: {
         registerCommand: (name: string, callback: (...args: any[]) => any) => {
           registeredCommands.set(name, callback);
@@ -115,6 +126,7 @@ describe("q1timeline registration", () => {
     const registeredCommands = new Map<string, (...args: any[]) => any>();
     const openFolderCalls: any[] = [];
     const vscode = {
+      ...quickFixApi(),
       commands: {
         registerCommand: (name: string, callback: (...args: any[]) => any) => {
           registeredCommands.set(name, callback);
@@ -161,10 +173,11 @@ describe("q1timeline registration", () => {
     }
   });
 
-  it("registers parameter override commands with the timeline controller", async () => {
+  it("registers commands that save and clear comparison baselines", async () => {
     const registeredCommands = new Map<string, (...args: any[]) => any>();
-    const calls: string[] = [];
+    const baselineCalls: string[] = [];
     const vscode = {
+      ...quickFixApi(),
       commands: {
         registerCommand: (name: string, callback: (...args: any[]) => any) => {
           registeredCommands.set(name, callback);
@@ -188,6 +201,63 @@ describe("q1timeline registration", () => {
             openQ1asmFilesInFolder() {}
             revealCurrentLineInTimeline() {}
             openTarget() {}
+            saveComparisonBaseline() {
+              baselineCalls.push("save");
+            }
+            clearComparisonBaseline() {
+              baselineCalls.push("clear");
+            }
+          },
+        };
+      }
+      return originalLoad.call(this, request, parent, isMain);
+    };
+    const modulePath = require.resolve("../../src/q1timeline/register");
+    delete require.cache[modulePath];
+    try {
+      const { registerQ1Timeline } = require("../../src/q1timeline/register");
+      registerQ1Timeline({ subscriptions: [] });
+
+      await registeredCommands.get("q1timeline.saveComparisonBaseline")?.();
+      await registeredCommands.get("q1timeline.clearComparisonBaseline")?.();
+
+      assert.deepEqual(baselineCalls, ["save", "clear"]);
+    } finally {
+      delete require.cache[modulePath];
+      Module._load = originalLoad;
+    }
+  });
+
+  it("registers parameter override commands with the timeline controller", async () => {
+    const registeredCommands = new Map<string, (...args: any[]) => any>();
+    const calls: string[] = [];
+    const vscode = {
+      ...quickFixApi(),
+      commands: {
+        registerCommand: (name: string, callback: (...args: any[]) => any) => {
+          registeredCommands.set(name, callback);
+          return { dispose: () => undefined };
+        },
+      },
+    };
+
+    const originalLoad = Module._load;
+    Module._load = function patchedLoad(request: string, parent: any, isMain: boolean) {
+      if (request === "vscode") {
+        return vscode;
+      }
+      if (request === "./controller") {
+        return {
+          TimelineController: class {
+            openPreview() {}
+            refreshPreview() {}
+            selectProjectFile() {}
+            selectQ1asmFilesInFolder() {}
+            openQ1asmFilesInFolder() {}
+            revealCurrentLineInTimeline() {}
+            openTarget() {}
+            saveComparisonBaseline() {}
+            clearComparisonBaseline() {}
             setAnalysisParameter() {
               calls.push("set");
             }

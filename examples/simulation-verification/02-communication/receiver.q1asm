@@ -1,0 +1,9 @@
+wait_sync 4
+# Keep the RT core occupied while the Q1 core waits for the message.
+wait 800
+fb_pop_data 16,R0
+nop
+add R0,1,R1
+nop
+wait_trigger 1,4
+stop

@@ -19,6 +19,7 @@ export interface TimelinePanelHandlers {
 
 export class TimelinePanel {
   private panel: vscode.WebviewPanel | undefined;
+  private ready = false;
   private pendingIr: QbsIr | undefined;
   private pendingSourceContext: TimelineSourceContext | undefined;
 
@@ -28,6 +29,7 @@ export class TimelinePanel {
   ) {}
 
   show(ir: QbsIr, paths?: OutputPaths): void {
+    const isFirstShow = !this.panel;
     if (!this.panel) {
       this.panel = vscode.window.createWebviewPanel(
         "qbsTimeline",
@@ -41,51 +43,60 @@ export class TimelinePanel {
           ],
         },
       );
+      const createdPanel = this.panel;
       this.panel.onDidDispose(() => {
-        this.panel = undefined;
+        if (this.panel === createdPanel) {
+          this.panel = undefined;
+          this.ready = false;
+          this.pendingIr = undefined;
+          this.pendingSourceContext = undefined;
+        }
       });
       this.panel.webview.onDidReceiveMessage((message: WebviewToExtensionMessage) => {
         void this.receiveMessage(message);
       });
+      const sharedCssUri = this.panel.webview.asWebviewUri(
+        vscode.Uri.joinPath(this.extensionUri, "out", "src", "shared", "timeline", "renderer.css"),
+      );
+      const sharedScriptUri = this.panel.webview.asWebviewUri(
+        vscode.Uri.joinPath(this.extensionUri, "out", "src", "shared", "timeline", "renderer.js"),
+      );
+      const cssUri = this.panel.webview.asWebviewUri(
+        vscode.Uri.joinPath(this.extensionUri, "out", "src", "qbs", "webview", "assets", "timeline.css"),
+      );
+      const modelScriptUri = this.panel.webview.asWebviewUri(
+        vscode.Uri.joinPath(this.extensionUri, "out", "src", "qbs", "webview", "assets", "timelineModel.js"),
+      );
+      const scriptUri = this.panel.webview.asWebviewUri(
+        vscode.Uri.joinPath(this.extensionUri, "out", "src", "qbs", "webview", "assets", "timeline.js"),
+      );
+      const nonce = randomBytes(16).toString("base64");
+      this.panel.webview.html = buildWebviewHtml({
+        title: getScheduleTitle(ir),
+        sharedCssUri: sharedCssUri.toString(),
+        cssUri: cssUri.toString(),
+        cspSource: this.panel.webview.cspSource,
+        sharedScriptUri: sharedScriptUri.toString(),
+        modelScriptUri: modelScriptUri.toString(),
+        scriptUri: scriptUri.toString(),
+        nonce,
+      });
     }
 
-    const sharedCssUri = this.panel.webview.asWebviewUri(
-      vscode.Uri.joinPath(this.extensionUri, "out", "src", "shared", "timeline", "renderer.css"),
-    );
-    const sharedScriptUri = this.panel.webview.asWebviewUri(
-      vscode.Uri.joinPath(this.extensionUri, "out", "src", "shared", "timeline", "renderer.js"),
-    );
-    const cssUri = this.panel.webview.asWebviewUri(
-      vscode.Uri.joinPath(this.extensionUri, "out", "src", "qbs", "webview", "assets", "timeline.css"),
-    );
-    const modelScriptUri = this.panel.webview.asWebviewUri(
-      vscode.Uri.joinPath(this.extensionUri, "out", "src", "qbs", "webview", "assets", "timelineModel.js"),
-    );
-    const scriptUri = this.panel.webview.asWebviewUri(
-      vscode.Uri.joinPath(this.extensionUri, "out", "src", "qbs", "webview", "assets", "timeline.js"),
-    );
-    const nonce = randomBytes(16).toString("base64");
     this.panel.title = `Q1Lens: ${getScheduleTitle(ir)}`;
     this.pendingIr = ir;
     this.pendingSourceContext = paths ? buildSourceContext(paths, ir) : undefined;
-    this.panel.webview.html = buildWebviewHtml({
-      title: getScheduleTitle(ir),
-      sharedCssUri: sharedCssUri.toString(),
-      cssUri: cssUri.toString(),
-      cspSource: this.panel.webview.cspSource,
-      sharedScriptUri: sharedScriptUri.toString(),
-      modelScriptUri: modelScriptUri.toString(),
-      scriptUri: scriptUri.toString(),
-      nonce,
-    });
-    this.panel.reveal(vscode.ViewColumn.Beside);
+    if (isFirstShow) {
+      this.panel.reveal(vscode.ViewColumn.Beside);
+    } else if (this.ready) {
+      void this.postPendingRender();
+    }
   }
 
   private async receiveMessage(message: WebviewToExtensionMessage): Promise<void> {
     if (message.type === "ready") {
-      if (this.pendingIr && this.panel) {
-        void this.panel.webview.postMessage({ type: "render", ir: this.pendingIr, sourceContext: this.pendingSourceContext });
-      }
+      this.ready = true;
+      await this.postPendingRender();
     } else if (message.type === "refresh") {
       await this.handlers.onRefresh();
     } else if (message.type === "openQ1Timeline") {
@@ -102,6 +113,16 @@ export class TimelinePanel {
       await this.handlers.onOpenScheduleFile();
     } else if (message.type === "openNotebookFile") {
       await this.handlers.onOpenNotebookFile();
+    }
+  }
+
+  private async postPendingRender(): Promise<void> {
+    if (this.pendingIr && this.panel) {
+      await this.panel.webview.postMessage({
+        type: "render",
+        ir: this.pendingIr,
+        sourceContext: this.pendingSourceContext,
+      });
     }
   }
 }

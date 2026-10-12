@@ -84,6 +84,35 @@ function parseWebviewMessage(message) {
     };
   }
 
+  if (
+    (message.type === "setAnalysisParameter" || message.type === "resetAnalysisParameter") &&
+    typeof message.name === "string" &&
+    message.name.trim().length > 0 &&
+    !message.name.includes("=") &&
+    typeof message.projectFile === "string" &&
+    message.projectFile.trim().length > 0
+  ) {
+    if (
+      message.type === "setAnalysisParameter" &&
+      typeof message.valueJson === "string" &&
+      hasOnlyKeys(message, ["type", "name", "valueJson", "projectFile"])
+    ) {
+      return {
+        valid: true,
+        type: message.type,
+        name: message.name,
+        valueJson: message.valueJson,
+        projectFile: message.projectFile,
+      };
+    }
+    if (
+      message.type === "resetAnalysisParameter" &&
+      hasOnlyKeys(message, ["type", "name", "projectFile"])
+    ) {
+      return { valid: true, type: message.type, name: message.name, projectFile: message.projectFile };
+    }
+  }
+
   return { valid: false, reason: "unknown webview message shape" };
 }
 

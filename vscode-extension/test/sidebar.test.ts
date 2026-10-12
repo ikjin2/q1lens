@@ -4,6 +4,7 @@ import { buildSidebarItems } from "../src/qbs/sidebar";
 describe("sidebar", () => {
   it("exposes the Q1Lens workflow actions", () => {
     assert.deepEqual(buildSidebarItems().map((item) => [item.label, item.command]), [
+      ["Check Python Environment", "q1lens.checkEnvironment"],
       ["Analyze and Open", "qbsTimeline.analyzeAndOpen"],
       ["Refresh", "qbsTimeline.refresh"],
       ["Open QBS IR", "qbsTimeline.openIr"],

@@ -42,6 +42,15 @@ describe("package metadata", () => {
     assert.ok(commands.includes("qbsTimeline.openCurrentFolderQ1Timeline"));
     assert.ok(commands.includes("q1timeline.openPreview"));
     assert.ok(commands.includes("q1timeline.refreshPreview"));
+    for (const command of [
+      "q1lens.checkEnvironment",
+      "q1lens.selectPythonEnvironment",
+      "q1timeline.setAnalysisParameter",
+      "q1timeline.clearAnalysisParameterOverrides",
+    ]) {
+      assert.ok(commands.includes(command));
+      assert.ok(packageJson().activationEvents.includes(`onCommand:${command}`));
+    }
   });
 
   it("uses Q1Lens as the visible command category", () => {

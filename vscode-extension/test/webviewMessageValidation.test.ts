@@ -89,4 +89,43 @@ describe("q1timeline webview message validation", () => {
     assert.equal(parseWebviewMessage({ type: "setLoopPreview", loopKey: "loop", visibleIterations: 2.5 }).valid, false);
     assert.equal(parseWebviewMessage({ type: "setLoopPreview", loopKey: "loop", visibleIterations: 2, extra: true }).valid, false);
   });
+
+  it("accepts project-scoped inline parameter edits without parsing their JSON", () => {
+    const message = {
+      type: "setAnalysisParameter",
+      name: "DURATION",
+      valueJson: " 9007199254740993 ",
+      projectFile: "C:\\repo\\q1timeline.yml",
+    };
+    assert.deepEqual(parseWebviewMessage(message), { valid: true, ...message });
+    assert.equal(parseWebviewMessage({ ...message, valueJson: "" }).valid, true);
+    const reset = { type: "resetAnalysisParameter", name: message.name, projectFile: message.projectFile };
+    assert.deepEqual(parseWebviewMessage(reset), { valid: true, ...reset });
+  });
+
+  it("rejects malformed or unscoped inline parameter messages", () => {
+    const message = {
+      type: "setAnalysisParameter",
+      name: "DURATION",
+      valueJson: "64",
+      projectFile: "C:\\repo\\q1timeline.yml",
+    };
+    for (const invalid of [
+      { ...message, name: "" },
+      { ...message, name: " " },
+      { ...message, name: "DURATION=64" },
+      { ...message, name: 64 },
+      { ...message, projectFile: undefined },
+      { ...message, projectFile: " " },
+      { ...message, projectFile: 64 },
+      { ...message, valueJson: undefined },
+      { ...message, valueJson: 64 },
+      { ...message, extra: true },
+      { ...message, type: "resetAnalysisParameter" },
+      { type: "resetAnalysisParameter", name: "DURATION" },
+      { type: "resetAnalysisParameter", name: "DURATION", projectFile: message.projectFile, extra: true },
+    ]) {
+      assert.equal(parseWebviewMessage(invalid).valid, false, JSON.stringify(invalid));
+    }
+  });
 });

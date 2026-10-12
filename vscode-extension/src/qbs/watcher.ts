@@ -2,6 +2,7 @@ export class DebouncedRefreshQueue {
   private timer: NodeJS.Timeout | undefined;
   private running = false;
   private queued = false;
+  private disposed = false;
 
   constructor(
     private readonly delayMs: number,
@@ -9,6 +10,9 @@ export class DebouncedRefreshQueue {
   ) {}
 
   request(): void {
+    if (this.disposed) {
+      return;
+    }
     if (this.running) {
       this.queued = true;
       return;
@@ -23,6 +27,8 @@ export class DebouncedRefreshQueue {
   }
 
   dispose(): void {
+    this.disposed = true;
+    this.queued = false;
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = undefined;
@@ -35,7 +41,7 @@ export class DebouncedRefreshQueue {
       await this.run();
     } finally {
       this.running = false;
-      if (this.queued) {
+      if (!this.disposed && this.queued) {
         this.queued = false;
         this.request();
       }

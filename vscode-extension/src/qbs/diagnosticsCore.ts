@@ -158,7 +158,7 @@ function concreteTimelineValue(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) {
     return value;
   }
-  if (isRecord(value) && typeof value.value === "number" && Number.isFinite(value.value)) {
+  if (isRecord(value) && (value.kind === undefined || value.kind === "concrete") && typeof value.value === "number" && Number.isFinite(value.value)) {
     return value.value;
   }
   return undefined;
@@ -201,6 +201,28 @@ function timelineEventSpan(event: Record<string, unknown>): SpanNs | undefined {
   return { start, end };
 }
 
+function timelineScheduleOrigins(ir: QbsIr, events: Record<string, unknown>[]): Map<string, number | undefined> {
+  const origins = new Map<string, number | undefined>();
+  const alignment = isRecord(ir.q1timeline_ir) ? ir.q1timeline_ir.alignment : undefined;
+  if (!isRecord(alignment)) {
+    return origins;
+  }
+  const byId = new Map(events.map((event) => [event.id, event]));
+  for (const [sequencer, entry] of Object.entries(alignment)) {
+    if (!isRecord(entry) || entry.mode !== "first_wait_sync") {
+      continue;
+    }
+    const anchor = byId.get(entry.anchor_event_id);
+    // QBS schedule time begins after the declared synchronization prelude.
+    // Display alignment uses its start; this comparison uses its completion.
+    // Keep the original event times and any subsequent waits unchanged.
+    const span = anchor && anchor.kind === "wait_sync" && timelineEventSequencer(anchor) === sequencer
+      ? timelineEventSpan(anchor) : undefined;
+    origins.set(sequencer, entry.unaligned || entry.confidence === "unknown" ? undefined : span?.end);
+  }
+  return origins;
+}
+
 function timelineEventMatchesInstructions(event: Record<string, unknown>, instructions: string[]): boolean {
   const kind = timelineEventKind(event);
   if (IGNORED_CROSS_LAYER_EVENT_KINDS.has(kind)) {
@@ -218,7 +240,7 @@ function timelineEventMatchesInstructions(event: Record<string, unknown>, instru
   });
 }
 
-function q1timelineSpanForMapping(ir: QbsIr, mapping: QbsIr["q1asm_provenance"][number]): SpanNs | undefined {
+function q1timelineSpanForMapping(ir: QbsIr, mapping: QbsIr["q1asm_provenance"][number], events: Record<string, unknown>[], origins: Map<string, number | undefined>): SpanNs | undefined {
   if (!mapping.sequencer) {
     return undefined;
   }
@@ -228,10 +250,11 @@ function q1timelineSpanForMapping(ir: QbsIr, mapping: QbsIr["q1asm_provenance"][
   }
   const aliases = sequencerAliases(ir, mapping.sequencer);
   const instructions = provenanceInstructions(mapping);
-  const spans = timelineEvents(ir).flatMap((event) => {
+  const spans = events.flatMap((event) => {
     const sequencer = timelineEventSequencer(event);
     const line = timelineEventLine(event);
     const span = timelineEventSpan(event);
+    const origin = sequencer && origins.has(sequencer) ? origins.get(sequencer) : 0;
     if (
       !sequencer
       || !aliases.has(sequencer)
@@ -239,11 +262,12 @@ function q1timelineSpanForMapping(ir: QbsIr, mapping: QbsIr["q1asm_provenance"][
       || line < lineRange.start
       || line > lineRange.end
       || !span
+      || origin === undefined
       || !timelineEventMatchesInstructions(event, instructions)
     ) {
       return [];
     }
-    return [span];
+    return [{ start: span.start - origin, end: span.end - origin }];
   });
   if (!spans.length) {
     return undefined;
@@ -291,10 +315,12 @@ function crossLayerDiagnostics(ir: QbsIr): QbsDiagnostic[] {
     return [];
   }
   const diagnostics: QbsDiagnostic[] = [];
+  const events = timelineEvents(ir);
+  const origins = timelineScheduleOrigins(ir, events);
   for (const block of ir.symbolic_pulses) {
     const mappings = ir.q1asm_provenance.filter((mapping) => provenanceMatchesBlock(mapping, block));
     for (const mapping of mappings) {
-      const q1Span = q1timelineSpanForMapping(ir, mapping);
+      const q1Span = q1timelineSpanForMapping(ir, mapping, events, origins);
       if (!q1Span) {
         continue;
       }

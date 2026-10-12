@@ -27,6 +27,10 @@
     "Other"
   ],
   "activationEvents": [
+    "onCommand:q1lens.checkEnvironment",
+    "onCommand:q1lens.selectPythonEnvironment",
+    "onCommand:q1timeline.setAnalysisParameter",
+    "onCommand:q1timeline.clearAnalysisParameterOverrides",
     "onCommand:qbsTimeline.analyzeAndOpen",
     "onCommand:qbsTimeline.refresh",
     "onCommand:qbsTimeline.openNotebookTimelineFromCell",
@@ -49,6 +53,24 @@
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
+      {
+        "command": "q1lens.checkEnvironment",
+        "title": "Check Python Environment",
+        "category": "Q1Lens"
+      },
+      {
+        "command": "q1lens.selectPythonEnvironment",
+        "title": "Select Python Environment",
+        "category": "Q1Lens"
+      },
+      {
+        "command": "q1timeline.setAnalysisParameter",
+        "title": "Q1Lens: Set Analysis Parameter..."
+      },
+      {
+        "command": "q1timeline.clearAnalysisParameterOverrides",
+        "title": "Q1Lens: Clear Analysis Parameter Overrides"
+      },
       {
         "command": "qbsTimeline.analyzeAndOpen",
         "title": "Analyze and Open",
@@ -503,7 +525,7 @@
     "compile": "tsc -p ./ && node ./scripts/copy-extension-assets.js",
     "watch": "tsc -watch -p ./",
     "test": "npm run compile && mocha \"out/test/**/*.test.js\" --ignore \"out/test/suite/**/*.test.js\"",
-    "test:extension": "npm run compile && node ./out/test/runTest.js",
+    "test:extension": "npm run compile && npm run bundle && node ./out/test/runTest.js",
     "package": "vsce package",
     "verify:installed": "node ./scripts/verify-installed-assets.js",
     "reinstall:local": "npm run package && code --install-extension q1lens-0.1.2.vsix --force && npm run verify:installed"

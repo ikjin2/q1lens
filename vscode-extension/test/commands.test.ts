@@ -4,12 +4,16 @@ import Module = require("node:module");
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  QBS_ANALYSIS_REQUIRED_MESSAGE,
+  QBS_ANALYZE_AND_OPEN_ACTION,
   QBS_AUTO_REFRESH_GLOB,
   analyzeQ1TimelineWithCli,
   createAnalyzeAndOpenHandler,
+  ensureQbsAnalysisAvailable,
   isWatchedPathForCurrentProject,
   loadQ1TimelineDiagnosticsFromDisk,
   openSourceTarget,
+  registerQbsAutoRefresh,
   resolveQ1AsmSourceTarget,
   resolveScheduleSourceTarget,
 } from "../src/qbs/commands";
@@ -321,6 +325,91 @@ describe("commands", () => {
 
   it("watches notebook schedules for QBS auto-refresh", () => {
     assert.equal(QBS_AUTO_REFRESH_GLOB.includes("*.ipynb"), true);
+  });
+
+  it("reconfigures exactly one auto-refresh watcher across canonical and legacy setting changes", () => {
+    let enabled = false;
+    let configurationListener: ((event: { affectsConfiguration(section: string): boolean }) => void) | undefined;
+    let created = 0;
+    let active = 0;
+    let disposed = 0;
+    const registration = registerQbsAutoRefresh({
+      readEnabled: () => enabled,
+      createWatcher: () => {
+        created += 1;
+        active += 1;
+        return {
+          onDidChange: () => ({ dispose: () => undefined }),
+          onDidCreate: () => ({ dispose: () => undefined }),
+          onDidDelete: () => ({ dispose: () => undefined }),
+          dispose: () => {
+            disposed += 1;
+            active -= 1;
+          },
+        } as any;
+      },
+      onDidChangeConfiguration: (listener) => {
+        configurationListener = listener;
+        return { dispose: () => undefined };
+      },
+      shouldRefresh: () => true,
+      run: async () => undefined,
+      delayMs: 1,
+    });
+    const change = (key: string) => configurationListener?.({
+      affectsConfiguration: (section) => section === key,
+    });
+
+    assert.equal(active, 0);
+    enabled = true;
+    change("q1lens.qbs.autoRefresh");
+    assert.deepEqual({ created, active, disposed }, { created: 1, active: 1, disposed: 0 });
+
+    enabled = false;
+    change("qbloxTimeline.qbs.autoRefresh");
+    assert.deepEqual({ created, active, disposed }, { created: 1, active: 0, disposed: 1 });
+
+    enabled = true;
+    change("qbsTimeline.autoRefresh");
+    assert.deepEqual({ created, active, disposed }, { created: 2, active: 1, disposed: 1 });
+
+    change("q1lens.qbs.autoRefresh");
+    assert.deepEqual({ created, active, disposed }, { created: 3, active: 1, disposed: 2 });
+    registration.dispose();
+    assert.deepEqual({ created, active, disposed }, { created: 3, active: 0, disposed: 3 });
+  });
+
+  it("only analyzes for a missing artifact after the explicit recovery action", async () => {
+    let available = false;
+    let analyzes = 0;
+    const prompts: Array<[string, string]> = [];
+    const cancelResult = await ensureQbsAnalysisAvailable({
+      isAvailable: () => available,
+      analyze: async () => {
+        analyzes += 1;
+        available = true;
+      },
+      prompt: async (message, action) => {
+        prompts.push([message, action]);
+        return undefined;
+      },
+    });
+
+    assert.equal(cancelResult, false);
+    assert.equal(analyzes, 0);
+    assert.deepEqual(prompts, [[QBS_ANALYSIS_REQUIRED_MESSAGE, QBS_ANALYZE_AND_OPEN_ACTION]]);
+
+    const recoveryResult = await ensureQbsAnalysisAvailable({
+      isAvailable: () => available,
+      analyze: async () => {
+        analyzes += 1;
+        available = true;
+      },
+      prompt: async () => QBS_ANALYZE_AND_OPEN_ACTION,
+    });
+
+    assert.equal(recoveryResult, true);
+    assert.equal(analyzes, 1);
   });
 
   it("skips q1timeline inline analysis when the QBS IR has no Q1ASM programs", async () => {
@@ -961,6 +1050,8 @@ describe("commands", () => {
     let panelHandlers: any;
     let findFilesCalls = 0;
     let analyzeCalls = 0;
+    let activeFile: string | undefined;
+    const analyzedProjects: string[] = [];
     let releaseSecondAnalyze!: () => void;
     const originalLoad = (Module as any)._load;
     const secondAnalyzeStarted = new Promise<void>((resolve) => {
@@ -974,7 +1065,9 @@ describe("commands", () => {
           createOutputChannel: () => ({ appendLine: () => {}, show: () => {}, dispose: () => {} }),
           showWarningMessage: async () => undefined,
           showQuickPick: async (items: any[]) => items[0],
-          activeTextEditor: undefined,
+          get activeTextEditor() {
+            return activeFile ? { document: { uri: { fsPath: activeFile } } } : undefined;
+          },
         },
         workspace: {
           getConfiguration: () => ({ get: (_key: string, fallback: any) => fallback }),
@@ -1020,7 +1113,10 @@ describe("commands", () => {
         }
         if (request === "./qbsCli") {
           return {
-            buildAnalyzeInvocation: () => ({ command: "mock", args: ["analyze"] }),
+            buildAnalyzeInvocation: (input: any) => {
+              analyzedProjects.push(input.projectFile);
+              return { command: "mock", args: ["analyze"] };
+            },
             buildRenderInvocation: () => ({ command: "mock", args: ["render"] }),
             buildQ1TimelineAnalyzeInvocation: () => ({ command: "mock", args: ["q1timeline"] }),
             runProcessWithSpawn: (_command: string, args: string[]) => {
@@ -1051,13 +1147,20 @@ describe("commands", () => {
       );
 
       await commands["qbsTimeline.analyzeAndOpen"]();
-      const secondRun = commands["qbsTimeline.analyzeAndOpen"]();
+      activeFile = join(projectB, "schedule.py");
+      const secondRun = commands["qbsTimeline.refresh"]();
       await secondAnalyzeStarted;
       await panelHandlers.onOpenQ1Timeline({ type: "openQ1Timeline", operationId: "op" });
 
+      assert.equal(findFilesCalls, 1);
+      assert.equal(analyzedProjects[1], join(projectA, "qbstimeline.yml"));
       assert.equal(openedTargets[0].q1asmFile.replace(/\\/g, "/").includes("/project-a/.qbs_timeline/"), true);
       releaseSecondAnalyze();
       await secondRun;
+
+      await commands["qbsTimeline.analyzeAndOpen"]();
+      assert.equal(findFilesCalls, 2);
+      assert.equal(analyzedProjects[2], join(projectB, "qbstimeline.yml"));
     } finally {
       delete require.cache[modulePath];
       (Module as any)._load = originalLoad;

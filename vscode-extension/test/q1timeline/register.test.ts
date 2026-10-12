@@ -160,4 +160,58 @@ describe("q1timeline registration", () => {
       Module._load = originalLoad;
     }
   });
+
+  it("registers parameter override commands with the timeline controller", async () => {
+    const registeredCommands = new Map<string, (...args: any[]) => any>();
+    const calls: string[] = [];
+    const vscode = {
+      commands: {
+        registerCommand: (name: string, callback: (...args: any[]) => any) => {
+          registeredCommands.set(name, callback);
+          return { dispose: () => undefined };
+        },
+      },
+    };
+
+    const originalLoad = Module._load;
+    Module._load = function patchedLoad(request: string, parent: any, isMain: boolean) {
+      if (request === "vscode") {
+        return vscode;
+      }
+      if (request === "./controller") {
+        return {
+          TimelineController: class {
+            openPreview() {}
+            refreshPreview() {}
+            selectProjectFile() {}
+            selectQ1asmFilesInFolder() {}
+            openQ1asmFilesInFolder() {}
+            revealCurrentLineInTimeline() {}
+            openTarget() {}
+            setAnalysisParameter() {
+              calls.push("set");
+            }
+            clearAnalysisParameterOverrides() {
+              calls.push("clear");
+            }
+          },
+        };
+      }
+      return originalLoad.call(this, request, parent, isMain);
+    };
+    const modulePath = require.resolve("../../src/q1timeline/register");
+    delete require.cache[modulePath];
+    try {
+      const { registerQ1Timeline } = require("../../src/q1timeline/register");
+      registerQ1Timeline({ subscriptions: [] });
+
+      await registeredCommands.get("q1timeline.setAnalysisParameter")?.();
+      await registeredCommands.get("q1timeline.clearAnalysisParameterOverrides")?.();
+
+      assert.deepEqual(calls, ["set", "clear"]);
+    } finally {
+      delete require.cache[modulePath];
+      Module._load = originalLoad;
+    }
+  });
 });

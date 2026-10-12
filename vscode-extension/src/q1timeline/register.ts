@@ -35,6 +35,8 @@ export function registerQ1Timeline(context: vscodeTypes.ExtensionContext): Q1Tim
     vscode.commands.registerCommand("q1timeline.selectQ1asmFilesInFolder", (sourceUri?: vscodeTypes.Uri) => controller.selectQ1asmFilesInFolder(sourceUri)),
     vscode.commands.registerCommand("q1timeline.openQ1asmFilesInFolder", (sourceUri?: vscodeTypes.Uri) => controller.openQ1asmFilesInFolder(sourceUri)),
     vscode.commands.registerCommand("q1timeline.revealCurrentLineInTimeline", () => controller.revealCurrentLineInTimeline()),
+    vscode.commands.registerCommand("q1timeline.setAnalysisParameter", () => controller.setAnalysisParameter()),
+    vscode.commands.registerCommand("q1timeline.clearAnalysisParameterOverrides", () => controller.clearAnalysisParameterOverrides()),
   );
 
   return {

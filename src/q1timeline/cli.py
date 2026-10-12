@@ -143,6 +143,36 @@ def _parse_loop_preview_counts(items: list[str] | None) -> dict[str, int]:
     return preview_counts
 
 
+def _parse_param_overrides(items: list[str] | None) -> dict[str, Any]:
+    overrides: dict[str, Any] = {}
+    for item in items or []:
+        raw_name, separator, raw_value = item.partition("=")
+        name = raw_name.strip()
+        if not separator or not name:
+            diagnostic = Diagnostic(
+                severity="error",
+                category="invalid_param_override",
+                message=f"Invalid parameter override: {item}",
+            )
+            raise ConfigLoadError(diagnostic.message, [diagnostic])
+        try:
+            value = json.loads(
+                raw_value,
+                parse_constant=_reject_non_finite_json_constant,
+                parse_float=_parse_finite_json_float,
+            )
+            validate_params_json_mapping({name: value})
+        except (json.JSONDecodeError, ValueError) as exc:
+            diagnostic = Diagnostic(
+                severity="error",
+                category="invalid_param_override",
+                message=f"Invalid parameter override {name}: {exc}",
+            )
+            raise ConfigLoadError(diagnostic.message, [diagnostic]) from exc
+        overrides[name] = value
+    return overrides
+
+
 def _print_diagnostic_report(diagnostics: list[Diagnostic]) -> None:
     print(format_summary(diagnostics))
     for diagnostic in diagnostics:
@@ -541,6 +571,10 @@ def _analyze_command(args: argparse.Namespace) -> int:
         loop_preview_counts = _parse_loop_preview_counts(args.loop_previews)
         if args.params:
             params = _load_json_override(args.params)
+        base_params = params
+        param_overrides = _parse_param_overrides(args.param_overrides)
+        if param_overrides:
+            params = {**params, **param_overrides}
         if args.display:
             display = _load_yaml_override(args.display)
             display_file = args.display.resolve()
@@ -610,6 +644,16 @@ def _analyze_command(args: argparse.Namespace) -> int:
     )
     output_target: Path | None = None
     try:
+        ir["analysis"]["parameters"] = []
+        for name, value in sorted(params.items()):
+            parameter = {
+                "name": name,
+                "value_json": json.dumps(value, sort_keys=True, allow_nan=False),
+                "overridden": name in param_overrides,
+            }
+            if name in param_overrides and name in base_params:
+                parameter["base_value_json"] = json.dumps(base_params[name], sort_keys=True, allow_nan=False)
+            ir["analysis"]["parameters"].append(parameter)
         if args.out:
             output_target = Path(args.out)
             write_timeline_ir(ir, args.out)
@@ -716,6 +760,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     analyze.add_argument("--params", type=Path, help="override params JSON file")
+    analyze.add_argument(
+        "--set-param",
+        action="append",
+        dest="param_overrides",
+        default=[],
+        metavar="NAME=JSON_VALUE",
+        help="override one analysis parameter with a JSON value; repeat for multiple parameters",
+    )
     analyze.add_argument("--display", type=Path, help="override display YAML file")
     analyze.add_argument("--verbose", action="store_true", help="print additional analysis details")
     analyze.set_defaults(render=True)

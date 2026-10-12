@@ -30,14 +30,18 @@ def build_consistency_report(
     q1timeline_ir: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     findings = _span_drift_findings(qbs_ir, q1timeline_ir or {})
+    coverage = _coverage(qbs_ir)
+    coverage_gaps = _coverage_gaps(qbs_ir, coverage)
     return {
         "version": "0.1.0",
         "summary": {
             "schedule": _nested_text(qbs_ir, "schedule", "name"),
             "finding_count": len(findings),
             "scheduler_bug_candidate_count": len(findings),
+            "coverage_gap_count": len(coverage_gaps),
         },
-        "coverage": _coverage(qbs_ir),
+        "coverage": coverage,
+        "coverage_gaps": coverage_gaps,
         "findings": findings,
         "scheduler_bug_candidates": [_candidate_from_finding(finding) for finding in findings],
     }
@@ -121,6 +125,69 @@ def _coverage(qbs_ir: Mapping[str, Any]) -> dict[str, Any]:
         "provenance_confidence": dict(sorted(confidence.items())),
         "q1asm_lines": q1asm_lines,
     }
+
+
+def _coverage_gaps(
+    qbs_ir: Mapping[str, Any],
+    coverage: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    provenance_rows = _records(qbs_ir.get("q1asm_provenance"))
+    gaps: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+
+    for block in _records(qbs_ir.get("symbolic_pulses")):
+        if any(_provenance_matches_block(row, block) for row in provenance_rows):
+            continue
+        gap = {
+            "kind": "unmapped_symbolic_block",
+            "source_id": _text(block.get("id")),
+            "operation_id": _text(block.get("operation_id")),
+            "schedulable_id": _text(block.get("schedulable_id")),
+            "symbolic_block_kind": _text(block.get("kind")),
+            "qbs_span_ns": _block_span_ns(block),
+        }
+        identity = _coverage_gap_sort_key(gap)
+        if identity not in seen:
+            seen.add(identity)
+            gaps.append(gap)
+
+    q1asm_coverage = coverage.get("q1asm_lines")
+    if isinstance(q1asm_coverage, Mapping):
+        for location in _records(q1asm_coverage.get("orphan_timed_instruction_locations")):
+            gap = {
+                "kind": "orphan_timed_instruction",
+                "sequencer_id": _text(location.get("sequencer_id")),
+                "line": _int(location.get("line")),
+                "instruction": _text(location.get("instruction")),
+            }
+            identity = _coverage_gap_sort_key(gap)
+            if identity not in seen:
+                seen.add(identity)
+                gaps.append(gap)
+
+    return sorted(gaps, key=_coverage_gap_sort_key)
+
+
+def _coverage_gap_sort_key(gap: Mapping[str, Any]) -> tuple[Any, ...]:
+    if gap.get("kind") == "unmapped_symbolic_block":
+        span = gap.get("qbs_span_ns")
+        span_start = _number(_nested_value(span, "start")) if isinstance(span, Mapping) else None
+        span_end = _number(_nested_value(span, "end")) if isinstance(span, Mapping) else None
+        return (
+            0,
+            _text(gap.get("source_id")) or "",
+            _text(gap.get("operation_id")) or "",
+            _text(gap.get("schedulable_id")) or "",
+            _text(gap.get("symbolic_block_kind")) or "",
+            span_start if span_start is not None else float("inf"),
+            span_end if span_end is not None else float("inf"),
+        )
+    return (
+        1,
+        _text(gap.get("sequencer_id")) or "",
+        _int(gap.get("line")) or 0,
+        _text(gap.get("instruction")) or "",
+    )
 
 
 def _q1asm_line_coverage(

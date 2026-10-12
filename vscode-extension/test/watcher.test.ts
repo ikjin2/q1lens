@@ -16,4 +16,27 @@ describe("DebouncedRefreshQueue", () => {
 
     assert.deepEqual(calls, ["run", "run"]);
   });
+
+  it("lets an active refresh finish but suppresses its queued rerun after disposal", async () => {
+    const calls: string[] = [];
+    let finishActive!: () => void;
+    const active = new Promise<void>((resolve) => {
+      finishActive = resolve;
+    });
+    const queue = new DebouncedRefreshQueue(1, async () => {
+      calls.push("run");
+      await active;
+    });
+
+    queue.request();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    queue.request();
+    queue.dispose();
+    finishActive();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    queue.request();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    assert.deepEqual(calls, ["run"]);
+  });
 });

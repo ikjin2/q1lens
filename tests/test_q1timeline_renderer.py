@@ -9,6 +9,64 @@ def _ns(value: int) -> dict:
     return {"kind": "concrete", "value": value}
 
 
+def test_parameters_panel_is_collapsed_between_timeline_and_analysis_details() -> None:
+    html = render_html({"version": "0.1.0", "events": [], "analysis": {"parameters": [
+        {"name": "DRIVE_DURATION", "value_json": "128", "overridden": True, "base_value_json": "64"},
+        {"name": "GAIN_I", "value_json": "10000", "overridden": False},
+    ]}})
+
+    assert '<details id="q1timeline-parameters" class="analysis-parameters">' in html
+    assert '<summary>Parameters · 2 · 1 overridden</summary>' in html
+    assert html.index('id="timeline-root"') < html.index('id="q1timeline-parameters"')
+    assert html.index('id="q1timeline-parameters"') < html.index('id="q1timeline-analysis-details"')
+    assert '<code>DRIVE_DURATION</code>' in html
+    assert '<tr data-parameter-index="0"><th scope="row"><code>DRIVE_DURATION</code>' in html
+    assert '<tr data-parameter-index="1"><th scope="row"><code>GAIN_I</code>' in html
+    assert '<code>128</code>' in html
+    assert '← base 64' in html
+    assert '<code>GAIN_I</code>' in html
+    assert '<code>10000</code>' in html
+    assert html.count('<span class="parameter-override">') == 1
+    assert 'not live hardware or register values' in html
+    assert '.parameters-table-scroll { max-height: 240px; overflow: auto; }' in html
+
+
+def test_parameters_panel_preserves_exact_values_and_escapes_html() -> None:
+    html = render_html({"version": "0.1.0", "events": [], "analysis": {"parameters": [
+        {"name": "<script>name</script>", "value_json": '"</code><script>alert(1)</script>"',
+         "overridden": True, "base_value_json": '"<base>"'},
+        {"name": "LARGE", "value_json": "9007199254740993", "overridden": False},
+        {"name": "NESTED", "value_json": '{"values": [1, null]}', "overridden": False},
+    ]}})
+
+    assert '&lt;script&gt;name&lt;/script&gt;' in html
+    assert '&quot;&lt;/code&gt;&lt;script&gt;alert(1)&lt;/script&gt;&quot;' in html
+    assert '← base &quot;&lt;base&gt;&quot;' in html
+    assert '<script>alert(1)</script>' not in html
+    assert '<tr data-parameter-index="0">' in html
+    assert '<code>9007199254740993</code>' in html
+    assert '<code>{&quot;values&quot;: [1, null]}</code>' in html
+
+
+def test_parameters_panel_marks_added_and_equal_value_overrides() -> None:
+    html = render_html({"version": "0.1.0", "events": [], "analysis": {"parameters": [
+        {"name": "NEW", "value_json": "null", "overridden": True},
+        {"name": "SAME", "value_json": "64", "overridden": True, "base_value_json": "64"},
+    ]}})
+
+    assert '<summary>Parameters · 2 · 2 overridden</summary>' in html
+    assert 'added for this analysis' in html
+    assert '<code>null</code>' in html
+    assert '← base 64' in html
+
+
+def test_parameters_panel_distinguishes_empty_snapshot_from_older_ir() -> None:
+    html = render_html({"version": "0.1.0", "events": [], "analysis": {"parameters": []}})
+    assert '<summary>Parameters · 0</summary>' in html
+    assert 'No parameters configured for this analysis.' in html
+    assert 'id="q1timeline-parameters"' not in render_html({"version": "0.1.0", "events": []})
+
+
 def test_branch_region_renders_marker_without_block_in_debug_mode() -> None:
     html = render_html(
         {

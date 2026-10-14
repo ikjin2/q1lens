@@ -123,7 +123,7 @@ def test_q1asm_tutorials_include_expected_teaching_signals(tmp_path: Path) -> No
         }
 
     assert "definite_underflow" in signals["07-timing-pathologies/27-short-loop-underflow"]
-    assert "possible_underflow" in signals["07-timing-pathologies/28-branch-housekeeping-underflow"]
+    assert "analysis_incomplete" in signals["07-timing-pathologies/28-branch-housekeeping-underflow"]
     assert "branch_region" in signals["10-stateful-programs/31-bounded-random-walk"]
     assert "acquire" in signals["10-stateful-programs/32-round-robin-bin-writer"]
     assert "branch_region" in signals["10-stateful-programs/33-hysteresis-threshold-controller"]
@@ -135,7 +135,7 @@ def test_q1asm_tutorials_include_expected_teaching_signals(tmp_path: Path) -> No
     ]
     assert {"branch_region", "latched_state_pending"} <= signals["11-control-flow-patterns/35-bounded-retry-loop"]
     assert "branch_region" in signals["11-control-flow-patterns/36-branch-table-selector"]
-    assert {"possible_underflow", "unresolved_branch"} <= signals["08-diagnostics-gallery/29-slack-and-branch-gallery"]
+    assert {"analysis_incomplete", "unresolved_branch"} <= signals["08-diagnostics-gallery/29-slack-and-branch-gallery"]
     assert {"latched_state_pending", "latched_state_applied", "play"} <= signals[
         "09-latched-state-patterns/30-atomic-parameter-window"
     ]

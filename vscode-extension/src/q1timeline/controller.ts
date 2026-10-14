@@ -28,6 +28,7 @@ const { prependPythonArgs } = require("./invocation");
 const { q1timelineConfigValue } = require("./settings");
 const {
   lookupEventIdsForSourceLine,
+  lookupEventIdsForSourceRange,
   lookupSourceForEvent,
 } = require("./sourceMapLookup");
 const updatePolicy = require("./updatePolicy");
@@ -719,6 +720,10 @@ export class TimelineController {
     this.analyzerResult = undefined;
     this.lastPreviewHtml = undefined;
     this.changeTimer = undefined;
+    this.sourceRangeTimer = undefined;
+    this.webviewReady = false;
+    this.sourceRevision = 0;
+    this.analyzedSourceRevision = 0;
     this.analysisRequestId = 0;
     this.analysisInFlight = false;
     this.analysisQueued = false;
@@ -758,6 +763,7 @@ export class TimelineController {
     context.subscriptions.push(
       vscode.workspace.onDidSaveTextDocument((document) => {
         if (this.isProjectRelated(document.uri)) {
+          this.invalidateSourceAnalysis();
           this.setUnsavedChangesStatus();
           if (this.shouldAnalyzeOnSave()) {
             this.runAnalysis();
@@ -768,6 +774,7 @@ export class TimelineController {
     context.subscriptions.push(
       vscode.workspace.onDidChangeTextDocument((event) => {
         if (this.isProjectRelated(event.document.uri)) {
+          this.invalidateSourceAnalysis();
           this.setUnsavedChangesStatus();
           if (this.shouldAnalyzeOnType()) {
             this.scheduleAnalysis();
@@ -794,6 +801,8 @@ export class TimelineController {
 
   setProjectUri(uri) {
     if (!this.projectUri || this.projectUri.fsPath !== uri.fsPath) {
+      this.invalidateSourceAnalysis();
+      this.webviewReady = false;
       this.lastAnalyzerTimelineIr = undefined;
       this.comparisonBaselineWarningPath = undefined;
       this.comparison = { mode: "none" };
@@ -926,6 +935,7 @@ export class TimelineController {
   }
 
   async openPreview(options = {}) {
+    this.cancelSourceRangeZoom();
     const sourceUri = this.previewSourceUri(options);
     const explicitSourceUri = options.sourceUri && options.sourceUri.fsPath ? options.sourceUri : undefined;
     let skipProjectDiscovery = false;
@@ -1024,6 +1034,8 @@ export class TimelineController {
     this.panelDisposables.push(
       this.panel.webview.onDidReceiveMessage((message) => this.handleWebviewMessage(message)),
       this.panel.onDidDispose(() => {
+        this.cancelSourceRangeZoom();
+        this.webviewReady = false;
         this.disposePanelDisposables();
         this.panel = undefined;
       })
@@ -1173,6 +1185,31 @@ export class TimelineController {
       q1asmFile: editor.document.uri.fsPath,
       line: (editor.selection?.active?.line ?? 0) + 1,
     };
+  }
+
+  async zoomToSelection() {
+    const editor = vscode.window.activeTextEditor;
+    const sourceUri = editor?.document?.uri;
+    const selection = editor?.selection;
+    if (!sourceUri?.fsPath || !isQ1asmPath(sourceUri.fsPath) || !selection?.start || !selection?.end || selection.isEmpty) {
+      vscode.window.showInformationMessage("Select a block in a Q1ASM file to view it in the timeline.");
+      return;
+    }
+    if (editor.document.isDirty) {
+      vscode.window.showInformationMessage("Save the Q1ASM file before viewing its selection in the timeline so source lines match the analyzed program.");
+      return;
+    }
+    const startLine = selection.start.line + 1;
+    const endLine = Math.max(startLine, selection.end.line + (selection.end.character === 0 ? 0 : 1));
+    this.pendingTarget = { q1asmFile: sourceUri.fsPath, line: startLine, endLine, zoomToRange: true };
+    const activeProjectUri = this.activeProjectUriForEditor(editor);
+    if (activeProjectUri) {
+      this.setProjectUri(activeProjectUri);
+      this.singleFileUri = undefined;
+      this.singleFileMode = false;
+    }
+    const preserveProject = Boolean(activeProjectUri || (this.projectUri && this.isProjectRelated(sourceUri)));
+    await this.openPreview({ sourceUri, preserveProject });
   }
 
   activeProjectUriForEditor(editor) {
@@ -1860,6 +1897,9 @@ export class TimelineController {
   }
 
   async onWatchedFile(uri) {
+    if (this.isProjectRelated(uri)) {
+      this.invalidateSourceAnalysis();
+    }
     if (this.projectUri && normalizedFsPath(uri.fsPath) === normalizedFsPath(this.projectUri.fsPath)) {
       await this.refreshProjectRelatedPaths();
     }
@@ -1929,6 +1969,8 @@ export class TimelineController {
       return Promise.resolve();
     }
     this.analysisInFlight = true;
+    this.cancelSourceRangeZoom();
+    const sourceRevision = this.sourceRevision;
     const analysisProjectFile = this.projectUri.fsPath;
     const analysisRequestId = ++this.analysisRequestId;
     this.setAnalysisStatus("analyzing", "Analyzing q1timeline project.");
@@ -2026,7 +2068,9 @@ export class TimelineController {
         this.logAnalyzerOutputFiles();
         this.setAnalysisStatus("idle", "Analysis complete.");
         this.analysisFailureCount = 0;
-        await this.refreshWebview();
+        if (await this.refreshWebview()) {
+          this.analyzedSourceRevision = sourceRevision;
+        }
       })
       .catch(async (error) => {
         if (!this.isCurrentAnalysis(analysisRequestId)) {
@@ -2281,6 +2325,8 @@ export class TimelineController {
   }
 
   async refreshWebview() {
+    this.cancelSourceRangeZoom();
+    this.webviewReady = false;
     try {
       this.timelineIr = await this.readJson("timeline_ir.json");
     } catch (error) {
@@ -2310,11 +2356,19 @@ export class TimelineController {
     html = injectWebviewState(html, this.webviewInitialState());
     html = injectWebviewAssetTags(html, this.panel.webview, this.context, nonce);
     html = injectContentSecurityPolicy(html, contentSecurityPolicy(this.panel.webview, nonce));
+    if (this.pendingTarget?.zoomToRange) {
+      this.pendingTarget.awaitingWebviewReady = true;
+    }
     this.panel.webview.html = html;
-    await this.revealPendingTarget();
+    if (!this.pendingTarget?.zoomToRange) {
+      await this.revealPendingTarget();
+    }
+    return Boolean(this.timelineIr);
   }
 
   clearPreviewAfterAnalyzerFailure(message) {
+    this.cancelSourceRangeZoom();
+    this.webviewReady = false;
     this.timelineIr = undefined;
     this.lastAnalyzerTimelineIr = undefined;
     this.lastPreviewHtml = undefined;
@@ -2385,7 +2439,13 @@ export class TimelineController {
       return;
     }
     if (parsedMessage.type === "webviewReady") {
+      this.webviewReady = true;
       this.output.appendLine("q1timeline webview script ready.");
+      if (this.pendingTarget?.zoomToRange && this.pendingTarget.awaitingWebviewReady) {
+        await this.revealPendingTarget();
+      } else if (vscode.window.activeTextEditor?.selection?.isEmpty === false) {
+        this.followSourceEditor(vscode.window.activeTextEditor);
+      }
       return;
     }
     if (parsedMessage.type === "diagnosticClick") {
@@ -2480,6 +2540,7 @@ export class TimelineController {
   }
 
   async openSourceLocation(source, options = {}) {
+    this.cancelSourceRangeZoom();
     const sourcePath = this.resolveSourcePath(source.file);
     const line = Math.max(0, Number(source.line || 1) - 1);
     const position = new vscode.Position(line, Math.max(0, Number(source.column || 1) - 1));
@@ -2572,6 +2633,7 @@ export class TimelineController {
   }
 
   followSourceEditor(editor, kind) {
+    this.cancelSourceRangeZoom();
     if (!editor) return;
     const reveal = this.hardwareSourceReveal;
     if (reveal) {
@@ -2583,7 +2645,56 @@ export class TimelineController {
       if (!manual && (reveal.opening || sameTarget)) return;
       this.hardwareSourceReveal = undefined;
     }
+    if (editor.selection?.isEmpty === false) {
+      this.scheduleSourceRangeZoom(editor);
+      return;
+    }
     this.highlightActiveSourceLine(editor);
+  }
+
+  cancelSourceRangeZoom() {
+    if (this.sourceRangeTimer !== undefined) {
+      clearTimeout(this.sourceRangeTimer);
+      this.sourceRangeTimer = undefined;
+    }
+  }
+
+  invalidateSourceAnalysis() {
+    this.sourceRevision += 1;
+    this.cancelSourceRangeZoom();
+  }
+
+  scheduleSourceRangeZoom(editor) {
+    const document = editor.document;
+    const selection = editor.selection;
+    const panel = this.panel;
+    const timelineIr = this.timelineIr;
+    if (!panel || !timelineIr?.source_map || !document?.uri?.fsPath ||
+        !isQ1asmPath(document.uri.fsPath) || !this.isProjectRelated(document.uri) ||
+        !selection?.start || !selection?.end) return;
+    const version = document.version;
+    this.sourceRangeTimer = setTimeout(() => {
+      this.sourceRangeTimer = undefined;
+      const current = editor.selection;
+      // Recheck after the drag settles: analysis, source, or focus may have changed.
+      if (vscode.window.activeTextEditor !== editor || document.version !== version ||
+          current?.isEmpty !== false || !current.start || !current.end ||
+          current.start.line !== selection.start.line || current.start.character !== selection.start.character ||
+          current.end.line !== selection.end.line || current.end.character !== selection.end.character ||
+          this.panel !== panel || this.timelineIr !== timelineIr || !this.webviewReady ||
+          this.hardwareSourceReveal || this.pendingTarget || this.analysisInFlight || this.analysisQueued ||
+          this.sourceRevision !== this.analyzedSourceRevision || document.isDirty ||
+          this.hasUnsavedProjectChanges() || !this.isProjectRelated(document.uri)) return;
+      const startLine = selection.start.line + 1;
+      const endLine = Math.max(startLine, selection.end.line + (selection.end.character === 0 ? 0 : 1));
+      const currentEventIds = new Set((timelineIr.events || []).map((event) => String(event.id)));
+      const highlightEventIds = lookupEventIdsForSourceRange(timelineIr, document.uri.fsPath, startLine, endLine)
+        .filter((eventId) => currentEventIds.has(String(eventId)));
+      if (highlightEventIds.length) {
+        this.postWebviewMessage({ type: "highlightEventIds", highlightEventIds, zoomToRange: true,
+          sourceRange: { file: document.uri.fsPath, startLine, endLine } });
+      }
+    }, 250);
   }
 
   highlightActiveSourceLine(editor) {
@@ -2610,9 +2721,21 @@ export class TimelineController {
       return;
     }
     try {
-      const highlightEventIds = lookupEventIdsForSourceLine(this.timelineIr, this.pendingTarget.q1asmFile, this.pendingTarget.line);
+      const target = this.pendingTarget;
+      let highlightEventIds = target.zoomToRange
+        ? lookupEventIdsForSourceRange(this.timelineIr, target.q1asmFile, target.line, target.endLine)
+        : lookupEventIdsForSourceLine(this.timelineIr, target.q1asmFile, target.line);
+      if (target.zoomToRange) {
+        const currentEventIds = new Set((this.timelineIr.events || []).map((event) => String(event.id)));
+        highlightEventIds = highlightEventIds.filter((eventId) => currentEventIds.has(String(eventId)));
+      }
       if (highlightEventIds.length) {
-        this.postWebviewMessage({ type: "highlightEventIds", highlightEventIds });
+        this.postWebviewMessage({ type: "highlightEventIds", highlightEventIds, ...(target.zoomToRange ? {
+          zoomToRange: true,
+          sourceRange: { file: target.q1asmFile, startLine: target.line, endLine: target.endLine },
+        } : {}) });
+      } else if (target.zoomToRange) {
+        vscode.window.showInformationMessage("No executed timeline events map to the selected Q1ASM lines.");
       }
     } finally {
       this.pendingTarget = undefined;
@@ -2688,6 +2811,8 @@ export class TimelineController {
   }
 
   dispose() {
+    this.cancelSourceRangeZoom();
+    this.webviewReady = false;
     if (this.changeTimer) {
       clearTimeout(this.changeTimer);
       this.changeTimer = undefined;

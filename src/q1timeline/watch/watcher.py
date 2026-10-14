@@ -10,7 +10,7 @@ import yaml
 
 from q1timeline.analysis.alignment import align_timelines
 from q1timeline.analysis.interpreter import AnalysisState, interpret_program
-from q1timeline.analysis.underflow import analyze_underflow
+from q1timeline.analysis.underflow import analyze_underflows
 from q1timeline.diagnostics import Diagnostic, has_fatal_diagnostics
 from q1timeline.ir.serialize import diagnostics_to_json, timeline_ir_from_states, write_timeline_ir
 from q1timeline.project import ConfigLoadError, ProjectConfig, load_project_config
@@ -287,8 +287,8 @@ def _analyze_config(config: ProjectConfig) -> list[AnalysisState]:
             execution_mode=config.analysis.execution_mode,
             max_steps=config.analysis.max_steps,
         )
-        analyze_underflow(state)
         states.append(state)
+    analyze_underflows(states)
     return states
 
 

@@ -778,7 +778,7 @@ def _group_events(events: list[dict[str, Any]], *, mode: str) -> tuple[list[dict
 def _lane_display_label(lane: str) -> str:
     base_lane = _debug_lane_candidate(lane)
     if base_lane in {NORMAL_Q1_ISSUE_LANE, "debug.q1_issue"}:
-        return "Q1 issue"
+        return "Q1 core"
     if base_lane.startswith("If "):
         return base_lane
     parsed = _branch_comparison_lane_parts(lane)
@@ -2830,7 +2830,7 @@ function renderInspector(eventId) {
   addInspectorField(fields, 'Time range', `${displayInspectorValue(event.t0)} -> ${displayInspectorValue(event.t1)}`);
   addInspectorField(fields, 'Source', source.file ? `${source.file}:${source.line || 1}` : 'unavailable');
   addInspectorField(fields, 'Confidence', event.confidence);
-  addInspectorField(fields, 'Q1 issue', event.kind === 'q1_issue' ? `${displayInspectorValue(event.t0)} -> ${displayInspectorValue(event.t1)}` : meta.q1_issue_event_id);
+  addInspectorField(fields, 'Q1 core', event.kind === 'q1_issue' ? `${displayInspectorValue(event.t0)} -> ${displayInspectorValue(event.t1)}` : meta.q1_issue_event_id);
   addInspectorField(fields, 'RT packet', meta.rt_packet_id);
   addInspectorField(fields, 'Queue depth', meta.estimated_depth);
   addInspectorField(fields, 'Slack', meta.slack_ns !== undefined ? `${meta.slack_ns} ns` : '');

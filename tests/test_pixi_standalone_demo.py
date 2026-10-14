@@ -59,7 +59,7 @@ def test_three_peak_demo1_generated_ir_contains_feedback_routes(tmp_path: Path) 
     assert exit_code == 0
     ir = json.loads(out_file.read_text(encoding="utf-8"))
 
-    assert len(ir["events"]) >= 700
+    assert sum(event["kind"] == "q1_issue" for event in ir["events"]) >= 400
     assert len(ir["feedback_flows"]) >= 18
     assert {flow["channel"] for flow in ir["feedback_flows"]} >= {"1", "2", "3"}
     assert any(event["kind"] == "feedback_pop" for event in ir["events"])

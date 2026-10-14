@@ -14,6 +14,90 @@ body.vscode-dark {
   pointer-events: none;
 }
 
+.shared-timeline-stage .q1timeline-wait-fold {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  z-index: 3;
+  box-sizing: border-box;
+  border-inline: 1px dashed var(--vscode-charts-purple, #7955ad);
+  background: repeating-linear-gradient(120deg, transparent 0 4px, color-mix(in srgb, var(--vscode-charts-purple, #7955ad) 12%, transparent) 4px 6px);
+  pointer-events: none;
+}
+
+.shared-timeline-stage .q1timeline-fold-toggle {
+  position: absolute;
+  top: 7px;
+  left: 0;
+  width: 100%;
+  height: 22px;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0;
+  padding: 0;
+  border: 1px solid var(--vscode-charts-purple, #7955ad);
+  border-radius: 2px;
+  background: var(--vscode-editor-background, #fff);
+  color: var(--vscode-editor-foreground, #3c2859);
+  font-size: 10px;
+  line-height: 10px;
+  white-space: nowrap;
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+.shared-timeline-stage .q1timeline-fold-slashes {
+  font-weight: 800;
+  font-size: 13px;
+  letter-spacing: 2px;
+  color: var(--vscode-charts-purple, #7955ad);
+}
+
+.shared-timeline-stage .q1timeline-fold-toggle:hover {
+  border-color: var(--vscode-focusBorder, #007acc);
+  background: var(--vscode-editorHoverWidget-background, #f0ebf7);
+}
+
+.shared-timeline-stage .q1timeline-fold-toggle:focus-visible {
+  outline: 2px solid var(--vscode-focusBorder, #007acc);
+  outline-offset: 2px;
+}
+
+.shared-timeline-stage .ruler .q1timeline-fold-toggle {
+  top: 21px;
+  width: max-content;
+  height: 18px;
+  flex-direction: row;
+  gap: 5px;
+  padding: 0 5px;
+}
+
+.shared-timeline-stage .q1timeline-wait-fold.is-expanded {
+  border-inline-style: solid;
+  background: color-mix(in srgb, var(--vscode-charts-purple, #7955ad) 5%, transparent);
+}
+
+.shared-timeline-stage .is-expanded .q1timeline-fold-toggle {
+  left: 50%;
+  transform: translateX(-50%);
+  width: max-content;
+  max-width: 100%;
+  flex-direction: row;
+  padding: 0 6px;
+}
+
+.shared-timeline-stage .is-expanded .q1timeline-fold-duration {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#q1timeline-wait-fold-button[aria-pressed="true"] {
+  background: var(--vscode-toolbar-activeBackground, #65708030);
+}
+
 .timeline-svg .hardware-time-cursor {
   stroke: var(--vscode-editorCursor-foreground, #007acc);
   stroke-width: 2;
@@ -62,6 +146,65 @@ body.mode-normal .event.loop-collapsed {
   display: inline-flex;
   gap: 2px;
   margin-left: 6px;
+}
+
+.q1timeline-layout-button {
+  padding: 3px 8px;
+  border-radius: 3px;
+  font: inherit;
+  cursor: pointer;
+}
+
+.instruction-view #q1timeline-time-basis-toggle,
+.instruction-view #q1timeline-fit-button,
+.instruction-view #q1timeline-reset-zoom-button,
+.instruction-view #q1timeline-wait-fold-button,
+.instruction-view #q1timeline-zoom-out-button,
+.instruction-view #q1timeline-zoom-in-button,
+.instruction-view #q1timeline-zoom-selection-button,
+.instruction-view #q1timeline-zoom-event-button,
+.instruction-view #q1timeline-pan-left-button,
+.instruction-view #q1timeline-pan-right-button,
+.instruction-view #q1timeline-time-window,
+.instruction-view .shared-q1-issue-toggle {
+  display: none;
+}
+
+.instruction-view .shared-timeline-stage .timeline-lanes {
+  min-width: calc(168px + var(--instruction-track-width));
+}
+
+.instruction-view .shared-timeline-stage .timeline-row {
+  grid-template-columns: 168px var(--instruction-track-width, 1px);
+}
+
+.instruction-view .shared-timeline-stage .ruler {
+  width: var(--instruction-track-width);
+}
+
+.instruction-view .shared-timeline-stage .lane-track {
+  background-size: var(--instruction-cell-width) 100%;
+}
+
+.instruction-view .shared-timeline-stage .timeline-block {
+  padding: 0 min(5px, calc(var(--instruction-cell-width) / 8));
+  border-width: min(1px, calc(var(--instruction-cell-width) / 4));
+}
+
+.instruction-view .shared-timeline-stage .stage-header {
+  left: 0;
+}
+
+.instruction-view .shared-timeline-stage .lane-label {
+  z-index: 5;
+}
+
+body.instruction-view.mode-normal .event.normal-feedback-collapsed {
+  display: flex;
+}
+
+.instruction-view .shared-timeline-stage .block-detail {
+  display: none;
 }
 
 .q1timeline-toolbar-button,

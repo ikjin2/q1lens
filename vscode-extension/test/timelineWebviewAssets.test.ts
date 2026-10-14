@@ -23,7 +23,7 @@ type Q1TimelineZoomFunctions = {
     start: number,
     end: number,
     full: { min: number; max: number },
-    minSpanRatio?: number,
+    minSpanNs?: number,
   ) => { min: number; max: number } | undefined;
   isTimelineSelectionTarget: (target: { closest?: (selector: string) => unknown }) => boolean;
 };
@@ -47,10 +47,11 @@ function extractFunctionSource(script: string, name: string): string | undefined
   if (start < 0) {
     return undefined;
   }
-  const bodyStart = script.indexOf("{", start);
-  if (bodyStart < 0) {
+  const signatureEnd = script.indexOf(") {", start);
+  if (signatureEnd < 0) {
     throw new Error(`Function ${name} has no body`);
   }
+  const bodyStart = signatureEnd + 2;
   let depth = 0;
   for (let index = bodyStart; index < script.length; index += 1) {
     const char = script[index];
@@ -112,6 +113,176 @@ function loadQ1TimelineLoopPreviewFunctions(script: string): Q1TimelineLoopPrevi
     .filter((source): source is string => Boolean(source));
   const loaded = Function(`${sources.join("\n")}\nreturn { loopPreviewEventIds };`)();
   return loaded as Q1TimelineLoopPreviewFunctions;
+}
+
+function loadQ1TimelineFoldRuntime(script: string, timelineIr: any, options: any = {}) {
+  const expandedState = script.match(/let timelineExpandedGaps = [\s\S]*?;\r?\n/)?.[0];
+  assert.ok(expandedState, "Missing persisted gap initialization");
+  const sources = [
+    "readPersistedWebviewState", "writePersistedWebviewState", "timelineExtentMatches",
+    "snapTimelineNs", "formatWindowValue", "formatFoldDuration", "timelineTimeScale",
+    "displayTimelineTime", "realTimelineTime", "timelineDisplayWindow", "toggleTimelineGap",
+    "toggleTimelineFolds", "renderWaitFolds", "clamp", "sharedTimelinePointerAnchorRatio",
+    "timelinePointerAnchorRatio", "timelineTimeFromPointer", "renderHardwareCursor", "isTimelineSelectionTarget",
+    "eventIsQ1Issue", "sourceRangeTimelineBounds", "zoomTimelineToEventRange",
+    "timelineWindowForRange", "setTimelineWindow", "writeTimelineWindowState",
+    "setTimelineLayout", "installTimelineMouseInteractions", "zoomTimelineToEvent", "zoomTimelineToHighlightedEvent",
+  ].map((name) => {
+    const source = extractFunctionSource(script, name);
+    assert.ok(source, `Missing ${name}`);
+    return source;
+  });
+  let activeElement: any;
+  function element(tagName: string, className = ""): any {
+    const node: any = {
+      tagName: tagName.toUpperCase(), className, children: [], dataset: {}, style: {}, attributes: {}, listeners: {}, scrollLeft: 0,
+      setAttribute(name: string, value: string) { this.attributes[name] = value; },
+      getAttribute(name: string) { return this.attributes[name]; },
+      focus() { activeElement = this; },
+      addEventListener(name: string, listener: (event: any) => void) { this.listeners[name] = listener; },
+      appendChild(child: any) { child.parentElement = this; this.children.push(child); return child; },
+      append(...children: any[]) { children.forEach((child) => this.appendChild(child)); },
+      remove() { this.parentElement.children = this.parentElement.children.filter((child: any) => child !== this); },
+      getBoundingClientRect: () => ({ left: 100, width: 1000 }),
+      querySelector(selector: string) { return this.children.find((child: any) => child.classList.contains(selector.slice(1))); },
+      closest(selector: string) {
+        if (this.tagName === "BUTTON" && selector.includes("button")) return this;
+        return this.parentElement?.closest(selector);
+      },
+    };
+    node.classList = { contains: (name: string) => node.className.split(" ").includes(name) };
+    return node;
+  }
+  const adapter = require(join(__dirname, "..", "src", "q1timeline", "media", "timelineAdapter.js"));
+  return Function("timelineIr", "adapter", "options", "element", "getActiveElement", `
+    let savedState = options.state || {};
+    const vscode = { getState: () => savedState, setState: state => { savedState = state; } };
+    const window = { q1timelineTimelineAdapter: adapter };
+    const timelineEventsById = new Map((timelineIr.events || []).map(event => [String(event.id), event]));
+    let timelineTimeBasis = options.basis || "local";
+    let timelineLayout = "time";
+    let instructionView = { cellWidth: 112, leftOrdinal: 0 };
+    let timelineWaitsCollapsed = savedState.timelineWaitsCollapsed !== false;
+    ${expandedState}
+    const timelineTimeScales = new Map();
+    let timelineWindow = options.current || { min: 0, max: 10000 };
+    let timelineSelectionRange = { start: 4900, end: 5100 };
+    let selectedTimelineEventId = "selected";
+    const hardwareView = { getState: () => ({ time: 5050 }) };
+    const tracks = [element("div", "ruler"), element("div", "lane-track"), element("div", "lane-track")];
+    const toolbar = element("button");
+    const document = {
+      get activeElement() { return getActiveElement(); },
+      createElement: tag => element(tag),
+      getElementById: id => id === "q1timeline-wait-fold-button" ? toolbar : undefined,
+      querySelector: () => tracks[1],
+      querySelectorAll: selector => selector === ".q1timeline-wait-fold"
+        ? tracks.flatMap(track => track.children.filter(child => child.classList.contains("q1timeline-wait-fold")))
+        : selector === ".q1timeline-fold-toggle"
+          ? tracks.flatMap(track => track.children.flatMap(child => child.children.filter(node => node.classList.contains("q1timeline-fold-toggle"))))
+          : tracks,
+    };
+    let renders = 0;
+    const scrolledEventIds = [];
+    function timelineSvg() {}
+    function timelineContainer() { return tracks[1]; }
+    function currentTimelineMode() { return "normal"; }
+    function renderTimelineLayoutToggle() {}
+    function renderSharedTimelineIfAvailable() {
+      tracks.forEach(track => { delete track.dataset.timelineMouseInteractions; track.listeners = {}; });
+      applyTimelineScale();
+    }
+    function findVisibleEventNodeByIds(ids) {
+      return { scrollIntoView() { scrolledEventIds.push(...ids); } };
+    }
+    function handleTimelineWheel() {}
+    function handleInstructionWheel() {}
+    function handleTimelinePointerDown() {}
+    function fullTimelineWindow() { return options.full || { min: 0, max: 10000 }; }
+    function currentTimelineWindow() { return timelineWindow; }
+    function setIconOnlyToolbarButton(node, icon, title) { node.title = title; }
+    function applyTimelineScale() {
+      renders += 1;
+      tracks.forEach(track => { track.children = []; });
+      renderWaitFolds();
+      renderHardwareCursor();
+    }
+    ${sources.join("\n")}
+    return {
+      tracks, toolbar, timelineTimeScale, displayTimelineTime, realTimelineTime, formatFoldDuration,
+      timelineTimeFromPointer, renderWaitFolds, renderHardwareCursor, toggleTimelineGap, toggleTimelineFolds, isTimelineSelectionTarget,
+      sourceRangeTimelineBounds, zoomTimelineToEventRange,
+      setTimelineLayout, installTimelineMouseInteractions, zoomTimelineToHighlightedEvent, scrolledEventIds,
+      layout: () => timelineLayout,
+      activeElement: () => document.activeElement,
+      state: () => savedState,
+      preserved: () => ({ window: timelineWindow, selection: timelineSelectionRange, selected: selectedTimelineEventId, time: hardwareView.getState().time }),
+      renders: () => renders,
+    };
+  `)(timelineIr, adapter, options, element, () => activeElement);
+}
+
+function loadQ1TimelineZoomRuntime(script: string, events: any[], options: any = {}) {
+  const full = options.full || { min: 0, max: 40_160_000 };
+  let savedState = options.state || {};
+  const sources = [
+    "concreteTime", "eventTime", "initialTimelineWindow", "fullTimelineWindow",
+    "currentTimelineWindow", "timelineExtentMatches", "persistedTimelineWindowFor",
+    "readPersistedWebviewState", "writePersistedWebviewState", "writeTimelineWindowState",
+    "snapTimelineNs", "clamp", "timelineWindowForRange", "setTimelineWindow",
+    "normalizedTimelineSelectionRange", "zoomTimelineSelection", "eventZoomTime",
+    "zoomTimelineToEvent", "zoomTimelineAround", "restoreTimelineZoom",
+    "fitTimelineToWindow", "resetTimelineZoom",
+    "displayTimelineTime", "realTimelineTime", "timelineDisplayWindow", "setTimelineDisplayWindow",
+    "timelineTicks", "visibleTimelineTicks", "formatWindowValue", "sharedTimelineTicks", "scaleTimelineTime",
+    "timelineSvgViewBoxWidth", "timelinePlotPixelWidth", "sharedTimelinePlotPixelWidth",
+    "timelinePointerAnchorRatio", "sharedTimelinePointerAnchorRatio", "timelineTimeFromPointer",
+    "panTimelineByPixels", "panTimeline", "handleTimelineWheel", "renderHardwareCursor",
+    "highlightedSpanNeedsZoom", "zoomTimelineToHighlightedEvent",
+  ].map((name) => {
+    const source = extractFunctionSource(script, name);
+    assert.ok(source, `Missing ${name}`);
+    return source;
+  });
+  const vscode = {
+    getState: () => savedState,
+    setState: (state: any) => { savedState = state; },
+  };
+  return Function("events", "full", "basis", "vscode", "scale", `
+    const timelineEventsById = new Map(events.map(event => [String(event.id), event]));
+    let timelineTimeBasis = basis;
+    let timelineLayout = "time";
+    let timelineWindow, timelineSelectionRange;
+    const cursor = { style: {}, hidden: false };
+    const track = {
+      getBoundingClientRect: () => ({ left: 100, width: 1000 }),
+      querySelector: () => cursor,
+    };
+    const document = { querySelector: () => track, querySelectorAll: () => [track] };
+    function timelineSvg() {}
+    function timelineGeometry() { return full; }
+    function timelineTimeScale() { return scale; }
+    function applyTimelineScale() {}
+    function syncTimelineZoomActionState() {}
+    const scrolledEventIds = [];
+    function findVisibleEventNodeByIds(ids) {
+      return { scrollIntoView() { scrolledEventIds.push(...ids); } };
+    }
+    ${sources.join("\n")}
+    return {
+      currentTimelineWindow, restoreTimelineZoom, fitTimelineToWindow, resetTimelineZoom,
+      zoomTimelineToEvent, zoomTimelineAround, setTimelineWindow,
+      timelineTimeFromPointer, handleTimelineWheel, panTimeline, sharedTimelineTicks, scaleTimelineTime,
+      zoomTimelineToHighlightedEvent, renderHardwareCursor,
+      cursor: () => cursor,
+      setTimeScale(next) { scale = next; },
+      setLayout(next) { timelineLayout = next; },
+      scrolledEventIds,
+      selectRange(start, end) { timelineSelectionRange = { start, end }; zoomTimelineSelection(); },
+      selection: () => timelineSelectionRange,
+      state: () => vscode.getState(),
+    };
+  `)(events, full, options.basis || "local", vscode, options.scale);
 }
 
 describe("timeline webview assets", () => {
@@ -929,8 +1100,8 @@ describe("timeline webview assets", () => {
     const { timelineWindowForRange, isTimelineSelectionTarget } = loadQ1TimelineZoomFunctions(script);
 
     assert.deepEqual(timelineWindowForRange(100, 20, { min: 0, max: 1000 }), { min: 20, max: 100 });
-    assert.deepEqual(timelineWindowForRange(500, 500, { min: 0, max: 1000 }), { min: 490, max: 510 });
-    assert.deepEqual(timelineWindowForRange(5, 5, { min: 0, max: 1000 }, 0.1), { min: 0, max: 100 });
+    assert.deepEqual(timelineWindowForRange(500, 500, { min: 0, max: 1000 }), { min: 499.5, max: 500.5 });
+    assert.deepEqual(timelineWindowForRange(5, 5, { min: 0, max: 1000 }, 100), { min: 0, max: 100 });
     assert.equal(timelineWindowForRange(Number.NaN, 10, { min: 0, max: 1000 }), undefined);
     assert.equal(isTimelineSelectionTarget({
       closest: (selector: string) => {
@@ -1056,7 +1227,7 @@ describe("timeline webview assets", () => {
     const sharedRenderer = readFileSync(join(__dirname, "..", "src", "shared", "timeline", "renderer.js"), "utf-8");
     const sharedCss = readFileSync(join(__dirname, "..", "src", "shared", "timeline", "renderer.css"), "utf-8");
 
-    assert.match(sharedRenderer, /const visibleWidth = Math\.max\(visibleEnd - visibleStart, 0\)/);
+    assert.match(sharedRenderer, /const visibleWidth = Math\.max\(timeCoordinate\(visibleEnd, viewport\) - timeCoordinate\(visibleStart, viewport\), 0\)/);
     assert.match(sharedRenderer, /const minMicroWidth = span \* 0\.0005/);
     assert.match(sharedRenderer, /tiny: visibleWidth < span \* 0\.0025/);
     assert.match(sharedRenderer, /compact: visibleWidth < span \* 0\.075/);
@@ -1135,14 +1306,16 @@ describe("timeline webview assets", () => {
         },
       };
     } } };
+    let hardwareMount: any;
     const document = {
-      getElementById: () => ({ before: () => {} }),
+      getElementById: () => ({ after: (root: any) => { hardwareMount = root; } }),
       createElement: () => ({ setAttribute: () => {} }),
     };
     const functions = Function("vscode", "window", "document", "setTimeout", "clearTimeout", `
       const timelineIr = { events: [{ id: "q1", meta: { aligned_t0: 100, aligned_t1: 104 } }] };
       const timelineEventsById = new Map(timelineIr.events.map(event => [event.id, event]));
       let hardwareView, hardwarePersistTimer;
+      function ensureAnalysisDetailsBody() {}
       function renderHardwareCursor() {}
       function renderTimeBasisToggle() {}
       function resetTimelineZoom() {}
@@ -1155,6 +1328,7 @@ describe("timeline webview assets", () => {
 
     assert.equal(functions.timeBasis(), "aligned");
     functions.initializeHardwareView();
+    assert.equal(hardwareMount.id, "q1timeline-hardware");
     hardwareState = { ...hardwareState, level: "detail", replayOpen: true, sequencerId: "seq0" };
     mountOptions.onStateChange({ ...hardwareState });
     assert.equal(timers.size, 1);
@@ -1191,6 +1365,8 @@ describe("timeline webview assets", () => {
 
     assert.equal(highlightedSpanNeedsZoom(10, 11, { min: 0, max: 1000 }, 500), true);
     assert.equal(highlightedSpanNeedsZoom(10, 100, { min: 0, max: 1000 }, 500), false);
+    assert.equal(highlightedSpanNeedsZoom(1200, 1600, { min: 0, max: 1000 }, 500), true);
+    assert.equal(highlightedSpanNeedsZoom(100, 50, { min: 75, max: 200 }, 500), true);
     assert.equal(highlightedSpanNeedsZoom(Number.NaN, 100, { min: 0, max: 1000 }, 500), false);
 
     assert.match(script, /function eventIsQ1Issue\(event\)/);
@@ -1251,7 +1427,7 @@ describe("timeline webview assets", () => {
     assert.match(script, /!sequencerHasQ1IssueLane\(sequencer\) && sequencerCollapsed\(sequencer\)/);
     assert.match(script, /function installSharedQ1IssueControls\(\)/);
     assert.match(script, /shared-q1-issue-toggle/);
-    assert.match(script, /button\.setAttribute\("aria-label", `\$\{expanded \? "Hide" : "Show"\} Q1 issue/);
+    assert.match(script, /button\.setAttribute\("aria-label", `\$\{expanded \? "Hide" : "Show"\} Q1 core/);
     assert.match(script, /button\.textContent = ""/);
     assert.doesNotMatch(script, /button\.textContent = expanded \? "Hide Q1" : "Show Q1"/);
     assert.match(script, /syncSharedSequencerFoldControls\(\)/);
@@ -1737,5 +1913,639 @@ describe("timeline webview assets", () => {
     assert.doesNotMatch(script, /renderAnalysisStatus\(initialAnalysisStatus\)/);
     assert.doesNotMatch(script, /renderDiagnosticSummary\(initialDiagnosticSummary\)/);
     assert.doesNotMatch(script, /renderConfidenceLegend\(\)/);
+  });
+
+  it("starts both timeline renderers at the displayed nested and multi-sequencer loop previews", () => {
+    const script = readFileSync(join(__dirname, "..", "src", "q1timeline", "media", "timeline.js"), "utf-8");
+    const event = (id: string, kind: string, start: number, end: number, meta: any = {}) => ({
+      id, kind, sequencer_id: id.split(":")[0],
+      t0: { kind: "concrete", value: start }, t1: { kind: "concrete", value: end },
+      meta: { aligned_t0: start + 100, aligned_t1: end + 100, ...meta },
+    });
+    const events = [
+      event("seq0:inner", "loop_block", 20, 40, {
+        count: 6, visible_iteration_count: 1, preview_policy: "first_iteration_only",
+        first_iteration_event_ids: ["seq0:wait"],
+      }),
+      event("seq0:wait", "wait", 20, 40),
+      event("seq0:outer", "loop_block", 20, 600, {
+        count: 100, visible_iteration_count: 1, preview_policy: "first_iteration_only",
+        first_iteration_event_ids: ["seq0:inner", "seq0:wait", "seq0:play"],
+      }),
+      event("seq0:play", "play", 580, 600),
+      event("seq1:outer", "loop_block", 20, 800, {
+        count: 100, visible_iteration_count: 1, preview_policy: "first_iteration_only",
+        first_iteration_event_ids: ["seq1:issue"],
+      }),
+      event("seq1:issue", "q1_issue", 800, 820),
+      event("seq0:stop", "stop", 40_000_000, 40_000_000),
+      event("seq0:stop-issue", "q1_issue", 40_000_000, 40_000_004, { op: "stop" }),
+    ];
+    for (const basis of ["local", "aligned"]) {
+      const expected = { min: 0, max: basis === "local" ? 820 : 920 };
+      assert.deepEqual(loadQ1TimelineZoomRuntime(script, events, { basis }).currentTimelineWindow(), expected);
+      const svg = loadQ1TimelineZoomRuntime(script, events, { basis });
+      svg.restoreTimelineZoom();
+      assert.deepEqual(svg.currentTimelineWindow(), expected);
+      assert.deepEqual(svg.state(), {});
+    }
+
+    events[4].meta.preview_policy = "requested_iterations";
+    events[4].meta.visible_iteration_count = 2;
+    events[4].meta.preview_iteration_event_ids = { 0: ["seq1:issue"], 1: ["seq1:next"] };
+    events.push(event("seq1:next", "q1_issue", 1600, 1700));
+    assert.deepEqual(loadQ1TimelineZoomRuntime(script, events).currentTimelineWindow(), { min: 0, max: 1700 });
+    assert.deepEqual(
+      loadQ1TimelineZoomRuntime(script, events, { full: { min: 200, max: 1600 } }).currentTimelineWindow(),
+      { min: 200, max: 1600 },
+    );
+  });
+
+  it("preserves saved zoom and keeps full-range defaults, Fit, and Reset available", () => {
+    const script = readFileSync(join(__dirname, "..", "src", "q1timeline", "media", "timeline.js"), "utf-8");
+    const full = { min: 0, max: 40_160_000 };
+    const events = [{
+      id: "loop", kind: "loop_block",
+      t0: { kind: "concrete", value: 0 }, t1: { kind: "concrete", value: 800 },
+      meta: { count: 100, visible_iteration_count: 1, preview_policy: "first_iteration_only" },
+    }];
+    const state = { timelineWindow: { min: 120, max: 180, fullMin: full.min, fullMax: full.max, basis: "local" } };
+    const shared = loadQ1TimelineZoomRuntime(script, events, { state });
+    assert.deepEqual(shared.currentTimelineWindow(), { min: 120, max: 180 });
+    const svg = loadQ1TimelineZoomRuntime(script, events, { state });
+    svg.restoreTimelineZoom();
+    assert.deepEqual(svg.currentTimelineWindow(), { min: 120, max: 180 });
+    assert.deepEqual(svg.state(), state);
+    for (const savedWindow of [
+      { ...state.timelineWindow, fullMax: 10_000 },
+      { ...state.timelineWindow, basis: "aligned" },
+    ]) {
+      assert.deepEqual(
+        loadQ1TimelineZoomRuntime(script, events, { state: { timelineWindow: savedWindow } }).currentTimelineWindow(),
+        { min: 0, max: 800 },
+      );
+    }
+    shared.fitTimelineToWindow();
+    assert.deepEqual(shared.currentTimelineWindow(), full);
+    svg.resetTimelineZoom();
+    assert.deepEqual(svg.currentTimelineWindow(), full);
+    assert.deepEqual(loadQ1TimelineZoomRuntime(script, []).currentTimelineWindow(), full);
+    events[0].meta.count = 1;
+    assert.deepEqual(loadQ1TimelineZoomRuntime(script, events).currentTimelineWindow(), full);
+  });
+
+  it("includes displayed pulses after hidden wait iterations with or without a fully shown outer loop", () => {
+    const script = readFileSync(join(__dirname, "..", "src", "q1timeline", "media", "timeline.js"), "utf-8");
+    const event = (id: string, kind: string, start: number, end: number, meta: any = {}) => ({
+      id, kind, t0: { kind: "concrete", value: start }, t1: { kind: "concrete", value: end }, meta,
+    });
+    const events = [
+      event("inner", "loop_block", 0, 100, {
+        count: 6, visible_iteration_count: 1, preview_policy: "first_iteration_only",
+        first_iteration_event_ids: ["wait"],
+      }),
+      event("wait", "wait", 0, 100),
+      event("play", "play", 600, 620),
+      event("stop", "stop", 40_000_000, 40_000_000),
+      event("stop-issue", "q1_issue", 40_000_000, 40_000_004, { op: "stop" }),
+    ];
+    assert.deepEqual(loadQ1TimelineZoomRuntime(script, events).currentTimelineWindow(), { min: 0, max: 620 });
+    events.push(event("outer", "loop_block", 0, 620, {
+      count: 1, visible_iteration_count: 1, preview_policy: "first_iteration_only",
+      first_iteration_event_ids: ["wait", "play"],
+    }));
+    const svg = loadQ1TimelineZoomRuntime(script, events);
+    svg.restoreTimelineZoom();
+    assert.deepEqual(svg.currentTimelineWindow(), { min: 0, max: 620 });
+  });
+
+  it("zooms nanosecond events and selections independently of a long execution extent", () => {
+    const script = readFileSync(join(__dirname, "..", "src", "q1timeline", "media", "timeline.js"), "utf-8");
+    const runtime = loadQ1TimelineZoomRuntime(script, []);
+    const event = (start: number, end: number) => ({
+      t0: { kind: "concrete", value: start }, t1: { kind: "concrete", value: end },
+    });
+    for (const [start, end, min, max] of [
+      [400, 404, 386, 418],
+      [400, 420, 380, 440],
+      [100, 100, 84, 116],
+      [0, 4, 0, 32],
+      [40_159_996, 40_160_000, 40_159_968, 40_160_000],
+    ]) {
+      runtime.zoomTimelineToEvent(event(start, end));
+      assert.deepEqual(runtime.currentTimelineWindow(), { min, max });
+    }
+    runtime.selectRange(404, 400);
+    assert.deepEqual(runtime.currentTimelineWindow(), { min: 400, max: 404 });
+    assert.equal(runtime.selection(), undefined);
+    runtime.zoomTimelineAround(2);
+    assert.deepEqual(runtime.currentTimelineWindow(), { min: 401, max: 403 });
+    runtime.zoomTimelineAround(8);
+    assert.equal(runtime.currentTimelineWindow().max - runtime.currentTimelineWindow().min, 1);
+    runtime.setTimelineWindow(-2, -1);
+    assert.deepEqual(runtime.currentTimelineWindow(), { min: 0, max: 1 });
+    runtime.setTimelineWindow(40_160_001, 40_160_002);
+    assert.deepEqual(runtime.currentTimelineWindow(), { min: 40_159_999, max: 40_160_000 });
+  });
+
+  it("keeps folded-time navigation, ticks, source highlights, and hardware cursor in real nanoseconds", () => {
+    const script = readFileSync(join(__dirname, "..", "src", "q1timeline", "media", "timeline.js"), "utf-8");
+    const scale = {
+      gaps: [{ start: 1000, end: 99_000, displayStart: 1000, displayEnd: 1100 }],
+      toDisplay: (time: number) => time <= 1000 ? time : time < 99_000 ? 1000 + (time - 1000) / 980 : time - 97_900,
+      fromDisplay: (time: number) => time <= 1000 ? time : time < 1100 ? 1000 + (time - 1000) * 980 : time + 97_900,
+    };
+    const full = { min: 0, max: 100_000 };
+    const runtime = loadQ1TimelineZoomRuntime(script, [], { full, scale });
+    assert.equal(runtime.timelineTimeFromPointer({ clientX: 600 }), 50_000);
+    assert.equal(runtime.scaleTimelineTime(50_000, full, { left: 100, right: 1100 }), 600);
+    assert.deepEqual(runtime.sharedTimelineTicks(), [
+      { leftPercent: 0, label: "0 ns" },
+      { leftPercent: 47.619, label: "1000 ns" },
+      { leftPercent: 95.238, label: "99900 ns" },
+      { leftPercent: 100, label: "100000 ns" },
+    ]);
+    runtime.renderHardwareCursor({ time: 50_000 });
+    assert.equal(runtime.cursor().style.left, "50%");
+    assert.equal(runtime.cursor().hidden, false);
+
+    const anchorBefore = runtime.timelineTimeFromPointer({ clientX: 850 });
+    runtime.handleTimelineWheel({ clientX: 850, deltaY: -1, preventDefault() {} });
+    assert.deepEqual(runtime.currentTimelineWindow(), { min: 315, max: 99_895 });
+    assert.equal(runtime.timelineTimeFromPointer({ clientX: 850 }), anchorBefore);
+
+    runtime.setTimelineWindow(500, 99_500);
+    runtime.handleTimelineWheel({ deltaX: 100, preventDefault() {} });
+    assert.deepEqual(runtime.currentTimelineWindow(), { min: 610, max: 99_610 });
+    runtime.setTimelineWindow(500, 99_500);
+    runtime.panTimeline(1);
+    assert.deepEqual(runtime.currentTimelineWindow(), { min: 775, max: 99_775 });
+
+    runtime.resetTimelineZoom();
+    runtime.zoomTimelineToHighlightedEvent({
+      t0: { kind: "concrete", value: 99_000 }, t1: { kind: "concrete", value: 99_004 },
+    });
+    assert.deepEqual(runtime.currentTimelineWindow(), { min: 85_280, max: 99_018 });
+    assert.equal(runtime.state().timelineWindow.min, 85_280);
+    assert.equal(runtime.state().timelineWindow.max, 99_018);
+  });
+
+  it("keeps a one-nanosecond view accurate when long waits are folded after zooming", () => {
+    const script = readFileSync(join(__dirname, "..", "src", "q1timeline", "media", "timeline.js"), "utf-8");
+    const scale = {
+      gaps: [{ start: 1000, end: 99_000, displayStart: 1000, displayEnd: 1100 }],
+      toDisplay: (time: number) => time <= 1000 ? time : time < 99_000 ? 1000 + (time - 1000) / 980 : time - 97_900,
+      fromDisplay: (time: number) => time <= 1000 ? time : time < 1100 ? 1000 + (time - 1000) * 980 : time + 97_900,
+    };
+    const runtime = loadQ1TimelineZoomRuntime(script, [], { full: { min: 0, max: 100_000 } });
+    runtime.setTimelineWindow(50_000, 50_001);
+    assert.equal(runtime.timelineTimeFromPointer({ clientX: 1100 }), 50_001);
+    runtime.setTimeScale(scale);
+    assert.ok(Math.abs(runtime.timelineTimeFromPointer({ clientX: 1100 }) - 50_001) < 1e-6);
+    assert.equal(runtime.scaleTimelineTime(50_001, runtime.currentTimelineWindow(), { left: 0, right: 1000 }), 1000);
+    assert.deepEqual(runtime.sharedTimelineTicks(), [
+      { leftPercent: 0, label: "50000 ns" }, { leftPercent: 100, label: "50001 ns" },
+    ]);
+    runtime.renderHardwareCursor({ time: 50_001 });
+    assert.equal(runtime.cursor().style.left, "100%");
+    runtime.zoomTimelineToHighlightedEvent({
+      t0: { kind: "concrete", value: 50_000 }, t1: { kind: "concrete", value: 50_001 },
+    });
+    assert.deepEqual(runtime.currentTimelineWindow(), { min: 50_000, max: 50_001 });
+
+    runtime.handleTimelineWheel({ deltaX: 1000, preventDefault() {} });
+    assert.deepEqual(runtime.currentTimelineWindow(), { min: 50_001, max: 50_002 });
+    runtime.zoomTimelineAround(2);
+    assert.equal(runtime.currentTimelineWindow().max - runtime.currentTimelineWindow().min, 1);
+    runtime.setTimelineWindow(50_000, 50_004);
+    runtime.panTimeline(1);
+    assert.deepEqual(runtime.currentTimelineWindow(), { min: 50_001, max: 50_005 });
+    runtime.zoomTimelineAround(2);
+    assert.deepEqual(runtime.currentTimelineWindow(), { min: 50_002, max: 50_004 });
+  });
+
+  it("expands and refolds one shared interval while retaining its controls and real coordinates", () => {
+    const script = readFileSync(join(__dirname, "..", "src", "q1timeline", "media", "timeline.js"), "utf-8");
+    const event = (kind: string, start: number, end: number, sequencer_id: string) => ({
+      kind, sequencer_id, confidence: "exact", t0: start, t1: end,
+    });
+    const runtime = loadQ1TimelineFoldRuntime(script, {
+      alignment: Object.fromEntries(["q0", "q1"].map((id) => [id, { offset: 0, mode: "manual:0", confidence: "exact" }])),
+      events: [event("wait", 0, 10_000, "q0"), event("wait", 0, 10_000, "q1"), event("marker_state", 5000, 5000, "q0")],
+    }, { current: { min: 100, max: 9900 } });
+    const preserved = JSON.parse(JSON.stringify(runtime.preserved()));
+    runtime.renderWaitFolds();
+    runtime.renderHardwareCursor();
+    const originalGaps = JSON.parse(JSON.stringify(runtime.timelineTimeScale().gaps));
+    const sampleTimes = [0, 100, 1000, 4950, 5050, 9000, 9900, 10_000];
+    const originalMapping = sampleTimes.map(runtime.displayTimelineTime);
+    const originalCursorStyles = runtime.tracks.map((track: any) => ({ ...track.querySelector(".hardware-time-cursor").style }));
+    assert.equal(runtime.displayTimelineTime(10_000), 192);
+    const markers = runtime.tracks.map((track: any) => track.children.filter((child: any) => child.classList.contains("q1timeline-wait-fold")));
+    assert.deepEqual(markers.map((items: any[]) => items.length), [2, 2, 2]);
+    assert.deepEqual(markers[0].map((node: any) => node.style), markers[1].map((node: any) => node.style));
+    assert.deepEqual(markers[1].map((node: any) => node.style), markers[2].map((node: any) => node.style));
+    const button = markers[1][0].children.find((child: any) => child.tagName === "BUTTON");
+    assert.ok(button, "The folded interval must be directly expandable from a sequencer lane");
+    assert.equal(button.children.find((node: any) => node.classList.contains("q1timeline-fold-slashes")).textContent, "//");
+    assert.equal(button.children.find((node: any) => node.classList.contains("q1timeline-fold-duration")).textContent, "4.97 µs");
+    assert.equal(button.getAttribute("aria-expanded"), "false");
+    assert.equal(button.dataset.trackIndex, "1");
+    assert.equal(runtime.isTimelineSelectionTarget(button), false);
+    let pointerStopped = false;
+    let clickStopped = false;
+    button.focus();
+    button.listeners.pointerdown({ stopPropagation() { pointerStopped = true; }, preventDefault() {} });
+    button.listeners.click({ stopPropagation() { clickStopped = true; }, preventDefault() {} });
+    assert.equal(pointerStopped, true);
+    assert.equal(clickStopped, true);
+    assert.equal(runtime.renders(), 1);
+    assert.deepEqual(runtime.preserved(), preserved);
+    assert.deepEqual(runtime.state().timelineExpandedGaps, [{ start: 16, end: 4984, basis: "local", fullMin: 0, fullMax: 10_000 }]);
+    assert.deepEqual(runtime.timelineTimeScale().gaps.map(({ start, end }: any) => ({ start, end })), [{ start: 5016, end: 9984 }]);
+    assert.equal(runtime.displayTimelineTime(10_000), 5096);
+    for (const time of [100, 1000, 4950, 5050, 9000, 9900]) {
+      const display = runtime.displayTimelineTime(time);
+      assert.ok(Math.abs(runtime.realTimelineTime(display) - time) < 1e-6);
+      const ratio = (display - runtime.displayTimelineTime(100)) / (runtime.displayTimelineTime(9900) - runtime.displayTimelineTime(100));
+      assert.ok(Math.abs(runtime.timelineTimeFromPointer({ clientX: 100 + ratio * 1000 }) - time) < 1e-6);
+    }
+    const expandedMarkers = runtime.tracks.map((track: any) => track.children.filter((child: any) => child.classList.contains("q1timeline-wait-fold")));
+    assert.deepEqual(expandedMarkers.map((items: any[]) => items.length), [2, 2, 2]);
+    assert.deepEqual(expandedMarkers.map((items: any[]) => items.map((node: any) => node.classList.contains("is-expanded"))), [[true, false], [true, false], [true, false]]);
+    assert.deepEqual(expandedMarkers[0].map((node: any) => node.style), expandedMarkers[1].map((node: any) => node.style));
+    assert.deepEqual(expandedMarkers[1].map((node: any) => node.style), expandedMarkers[2].map((node: any) => node.style));
+    for (const items of expandedMarkers) {
+      const expandedButton = items[0].children.find((child: any) => child.tagName === "BUTTON");
+      assert.equal(expandedButton.getAttribute("aria-expanded"), "true");
+      assert.equal(expandedButton.children.some((node: any) => node.classList.contains("q1timeline-fold-slashes")), false);
+      assert.equal(expandedButton.children.find((node: any) => node.classList.contains("q1timeline-fold-duration")).textContent, "4.97 µs expanded · collapse");
+    }
+    const collapseButton = expandedMarkers[1][0].children.find((child: any) => child.tagName === "BUTTON");
+    assert.equal(runtime.activeElement(), collapseButton);
+    assert.equal(collapseButton.dataset.timeStart, "16");
+    assert.equal(collapseButton.dataset.timeEnd, "4984");
+    assert.equal(collapseButton.dataset.trackIndex, "1");
+    assert.equal(runtime.toolbar.title, "Expand all unchanged intervals");
+
+    collapseButton.listeners.click({ stopPropagation() {}, preventDefault() {} });
+    assert.equal(runtime.renders(), 2);
+    assert.deepEqual(runtime.preserved(), preserved);
+    assert.deepEqual(runtime.state().timelineExpandedGaps, []);
+    assert.deepEqual(runtime.timelineTimeScale().gaps, originalGaps);
+    assert.deepEqual(sampleTimes.map(runtime.displayTimelineTime), originalMapping);
+    assert.deepEqual(runtime.tracks.map((track: any) => track.querySelector(".hardware-time-cursor").style), originalCursorStyles);
+    const refoldedMarkers = runtime.tracks.map((track: any) => track.children.filter((child: any) => child.classList.contains("q1timeline-wait-fold")));
+    assert.deepEqual(refoldedMarkers.map((items: any[]) => items.map((node: any) => node.classList.contains("is-expanded"))), [[false, false], [false, false], [false, false]]);
+    const refoldedButton = refoldedMarkers[1][0].children.find((child: any) => child.tagName === "BUTTON");
+    assert.equal(runtime.activeElement(), refoldedButton);
+    assert.equal(refoldedButton.getAttribute("aria-expanded"), "false");
+    assert.equal(refoldedButton.children.find((node: any) => node.classList.contains("q1timeline-fold-slashes")).textContent, "//");
+  });
+
+  it("restores per-gap choices only for matching coordinates and can expand or refold every interval", () => {
+    const script = readFileSync(join(__dirname, "..", "src", "q1timeline", "media", "timeline.js"), "utf-8");
+    const ir = { events: [
+      { kind: "wait", sequencer_id: "q0", confidence: "exact", t0: 0, t1: 10_000 },
+      { kind: "marker_state", sequencer_id: "q0", confidence: "exact", t0: 5000, t1: 5000 },
+    ] };
+    const state = { timelineWaitsCollapsed: true, timelineExpandedGaps: [
+      { start: 16, end: 4984, basis: "local", fullMin: 0, fullMax: 10_000 },
+    ] };
+    const runtime = loadQ1TimelineFoldRuntime(script, ir, { state });
+    assert.deepEqual([32, 4968, 1_250_000].map(runtime.formatFoldDuration), ["32 ns", "4.97 µs", "1.25 ms"]);
+    assert.equal(runtime.timelineTimeScale().gaps.length, 1);
+    assert.equal(runtime.timelineTimeScale(true).gaps.length, 2);
+    runtime.toggleTimelineFolds();
+    assert.equal(runtime.state().timelineWaitsCollapsed, false);
+    assert.deepEqual(runtime.state().timelineExpandedGaps, []);
+    assert.equal(runtime.displayTimelineTime(10_000), 10_000);
+    assert.equal(runtime.toolbar.title, "Fold all unchanged intervals");
+    assert.equal(runtime.toolbar.disabled, false);
+    runtime.toggleTimelineFolds();
+    assert.equal(runtime.state().timelineWaitsCollapsed, true);
+    assert.equal(runtime.timelineTimeScale().gaps.length, 2);
+    assert.equal(runtime.displayTimelineTime(10_000), 192);
+    for (const gap of [...runtime.timelineTimeScale(true).gaps]) runtime.toggleTimelineGap(gap);
+    assert.equal(runtime.timelineTimeScale().gaps.length, 0);
+    assert.equal(runtime.toolbar.title, "Fold all unchanged intervals");
+    assert.equal(runtime.toolbar.disabled, false);
+    runtime.toggleTimelineFolds();
+    assert.equal(runtime.timelineTimeScale().gaps.length, 2);
+    assert.deepEqual(runtime.state().timelineExpandedGaps, []);
+    assert.equal(loadQ1TimelineFoldRuntime(script, ir, { state, basis: "aligned" }).timelineTimeScale().gaps.length, 2);
+    assert.equal(loadQ1TimelineFoldRuntime(script, ir, { state, full: { min: 0, max: 12_000 } }).timelineTimeScale().gaps.length, 2);
+    const changed = { events: [ir.events[0], { ...ir.events[1], t0: 4000, t1: 4000 }] };
+    assert.equal(loadQ1TimelineFoldRuntime(script, changed, { state }).timelineTimeScale().gaps.length, 2);
+    const malformed = { timelineExpandedGaps: [null, {}, { ...state.timelineExpandedGaps[0], end: -1 }] };
+    assert.equal(loadQ1TimelineFoldRuntime(script, ir, { state: malformed }).timelineTimeScale().gaps.length, 2);
+  });
+
+  it("refolds one interval after expanding all and restores the remaining controls after reload", () => {
+    const script = readFileSync(join(__dirname, "..", "src", "q1timeline", "media", "timeline.js"), "utf-8");
+    const ir = { events: [
+      { kind: "wait", sequencer_id: "q0", confidence: "exact", t0: 0, t1: 15_000 },
+      { kind: "marker_state", sequencer_id: "q0", confidence: "exact", t0: 5000, t1: 5000 },
+      { kind: "marker_state", sequencer_id: "q0", confidence: "exact", t0: 10_000, t1: 10_000 },
+    ] };
+    const options = { current: { min: 0, max: 15_000 }, full: { min: 0, max: 15_000 } };
+    const runtime = loadQ1TimelineFoldRuntime(script, ir, options);
+    const preserved = JSON.parse(JSON.stringify(runtime.preserved()));
+    const markers = (view: any) => view.tracks[1].children.filter((node: any) => node.classList.contains("q1timeline-wait-fold"));
+    const click = (marker: any) => marker.children.find((node: any) => node.tagName === "BUTTON").listeners.click({ stopPropagation() {}, preventDefault() {} });
+    runtime.toggleTimelineFolds();
+    assert.equal(runtime.displayTimelineTime(15_000), 15_000);
+    assert.deepEqual(markers(runtime).map((node: any) => node.classList.contains("is-expanded")), [true, true, true]);
+    click(markers(runtime)[1]);
+    assert.deepEqual(runtime.timelineTimeScale().gaps.map(({ start, end }: any) => ({ start, end })), [{ start: 5016, end: 9984 }]);
+    assert.deepEqual(markers(runtime).map((node: any) => node.classList.contains("is-expanded")), [true, false, true]);
+    assert.equal(runtime.displayTimelineTime(4984) - runtime.displayTimelineTime(16), 4968);
+    assert.equal(runtime.displayTimelineTime(9984) - runtime.displayTimelineTime(5016), 64);
+    assert.equal(runtime.displayTimelineTime(14_984) - runtime.displayTimelineTime(10_016), 4968);
+    assert.deepEqual(runtime.preserved(), preserved);
+
+    const reloaded = loadQ1TimelineFoldRuntime(script, ir, { ...options, state: JSON.parse(JSON.stringify(runtime.state())) });
+    reloaded.renderWaitFolds();
+    assert.deepEqual(reloaded.timelineTimeScale().gaps, runtime.timelineTimeScale().gaps);
+    assert.deepEqual(markers(reloaded).map((node: any) => node.classList.contains("is-expanded")), [true, false, true]);
+    const expandedButton = markers(reloaded)[0].children.find((node: any) => node.tagName === "BUTTON");
+    assert.equal(expandedButton.getAttribute("aria-expanded"), "true");
+    click(markers(reloaded)[0]);
+    assert.deepEqual(reloaded.timelineTimeScale().gaps.map(({ start, end }: any) => ({ start, end })), [
+      { start: 16, end: 4984 }, { start: 5016, end: 9984 },
+    ]);
+    assert.deepEqual(markers(reloaded).map((node: any) => node.classList.contains("is-expanded")), [false, false, true]);
+    assert.equal(reloaded.displayTimelineTime(14_984) - reloaded.displayTimelineTime(10_016), 4968);
+    assert.deepEqual(reloaded.preserved(), preserved);
+    const refoldedReload = loadQ1TimelineFoldRuntime(script, ir, { ...options, state: JSON.parse(JSON.stringify(reloaded.state())) });
+    assert.deepEqual(refoldedReload.timelineTimeScale().gaps, reloaded.timelineTimeScale().gaps);
+  });
+
+  it("preserves real-time state and per-gap choices while browsing equal-width instructions", () => {
+    const script = readFileSync(join(__dirname, "..", "src", "q1timeline", "media", "timeline.js"), "utf-8");
+    const state = {
+      timelineWaitsCollapsed: true,
+      timelineExpandedGaps: [{ start: 16, end: 4984, basis: "local", fullMin: 0, fullMax: 10_000 }],
+      expandedQ1IssueSequencers: ["q0"],
+    };
+    const runtime = loadQ1TimelineFoldRuntime(script, { events: [
+      { id: "wait", kind: "wait", sequencer_id: "q0", confidence: "exact", t0: 0, t1: 10_000 },
+      { id: "marker", kind: "marker_state", sequencer_id: "q0", confidence: "exact", t0: 5000, t1: 5000 },
+    ] }, { state, current: { min: 4500, max: 5500 } });
+    const preserved = JSON.parse(JSON.stringify(runtime.preserved()));
+    const scale = runtime.timelineTimeScale();
+    runtime.setTimelineLayout("instruction");
+    assert.equal(runtime.layout(), "instruction");
+    assert.deepEqual(runtime.preserved(), preserved);
+    assert.deepEqual(runtime.state(), { ...state, timelineLayout: "instruction" });
+    assert.equal(runtime.timelineTimeScale(), scale, "Changing layout must not rebuild or alter the real-time scale");
+    assert.ok(runtime.tracks.every((track: any) => track.children.length === 0), "Instruction slots must not receive real-time fold or hardware overlays");
+
+    runtime.installTimelineMouseInteractions();
+    assert.deepEqual(Object.keys(runtime.tracks[1].listeners).sort(), ["scroll", "wheel"], "Instruction zoom and native scroll must not install real-time pointer handlers");
+    assert.equal(runtime.tracks[1].style.touchAction, undefined);
+    runtime.zoomTimelineToHighlightedEvent({ id: "marker", t0: 5000, t1: 5000 });
+    assert.deepEqual(runtime.scrolledEventIds, ["marker"]);
+    assert.deepEqual(runtime.preserved(), preserved);
+
+    runtime.setTimelineLayout("time");
+    assert.deepEqual(runtime.preserved(), preserved);
+    assert.deepEqual(runtime.state(), { ...state, timelineLayout: "time" });
+    assert.equal(runtime.timelineTimeScale(), scale);
+    assert.ok(runtime.tracks.every((track: any) => track.querySelector(".hardware-time-cursor")));
+    assert.ok(runtime.tracks.every((track: any) => track.querySelector(".q1timeline-wait-fold")));
+    runtime.installTimelineMouseInteractions();
+    assert.deepEqual(Object.keys(runtime.tracks[1].listeners).sort(), ["pointerdown", "wheel"]);
+  });
+
+  it("highlights all source-range instruction aliases without zooming time or moving the hardware cursor", () => {
+    const script = readFileSync(join(__dirname, "..", "src", "q1timeline", "media", "timeline.js"), "utf-8");
+    const handlerStart = script.indexOf('\n  window.addEventListener("message", (event) => {');
+    assert.ok(handlerStart >= 0);
+    const handlerSource = script.slice(handlerStart, script.lastIndexOf("\n})();"));
+    const scrolled: string[] = [];
+    const fitted: string[][] = [];
+    const blocks = [
+      { eventId: "q1", eventIds: "q1" },
+      { eventId: "play-path0", eventIds: "play-path0 play-path1" },
+      { eventId: "unrelated", eventIds: "unrelated" },
+    ].map((dataset) => ({
+      dataset, selected: false, attributes: {} as Record<string, string>, classList: {} as any,
+      setAttribute(name: string, value: string) { this.attributes[name] = value; },
+      scrollIntoView() { scrolled.push(dataset.eventId); },
+    }));
+    blocks.forEach((block) => { block.classList.toggle = (_name: string, selected: boolean) => { block.selected = selected; }; });
+    const summary = { hidden: true, textContent: "", setAttribute() {} };
+    let handler: (event: any) => void = () => { throw new Error("Message handler was not registered"); };
+    const sourceSelection = Function("window", "document", "summary", "fitInstructionSelection", `
+      let timelineLayout = "instruction";
+      let selectedTimelineEventId = "previous";
+      let selectedSourceEventIds = new Set();
+      function renderSharedEventInspector() {}
+      function ensureRelatedBlockSummaryNode() { return summary; }
+      function zoomTimelineToEventRange() { throw new Error("Instruction highlight changed the real-time window"); }
+      const hardwareView = { selectEvent() { throw new Error("Range highlight moved the hardware cursor"); } };
+      ${handlerSource}
+      return () => Array.from(selectedSourceEventIds);
+    `)({ addEventListener: (_name: string, listener: (event: any) => void) => { handler = listener; } },
+      { querySelectorAll: () => blocks }, summary, (selected: typeof blocks) => { fitted.push(selected.map((block) => block.dataset.eventId)); });
+    handler({ data: { type: "highlightEventIds", zoomToRange: true, highlightEventIds: ["q1", "play-path1"] } });
+    assert.deepEqual(blocks.map((block) => block.selected), [true, true, false]);
+    assert.deepEqual(blocks.map((block) => block.attributes["aria-selected"]), ["true", "true", "false"]);
+    assert.deepEqual(scrolled, []);
+    assert.deepEqual(fitted, [["q1", "play-path0"]]);
+    assert.deepEqual(sourceSelection(), ["q1", "play-path1"]);
+    assert.match(summary.textContent, /2 blocks.*instruction order/);
+    handler({ data: { type: "highlightEventIds", zoomToRange: true, highlightEventIds: ["missing"] } });
+    assert.deepEqual(blocks.map((block) => block.selected), [false, false, false]);
+    assert.deepEqual(fitted, [["q1", "play-path0"], []]);
+    assert.match(summary.textContent, /no blocks/);
+  });
+
+  it("renders instruction coordinates independently while restoring the saved time viewport and source selection", () => {
+    const script = readFileSync(join(__dirname, "..", "src", "q1timeline", "media", "timeline.js"), "utf-8");
+    const renderSource = extractFunctionSource(script, "renderSharedTimelineIfAvailable");
+    assert.ok(renderSource);
+    const adapter = require(join(__dirname, "..", "src", "q1timeline", "media", "timelineAdapter.js"));
+    let rendered: any;
+    const stage = { scrollLeft: 88, dataset: {}, style: { setProperty() {} }, querySelectorAll: () => [] };
+    const root = { querySelector: () => stage };
+    const noopNames = [
+      "renderTimelineLayoutToggle", "renderTimelineWindowStatus", "renderTimeBasisToggle", "installSharedQ1IssueControls",
+      "syncSharedSequencerFoldControls", "installTimelineControlChips", "installTimelineMouseInteractions", "applySharedSelection",
+      "renderWaitFolds", "renderHardwareCursor",
+      "setInstructionView",
+    ];
+    const runtime = Function("window", "document", `
+      let timelineLayout = "time", timelineTimeBasis = "local", sharedTimelineActive = false;
+      let instructionView = { cellWidth: 112, leftOrdinal: 0 };
+      let selectedTimelineEventId;
+      const selectedSourceEventIds = new Set(["play-path1"]);
+      const expandedQ1IssueSequencers = new Set();
+      const timelineIr = { events: [
+        { id: "q1", kind: "q1_issue", sequencer_id: "q0", t0: 8, t1: 12, source: { raw: "play 0,1,4" } },
+        { id: "play", kind: "play", sequencer_id: "q0", t0: 400016, t1: 400020,
+          meta: { path_event_ids: ["play-path0", "play-path1"] } },
+      ] };
+      function currentTimelineMode() { return "normal"; }
+      function currentTimelineWindow() { return { min: 400000, max: 400060 }; }
+      function sharedTimelineViewport() { return { start: 400000, end: 400060 }; }
+      function sharedTimelineTicks() { return [{ leftPercent: 0, label: "400000 ns" }]; }
+      function sharedTimelineSelectionRange() { return { start: 400016, end: 400020 }; }
+      ${noopNames.map((name) => `function ${name}() {}`).join("\n")}
+      ${renderSource}
+      return {
+        render(layout) { timelineLayout = layout; return renderSharedTimelineIfAvailable(); },
+        q1Preference: () => Array.from(expandedQ1IssueSequencers),
+      };
+    `)({ q1timelineTimelineAdapter: adapter, q1lensSharedTimeline: { renderTimeline: (_root: any, model: any) => { rendered = model; } } },
+      { getElementById: () => root });
+    assert.equal(runtime.render("instruction"), true);
+    assert.deepEqual(rendered.viewport, { start: 0, end: 1 });
+    assert.equal(rendered.selectionRange, undefined);
+    assert.equal(rendered.lanes.find((lane: any) => lane.kind === "q1-issue").hidden, false);
+    assert.equal(rendered.lanes.flatMap((lane: any) => lane.blocks).find((block: any) => block.eventIds.includes("play-path1")).selected, true);
+    assert.deepEqual(runtime.q1Preference(), []);
+    assert.equal(runtime.render("time"), true);
+    assert.deepEqual(rendered.viewport, { start: 400000, end: 400060 });
+    assert.deepEqual(rendered.selectionRange, { start: 400016, end: 400020 });
+    assert.deepEqual(rendered.ticks, [{ leftPercent: 0, label: "400000 ns" }]);
+    assert.equal(rendered.lanes.find((lane: any) => lane.kind === "q1-issue").hidden, true);
+    assert.equal(rendered.lanes.flatMap((lane: any) => lane.blocks).find((block: any) => block.eventIds.includes("play-path1")).selected, true);
+    assert.deepEqual(runtime.q1Preference(), []);
+  });
+
+  it("uses RT source-range bounds instead of Q1 issue times or enclosing loop summaries", () => {
+    const script = readFileSync(join(__dirname, "..", "src", "q1timeline", "media", "timeline.js"), "utf-8");
+    const event = (id: string, kind: string, start: number, end: number, extra = {}) => ({
+      id, kind, sequencer_id: "Control", lane: `rt.${kind}`, confidence: "exact", t0: start, t1: end, ...extra,
+    });
+    const runtime = loadQ1TimelineFoldRuntime(script, { events: [
+      event("issue", "q1_issue", 200, 204), event("gain", "latched_state_pending", 400_016, 400_016),
+      event("playI", "play", 400_016, 400_020), event("playQ", "play", 400_016, 400_020),
+      event("wait", "wait", 400_020, 400_060), event("repeat", "play", 800_016, 800_020),
+      event("loop", "loop_block", 12, 40_160_000), event("preview", "loop_iteration_preview", 12, 401_548),
+      event("branch", "branch_region", 0, 40_160_000), event("debug", "slack", 0, 40_160_000, { lane: "debug.slack" }),
+      event("removed", "play", 0, 4, { meta: { diff_status: "removed" } }),
+    ] });
+    assert.deepEqual(runtime.sourceRangeTimelineBounds([
+      "issue", "loop", "preview", "branch", "debug", "gain", "playI", "playI", "playQ", "wait", "removed", "missing",
+    ]), { start: 400_016, end: 400_060, eventIds: ["gain", "playI", "playQ", "wait"], clock: "RT" });
+    assert.deepEqual(runtime.sourceRangeTimelineBounds(["playI", "repeat"]), {
+      start: 400_016, end: 800_020, eventIds: ["playI", "repeat"], clock: "RT",
+    });
+    assert.deepEqual(runtime.sourceRangeTimelineBounds(["issue", "loop", "preview", "debug"]), {
+      start: 200, end: 204, eventIds: ["issue"], clock: "Q1 core",
+    });
+    assert.equal(runtime.sourceRangeTimelineBounds(["loop", "preview", "branch", "debug", "removed"]), undefined);
+  });
+
+  it("rejects unknown source-range endpoints and never mixes aligned and local clocks", () => {
+    const script = readFileSync(join(__dirname, "..", "src", "q1timeline", "media", "timeline.js"), "utf-8");
+    const play = { id: "play", kind: "play", sequencer_id: "q0", lane: "rt.play", confidence: "exact", t0: 400_016, t1: 400_020 };
+    const issue = { ...play, id: "issue", kind: "q1_issue", t0: 200, t1: 204 };
+    const valid = { ...play, meta: { aligned_t0: 401_016, aligned_t1: 401_020 } };
+    const aligned = loadQ1TimelineFoldRuntime(script, { events: [valid, issue] }, { basis: "aligned" });
+    assert.deepEqual(aligned.sourceRangeTimelineBounds(["issue", "play"]), {
+      start: 401_016, end: 401_020, eventIds: ["play"], clock: "RT",
+    });
+    const cases = [
+      { basis: "local", event: { ...play, t1: { kind: "symbolic", expr: "T" } } },
+      { basis: "local", event: { ...play, t0: { kind: "concrete", value: null } } },
+      { basis: "local", event: { ...play, t1: undefined } },
+      { basis: "local", event: { ...play, t1: 400_015 } },
+      { basis: "aligned", event: play },
+      { basis: "aligned", event: { ...play, meta: { aligned_t0: null, aligned_t1: 401_020 } } },
+      { basis: "aligned", event: { ...play, meta: { aligned_t0: 401_016, aligned_t1: "401020" } } },
+      { basis: "aligned", event: { ...play, meta: { aligned_t0: 401_016, aligned_t1: NaN } } },
+    ];
+    for (const { basis, event } of cases) {
+      const runtime = loadQ1TimelineFoldRuntime(script, { events: [event, issue, { ...valid, id: "other" }] }, { basis });
+      const before = JSON.parse(JSON.stringify(runtime.preserved()));
+      assert.equal(runtime.sourceRangeTimelineBounds(["play", "other", "issue"]), undefined);
+      assert.equal(runtime.zoomTimelineToEventRange(["play", "other", "issue"]), undefined);
+      assert.deepEqual(runtime.preserved(), before);
+      assert.equal(runtime.renders(), 0);
+    }
+  });
+
+  it("zooms a source range linearly including edge padding while preserving folds outside the window", () => {
+    const script = readFileSync(join(__dirname, "..", "src", "q1timeline", "media", "timeline.js"), "utf-8");
+    const event = (id: string, kind: string, start: number, end: number, sequencer_id = "q0") => ({
+      id, kind, sequencer_id, lane: `rt.${kind}`, confidence: "exact", t0: start, t1: end,
+      meta: { aligned_t0: start + 1000, aligned_t1: end + 1000 },
+    });
+    const ir = {
+      alignment: Object.fromEntries(["q0", "q1"].map(id => [id, { offset: 1000, mode: "manual:1000", confidence: "exact" }])),
+      events: [event("wait0", "wait", 0, 20_000), event("wait1", "wait", 0, 20_000, "q1"),
+        event("selected", "upd_param", 5000, 5400), event("change1", "marker_state", 10_000, 10_000),
+        event("change2", "marker_state", 15_000, 15_000)],
+    };
+    for (const basis of ["local", "aligned"]) {
+      const offset = basis === "aligned" ? 1000 : 0;
+      const full = { min: offset, max: 20_000 + offset };
+      const runtime = loadQ1TimelineFoldRuntime(script, ir, { basis, full });
+      assert.equal(runtime.timelineTimeScale().gaps.length, 4);
+      assert.deepEqual(runtime.zoomTimelineToEventRange(["selected"]), {
+        start: 5000 + offset, end: 5400 + offset, eventIds: ["selected"], clock: "RT",
+      });
+      assert.deepEqual(runtime.preserved(), {
+        window: { min: 4980 + offset, max: 5420 + offset },
+        selection: { start: 5000 + offset, end: 5400 + offset }, selected: undefined, time: 5050,
+      });
+      assert.deepEqual(runtime.timelineTimeScale().gaps.map(({ start, end }: any) => ({ start, end })), [
+        { start: 10_016 + offset, end: 14_984 + offset }, { start: 15_016 + offset, end: 19_984 + offset },
+      ]);
+      assert.equal(runtime.displayTimelineTime(5420 + offset) - runtime.displayTimelineTime(4980 + offset), 440);
+      assert.equal(runtime.timelineTimeFromPointer({ clientX: 600 }), 5200 + offset);
+      assert.deepEqual(runtime.state().timelineWindow, {
+        min: 4980 + offset, max: 5420 + offset, fullMin: full.min, fullMax: full.max, basis,
+      });
+      assert.equal(runtime.state().timelineExpandedGaps.length, 2);
+    }
+    const linear = loadQ1TimelineFoldRuntime(script, ir, { full: { min: 0, max: 20_000 }, state: { timelineWaitsCollapsed: false } });
+    linear.zoomTimelineToEventRange(["selected"]);
+    assert.equal(linear.state().timelineWaitsCollapsed, false);
+    assert.equal(linear.timelineTimeScale(), undefined);
+    assert.equal(linear.displayTimelineTime(20_000), 20_000);
+    const point = loadQ1TimelineFoldRuntime(script, ir, { full: { min: 0, max: 20_000 } });
+    point.zoomTimelineToEventRange(["change1"]);
+    assert.deepEqual(point.preserved().window, { min: 9998, max: 10_002 });
+    assert.deepEqual(point.preserved().selection, { start: 10_000, end: 10_000 });
+  });
+
+  it("preserves another sequencer's pulse width when shared blocks use the wait-fold scale", () => {
+    const adapter = require(join(__dirname, "..", "src", "q1timeline", "media", "timelineAdapter.js"));
+    const renderer = require(join(__dirname, "..", "src", "shared", "timeline", "renderer.js"));
+    const event = (kind: string, start: number, end: number, sequencer_id: string, meta = {}) => ({
+      kind, sequencer_id, lane: `rt.${kind}`, confidence: "exact", meta,
+      t0: { kind: "concrete", value: start }, t1: { kind: "concrete", value: end },
+    });
+    const timeScale = adapter.buildWaitTimeScale({
+      alignment: {
+        q0: { offset: 0, mode: "manual:0", confidence: "exact" },
+        q1: { offset: 0, mode: "manual:0", confidence: "exact" },
+      },
+      events: [
+        event("upd_param", 0, 4, "q0", { applied_state: { awg_offset: [0, 0], marker: 0 } }),
+        event("upd_param", 0, 4, "q1", { applied_state: { awg_offset: [0, 0], marker: 0 } }),
+        event("wait", 4, 20_000, "q0"), event("wait", 4, 4000, "q1"),
+        event("play", 20_000, 20_100, "q0"), event("play", 4000, 7000, "q1"),
+        event("wait", 7000, 20_100, "q1"),
+      ],
+    });
+    const viewport = { start: 0, end: 20_100, timeScale };
+    const otherPulse = renderer.blockStyle({ start: 4000, duration: 3000 }, viewport);
+    const lastPulse = renderer.blockStyle({ start: 20_000, duration: 100 }, viewport);
+    assert.equal(timeScale.gaps.length, 1);
+    assert.ok(timeScale.gaps[0].end < 4000);
+    assert.equal(timeScale.toDisplay(20_100) - timeScale.toDisplay(4000), 16_100);
+    const displaySpan = timeScale.toDisplay(viewport.end) - timeScale.toDisplay(viewport.start);
+    assert.equal(timeScale.toDisplay(7000) - timeScale.toDisplay(4000), 3000);
+    assert.equal(timeScale.toDisplay(20_100) - timeScale.toDisplay(20_000), 100);
+    assert.ok(Math.abs(otherPulse.widthPercent - 3000 / displaySpan * 100) < 0.001);
+    assert.ok(Math.abs(lastPulse.widthPercent - 100 / displaySpan * 100) < 0.001);
+    assert.ok(otherPulse.leftPercent + otherPulse.widthPercent < lastPulse.leftPercent);
+    assert.ok(Math.abs(lastPulse.leftPercent + lastPulse.widthPercent - 100) < 0.002);
   });
 });

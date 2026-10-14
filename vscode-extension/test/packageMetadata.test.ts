@@ -160,7 +160,7 @@ describe("package metadata", () => {
     assert.equal(scripts["verify:installed"], "node ./scripts/verify-installed-assets.js");
     assert.equal(
       scripts["reinstall:local"],
-      "npm run package && code --install-extension q1lens-0.2.0.vsix --force && npm run verify:installed",
+      "npm run package && code --install-extension q1lens-0.2.1.vsix --force && npm run verify:installed",
     );
   });
 
@@ -170,5 +170,15 @@ describe("package metadata", () => {
     assert.equal(manifest.main, "./dist/extension.js");
     assert.ok(manifest.scripts["vscode:prepublish"].includes("npm run bundle"));
     assert.ok(manifest.scripts.bundle.includes("--external:vscode"));
+  });
+
+  it("exposes selection zoom only in the Q1ASM editor context menu with a selection", () => {
+    const manifest = packageJson();
+    assert.ok(manifest.activationEvents.includes("onCommand:q1timeline.zoomToSelection"));
+    assert.equal(manifest.contributes.commands.find((entry: any) => entry.command === "q1timeline.zoomToSelection")?.title,
+      "Q1Lens: View Selection in Timeline");
+    const entries = Object.entries(manifest.contributes.menus).flatMap(([menu, items]) =>
+      (items as any[]).filter((entry) => entry.command === "q1timeline.zoomToSelection").map((entry) => ({ menu, when: entry.when })));
+    assert.deepEqual(entries, [{ menu: "editor/context", when: "resourceExtname == .q1asm && editorHasSelection" }]);
   });
 });

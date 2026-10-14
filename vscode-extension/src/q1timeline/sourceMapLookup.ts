@@ -45,14 +45,19 @@ function sourceMatchesLine(source, sourceFile, line) {
 }
 
 function lookupEventIdsForSourceLine(timelineIr, sourceFile, line) {
+  return lookupEventIdsForSourceRange(timelineIr, sourceFile, line, line);
+}
+
+function lookupEventIdsForSourceRange(timelineIr, sourceFile, startLine, endLine) {
   const bySource = timelineIr && timelineIr.source_map && timelineIr.source_map.by_source
     ? timelineIr.source_map.by_source
     : {};
   const byEventId = timelineIr && timelineIr.source_map && timelineIr.source_map.by_event_id
     ? timelineIr.source_map.by_event_id
     : {};
-  const sourceLine = Number(line);
-  if (!Number.isFinite(sourceLine)) {
+  const firstLine = Number(startLine);
+  const lastLine = Number(endLine);
+  if (!Number.isFinite(firstLine) || !Number.isFinite(lastLine) || firstLine > lastLine) {
     return [];
   }
 
@@ -61,11 +66,12 @@ function lookupEventIdsForSourceLine(timelineIr, sourceFile, line) {
   const eventsById = new Map((timelineIr && Array.isArray(timelineIr.events) ? timelineIr.events : []).map((event) => [String(event.id), event]));
   for (const [key, value] of Object.entries(bySource)) {
     const parsed = parseSourceLineKey(key);
-    if (!parsed || parsed.line !== sourceLine || !sourceFileMatches(parsed.file, sourceFile, timelineIr)) {
+    if (!parsed || parsed.line < firstLine || parsed.line > lastLine || !sourceFileMatches(parsed.file, sourceFile, timelineIr)) {
       continue;
     }
     const matches = Array.isArray(value) ? value : [];
-    for (const eventId of matches) {
+    for (const matchedId of matches) {
+      const eventId = String(matchedId);
       if (isRemovedEvent(eventsById.get(String(eventId)))) {
         continue;
       }
@@ -80,7 +86,7 @@ function lookupEventIdsForSourceLine(timelineIr, sourceFile, line) {
       continue;
     }
     const hasMatchingSource = normalizeSources(entry).some((source) =>
-      sourceMatchesLineWithTimeline(source, sourceFile, sourceLine, timelineIr)
+      sourceMatchesRangeWithTimeline(source, sourceFile, firstLine, lastLine, timelineIr)
     );
     if (hasMatchingSource && !seen.has(eventId)) {
       seen.add(eventId);
@@ -95,7 +101,7 @@ function lookupEventIdsForSourceLine(timelineIr, sourceFile, line) {
     if (seen.has(eventId)) {
       continue;
     }
-    if (sourceMatchesLineWithTimeline(event.source, sourceFile, sourceLine, timelineIr)) {
+    if (sourceMatchesRangeWithTimeline(event.source, sourceFile, firstLine, lastLine, timelineIr)) {
       seen.add(eventId);
       eventIds.push(eventId);
     }
@@ -107,12 +113,12 @@ function isRemovedEvent(event) {
   return event && event.meta && event.meta.diff_status === "removed";
 }
 
-function sourceMatchesLineWithTimeline(source, sourceFile, line, timelineIr) {
+function sourceMatchesRangeWithTimeline(source, sourceFile, startLine, endLine, timelineIr) {
   if (!source || !source.file) {
     return false;
   }
   const sourceLine = Number(source.line);
-  if (!Number.isFinite(sourceLine) || sourceLine !== line) {
+  if (!Number.isFinite(sourceLine) || sourceLine < startLine || sourceLine > endLine) {
     return false;
   }
   return sourceFileMatches(String(source.file), sourceFile, timelineIr);
@@ -164,4 +170,5 @@ function hasDirectory(filePath) {
 export {
   lookupSourceForEvent,
   lookupEventIdsForSourceLine,
+  lookupEventIdsForSourceRange,
 };

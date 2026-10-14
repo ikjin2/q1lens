@@ -9,7 +9,7 @@ from typing import Any
 from q1timeline.analysis.alignment import align_timelines
 from q1timeline.analysis.hardware_readiness import analyze_hardware_readiness
 from q1timeline.analysis.interpreter import AnalysisState, interpret_program
-from q1timeline.analysis.underflow import analyze_underflow
+from q1timeline.analysis.underflow import analyze_underflows
 from q1timeline.ir.serialize import timeline_ir_from_states
 from q1timeline.project import is_valid_alignment_mode, is_valid_branch_policy, validate_params_json_mapping
 from q1timeline.q1asm.parser import parse_q1asm
@@ -49,6 +49,8 @@ def analyze_text(
         simulation=simulation,
         sequence=sequence,
     )
+    if execution_mode != "simulation":
+        analyze_underflows([state])
     if hardware_readiness:
         analyze_hardware_readiness(state)
     align_timelines([state], mode=alignment_mode, anchor_kinds=anchor_kinds)
@@ -105,6 +107,7 @@ def analyze_documents(
             )
             for file, text in validated_documents.items()
         ]
+        analyze_underflows(states)
     if hardware_readiness:
         for state in states:
             analyze_hardware_readiness(state)
@@ -150,7 +153,6 @@ def _analyze_program_text(
         execution_mode=execution_mode,
         max_steps=max_steps,
     )
-    analyze_underflow(state)
     return state
 
 

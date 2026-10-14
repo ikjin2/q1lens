@@ -140,6 +140,60 @@ async function withMockedVscode(vscode: any, callback: (controllerModule: any) =
   }
 }
 
+function automaticSourceFollow(vscode: any, TimelineController: any) {
+  const sourcePath = "C:\\repo\\q1asm\\seq0.q1asm";
+  const posted: any[] = [];
+  const editor = { document: { uri: vscode.Uri.file(sourcePath), version: 1, isDirty: false }, selection: sourceSelection() };
+  vscode.window.activeTextEditor = editor;
+  const controller = new TimelineController(createContext());
+  controller.projectUri = vscode.Uri.file("C:\\repo\\q1timeline.yml");
+  controller.projectRelatedPaths = new Set([sourcePath]);
+  controller.panel = { webview: { postMessage: (message) => posted.push(message) }, dispose() {} };
+  controller.webviewReady = true;
+  controller.timelineIr = {
+    source_map: { by_source: { [`${sourcePath}:3`]: ["e3", "removed", "missing"], [`${sourcePath}:4`]: ["e4"], [`${sourcePath}:5`]: ["e5"] } },
+    events: [{ id: "e3" }, { id: "e4" }, { id: "e5" }, { id: "removed", meta: { diff_status: "removed" } }],
+  };
+  return { controller, editor, posted, sourcePath };
+}
+
+function sourceSelection(startLine = 2, endLine = 4, endCharacter = 0, backwards = false) {
+  const start = { line: startLine, character: 0 };
+  const end = { line: endLine, character: endCharacter };
+  return { start, end, anchor: backwards ? end : start, active: backwards ? start : end,
+    isEmpty: startLine === endLine && endCharacter === 0 };
+}
+
+async function withFakeTimers(callback: (clock: any) => Promise<void>) {
+  const originalSetTimeout = global.setTimeout;
+  const originalClearTimeout = global.clearTimeout;
+  const pending = new Map<number, { at: number; callback: () => void }>();
+  let now = 0;
+  let nextId = 1;
+  global.setTimeout = ((callback, delay = 0) => {
+    const id = nextId++;
+    pending.set(id, { at: now + Number(delay), callback });
+    return id;
+  }) as any;
+  global.clearTimeout = ((id) => { pending.delete(Number(id)); }) as any;
+  try {
+    await callback({ advance(milliseconds: number) {
+      const end = now + milliseconds;
+      while (true) {
+        const due = [...pending.entries()].filter(([, timer]) => timer.at <= end).sort((a, b) => a[1].at - b[1].at)[0];
+        if (!due) break;
+        now = due[1].at;
+        pending.delete(due[0]);
+        due[1].callback();
+      }
+      now = end;
+    } });
+  } finally {
+    global.setTimeout = originalSetTimeout;
+    global.clearTimeout = originalClearTimeout;
+  }
+}
+
 describe("q1timeline controller", () => {
   it("does not warn for supported legacy and current analyzer releases", async () => {
     const vscode = createMockVscode();
@@ -2617,6 +2671,431 @@ describe("q1timeline controller", () => {
       const controller = new TimelineController(createContext());
       await controller.showAnalyzerMissingMessage(new Error("No module named q1lens"));
       assert.deepEqual(calls, [["q1lens.checkEnvironment", "q1timeline.refreshPreview"]]);
+      controller.dispose();
+    });
+  });
+
+  it("snapshots a backwards selected block before opening and excludes an end at column zero", async () => {
+    const vscode = createMockVscode();
+    const sourcePath = "C:\\repo\\q1asm\\seq0.q1asm";
+    const posted: any[] = [];
+    const editor = {
+      document: { uri: vscode.Uri.file(sourcePath) },
+      selection: { start: { line: 2, character: 3 }, end: { line: 4, character: 0 },
+        anchor: { line: 4, character: 0 }, active: { line: 2, character: 3 }, isEmpty: false },
+    };
+    vscode.window.activeTextEditor = editor;
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      controller.findProjectFileUpward = () => undefined;
+      controller.openPreview = async (options) => {
+        assert.equal(options.sourceUri.fsPath, sourcePath);
+        assert.deepEqual(controller.pendingTarget, { q1asmFile: sourcePath, line: 3, endLine: 4, zoomToRange: true });
+        editor.selection = { ...editor.selection, start: { line: 8, character: 0 }, end: { line: 9, character: 1 } };
+        vscode.window.activeTextEditor = undefined;
+        await Promise.resolve();
+        controller.panel = { webview: { postMessage: (message) => posted.push(message) }, dispose: () => {} };
+        controller.timelineIr = { events: [
+          { id: "seq0:e3", source: { file: sourcePath, line: 3 } },
+          { id: "seq0:e4", source: { file: sourcePath, line: 4 } },
+          { id: "seq0:e5", source: { file: sourcePath, line: 5 } },
+        ] };
+        await controller.revealPendingTarget();
+      };
+      await controller.zoomToSelection();
+      assert.deepEqual(posted, [{ type: "highlightEventIds", highlightEventIds: ["seq0:e3", "seq0:e4"],
+        zoomToRange: true, sourceRange: { file: sourcePath, startLine: 3, endLine: 4 } }]);
+      assert.equal(controller.pendingTarget, undefined);
+      controller.dispose();
+    });
+  });
+
+  it("switches projects and refreshes the saved program before revealing a selected block", async () => {
+    const vscode = createMockVscode();
+    const sourcePath = "C:\\repo\\project-b\\q1asm\\seq0.q1asm";
+    const projectPath = "C:\\repo\\project-b\\q1timeline.yml";
+    const posted: any[] = [];
+    vscode.window.activeTextEditor = { document: { uri: vscode.Uri.file(sourcePath) },
+      selection: { start: { line: 4, character: 0 }, end: { line: 6, character: 2 }, isEmpty: false } };
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      controller.projectUri = vscode.Uri.file("C:\\repo\\project-a\\q1timeline.yml");
+      controller.panel = { webview: { postMessage: (message) => posted.push(message) }, reveal: () => {}, dispose: () => {} };
+      controller.timelineIr = { events: [{ id: "old", source: { file: "q1asm/seq0.q1asm", line: 5 } }] };
+      controller.findProjectFileUpward = () => vscode.Uri.file(projectPath);
+      controller.refreshProjectRelatedPaths = async () => undefined;
+      controller.startWatchers = () => undefined;
+      let analysisCount = 0;
+      controller.runAnalysis = async () => {
+        analysisCount += 1;
+        assert.equal(controller.timelineIr, undefined);
+        assert.deepEqual(controller.pendingTarget, { q1asmFile: sourcePath, line: 5, endLine: 7, zoomToRange: true });
+        controller.timelineIr = { events: [{ id: "new", source: { file: sourcePath, line: 7 } }] };
+        await controller.revealPendingTarget();
+      };
+      await controller.zoomToSelection();
+      assert.equal(controller.projectUri.fsPath, projectPath);
+      assert.equal(analysisCount, 1);
+      assert.deepEqual(posted, [{ type: "highlightEventIds", highlightEventIds: ["new"], zoomToRange: true,
+        sourceRange: { file: sourcePath, startLine: 5, endLine: 7 } }]);
+      controller.dispose();
+    });
+  });
+
+  it("keeps a selected block queued until a fresher in-flight analysis completes", async () => {
+    const vscode = createMockVscode();
+    const sourcePath = "C:\\repo\\q1asm\\seq0.q1asm";
+    const posted: any[] = [];
+    vscode.window.activeTextEditor = { document: { uri: vscode.Uri.file(sourcePath) },
+      selection: { start: { line: 2, character: 0 }, end: { line: 3, character: 2 }, isEmpty: false } };
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      controller.projectUri = vscode.Uri.file("C:\\repo\\q1timeline.yml");
+      controller.panel = { webview: { postMessage: (message) => posted.push(message) }, reveal: () => {}, dispose: () => {} };
+      controller.timelineIr = { events: [{ id: "old", source: { file: sourcePath, line: 3 } }] };
+      controller.findProjectFileUpward = () => controller.projectUri;
+      controller.refreshProjectRelatedPaths = async () => undefined;
+      controller.startWatchers = () => undefined;
+      controller.analysisInFlight = true;
+      await controller.zoomToSelection();
+      assert.equal(controller.analysisQueued, true);
+      assert.equal(controller.pendingTarget?.endLine, 4);
+      assert.equal(posted.some((message) => message.type === "highlightEventIds"), false);
+      controller.analysisInFlight = false;
+      controller.analysisQueued = false;
+      controller.timelineIr = { events: [{ id: "fresh", source: { file: sourcePath, line: 4 } }] };
+      await controller.revealPendingTarget();
+      assert.deepEqual(posted.find((message) => message.type === "highlightEventIds")?.highlightEventIds, ["fresh"]);
+      assert.equal(controller.pendingTarget, undefined);
+      controller.dispose();
+    });
+  });
+
+  it("reports missing selection and unsaved Q1ASM without saving or opening a preview", async () => {
+    const vscode = createMockVscode();
+    const messages: string[] = [];
+    vscode.window.showInformationMessage = async (message) => { messages.push(message); };
+    const selection = { start: { line: 1, character: 0 }, end: { line: 2, character: 1 }, isEmpty: false };
+    let saves = 0;
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      let opens = 0;
+      controller.openPreview = async () => { opens += 1; };
+      for (const editor of [undefined,
+        { document: { uri: vscode.Uri.file("C:\\repo\\notes.txt") }, selection },
+        { document: { uri: vscode.Uri.file("C:\\repo\\seq0.q1asm") }, selection: { ...selection, isEmpty: true } },
+        { document: { uri: vscode.Uri.file("C:\\repo\\seq0.q1asm"), isDirty: true, save: () => { saves += 1; } }, selection },
+      ]) {
+        vscode.window.activeTextEditor = editor;
+        await controller.zoomToSelection();
+      }
+      assert.equal(opens, 0);
+      assert.equal(saves, 0);
+      assert.equal(messages.length, 4);
+      assert.match(messages[3], /Save the Q1ASM file/);
+      assert.equal(controller.pendingTarget, undefined);
+      controller.dispose();
+    });
+  });
+
+  it("reports selected source lines with no current mapped execution", async () => {
+    const vscode = createMockVscode();
+    const sourcePath = "C:\\repo\\seq0.q1asm";
+    const messages: string[] = [];
+    const posted: any[] = [];
+    vscode.window.showInformationMessage = async (message) => { messages.push(message); };
+    vscode.window.activeTextEditor = { document: { uri: vscode.Uri.file(sourcePath) },
+      selection: { start: { line: 1, character: 0 }, end: { line: 1, character: 3 }, isEmpty: false } };
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      controller.findProjectFileUpward = () => undefined;
+      controller.panel = { webview: { postMessage: (message) => posted.push(message) }, dispose: () => {} };
+      controller.openPreview = async () => { await controller.revealPendingTarget(); };
+      for (const timelineIr of [{ events: [] },
+        { events: [{ id: "other", source: { file: "other.q1asm", line: 2 } }] },
+        { events: [{ id: "removed", source: { file: sourcePath, line: 2 }, meta: { diff_status: "removed" } }],
+          source_map: { by_source: { [`${sourcePath}:2`]: ["removed", "missing"] } } },
+      ]) {
+        controller.timelineIr = timelineIr;
+        await controller.zoomToSelection();
+        assert.equal(controller.pendingTarget, undefined);
+      }
+      assert.deepEqual(posted, []);
+      assert.equal(messages.length, 3);
+      assert.ok(messages.every((message) => /No executed timeline events/.test(message)));
+      controller.dispose();
+    });
+  });
+
+  it("debounces automatic selected-block zoom and normalizes backwards column-zero ranges", async () => {
+    const vscode = createMockVscode();
+    await withFakeTimers(async (clock) => withMockedVscode(vscode, async ({ TimelineController }) => {
+      const { controller, editor, posted, sourcePath } = automaticSourceFollow(vscode, TimelineController);
+      editor.selection = sourceSelection(1, 3, 1);
+      controller.followSourceEditor(editor);
+      assert.deepEqual(posted, [], "a selected block must not send an immediate caret highlight");
+      clock.advance(100);
+      editor.selection = sourceSelection(2, 4, 0, true);
+      controller.followSourceEditor(editor);
+      clock.advance(249);
+      assert.deepEqual(posted, []);
+      clock.advance(1);
+      assert.deepEqual(posted, [{ type: "highlightEventIds", highlightEventIds: ["e3", "e4"], zoomToRange: true,
+        sourceRange: { file: sourcePath, startLine: 3, endLine: 4 } }]);
+      clock.advance(1000);
+      assert.equal(posted.length, 1);
+      controller.dispose();
+    }));
+  });
+
+  it("silently ignores automatic selection zoom for unrelated, dirty, stale, or unmapped source", async () => {
+    const vscode = createMockVscode();
+    const notices: string[] = [];
+    vscode.window.showInformationMessage = async (message) => { notices.push(message); };
+    await withFakeTimers(async (clock) => withMockedVscode(vscode, async ({ TimelineController }) => {
+      for (const [reason, change] of [
+        ["unrelated file", ({ controller }) => controller.projectRelatedPaths.clear()],
+        ["non-Q1ASM file", ({ controller, editor }) => { editor.document.uri = vscode.Uri.file("C:\\repo\\notes.txt"); controller.projectRelatedPaths.add(editor.document.uri.fsPath); }],
+        ["dirty source", ({ editor }) => { editor.document.isDirty = true; }],
+        ["dirty related source", ({ editor }) => { vscode.workspace.textDocuments = [{ uri: editor.document.uri, isDirty: true }]; }],
+        ["saved but stale analysis", ({ controller }) => { controller.sourceRevision += 1; }],
+        ["analysis running", ({ controller }) => { controller.analysisInFlight = true; }],
+        ["analysis queued", ({ controller }) => { controller.analysisQueued = true; }],
+        ["no mapped execution", ({ controller }) => { controller.timelineIr.events = []; }],
+        ["missing source map", ({ controller }) => { delete controller.timelineIr.source_map; }],
+      ]) {
+        const setup = automaticSourceFollow(vscode, TimelineController);
+        change(setup);
+        setup.controller.followSourceEditor(setup.editor);
+        clock.advance(250);
+        assert.deepEqual(setup.posted, [], reason);
+        setup.controller.dispose();
+        vscode.workspace.textDocuments = [];
+      }
+      assert.deepEqual(notices, [], "automatic selection changes must not display repeated notifications");
+    }));
+  });
+
+  it("discards delayed selected-block zoom when its source, selection, editor, or view changed", async () => {
+    const vscode = createMockVscode();
+    await withFakeTimers(async (clock) => withMockedVscode(vscode, async ({ TimelineController }) => {
+      for (const [reason, change] of [
+        ["document version", ({ editor }) => { editor.document.version += 1; }],
+        ["selection", ({ editor }) => { editor.selection = sourceSelection(3, 4, 1); }],
+        ["active editor", ({ editor }) => { vscode.window.activeTextEditor = { ...editor }; }],
+        ["panel", ({ controller }) => { controller.panel = { ...controller.panel }; }],
+        ["timeline IR", ({ controller }) => { controller.timelineIr = { ...controller.timelineIr }; }],
+        ["webview readiness", ({ controller }) => { controller.webviewReady = false; }],
+        ["source revision", ({ controller }) => controller.invalidateSourceAnalysis()],
+        ["hardware source reveal", ({ controller, editor, sourcePath }) => {
+          controller.hardwareSourceReveal = { path: sourcePath.toLowerCase(), position: editor.selection.active, opening: true };
+          controller.followSourceEditor(editor);
+        }],
+      ]) {
+        const setup = automaticSourceFollow(vscode, TimelineController);
+        setup.controller.followSourceEditor(setup.editor);
+        clock.advance(100);
+        change(setup);
+        clock.advance(1000);
+        assert.deepEqual(setup.posted, [], reason);
+        setup.controller.dispose();
+      }
+    }));
+  });
+
+  it("cancels selected-block zoom on caret collapse, editor exit, source navigation, and disposal", async () => {
+    const vscode = createMockVscode();
+    await withFakeTimers(async (clock) => withMockedVscode(vscode, async ({ TimelineController }) => {
+      const caret = automaticSourceFollow(vscode, TimelineController);
+      caret.controller.followSourceEditor(caret.editor);
+      caret.editor.selection = sourceSelection(3, 3, 0);
+      caret.controller.followSourceEditor(caret.editor);
+      assert.deepEqual(caret.posted, [{ type: "highlightEventIds", highlightEventIds: ["e4"] }]);
+      clock.advance(1000);
+      assert.equal(caret.posted.length, 1, "collapsing to a caret retains the existing immediate highlight behavior");
+      assert.equal(caret.controller.sourceRangeTimer, undefined);
+      caret.controller.dispose();
+
+      const exiting = automaticSourceFollow(vscode, TimelineController);
+      exiting.controller.followSourceEditor(exiting.editor);
+      vscode.window.activeTextEditor = undefined;
+      exiting.controller.followSourceEditor(undefined);
+      assert.equal(exiting.controller.sourceRangeTimer, undefined);
+      clock.advance(1000);
+      assert.deepEqual(exiting.posted, []);
+      exiting.controller.dispose();
+
+      const navigation = automaticSourceFollow(vscode, TimelineController);
+      navigation.controller.followSourceEditor(navigation.editor);
+      vscode.workspace.openTextDocument = async () => navigation.editor.document;
+      vscode.window.showTextDocument = async () => ({ ...navigation.editor, setDecorations() {}, revealRange() {} });
+      await navigation.controller.openSourceLocation({ file: navigation.sourcePath, line: 5 }, { preserveHardwareCursor: true });
+      assert.equal(navigation.controller.sourceRangeTimer, undefined);
+      clock.advance(1000);
+      assert.deepEqual(navigation.posted, []);
+      navigation.controller.dispose();
+
+      const disposed = automaticSourceFollow(vscode, TimelineController);
+      disposed.controller.followSourceEditor(disposed.editor);
+      disposed.controller.dispose();
+      assert.equal(disposed.controller.sourceRangeTimer, undefined);
+      clock.advance(1000);
+      assert.deepEqual(disposed.posted, []);
+    }));
+  });
+
+  it("resumes the current selected block after webview readiness with explicit targets taking priority", async () => {
+    const vscode = createMockVscode();
+    await withFakeTimers(async (clock) => withMockedVscode(vscode, async ({ TimelineController }) => {
+      const setup = automaticSourceFollow(vscode, TimelineController);
+      setup.controller.webviewReady = false;
+      setup.controller.followSourceEditor(setup.editor);
+      clock.advance(250);
+      assert.deepEqual(setup.posted, []);
+      setup.editor.selection = sourceSelection(3, 5, 0, true);
+      await setup.controller.handleWebviewMessage({ type: "webviewReady" });
+      clock.advance(250);
+      assert.deepEqual(setup.posted, [{ type: "highlightEventIds", highlightEventIds: ["e4", "e5"], zoomToRange: true,
+        sourceRange: { file: setup.sourcePath, startLine: 4, endLine: 5 } }]);
+      setup.controller.dispose();
+
+      const explicit = automaticSourceFollow(vscode, TimelineController);
+      explicit.controller.webviewReady = false;
+      explicit.controller.pendingTarget = { q1asmFile: explicit.sourcePath, line: 5, endLine: 5, zoomToRange: true, awaitingWebviewReady: true };
+      await explicit.controller.handleWebviewMessage({ type: "webviewReady" });
+      clock.advance(1000);
+      assert.deepEqual(explicit.posted, [{ type: "highlightEventIds", highlightEventIds: ["e5"], zoomToRange: true,
+        sourceRange: { file: explicit.sourcePath, startLine: 5, endLine: 5 } }]);
+      assert.equal(explicit.controller.pendingTarget, undefined);
+      explicit.controller.dispose();
+
+      const collapsed = automaticSourceFollow(vscode, TimelineController);
+      collapsed.controller.webviewReady = false;
+      collapsed.controller.followSourceEditor(collapsed.editor);
+      collapsed.editor.selection = sourceSelection(3, 3, 0);
+      await collapsed.controller.handleWebviewMessage({ type: "webviewReady" });
+      clock.advance(1000);
+      assert.deepEqual(collapsed.posted, [], "readiness must not restore a selection that has collapsed");
+      collapsed.controller.dispose();
+    }));
+  });
+
+  it("keeps saved manual-mode source stale through rerender until fresh analysis succeeds", async () => {
+    const vscode = createMockVscode();
+    let changed: any;
+    let saved: any;
+    vscode.workspace.onDidChangeTextDocument = (handler) => { changed = handler; return { dispose() {} }; };
+    vscode.workspace.onDidSaveTextDocument = (handler) => { saved = handler; return { dispose() {} }; };
+    const outputDir = mkdtempSync(join(tmpdir(), "q1-source-revision-"));
+    await withFakeTimers(async (clock) => withMockedVscode(vscode, async ({ TimelineController }) => {
+      const { controller, editor, posted } = automaticSourceFollow(vscode, TimelineController);
+      controller.updateMode = () => "manual";
+      const logs: string[] = [];
+      controller.output.appendLine = (message) => logs.push(message);
+      controller.outputDir = outputDir;
+      Object.assign(controller.panel.webview, { html: "", cspSource: "vscode-resource:", asWebviewUri: (uri) => uri });
+      assert.equal(controller.sourceRevision, 0);
+      assert.equal(controller.analyzedSourceRevision, 0);
+      controller.followSourceEditor(editor);
+      editor.document.isDirty = true;
+      editor.document.version += 1;
+      changed({ document: editor.document });
+      assert.equal(controller.sourceRangeTimer, undefined);
+      editor.document.isDirty = false;
+      saved(editor.document);
+      const savedRevision = controller.sourceRevision;
+      assert.ok(savedRevision >= 2);
+      await controller.onWatchedFile(editor.document.uri);
+      assert.ok(controller.sourceRevision > savedRevision, "watch events must also invalidate saved analysis in manual mode");
+      controller.followSourceEditor(editor);
+      clock.advance(250);
+      assert.equal(posted.some((message) => message.zoomToRange), false);
+
+      const timelineIr = controller.timelineIr;
+      const writeOutputs = () => {
+        writeFileSync(join(outputDir, "timeline_ir.json"), JSON.stringify(timelineIr), "utf8");
+        writeFileSync(join(outputDir, "diagnostics.json"), "[]", "utf8");
+        writeFileSync(join(outputDir, "timeline.html"), "<html><head></head><body></body></html>", "utf8");
+      };
+      writeOutputs();
+      await controller.refreshWebview();
+      assert.equal(controller.analyzedSourceRevision, 0, "rerendering old IR must not make edited source current");
+      await controller.handleWebviewMessage({ type: "webviewReady" });
+      clock.advance(250);
+      assert.equal(posted.some((message) => message.zoomToRange), false);
+
+      controller.execFile = async () => { writeOutputs(); return { stdout: JSON.stringify({ schema_version: "0.2.0", status: "ok" }), stderr: "", exitCode: 0, elapsedMs: 1 }; };
+      controller.runRender = async () => ({ stdout: "", stderr: "", exitCode: 0, elapsedMs: 1 });
+      await controller.runAnalysis();
+      assert.equal(controller.analyzedSourceRevision, controller.sourceRevision, logs.join("\n"));
+      await controller.handleWebviewMessage({ type: "webviewReady" });
+      clock.advance(250);
+      assert.equal(posted.filter((message) => message.zoomToRange).length, 1);
+      controller.dispose();
+    }));
+  });
+
+  it("does not mark failed refreshes or source edits during analysis as current", async () => {
+    const vscode = createMockVscode();
+    const outputDir = mkdtempSync(join(tmpdir(), "q1-source-snapshot-"));
+    await withFakeTimers(async (clock) => withMockedVscode(vscode, async ({ TimelineController }) => {
+      const { controller, editor, posted } = automaticSourceFollow(vscode, TimelineController);
+      controller.outputDir = outputDir;
+      const logs: string[] = [];
+      controller.output.appendLine = (message) => logs.push(message);
+      controller.invalidateSourceAnalysis();
+      const result = { stdout: JSON.stringify({ schema_version: "0.2.0", status: "ok" }), stderr: "", exitCode: 0, elapsedMs: 1 };
+      controller.execFile = async () => result;
+      controller.runRender = async () => ({ stdout: "", stderr: "", exitCode: 0, elapsedMs: 1 });
+      controller.refreshWebview = async () => false;
+      await controller.runAnalysis();
+      assert.equal(controller.analyzedSourceRevision, 0);
+
+      const analyzedRevision = controller.sourceRevision;
+      controller.execFile = async () => {
+        controller.invalidateSourceAnalysis();
+        return result;
+      };
+      controller.refreshWebview = async () => true;
+      await controller.runAnalysis();
+      assert.equal(controller.analyzedSourceRevision, analyzedRevision, logs.join("\n"));
+      assert.ok(controller.sourceRevision > controller.analyzedSourceRevision);
+      controller.followSourceEditor(editor);
+      clock.advance(250);
+      assert.equal(posted.some((message) => message.zoomToRange), false);
+      controller.dispose();
+    }));
+  });
+
+  it("delivers a selected range once after the freshly rendered webview reports ready", async () => {
+    const vscode = createMockVscode();
+    const outputDir = mkdtempSync(join(tmpdir(), "q1-selection-ready-"));
+    const sourcePath = join(outputDir, "seq0.q1asm");
+    const timelineIr = { events: [{ id: "selected", source: { file: sourcePath, line: 3 } }] };
+    writeFileSync(join(outputDir, "timeline_ir.json"), JSON.stringify(timelineIr), "utf8");
+    writeFileSync(join(outputDir, "diagnostics.json"), "[]", "utf8");
+    writeFileSync(join(outputDir, "timeline.html"), "<html><head></head><body></body></html>", "utf8");
+    const posted: any[] = [];
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      controller.projectUri = vscode.Uri.file(join(outputDir, "q1timeline.yml"));
+      controller.outputDir = outputDir;
+      controller.panel = { webview: { html: "", cspSource: "vscode-resource:",
+        asWebviewUri: (uri) => uri, postMessage: (message) => posted.push(message) }, dispose: () => {} };
+      controller.timelineIr = { events: [{ id: "old", source: { file: sourcePath, line: 3 } }] };
+      controller.pendingTarget = { q1asmFile: sourcePath, line: 3, endLine: 4, zoomToRange: true };
+      await controller.handleWebviewMessage({ type: "webviewReady" });
+      assert.ok(controller.pendingTarget, "Readiness from the previous view must not consume a new request");
+      await controller.refreshWebview();
+      assert.equal(posted.some((message) => message.type === "highlightEventIds"), false);
+      assert.equal(controller.pendingTarget?.awaitingWebviewReady, true);
+      await controller.handleWebviewMessage({ type: "webviewReady" });
+      await controller.handleWebviewMessage({ type: "webviewReady" });
+      assert.deepEqual(posted.filter((message) => message.type === "highlightEventIds"), [{
+        type: "highlightEventIds", highlightEventIds: ["selected"], zoomToRange: true,
+        sourceRange: { file: sourcePath, startLine: 3, endLine: 4 },
+      }]);
+      assert.equal(controller.pendingTarget, undefined);
       controller.dispose();
     });
   });

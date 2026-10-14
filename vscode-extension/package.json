@@ -2,7 +2,7 @@
   "name": "q1lens",
   "displayName": "Q1Lens",
   "description": "Inspect Qblox schedules, symbolic pulses, Q1ASM timelines, and lowering provenance inside VS Code.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "publisher": "q1lens",
   "author": {
     "name": "Ik Kyeong Jin",
@@ -42,6 +42,7 @@
     "onCommand:q1timeline.selectProjectFile",
     "onCommand:q1timeline.selectQ1asmFilesInFolder",
     "onCommand:q1timeline.revealCurrentLineInTimeline",
+    "onCommand:q1timeline.zoomToSelection",
     "onLanguage:q1asm",
     "workspaceContains:**/qbstimeline.yml",
     "workspaceContains:**/qbstimeline.yaml",
@@ -144,6 +145,10 @@
         "title": "Q1Lens: Reveal Current Line in Timeline"
       },
       {
+        "command": "q1timeline.zoomToSelection",
+        "title": "Q1Lens: View Selection in Timeline"
+      },
+      {
         "command": "q1timeline.saveComparisonBaseline",
         "title": "Q1Lens: Save Timeline Comparison Baseline"
       },
@@ -197,6 +202,11 @@
         }
       ],
       "editor/context": [
+        {
+          "command": "q1timeline.zoomToSelection",
+          "when": "resourceExtname == .q1asm && editorHasSelection",
+          "group": "navigation@0"
+        },
         {
           "command": "q1timeline.openPreview",
           "when": "resourceExtname == .q1asm",
@@ -560,7 +570,7 @@
     "test:extension": "npm run compile && npm run bundle && node ./out/test/runTest.js",
     "package": "vsce package",
     "verify:installed": "node ./scripts/verify-installed-assets.js",
-    "reinstall:local": "npm run package && code --install-extension q1lens-0.2.0.vsix --force && npm run verify:installed",
+    "reinstall:local": "npm run package && code --install-extension q1lens-0.2.1.vsix --force && npm run verify:installed",
     "test:browser": "playwright test"
   },
   "dependencies": {

@@ -19,11 +19,11 @@ def _analyze(tmp_path: Path) -> dict:
     return json.loads(out_file.read_text(encoding="utf-8"))
 
 
-def test_adaptive_array_demo_is_larger_than_three_peak(tmp_path: Path) -> None:
+def test_adaptive_array_demo_has_large_multisequencer_execution(tmp_path: Path) -> None:
     ir = _analyze(tmp_path)
 
     assert len(ir["sequencers"]) >= 14
-    assert len(ir["events"]) > 850
+    assert sum(event["kind"] == "q1_issue" for event in ir["events"]) >= 300
     assert len(ir["feedback_flows"]) >= 27
 
 

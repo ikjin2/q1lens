@@ -3265,6 +3265,10 @@ def _emit_compact_loop(
             "preview_iteration_event_ids": preview_iteration_event_ids,
         },
     )
+    if isinstance(t0, Concrete) and isinstance(t1, Concrete) and _is_wait_only_loop(
+        state, instruction, start_pc, count, duration
+    ):
+        loop_block.meta["wait_only"] = True
     _emit_event(
         state,
         lane="rt.loop.preview",
@@ -3379,6 +3383,32 @@ def _emit_compact_loop(
                 meta={"op": "loop", "loop_id": loop_id, "loop_complete": True},
             )
     return True
+
+
+def _is_wait_only_loop(
+    state: AnalysisState,
+    instruction: Instr,
+    start_pc: int,
+    count: Value | None,
+    duration: Value,
+) -> bool:
+    if instruction.op != "loop" or not isinstance(count, Concrete) or count.value <= 0:
+        return False
+    if not isinstance(duration, Concrete) or duration.value <= 0:
+        return False
+    body = [state.instructions_by_pc[pc] for pc in range(start_pc, instruction.pc)]
+    if not body:
+        return False
+    total = 0
+    for item in body:
+        # Immediate waits cannot change duration when the loop counter decrements.
+        if item.op != "wait" or len(item.args) != 1 or item.args[0].kind != "imm":
+            return False
+        value = item.args[0].value
+        if not isinstance(value, int) or not 4 <= value <= _RT_DURATION_MAX or value % 4:
+            return False
+        total += value
+    return total == duration.value
 
 
 def _loop_preview_key(state: AnalysisState, start_source: SourceLocation, end_source: SourceLocation) -> str:

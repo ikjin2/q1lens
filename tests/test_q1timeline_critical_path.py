@@ -118,6 +118,40 @@ def test_assumed_runtime_branch_marks_the_concrete_path_partial() -> None:
     ]
 
 
+def test_queue_prefill_uncertainty_does_not_change_concrete_dependency_path() -> None:
+    ir = analyze_text("wait_sync 4\nupd_param 4\nnop\nnop\nupd_param 4\nstop\n")
+    incomplete = [item for item in ir["diagnostics"] if item["category"] == "analysis_incomplete"]
+    incomplete_events = [event for event in ir["events"] if event["kind"] == "analysis_incomplete"]
+
+    assert incomplete and incomplete_events
+    assert all(item["details"]["reason"] == "sync_start_uncertain" for item in incomplete)
+    assert all(item["details"]["analysis_scope"] == "rt_queue" for item in incomplete)
+    assert all(event["meta"]["analysis_scope"] == "rt_queue" for event in incomplete_events)
+    assert ir["critical_path"]["status"] == "exact"
+    assert ir["critical_path"]["duration_ns"] == 12
+    assert ir["critical_path"]["reasons"] == []
+
+
+@pytest.mark.parametrize("wait", ["wait R0", "wait_trigger 1,4"])
+def test_unknown_runtime_or_trigger_timing_remains_path_uncertainty(wait: str) -> None:
+    ir = analyze_text(f"{wait}\nupd_param 4\nstop\n")
+
+    assert ir["critical_path"]["status"] != "exact"
+    assert "analysis_incomplete" in {reason["code"] for reason in ir["critical_path"]["reasons"]}
+    incomplete = [item for item in ir["diagnostics"] if item["category"] == "analysis_incomplete"]
+    assert any(item.get("details", {}).get("analysis_scope") != "rt_queue" for item in incomplete)
+
+
+def test_missing_sync_participant_remains_path_uncertainty() -> None:
+    ir = analyze_documents({
+        "waiting.q1asm": "wait_sync 4\nupd_param 4\nstop\n",
+        "missing.q1asm": "wait 8\nstop\n",
+    }, alignment_mode="none")
+
+    assert ir["critical_path"]["status"] == "partial"
+    assert "analysis_incomplete" in {reason["code"] for reason in ir["critical_path"]["reasons"]}
+
+
 @pytest.mark.parametrize(
     "source, diagnostic_category, reason_code, duration_ns",
     [

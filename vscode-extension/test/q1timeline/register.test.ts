@@ -21,9 +21,10 @@ function quickFixApi() {
 }
 
 describe("q1timeline registration", () => {
-  it("passes a selected Q1ASM URI from the open preview command to the controller", async () => {
+  it("registers selection zoom and passes a selected Q1ASM URI to the open preview command", async () => {
     const registeredCommands = new Map<string, (...args: any[]) => any>();
     const previewCalls: any[] = [];
+    let selectionZoomCalls = 0;
     const vscode = {
       ...quickFixApi(),
       commands: {
@@ -50,6 +51,7 @@ describe("q1timeline registration", () => {
             selectQ1asmFilesInFolder() {}
             openQ1asmFilesInFolder() {}
             revealCurrentLineInTimeline() {}
+            zoomToSelection() { selectionZoomCalls += 1; }
             openTarget() {}
           },
         };
@@ -64,8 +66,10 @@ describe("q1timeline registration", () => {
       const selectedUri = createUri("C:\\repo\\clicked.q1asm");
 
       await registeredCommands.get("q1timeline.openPreview")?.(selectedUri);
+      await registeredCommands.get("q1timeline.zoomToSelection")?.();
 
       assert.equal(previewCalls[0].sourceUri.fsPath, selectedUri.fsPath);
+      assert.equal(selectionZoomCalls, 1);
     } finally {
       delete require.cache[modulePath];
       Module._load = originalLoad;

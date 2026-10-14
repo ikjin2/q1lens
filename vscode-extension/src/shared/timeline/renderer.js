@@ -41,8 +41,12 @@
     return { start, end: start + span };
   }
 
+  function timeCoordinate(time, viewport) {
+    return viewport.timeScale ? viewport.timeScale.toDisplay(Number(time)) : Number(time);
+  }
+
   function viewportDuration(viewport) {
-    return Math.max(Number(viewport.end) - Number(viewport.start), 1e-9);
+    return Math.max(timeCoordinate(viewport.end, viewport) - timeCoordinate(viewport.start, viewport), 1e-9);
   }
 
   function panViewport(totalTime, current, deltaRatio) {
@@ -68,11 +72,11 @@
     const span = viewportDuration(viewport);
     const visibleStart = Math.max(start, viewport.start);
     const visibleEnd = Math.min(end, viewport.end);
-    const visibleWidth = Math.max(visibleEnd - visibleStart, 0);
+    const visibleWidth = Math.max(timeCoordinate(visibleEnd, viewport) - timeCoordinate(visibleStart, viewport), 0);
     const minMicroWidth = span * 0.0005;
     const width = Math.max(visibleWidth, minMicroWidth);
     return {
-      leftPercent: pct(visibleStart - viewport.start, span),
+      leftPercent: pct(timeCoordinate(visibleStart, viewport) - timeCoordinate(viewport.start, viewport), span),
       widthPercent: pct(width, span),
       tiny: visibleWidth < span * 0.0025,
       compact: visibleWidth < span * 0.075,
@@ -88,7 +92,7 @@
     const clipped = raw < viewport.start || raw > viewport.end;
     const visible = clamp(raw, viewport.start, viewport.end);
     return {
-      leftPercent: pct(visible - viewport.start, span),
+      leftPercent: pct(timeCoordinate(visible, viewport) - timeCoordinate(viewport.start, viewport), span),
       clipped,
     };
   }
@@ -107,9 +111,9 @@
     const span = viewportDuration(viewport);
     const visibleStart = Math.max(left, viewport.start);
     const visibleEnd = Math.min(right, viewport.end);
-    const width = Math.max(visibleEnd - visibleStart, span * minRatio);
+    const width = Math.max(timeCoordinate(visibleEnd, viewport) - timeCoordinate(visibleStart, viewport), span * minRatio);
     return {
-      leftPercent: pct(visibleStart - viewport.start, span),
+      leftPercent: pct(timeCoordinate(visibleStart, viewport) - timeCoordinate(viewport.start, viewport), span),
       widthPercent: pct(width, span),
       clippedStart: left < viewport.start,
       clippedEnd: right > viewport.end,
@@ -300,8 +304,8 @@
     const right = Math.max(start, end);
     const span = viewportDuration(viewport);
     const overlay = element("div", "time-selection");
-    overlay.style.left = `${pct(left - viewport.start, span)}%`;
-    overlay.style.width = `${pct(right - left, span)}%`;
+    overlay.style.left = `${pct(timeCoordinate(left, viewport) - timeCoordinate(viewport.start, viewport), span)}%`;
+    overlay.style.width = `${pct(timeCoordinate(right, viewport) - timeCoordinate(left, viewport), span)}%`;
     return overlay;
   }
 

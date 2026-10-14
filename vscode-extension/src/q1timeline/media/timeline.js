@@ -4,6 +4,7 @@
   const timelineEventsById = new Map((timelineIr.events || []).map((event) => [String(event.id), event]));
   let sharedTimelineActive = false;
   let selectedTimelineEventId = undefined;
+  let selectedSourceEventIds = new Set();
   let activeTimelineControlChip = undefined;
   let hardwareView;
   let hardwarePersistTimer;
@@ -170,7 +171,7 @@
     addInspectorField(fields, "Time range", `${displayInspectorValue(eventTime(event, "t0"))} -> ${displayInspectorValue(eventTime(event, "t1"))}`);
     addInspectorField(fields, "Source", source.file ? `${source.file}:${source.line || 1}` : "unavailable");
     addInspectorField(fields, "Confidence", event.confidence);
-    addInspectorField(fields, "Q1 issue", event.kind === "q1_issue" ? `${displayInspectorValue(event.t0)} -> ${displayInspectorValue(event.t1)}` : meta.q1_issue_event_id);
+    addInspectorField(fields, "Q1 core", event.kind === "q1_issue" ? `${displayInspectorValue(event.t0)} -> ${displayInspectorValue(event.t1)}` : meta.q1_issue_event_id);
     addInspectorField(fields, "RT packet", meta.rt_packet_id);
     addInspectorField(fields, "Queue depth", meta.estimated_depth);
       addInspectorField(fields, "Slack", meta.slack_ns !== undefined ? `${meta.slack_ns} ns` : "");
@@ -193,6 +194,7 @@
     eventNode.setAttribute("aria-selected", "true");
     const eventId = eventNode.dataset.eventId;
     selectedTimelineEventId = eventId;
+    selectedSourceEventIds.clear();
     if (hardwareView && options.syncHardware !== false) {
       hardwareView.selectEvent(eventId);
     }
@@ -265,6 +267,7 @@
   }
 
   function expandQ1IssueLanesForHighlight(eventIds) {
+    if (timelineLayout === "instruction") return false;
     let changed = false;
     for (const eventId of Array.isArray(eventIds) ? eventIds : []) {
       const event = timelineEventsById.get(String(eventId));
@@ -500,6 +503,7 @@
     });
     loopMeta.visible_iteration_count = 1;
     loopMeta.shown_iterations = [0];
+    timelineTimeScales.clear();
     timelineEventsById.set(String(loopEvent.id), loopEvent);
     if (Array.isArray(timelineIr.feedback_flows) && removedEventIds.size) {
       timelineIr.feedback_flows = timelineIr.feedback_flows.filter((flow) => (
@@ -529,6 +533,9 @@
   }
 
   function timelineControlChipLeft(node) {
+    if (node && node.dataset && node.dataset.instructionIndex !== undefined) {
+      return `calc(var(--instruction-cell-width) * ${Number(node.dataset.instructionIndex) + 0.5})`;
+    }
     const left = Number.parseFloat(node && node.style ? node.style.left : "");
     const width = Number.parseFloat(node && node.style ? node.style.width : "");
     if (!Number.isFinite(left)) {
@@ -816,30 +823,137 @@
   function syncSharedSequencerFoldControls() {
     for (const laneNode of document.querySelectorAll('.shared-timeline-stage [data-lane-role="q1-issue"]')) {
       const sequencer = q1IssueLaneParent(laneNode);
-      setTimelineNodeHidden(laneNode, !sequencerQ1IssueExpanded(sequencer));
+      setTimelineNodeHidden(laneNode, timelineLayout !== "instruction" && !sequencerQ1IssueExpanded(sequencer));
     }
     for (const button of document.querySelectorAll(".shared-q1-issue-toggle")) {
       const sequencer = button.dataset.sequencerControl;
       const expanded = sequencerQ1IssueExpanded(sequencer);
       button.textContent = "";
       button.setAttribute("aria-expanded", String(expanded));
-      button.setAttribute("aria-label", `${expanded ? "Hide" : "Show"} Q1 issue for ${sequencer}`);
+      button.setAttribute("aria-label", `${expanded ? "Hide" : "Show"} Q1 core for ${sequencer}`);
       button.title = button.getAttribute("aria-label");
     }
   }
 
   function sharedTimelineViewport() {
     const window = currentTimelineWindow();
-    return { start: window.min, end: window.max };
+    return { start: window.min, end: window.max, timeScale: timelineTimeScale() };
   }
 
   function sharedTimelineTicks() {
     const window = currentTimelineWindow();
-    const span = Math.max(window.max - window.min, 1);
-    return timelineTicks(window.min, window.max).map((tick) => ({
-      leftPercent: Math.round(((tick - window.min) / span) * 100000) / 1000,
+    const display = timelineDisplayWindow(window);
+    const span = Math.max(display.max - display.min, 1e-9);
+    return visibleTimelineTicks(window).map((tick) => ({
+      leftPercent: Math.round(((displayTimelineTime(tick) - display.min) / span) * 100000) / 1000,
       label: `${formatWindowValue(tick)} ns`,
     }));
+  }
+
+  function formatFoldDuration(duration) {
+    const unit = duration >= 1e6 ? "ms" : duration >= 1e3 ? "µs" : "ns";
+    const divisor = unit === "ms" ? 1e6 : unit === "µs" ? 1e3 : 1;
+    return `${Number((duration / divisor).toPrecision(3))} ${unit}`;
+  }
+
+  function toggleTimelineGap(gap) {
+    const scale = timelineTimeScale();
+    const folded = scale && scale.gaps.some((item) => item.start === gap.start && item.end === gap.end);
+    const full = fullTimelineWindow();
+    if (folded) {
+      timelineExpandedGaps.push({ start: gap.start, end: gap.end, basis: timelineTimeBasis,
+        fullMin: full.min, fullMax: full.max });
+    } else {
+      if (!timelineWaitsCollapsed) {
+        timelineExpandedGaps = timelineTimeScale(true).gaps.map((item) => ({ start: item.start, end: item.end,
+          basis: timelineTimeBasis, fullMin: full.min, fullMax: full.max }));
+        timelineWaitsCollapsed = true;
+      }
+      timelineExpandedGaps = timelineExpandedGaps.filter((item) => !(item.start === gap.start && item.end === gap.end &&
+        item.basis === timelineTimeBasis && timelineExtentMatches({ min: item.fullMin, max: item.fullMax }, full)));
+    }
+    timelineTimeScales.clear();
+    writePersistedWebviewState({ timelineWaitsCollapsed, timelineExpandedGaps });
+    applyTimelineScale();
+  }
+
+  function toggleTimelineFolds() {
+    const scale = timelineTimeScale();
+    timelineWaitsCollapsed = !(scale && scale.gaps.length);
+    timelineExpandedGaps = [];
+    timelineTimeScales.clear();
+    writePersistedWebviewState({ timelineWaitsCollapsed, timelineExpandedGaps });
+    applyTimelineScale();
+  }
+
+  function renderWaitFolds() {
+    if (timelineLayout === "instruction") return;
+    const scale = timelineTimeScale();
+    const candidates = timelineTimeScale(true);
+    const button = document.getElementById("q1timeline-wait-fold-button");
+    if (button) {
+      const unavailable = !candidates || !candidates.gaps.length;
+      const collapsed = Boolean(scale && scale.gaps.length);
+      setIconOnlyToolbarButton(button, "foldWaits", unavailable ? "No unchanged interval shared by all sequencers" : collapsed ? "Expand all unchanged intervals" : "Fold all unchanged intervals");
+      button.disabled = unavailable;
+      button.setAttribute("aria-pressed", String(collapsed));
+    }
+    if (!candidates) return;
+    const current = currentTimelineWindow();
+    const display = timelineDisplayWindow(current);
+    const span = Math.max(1e-9, display.max - display.min);
+    const tracks = Array.from(document.querySelectorAll(".shared-timeline-stage .ruler, .shared-timeline-stage .lane-track"));
+    for (const gap of candidates.gaps) {
+      if (gap.end <= current.min || gap.start >= current.max) continue;
+      const folded = Boolean(scale && scale.gaps.some((item) => item.start === gap.start && item.end === gap.end));
+      const start = Math.max(gap.start, current.min);
+      const end = Math.min(gap.end, current.max);
+      const left = displayTimelineTime(start);
+      const right = displayTimelineTime(end);
+      if ((right - left) / span < 0.001) continue;
+      for (const [trackIndex, track] of tracks.entries()) {
+        const marker = document.createElement("span");
+        marker.className = `q1timeline-wait-fold${folded ? "" : " is-expanded"}`;
+        marker.style.left = `${(left - display.min) / span * 100}%`;
+        marker.style.width = `${(right - left) / span * 100}%`;
+        marker.dataset.timeStart = String(gap.start);
+        marker.dataset.timeEnd = String(gap.end);
+        const duration = formatFoldDuration(gap.end - gap.start);
+        const toggle = document.createElement("button");
+        toggle.type = "button";
+        toggle.className = "q1timeline-fold-toggle";
+        toggle.dataset.timeStart = String(gap.start);
+        toggle.dataset.timeEnd = String(gap.end);
+        toggle.dataset.trackIndex = String(trackIndex);
+        toggle.title = `${folded ? "Folded" : "Expanded at full duration:"} ${formatWindowValue(gap.end - gap.start)} ns (${formatWindowValue(gap.start)}..${formatWindowValue(gap.end)} ns). Click to ${folded ? "expand" : "collapse"} only this interval across all sequencers. No Q1ASM state changes occur here; constant output or marker levels may remain active.`;
+        toggle.setAttribute("aria-label", `${folded ? "Expand" : "Collapse"} ${duration} interval across all sequencers (${formatWindowValue(gap.start)}..${formatWindowValue(gap.end)} ns)`);
+        toggle.setAttribute("aria-expanded", String(!folded));
+        if (folded) {
+          const slash = document.createElement("span");
+          slash.className = "q1timeline-fold-slashes";
+          slash.textContent = "//";
+          slash.setAttribute("aria-hidden", "true");
+          toggle.append(slash);
+        }
+        const label = document.createElement("span");
+        label.className = "q1timeline-fold-duration";
+        label.textContent = !folded ? `${duration} expanded · collapse` : track.classList.contains("ruler") ? `${duration} folded · expand` : duration;
+        toggle.append(label);
+        toggle.addEventListener("pointerdown", (event) => event.stopPropagation());
+        toggle.addEventListener("click", (event) => {
+          event.stopPropagation();
+          const hadFocus = document.activeElement === toggle;
+          toggleTimelineGap(gap);
+          if (hadFocus) {
+            const replacement = Array.from(document.querySelectorAll(".q1timeline-fold-toggle")).find((node) =>
+              node.dataset.timeStart === String(gap.start) && node.dataset.timeEnd === String(gap.end) && node.dataset.trackIndex === String(trackIndex));
+            (replacement || document.getElementById("q1timeline-wait-fold-button")).focus({ preventScroll: true });
+          }
+        });
+        marker.append(toggle);
+        track.appendChild(marker);
+      }
+    }
   }
 
   function normalizedTimelineSelectionRange() {
@@ -883,17 +997,26 @@
       return false;
     }
     currentTimelineWindow();
+    const previousStage = root.querySelector(".shared-timeline-stage");
+    if (timelineLayout === "instruction" && previousStage && previousStage.dataset.instructionCount) {
+      instructionView.leftOrdinal = previousStage.scrollLeft / instructionView.cellWidth;
+    }
+    renderTimelineLayoutToggle();
     const model = window.q1timelineTimelineAdapter.buildQ1TimelineSharedModel(timelineIr, {
       mode,
+      layout: timelineLayout,
       timeBasis: timelineTimeBasis,
       expandedQ1IssueSequencers: Array.from(expandedQ1IssueSequencers || []),
     });
-    model.viewport = sharedTimelineViewport();
-    model.ticks = sharedTimelineTicks();
-    model.selectionRange = sharedTimelineSelectionRange();
+    if (timelineLayout !== "instruction") {
+      model.viewport = sharedTimelineViewport();
+      model.ticks = sharedTimelineTicks();
+      model.selectionRange = sharedTimelineSelectionRange();
+    }
     for (const lane of model.lanes || []) {
       for (const block of lane.blocks || []) {
-        block.selected = selectedTimelineEventId !== undefined && String(block.eventId || block.id) === selectedTimelineEventId;
+        block.selected = (selectedTimelineEventId !== undefined && String(block.eventId || block.id) === selectedTimelineEventId) ||
+          (block.eventIds || [block.eventId || block.id]).some((id) => selectedSourceEventIds.has(String(id)));
       }
     }
     for (const annotation of model.annotations || []) {
@@ -918,6 +1041,20 @@
         }
       },
     });
+    if (timelineLayout === "instruction") {
+      const stage = root.querySelector(".shared-timeline-stage");
+      stage.dataset.instructionCount = String(model.viewport.end);
+      const blocks = new Map(model.lanes.flatMap((lane) => lane.blocks.map((block) => [String(block.id), block])));
+      stage.querySelectorAll(".timeline-block").forEach((node) => {
+        const index = blocks.get(node.dataset.blockId).start;
+        node.dataset.instructionIndex = String(index);
+        // Use exact slots, without the time renderer's minimum width or rounded percentages.
+        node.style.left = `calc(var(--instruction-cell-width) * ${index})`;
+        node.style.width = "var(--instruction-cell-width)";
+        node.classList.remove("is-tiny", "is-compact");
+      });
+      setInstructionView(stage, instructionView.cellWidth);
+    }
     sharedTimelineActive = true;
     renderTimelineWindowStatus(currentTimelineWindow());
     renderTimeBasisToggle();
@@ -926,6 +1063,7 @@
     installTimelineControlChips();
     installTimelineMouseInteractions();
     applySharedSelection(options);
+    renderWaitFolds();
     renderHardwareCursor();
     return true;
   }
@@ -1054,7 +1192,7 @@
       addInspectorField(fields, "Aligned time", meta.aligned_t0 !== undefined || meta.aligned_t1 !== undefined ? `${displayInspectorValue(meta.aligned_t0)} -> ${displayInspectorValue(meta.aligned_t1)}` : "");
       addInspectorField(fields, "Source", source.file ? `${source.file}:${source.line || 1}` : "unavailable");
       addInspectorField(fields, "Confidence", event.confidence);
-      addInspectorField(fields, "Q1 issue", event.kind === "q1_issue" ? `${displayInspectorValue(event.t0)} -> ${displayInspectorValue(event.t1)}` : meta.q1_issue_event_id);
+      addInspectorField(fields, "Q1 core", event.kind === "q1_issue" ? `${displayInspectorValue(event.t0)} -> ${displayInspectorValue(event.t1)}` : meta.q1_issue_event_id);
       addInspectorField(fields, "RT packet", meta.rt_packet_id);
       addInspectorField(fields, "Queue depth", meta.estimated_depth);
       addInspectorField(fields, "Slack", meta.slack_ns !== undefined ? `${meta.slack_ns} ns` : "");
@@ -1275,6 +1413,13 @@
   const initialAlignmentPolicy = state.alignmentPolicy || "unknown";
   const initialSingleFileMode = Boolean(state.singleFileMode);
   let timelineTimeBasis = initialTimelineTimeBasis();
+  let timelineLayout = readPersistedWebviewState().timelineLayout === "instruction" ? "instruction" : "time";
+  let instructionView = { cellWidth: 112, leftOrdinal: 0 };
+  let timelineWaitsCollapsed = readPersistedWebviewState().timelineWaitsCollapsed !== false;
+  let timelineExpandedGaps = (Array.isArray(readPersistedWebviewState().timelineExpandedGaps)
+    ? readPersistedWebviewState().timelineExpandedGaps : []).filter((gap) => gap &&
+      ["local", "aligned"].includes(gap.basis) && [gap.start, gap.end, gap.fullMin, gap.fullMax].every(Number.isFinite) && gap.end > gap.start);
+  const timelineTimeScales = new Map();
   let timelineZoom = 1;
   let timelineWindow = undefined;
   let timelineDrag = undefined;
@@ -1508,6 +1653,7 @@
 
   function toolbarSvgIcon(name) {
     const icons = {
+      foldWaits: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 8h6l-3 8h6l-3-8h6l-3 8h9"/></svg>',
       refresh: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/></svg>',
       sync: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 0 1-15.4 6.4"/><path d="M3 12A9 9 0 0 1 18.4 5.6"/><path d="M3 19v-5h5"/><path d="M21 5v5h-5"/></svg>',
       alignment: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16"/><path d="M7 12h10"/><path d="M4 17h16"/><path d="M12 4v16"/></svg>',
@@ -1578,6 +1724,22 @@
       }
       node.append(timeBasisGroup);
 
+      const layoutGroup = document.createElement("span");
+      layoutGroup.id = "q1timeline-layout-toggle";
+      layoutGroup.className = "q1timeline-toolbar-group";
+      layoutGroup.setAttribute("role", "group");
+      layoutGroup.setAttribute("aria-label", "Timeline layout");
+      for (const [layout, label] of [["time", "Time scale"], ["instruction", "Instruction"]]) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "q1timeline-layout-button";
+        button.dataset.timelineLayout = layout;
+        button.textContent = label;
+        button.addEventListener("click", () => setTimelineLayout(layout));
+        layoutGroup.append(button);
+      }
+      node.append(layoutGroup);
+
       const modeGroup = document.createElement("span");
       modeGroup.id = "q1timeline-mode-toggle";
       modeGroup.className = "q1timeline-toolbar-group";
@@ -1612,6 +1774,14 @@
       setIconOnlyToolbarButton(resetZoomButton, "reset", "Reset zoom");
       resetZoomButton.addEventListener("click", resetTimelineZoom);
       node.append(resetZoomButton);
+
+      const waitFoldButton = document.createElement("button");
+      waitFoldButton.id = "q1timeline-wait-fold-button";
+      waitFoldButton.type = "button";
+      setIconOnlyToolbarButton(waitFoldButton, "foldWaits", timelineWaitsCollapsed ? "Expand all unchanged intervals" : "Fold all unchanged intervals");
+      waitFoldButton.setAttribute("aria-pressed", String(timelineWaitsCollapsed));
+      waitFoldButton.addEventListener("click", toggleTimelineFolds);
+      node.append(waitFoldButton);
 
       const zoomOutButton = document.createElement("button");
       zoomOutButton.id = "q1timeline-zoom-out-button";
@@ -1696,6 +1866,75 @@
     const currentMode = mode === "debug" ? "debug" : "normal";
     renderModeToggle(currentMode);
     vscode.postMessage({ type: "setViewMode", mode: currentMode });
+  }
+
+  function renderTimelineLayoutToggle() {
+    toggleClass(document.body, "instruction-view", timelineLayout === "instruction");
+    for (const button of document.querySelectorAll("[data-timeline-layout]")) {
+      const active = button.dataset.timelineLayout === timelineLayout;
+      button.setAttribute("aria-pressed", String(active));
+      styleSegmentedToggleButton(button, active);
+    }
+  }
+
+  function setTimelineLayout(layout) {
+    if (layout === timelineLayout) return;
+    const stage = timelineContainer();
+    if (timelineLayout === "instruction" && stage) {
+      instructionView.leftOrdinal = stage.scrollLeft / instructionView.cellWidth;
+    }
+    timelineLayout = layout === "instruction" ? "instruction" : "time";
+    writePersistedWebviewState({ timelineLayout });
+    renderTimelineLayoutToggle();
+    renderSharedTimelineIfAvailable(currentTimelineMode(), { preserveSelection: true });
+  }
+
+  function instructionPlotWidth(stage) {
+    const label = stage.querySelector(".lane-label");
+    const labelWidth = label ? label.getBoundingClientRect().width : 168;
+    return Math.max(1, stage.clientWidth - labelWidth);
+  }
+
+  function setInstructionView(stage, cellWidth, leftOrdinal = instructionView.leftOrdinal) {
+    const count = Number(stage.dataset.instructionCount);
+    const plotWidth = instructionPlotWidth(stage);
+    cellWidth = clamp(cellWidth, plotWidth / count, plotWidth);
+    leftOrdinal = clamp(leftOrdinal, 0, Math.max(0, count - plotWidth / cellWidth));
+    stage.style.setProperty("--instruction-cell-width", `${cellWidth}px`);
+    stage.style.setProperty("--instruction-track-width", `${count * cellWidth}px`);
+    stage.scrollLeft = leftOrdinal * cellWidth;
+    instructionView = { cellWidth, leftOrdinal: stage.scrollLeft / cellWidth };
+  }
+
+  function fitInstructionSelection(nodes) {
+    if (!nodes.length) return;
+    const stage = timelineContainer();
+    const indices = nodes.map((node) => Number(node.dataset.instructionIndex));
+    const start = Math.min(...indices);
+    const end = Math.max(...indices) + 1;
+    const padding = (end - start) * 0.05;
+    setInstructionView(stage, instructionPlotWidth(stage) / (end - start + 2 * padding), start - padding);
+    nodes[0].scrollIntoView({ block: "nearest", inline: "nearest" });
+  }
+
+  function handleInstructionWheel(event) {
+    const stage = event.currentTarget;
+    const deltaX = Number(event.deltaX || 0);
+    const deltaY = Number(event.deltaY || 0);
+    if (!deltaX && !deltaY) return;
+    event.preventDefault();
+    if (event.shiftKey || deltaX) {
+      stage.scrollLeft += deltaX || deltaY;
+      instructionView.leftOrdinal = stage.scrollLeft / instructionView.cellWidth;
+      return;
+    }
+    const plotWidth = instructionPlotWidth(stage);
+    const labelWidth = stage.clientWidth - plotWidth;
+    const x = clamp(event.clientX - stage.getBoundingClientRect().left - labelWidth, 0, plotWidth);
+    const anchor = (stage.scrollLeft + x) / instructionView.cellWidth;
+    const width = clamp(instructionView.cellWidth * (deltaY < 0 ? 1.25 : 1 / 1.25),
+      plotWidth / Number(stage.dataset.instructionCount), plotWidth);
+    setInstructionView(stage, width, anchor - x / width);
   }
 
   function styleSegmentedToggleButton(button, active) {
@@ -1925,7 +2164,7 @@
         button.setAttribute(
           "aria-label",
           q1IssueDisclosure
-            ? `${expanded ? "Hide" : "Show"} Q1 issue for ${sequencer}`
+            ? `${expanded ? "Hide" : "Show"} Q1 core for ${sequencer}`
             : `${expanded ? "Collapse" : "Expand"} ${sequencer}`,
         );
         button.title = button.getAttribute("aria-label");
@@ -2074,10 +2313,36 @@
     return { min: geometry.min, max: geometry.max };
   }
 
+  function initialTimelineWindow(full) {
+    let previewEnd = full.min;
+    let hasHiddenIterations = false;
+    for (const event of timelineEventsById.values()) {
+      const meta = event.meta || {};
+      if (
+        event.kind === "loop_block" &&
+        ["first_iteration_only", "requested_iterations"].includes(meta.preview_policy) &&
+        Number(meta.count) > (Number(meta.visible_iteration_count) || 1)
+      ) {
+        hasHiddenIterations = true;
+      }
+      // Stops retain the full execution time even when repeated iterations are omitted.
+      if (event.kind === "stop" || (event.kind === "q1_issue" && meta.op === "stop")) {
+        continue;
+      }
+      const end = eventTime(event, "t1");
+      if (Number.isFinite(end)) {
+        previewEnd = Math.max(previewEnd, end);
+      }
+    }
+    return hasHiddenIterations && previewEnd > full.min
+      ? { min: full.min, max: Math.min(full.max, previewEnd) }
+      : full;
+  }
+
   function currentTimelineWindow() {
     if (!timelineWindow) {
       const full = fullTimelineWindow();
-      timelineWindow = persistedTimelineWindowFor(full) || full;
+      timelineWindow = persistedTimelineWindowFor(full) || initialTimelineWindow(full);
     }
     return timelineWindow;
   }
@@ -2141,8 +2406,55 @@
   }
 
   function scaleTimelineTime(time, window, geometry) {
-    const span = Math.max(1, window.max - window.min);
-    return geometry.left + ((time - window.min) / span) * (geometry.right - geometry.left);
+    const display = timelineDisplayWindow(window);
+    const span = Math.max(1e-9, display.max - display.min);
+    return geometry.left + ((displayTimelineTime(time) - display.min) / span) * (geometry.right - geometry.left);
+  }
+
+  function timelineTimeScale(includeExpanded = false) {
+    const adapter = window.q1timelineTimelineAdapter;
+    if ((!timelineWaitsCollapsed && !includeExpanded) || timelineSvg() || !adapter || !adapter.buildWaitTimeScale) return undefined;
+    const key = `${timelineTimeBasis}:${includeExpanded ? "all" : "folded"}`;
+    if (!timelineTimeScales.has(key)) {
+      const full = fullTimelineWindow();
+      const expandedGaps = includeExpanded ? [] : timelineExpandedGaps.filter((gap) => gap.basis === timelineTimeBasis &&
+        timelineExtentMatches({ min: gap.fullMin, max: gap.fullMax }, full));
+      timelineTimeScales.set(key, adapter.buildWaitTimeScale(timelineIr, { timeBasis: timelineTimeBasis, expandedGaps }));
+    }
+    return timelineTimeScales.get(key);
+  }
+
+  function displayTimelineTime(time) {
+    const scale = timelineTimeScale();
+    return scale ? scale.toDisplay(time) : time;
+  }
+
+  function realTimelineTime(time) {
+    const scale = timelineTimeScale();
+    return scale ? scale.fromDisplay(time) : time;
+  }
+
+  function timelineDisplayWindow(window) {
+    return { min: displayTimelineTime(window.min), max: displayTimelineTime(window.max) };
+  }
+
+  function visibleTimelineTicks(window) {
+    const scale = timelineTimeScale();
+    if (!scale || !scale.gaps.some((gap) => gap.start < window.max && gap.end > window.min)) {
+      return timelineTicks(window.min, window.max);
+    }
+    const display = timelineDisplayWindow(window);
+    const edgeSpacing = (display.max - display.min) * 0.01;
+    const ticks = timelineTicks(display.min, display.max).map(realTimelineTime).filter((time) =>
+      displayTimelineTime(time) > display.min + edgeSpacing && displayTimelineTime(time) < display.max - edgeSpacing &&
+      !scale.gaps.some((gap) => time > gap.start && time < gap.end)
+    );
+    return [window.min, ...ticks, window.max];
+  }
+
+  function setTimelineDisplayWindow(min, max) {
+    const window = timelineWindowForRange(min, max, timelineDisplayWindow(fullTimelineWindow()), 1e-9);
+    if (window) setTimelineWindow(realTimelineTime(window.min), realTimelineTime(window.max));
   }
 
   function clamp(value, min, max) {
@@ -2830,7 +3142,7 @@
     }
     axis.replaceChildren();
     const height = timelineSvgViewBoxHeight(svg);
-    for (const tick of timelineTicks(window.min, window.max)) {
+    for (const tick of visibleTimelineTicks(window)) {
       const x = scaleTimelineTime(tick, window, geometry);
       const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
       line.setAttribute("class", "grid time-tick");
@@ -2883,7 +3195,7 @@
     return ticks.slice(0, 8);
   }
 
-  function timelineWindowForRange(start, end, full, minSpanRatio = 0.02) {
+  function timelineWindowForRange(start, end, full, minSpanNs = 1) {
     const fullMin = Number(full && full.min);
     const fullMax = Number(full && full.max);
     const rawStart = Number(start);
@@ -2898,7 +3210,7 @@
       return undefined;
     }
     const fullSpan = fullMax - fullMin;
-    const minSpan = Math.max(1, fullSpan * Math.max(0, Number(minSpanRatio) || 0));
+    const minSpan = Math.max(1e-9, Number(minSpanNs) || 1);
     const left = Math.min(rawStart, rawEnd);
     const right = Math.max(rawStart, rawEnd);
     const center = (left + right) / 2;
@@ -2931,7 +3243,10 @@
     ) {
       return false;
     }
-    const visiblePixels = (Math.abs(rawEnd - rawStart) / Math.max(1, windowMax - windowMin)) * Math.max(1, Number(plotPixelWidth) || 1);
+    if (Math.min(rawStart, rawEnd) < windowMin || Math.max(rawStart, rawEnd) > windowMax) {
+      return true;
+    }
+    const visiblePixels = (Math.abs(rawEnd - rawStart) / Math.max(1e-9, windowMax - windowMin)) * Math.max(1, Number(plotPixelWidth) || 1);
     return visiblePixels < Math.max(1, Number(minPixels) || 1);
   }
 
@@ -2940,8 +3255,7 @@
     const fullMin = snapTimelineNs(full.min);
     const fullMax = Math.max(fullMin + 1, snapTimelineNs(full.max));
     const fullSpan = Math.max(1, fullMax - fullMin);
-    const minSpan = Math.max(1, fullSpan / 1000);
-    let span = Math.max(minSpan, max - min);
+    let span = Math.max(1, max - min);
     span = Math.min(fullSpan, span);
     let nextMin = min;
     let nextMax = min + span;
@@ -2990,7 +3304,7 @@
       syncTimelineZoomActionState();
       return;
     }
-    const window = timelineWindowForRange(range.start, range.end, fullTimelineWindow(), 0);
+    const window = timelineWindowForRange(range.start, range.end, fullTimelineWindow());
     if (!window) {
       return;
     }
@@ -3011,6 +3325,11 @@
   }
 
   function zoomTimelineToEvent(event) {
+    if (timelineLayout === "instruction") {
+      const node = event && findVisibleEventNodeByIds([String(event.id)]);
+      if (node) node.scrollIntoView({ block: "nearest", inline: "nearest" });
+      return;
+    }
     if (!event) {
       syncTimelineZoomActionState();
       return;
@@ -3018,16 +3337,23 @@
     const start = eventZoomTime(event, "t0");
     const end = eventZoomTime(event, "t1");
     const fallbackEnd = end === undefined ? start : end;
-    const window = timelineWindowForRange(start, fallbackEnd, fullTimelineWindow());
+    const displayStart = displayTimelineTime(start);
+    const displayEnd = displayTimelineTime(fallbackEnd);
+    const minSpan = Math.max(32, Math.abs(displayEnd - displayStart) * 3);
+    const window = timelineWindowForRange(displayStart, displayEnd, timelineDisplayWindow(fullTimelineWindow()), minSpan);
     if (!window) {
       return;
     }
     timelineSelectionRange = undefined;
-    setTimelineWindow(window.min, window.max);
+    setTimelineWindow(realTimelineTime(window.min), realTimelineTime(window.max));
   }
 
   function zoomTimelineToHighlightedEvent(event) {
     if (!event) {
+      return;
+    }
+    if (timelineLayout === "instruction") {
+      zoomTimelineToEvent(event);
       return;
     }
     const start = eventZoomTime(event, "t0");
@@ -3035,9 +3361,58 @@
     const fallbackEnd = end === undefined ? start : end;
     const svg = timelineSvg();
     const geometry = svg ? timelineGeometry(svg) : undefined;
-    if (highlightedSpanNeedsZoom(start, fallbackEnd, currentTimelineWindow(), timelinePlotPixelWidth(svg, geometry))) {
+    if (highlightedSpanNeedsZoom(displayTimelineTime(start), displayTimelineTime(fallbackEnd), timelineDisplayWindow(currentTimelineWindow()), timelinePlotPixelWidth(svg, geometry))) {
       zoomTimelineToEvent(event);
     }
+  }
+
+  function sourceRangeTimelineBounds(eventIds) {
+    const events = Array.from(new Set(eventIds.map(String))).map((id) => timelineEventsById.get(id))
+      .filter((event) => event && event.meta?.diff_status !== "removed");
+    const rtEvents = events.filter((event) => !eventIsQ1Issue(event) && !String(event.lane || "").startsWith("debug.") &&
+      !["loop_block", "loop_iteration_preview", "branch_region"].includes(event.kind));
+    const selected = rtEvents.length ? rtEvents : events.filter(eventIsQ1Issue);
+    if (!selected.length) return undefined;
+    let start = Infinity;
+    let end = -Infinity;
+    for (const event of selected) {
+      const times = ["t0", "t1"].map((edge) => {
+        if (timelineTimeBasis === "aligned") {
+          const value = event.meta && event.meta[`aligned_${edge}`];
+          return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+        }
+        const value = event[edge];
+        if (typeof value === "number" && Number.isFinite(value)) return value;
+        return value && value.kind === "concrete" && typeof value.value === "number" && Number.isFinite(value.value) ? value.value : undefined;
+      });
+      if (times.some((time) => time === undefined) || times[1] < times[0]) return undefined;
+      start = Math.min(start, times[0]);
+      end = Math.max(end, times[1]);
+    }
+    return { start, end, eventIds: selected.map((event) => String(event.id)), clock: rtEvents.length ? "RT" : "Q1 core" };
+  }
+
+  function zoomTimelineToEventRange(eventIds) {
+    const range = sourceRangeTimelineBounds(eventIds);
+    if (!range) return undefined;
+    const full = fullTimelineWindow();
+    const padding = Math.max(1, (range.end - range.start) * 0.05);
+    const window = timelineWindowForRange(range.start - padding, range.end + padding, full, 4);
+    if (!window) return undefined;
+    const scale = timelineTimeScale();
+    if (scale) {
+      for (const gap of scale.gaps) {
+        if (gap.end <= window.min || gap.start >= window.max) continue;
+        timelineExpandedGaps.push({ start: gap.start, end: gap.end, basis: timelineTimeBasis,
+          fullMin: full.min, fullMax: full.max });
+      }
+      timelineTimeScales.clear();
+      writePersistedWebviewState({ timelineExpandedGaps });
+    }
+    timelineSelectionRange = { start: range.start, end: range.end };
+    selectedTimelineEventId = undefined;
+    setTimelineWindow(window.min, window.max);
+    return range;
   }
 
   function zoomTimelineToSelectedEvent() {
@@ -3071,16 +3446,17 @@
       setTimelineWindow(persisted.min, persisted.max, { persist: false });
       return;
     }
-    resetTimelineZoom({ persist: false });
+    const initial = initialTimelineWindow(full);
+    setTimelineWindow(initial.min, initial.max, { persist: false });
   }
 
   function zoomTimelineAround(factor, anchorRatio = 0.5) {
-    const current = currentTimelineWindow();
-    const span = Math.max(1, current.max - current.min);
+    const current = timelineDisplayWindow(currentTimelineWindow());
+    const span = Math.max(1e-9, current.max - current.min);
     const nextSpan = span / factor;
     const anchor = current.min + span * clamp(anchorRatio, 0, 1);
     const clampedAnchorRatio = clamp(anchorRatio, 0, 1);
-    setTimelineWindow(anchor - nextSpan * clampedAnchorRatio, anchor + nextSpan * (1 - clampedAnchorRatio));
+    setTimelineDisplayWindow(anchor - nextSpan * clampedAnchorRatio, anchor + nextSpan * (1 - clampedAnchorRatio));
   }
 
   function zoomTimelineIn() {
@@ -3143,18 +3519,18 @@
   }
 
   function timelineTimeFromPointer(event, svg, geometry) {
-    const current = currentTimelineWindow();
-    const span = Math.max(1, current.max - current.min);
-    return current.min + span * timelinePointerAnchorRatio(event, svg, geometry);
+    const current = timelineDisplayWindow(currentTimelineWindow());
+    const span = Math.max(1e-9, current.max - current.min);
+    return realTimelineTime(current.min + span * timelinePointerAnchorRatio(event, svg, geometry));
   }
 
   function panTimelineByPixels(deltaX) {
     const svg = timelineSvg();
     const geometry = svg ? timelineGeometry(svg) : undefined;
-    const current = currentTimelineWindow();
-    const span = Math.max(1, current.max - current.min);
+    const current = timelineDisplayWindow(currentTimelineWindow());
+    const span = Math.max(1e-9, current.max - current.min);
     const shift = (Number(deltaX) / timelinePlotPixelWidth(svg, geometry)) * span;
-    setTimelineWindow(current.min + shift, current.max + shift);
+    setTimelineDisplayWindow(current.min + shift, current.max + shift);
   }
 
   function handleTimelineWheel(event) {
@@ -3265,7 +3641,7 @@
     if (!container || (!svg && !document.querySelector(".shared-timeline-stage")) || !Number.isFinite(Number(event.clientX))) {
       return;
     }
-    const current = currentTimelineWindow();
+    const current = timelineDisplayWindow(currentTimelineWindow());
     timelineDrag = {
       pointerId: event.pointerId,
       startClientX: Number(event.clientX),
@@ -3292,14 +3668,14 @@
       return;
     }
     const geometry = svg ? timelineGeometry(svg) : undefined;
-    const span = Math.max(1, timelineDrag.startMax - timelineDrag.startMin);
+    const span = Math.max(1e-9, timelineDrag.startMax - timelineDrag.startMin);
     const deltaX = Number(event.clientX) - timelineDrag.startClientX;
     if (!timelineDrag.moved && Math.abs(deltaX) < timelineDragThresholdPx) {
       return;
     }
     timelineDrag.moved = true;
     const shift = -(deltaX / timelinePlotPixelWidth(svg, geometry)) * span;
-    setTimelineWindow(timelineDrag.startMin + shift, timelineDrag.startMax + shift);
+    setTimelineDisplayWindow(timelineDrag.startMin + shift, timelineDrag.startMax + shift);
     event.preventDefault();
   }
 
@@ -3326,6 +3702,17 @@
     if (!container || container.dataset.timelineMouseInteractions === "true") {
       return;
     }
+    if (timelineLayout === "instruction") {
+      container.dataset.timelineMouseInteractions = "true";
+      container.title = "Equal-width blocks in each lane's instruction order. Wheel zooms around the pointer. Shift+wheel or the horizontal scrollbar pans. Click a block for its actual timing and hardware state.";
+      container.addEventListener("wheel", handleInstructionWheel, { passive: false });
+      container.addEventListener("scroll", () => {
+        if (timelineLayout === "instruction" && container.isConnected) {
+          instructionView.leftOrdinal = container.scrollLeft / instructionView.cellWidth;
+        }
+      });
+      return;
+    }
     container.dataset.timelineMouseInteractions = "true";
     container.style.cursor = "grab";
     container.style.touchAction = "none";
@@ -3335,10 +3722,10 @@
   }
 
   function panTimeline(direction) {
-    const current = currentTimelineWindow();
-    const span = Math.max(1, current.max - current.min);
+    const current = timelineDisplayWindow(currentTimelineWindow());
+    const span = Math.max(1e-9, current.max - current.min);
     const shift = direction * span * 0.25;
-    setTimelineWindow(current.min + shift, current.max + shift);
+    setTimelineDisplayWindow(current.min + shift, current.max + shift);
   }
 
   function renderRelatedBlockSummary(highlightEventIds) {
@@ -3355,11 +3742,12 @@
   }
 
   function renderHardwareCursor(state = hardwareView && hardwareView.getState()) {
+    if (timelineLayout === "instruction") return;
     if (!state || !Number.isFinite(state.time)) {
       return;
     }
-    const current = currentTimelineWindow();
-    const ratio = (state.time - current.min) / Math.max(1, current.max - current.min);
+    const current = timelineDisplayWindow(currentTimelineWindow());
+    const ratio = (displayTimelineTime(state.time) - current.min) / Math.max(1e-9, current.max - current.min);
     const visible = ratio >= 0 && ratio <= 1;
     for (const track of document.querySelectorAll(".shared-timeline-stage .lane-track, .shared-timeline-stage .ruler")) {
       let cursor = track.querySelector(".hardware-time-cursor");
@@ -3400,7 +3788,8 @@
     const root = document.createElement("section");
     root.id = "q1timeline-hardware";
     root.setAttribute("aria-label", "Sequencer hardware state");
-    timelineRoot.before(root);
+    ensureAnalysisDetailsBody();
+    document.getElementById("q1timeline-analysis-details").after(root);
     hardwareView = window.q1lensHardwareView.mount(root, timelineIr, {
       initialState: { ...readPersistedWebviewState().hardwareState, basis: timelineTimeBasis },
       onStateChange(state) {
@@ -3514,6 +3903,49 @@
       return;
     }
     if (!event.data || event.data.type !== "highlightEventIds") {
+      return;
+    }
+    if (event.data.zoomToRange) {
+      if (timelineLayout === "instruction") {
+        const ids = new Set((event.data.highlightEventIds || []).map(String));
+        selectedSourceEventIds = ids;
+        const selected = [];
+        document.querySelectorAll(".shared-timeline-stage .timeline-block[data-event-id]").forEach((node) => {
+          const matches = (node.dataset.eventIds || node.dataset.eventId).split(/\s+/).some((id) => ids.has(id));
+          node.classList.toggle("is-selected", matches);
+          node.setAttribute("aria-selected", String(matches));
+          if (matches) selected.push(node);
+        });
+        selectedTimelineEventId = undefined;
+        renderSharedEventInspector(null);
+        fitInstructionSelection(selected);
+        const summary = ensureRelatedBlockSummaryNode();
+        summary.hidden = false;
+        summary.setAttribute("role", "status");
+        summary.textContent = selected.length ? `${selected.length} blocks from the selected code · instruction order in each lane` : "The selected code has no blocks in the current view.";
+        return;
+      }
+      const range = zoomTimelineToEventRange(event.data.highlightEventIds || []);
+      const summary = ensureRelatedBlockSummaryNode();
+      summary.hidden = false;
+      summary.setAttribute("role", "status");
+      if (!range) {
+        summary.textContent = "The selected code has no complete timing in this time basis. The timeline window is unchanged.";
+        const details = summary.closest("details");
+        if (details) details.open = true;
+        return;
+      }
+      if (range.clock === "Q1 core") expandQ1IssueLanesForHighlight(range.eventIds);
+      const ids = new Set(range.eventIds);
+      selectedSourceEventIds = ids;
+      document.querySelectorAll("[data-event-id]").forEach((node) => {
+        const selected = ids.has(node.dataset.eventId);
+        node.classList.toggle("is-selected", selected);
+        node.setAttribute("aria-selected", String(selected));
+      });
+      const source = event.data.sourceRange;
+      const label = source ? `${String(source.file).split(/[\\/]/).pop()}:${source.startLine}–${source.endLine}` : "Selected code";
+      summary.textContent = `${label} · ${range.clock} ${formatWindowValue(range.start)}..${formatWindowValue(range.end)} ns · analyzed occurrences · linear time`;
       return;
     }
     const highlightEventIds = prioritizedHighlightEventIds(event.data.highlightEventIds || []);

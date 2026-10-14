@@ -3,7 +3,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createQ1TimelineControllerState, q1timelineProjectOutputDir } from "../../src/q1timeline/register";
-import { lookupEventIdsForSourceLine, lookupSourceForEvent } from "../../src/q1timeline/sourceMapLookup";
+import { lookupEventIdsForSourceLine, lookupEventIdsForSourceRange, lookupSourceForEvent } from "../../src/q1timeline/sourceMapLookup";
 import {
   collectProjectRelatedPaths,
   isProjectRelatedPath,
@@ -464,5 +464,33 @@ describe("q1timeline internal API", () => {
       prependPythonArgs(["-X", "utf8"], ["-m", "q1lens", "q1timeline"]),
       ["-X", "utf8", "-m", "q1lens", "q1timeline"],
     );
+  });
+
+  it("looks up every selected source line across map formats without duplicates or removed events", () => {
+    const file = "q1asm/seq0.q1asm";
+    const timelineIr = {
+      project: { root: "C:\\repo" },
+      source_map: {
+        by_source: { [`${file}:2`]: ["a", "a", "removed"], [`${file}:4`]: ["b"], [`${file}:5`]: ["outside"] },
+        by_event_id: {
+          a: { file, line: 2 }, b: [{ file, line: 4 }], c: { sources: [{ file, line: 3 }] },
+          d: { source: { file, line: 4 } }, removed: { file, line: 3 },
+          other: { file: "other/seq0.q1asm", line: 3 },
+        },
+      },
+      events: [
+        { id: "a", source: { file, line: 2 } }, { id: "e", source: { file, line: 3 } },
+        { id: "removed", source: { file, line: 3 }, meta: { diff_status: "removed" } },
+        { id: "before", source: { file, line: 1 } },
+      ],
+    };
+    const before = JSON.stringify(timelineIr);
+    assert.deepEqual(lookupEventIdsForSourceRange(timelineIr, "C:\\repo\\q1asm\\seq0.q1asm", 2, 4), ["a", "b", "c", "d", "e"]);
+    assert.deepEqual(lookupEventIdsForSourceRange(timelineIr, file, 4, 4), lookupEventIdsForSourceLine(timelineIr, file, 4));
+    assert.deepEqual(lookupEventIdsForSourceRange(timelineIr, "missing.q1asm", 2, 4), []);
+    assert.deepEqual(lookupEventIdsForSourceRange(timelineIr, file, 4, 2), []);
+    assert.deepEqual(lookupEventIdsForSourceRange(timelineIr, file, Number.NaN, 4), []);
+    assert.deepEqual(lookupEventIdsForSourceRange({}, file, 1, 100_000), []);
+    assert.equal(JSON.stringify(timelineIr), before);
   });
 });

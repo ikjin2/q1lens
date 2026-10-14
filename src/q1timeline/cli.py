@@ -16,7 +16,7 @@ from q1timeline import __version__
 from q1timeline.analysis.alignment import align_timelines
 from q1timeline.analysis.hardware_readiness import analyze_hardware_readiness
 from q1timeline.analysis.interpreter import LOOP_PREVIEW_MAX_VISIBLE_ITERATIONS, interpret_program
-from q1timeline.analysis.underflow import analyze_underflow
+from q1timeline.analysis.underflow import analyze_underflows
 from q1timeline.diagnostics import (
     DIAGNOSTICS_SCHEMA_VERSION,
     Diagnostic,
@@ -656,7 +656,6 @@ def _analyze_command(args: argparse.Namespace) -> int:
             execution_mode=execution_mode,
             max_steps=max_steps,
         )
-        analyze_underflow(state)
         states.append(state)
     if execution_mode == "simulation":
         from q1timeline.simulation.runtime import simulate_programs
@@ -673,6 +672,8 @@ def _analyze_command(args: argparse.Namespace) -> int:
             else:
                 print(f"q1timeline analyze: {exc}", file=sys.stderr)
             return 2
+    if execution_mode != "simulation":
+        analyze_underflows(states)
     if args.hardware_readiness:
         for state in states:
             analyze_hardware_readiness(state)

@@ -120,7 +120,7 @@
           pendingById.set(String(event.id), item);
           series.steps.push(setTime);
         } else {
-          series.warnings.add("Pending parameter timing is unavailable without its Q1 issue event.");
+          series.warnings.add("Pending parameter timing is unavailable without its Q1 core event.");
         }
       }
       const rtCommand = (String(event.lane || "").startsWith("rt.") && meta.rt_packet_id && event.kind !== "marker_state" && (!SIMULATION_EVENTS.has(event.kind) || event.kind === "conditional_skip")) || event.kind === "stop";

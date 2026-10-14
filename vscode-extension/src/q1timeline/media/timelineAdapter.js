@@ -173,12 +173,12 @@
     if (event.kind === "q1_issue") {
       return {
         id: `${base}:q1_issue`,
-        label: "Q1 issue",
+        label: "Q1 core",
         kind: "q1-issue",
         role: "q1-issue",
         parentGroupId: base,
         sequencer,
-        hidden: !(options && options.expandedQ1IssueSequencers && options.expandedQ1IssueSequencers.has(sequencer)),
+        hidden: !(options && (options.layout === "instruction" || options.expandedQ1IssueSequencers && options.expandedQ1IssueSequencers.has(sequencer))),
       };
     }
     if (isPlayPathEvent(event) && !(options && options.mergedPlayEventIds && options.mergedPlayEventIds.has(String(event.id)))) {
@@ -489,6 +489,59 @@
     });
   }
 
+  function applyInstructionLayout(lanes, annotations, events) {
+    const eventOrder = new Map(events.map((event, index) => [String(event.id), index]));
+    const positions = new Map();
+    const startsByLane = new Map();
+    const blockOrder = (block) => Math.min(...block.eventIds.map((id) => eventOrder.get(id) ?? events.length));
+    let maxCount = 1;
+    for (const lane of lanes) {
+      if (lane.kind === "runtime") lane.label = `${lane.sequencer || lane.label} · RT`;
+      lane.blocks.sort((left, right) => left.start - right.start || blockOrder(left) - blockOrder(right));
+      startsByLane.set(lane.id, lane.blocks.map((block) => block.start));
+      maxCount = Math.max(maxCount, lane.blocks.length);
+      lane.blocks.forEach((block, index) => {
+        block.start = index;
+        block.duration = 1;
+        for (const id of block.eventIds) {
+          positions.set(id, { laneId: lane.id, laneKind: lane.kind, start: index, end: index + 1 });
+        }
+      });
+    }
+    function insertionPosition(laneId, time) {
+      const starts = startsByLane.get(laneId) || [];
+      const index = starts.findIndex((start) => start >= time);
+      return index < 0 ? starts.length : index;
+    }
+    for (const annotation of annotations) {
+      if (annotation.type === "loop-range") {
+        const members = annotation.eventIds.map((id) => positions.get(id)).filter(Boolean);
+        const anchor = members.find((position) => position.laneId === annotation.laneId)
+          || members.find((position) => position.laneKind !== "q1-issue") || members[0];
+        if (anchor) {
+          const laneMembers = members.filter((position) => position.laneId === anchor.laneId);
+          annotation.laneId = anchor.laneId;
+          annotation.start = Math.min(...laneMembers.map((position) => position.start));
+          annotation.end = Math.max(...laneMembers.map((position) => position.end));
+        } else {
+          annotation.start = insertionPosition(annotation.laneId, annotation.start);
+          annotation.end = annotation.start;
+        }
+      } else {
+        const flow = annotation.domain.flow;
+        const from = positions.get(String(flow.from_event_id));
+        const to = positions.get(String(flow.to_event_id));
+        annotation.fromTime = from ? from.end : insertionPosition(annotation.fromLaneId || annotation.laneId, annotation.fromTime);
+        annotation.toTime = to ? to.start : insertionPosition(annotation.toLaneId || annotation.laneId, annotation.toTime);
+        if (annotation.type === "feedback-inline") {
+          annotation.start = Math.min(annotation.fromTime, annotation.toTime);
+          annotation.end = Math.max(annotation.fromTime, annotation.toTime);
+        }
+      }
+    }
+    return maxCount;
+  }
+
   function buildQ1TimelineSharedModel(timelineIr, options = {}) {
     const mode = options.mode === "debug" ? "debug" : "normal";
     const events = Array.isArray(timelineIr && timelineIr.events) ? timelineIr.events : [];
@@ -503,7 +556,8 @@
         ? options.expandedQ1IssueSequencers.map((sequencer) => String(sequencer))
         : []
     );
-    const adapterOptions = { mode, timeBasis: options.timeBasis, mergedPlayEventIds, expandedQ1IssueSequencers };
+    const instruction = options.layout === "instruction";
+    const adapterOptions = { mode, layout: options.layout, timeBasis: options.timeBasis, mergedPlayEventIds, expandedQ1IssueSequencers };
     let maxTime = 1;
 
     function ensureLane(lane) {
@@ -529,6 +583,7 @@
         continue;
       }
       if (event.kind === "loop_block") {
+        if (instruction) ensureLane(eventLane(event, adapterOptions));
         const annotation = loopAnnotation(event, adapterOptions);
         annotations.push(annotation);
         maxTime = Math.max(maxTime, annotation.end);
@@ -564,16 +619,20 @@
       );
     }
 
+    if (instruction) maxTime = applyInstructionLayout(lanes, annotations, events);
     const viewport = {
       start: 0,
       end: maxTime,
     };
     return {
       title: "Q1ASM Timeline",
-      subtitle: `${lanes.length} lanes / ${events.length} events`,
+      subtitle: instruction ? "Independent instruction order per lane; columns do not show simultaneous time" : `${lanes.length} lanes / ${events.length} events`,
       totalTime: maxTime,
       viewport,
-      ticks: ticksForViewport(viewport),
+      ticks: instruction ? [...new Set([0, 0.25, 0.5, 0.75, 1].map((ratio) => Math.round(maxTime * ratio)))].map((index) => ({
+        leftPercent: index / maxTime * 100,
+        label: `#${index}`,
+      })) : ticksForViewport(viewport),
       lanes,
       annotations,
       inspector: {
@@ -583,8 +642,201 @@
     };
   }
 
+  function buildWaitTimeScale(timelineIr, options = {}) {
+    const gaps = [];
+    const scale = {
+      gaps,
+      toDisplay(time) {
+        let removed = 0;
+        for (const gap of gaps) {
+          if (time < gap.start) break;
+          if (time <= gap.end) {
+            return gap.displayStart + ((time - gap.start) / (gap.end - gap.start)) * (gap.displayEnd - gap.displayStart);
+          }
+          removed += gap.end - gap.start - (gap.displayEnd - gap.displayStart);
+        }
+        return time - removed;
+      },
+      fromDisplay(time) {
+        let removed = 0;
+        for (const gap of gaps) {
+          if (time < gap.displayStart) break;
+          if (time <= gap.displayEnd) {
+            return gap.start + ((time - gap.displayStart) / (gap.displayEnd - gap.displayStart)) * (gap.end - gap.start);
+          }
+          removed += gap.end - gap.start - (gap.displayEnd - gap.displayStart);
+        }
+        return time + removed;
+      },
+    };
+    function concreteTime(value) {
+      if (typeof value === "number" && Number.isFinite(value)) return value;
+      if (value && typeof value === "object" && (!value.kind || value.kind === "concrete")) {
+        const number = value.value ?? value.value_ns;
+        if (typeof number === "number" && Number.isFinite(number)) return number;
+      }
+      return undefined;
+    }
+    function merge(intervals) {
+      const merged = [];
+      for (const interval of intervals.sort((a, b) => a.start - b.start || a.end - b.end)) {
+        const last = merged[merged.length - 1];
+        if (last && interval.start <= last.end) last.end = Math.max(last.end, interval.end);
+        else merged.push({ ...interval });
+      }
+      return merged;
+    }
+    function intersect(left, right) {
+      const result = [];
+      let a = 0;
+      let b = 0;
+      while (a < left.length && b < right.length) {
+        const start = Math.max(left[a].start, right[b].start);
+        const end = Math.min(left[a].end, right[b].end);
+        if (end > start) result.push({ start, end });
+        if (left[a].end < right[b].end) a += 1;
+        else b += 1;
+      }
+      return result;
+    }
+    function subtract(intervals, exclusions) {
+      const result = [];
+      const blocked = merge(exclusions);
+      let index = 0;
+      for (const interval of intervals) {
+        let start = interval.start;
+        while (index < blocked.length && blocked[index].end < start) index += 1;
+        let current = index;
+        while (current < blocked.length && blocked[current].start < interval.end) {
+          const block = blocked[current];
+          if (block.start > start) result.push({ start, end: block.start });
+          start = Math.max(start, block.end);
+          if (start >= interval.end) break;
+          current += 1;
+        }
+        if (start < interval.end) result.push({ start, end: interval.end });
+      }
+      return result;
+    }
+    const events = Array.isArray(timelineIr && timelineIr.events) ? timelineIr.events : [];
+    const sequencers = new Set((timelineIr && timelineIr.sequencers || []).map((seq) => String(seq.id)));
+    for (const event of events) if (event.sequencer_id !== undefined) sequencers.add(String(event.sequencer_id));
+    if (!sequencers.size) return scale;
+    const offsets = new Map();
+    const sharedClock = [...sequencers].every((id) => timelineIr.execution && timelineIr.execution[id] && timelineIr.execution[id].timing_model === "event_driven");
+    for (const id of sequencers) {
+      const alignment = timelineIr.alignment && timelineIr.alignment[id];
+      const offset = alignment ? concreteTime(alignment.offset) : 0;
+      if ((sequencers.size > 1 && !alignment) || (alignment && (alignment.confidence !== "exact" || alignment.unaligned || offset === undefined))) return scale;
+      if (sequencers.size > 1 && alignment.mode !== "first_wait_sync" && !String(alignment.mode).startsWith("manual:") && !(alignment.mode === "none" && sharedClock)) return scale;
+      offsets.set(id, offset);
+    }
+    // Local clocks with different origins cannot establish simultaneous unchanged time.
+    if (options.timeBasis !== "aligned" && new Set(offsets.values()).size > 1) return scale;
+    const ignoredKinds = new Set(["q1_issue", "queue_depth", "slack", "analysis_incomplete", "latched_state_pending", "rt_queue_enqueue", "rt_queue_dequeue", "q1_stall", "loop_iteration_preview"]);
+    const waitKinds = new Set(["wait", "wait_sync", "wait_trigger"]);
+    const knownKinds = new Set(["upd_param", "latched_state_applied", "marker_state", "branch_region", "feedback_com", "feedback_pop", "feedback_receive", "feedback_send", "acquisition_result", "fb_acq_tb_id", "fb_acq_iq_id", "fb_acq_tb_valid", "fb_acq_tb_cfg", "fb_acq_iq_shift"]);
+    if (events.some((event) => event.sequencer_id === undefined && !ignoredKinds.has(event.kind))) return scale;
+    let common;
+    for (const id of sequencers) {
+      const simulation = timelineIr.simulation && timelineIr.simulation[id];
+      const parameters = simulation && simulation.signals && simulation.signals.parameters;
+      // Filter settling can keep the physical output active after offset becomes zero.
+      const identityFilter = (values) => Array.isArray(values) && values.length === 1 && values[0] === 1;
+      if (simulation && simulation.physical_enabled && (!parameters ||
+        !identityFilter(parameters.fir) || !parameters.iir || !identityFilter(parameters.iir.a) || !identityFilter(parameters.iir.b))) return scale;
+      const offset = options.timeBasis === "aligned" ? offsets.get(id) : 0;
+      const records = [];
+      for (const event of events) {
+        // Static set_cond is unresolved: subsequent wait timing may be conditional.
+        const unresolvedCondition = event.kind === "latched_state_pending" && event.meta && event.meta.field === "set_cond";
+        if (String(event.sequencer_id) !== id || (ignoredKinds.has(event.kind) && !unresolvedCondition)) continue;
+        const localStart = concreteTime(event.t0 ?? event.t0_ns);
+        const localEnd = concreteTime(event.t1 ?? event.t1_ns);
+        if (localStart === undefined || localEnd === undefined || localEnd < localStart) return scale;
+        if (options.timeBasis === "aligned" && ["t0", "t1"].some((edge, index) => {
+          const value = event.meta && event.meta[`aligned_${edge}`];
+          return value !== undefined && concreteTime(value) !== [localStart, localEnd][index] + offset;
+        })) return scale;
+        records.push({ event, start: localStart + offset, end: localEnd + offset });
+      }
+      records.sort((a, b) => a.start - b.start);
+      if (!records.length) return scale;
+      const waitLoops = records.flatMap(({ event, start }) => {
+        const meta = event.meta || {};
+        const count = concreteTime(meta.count);
+        const period = concreteTime(meta.period);
+        const end = start + count * period;
+        return event.kind === "loop_block" && event.confidence === "exact" && meta.wait_only === true &&
+          Number.isInteger(count) && count > 0 && period > 0 && Number.isFinite(end)
+          ? [{ start, end }] : [];
+      });
+      const observed = [{ start: records[0].start,
+        end: [...records, ...waitLoops].reduce((last, record) => Math.max(last, record.end), records[0].start) }];
+      const blocked = [];
+      const acquisitionEnds = new Map();
+      for (const { event, start } of records) {
+        const meta = event.meta || {};
+        if (event.kind !== "acquisition_result" || event.confidence !== "exact" || !meta.rt_packet_id || !["configured", "weight_memory"].includes(meta.integration_length_source)) continue;
+        const acquiredAt = concreteTime(meta.start_ns);
+        const duration = concreteTime(meta.duration_ns);
+        if (acquiredAt !== undefined && duration > 0 && Math.abs(acquiredAt + offset + duration - start) < 1e-6) {
+          acquisitionEnds.set(meta.rt_packet_id, { start: acquiredAt + offset, end: start });
+        }
+      }
+      // Fold unchanged modeled state, including held nonzero or unknown levels.
+      // Every applied-state boundary remains visible; this does not claim hardware idle.
+      for (const { event, start, end } of records) {
+        const meta = event.meta || {};
+        const provenWaitCopy = waitKinds.has(event.kind) && waitLoops.some((loop) => start >= loop.start && end <= loop.end);
+        if (event.confidence !== "exact" || (meta.preview_source_event_id && !provenWaitCopy) || meta.assumed_branch_path || meta.comparison_paths) {
+          blocked.push({ start, end: Infinity });
+          continue;
+        }
+        if (waitKinds.has(event.kind)) continue;
+        if (event.kind === "loop_block") {
+          const count = concreteTime(meta.count);
+          const period = concreteTime(meta.period);
+          if (meta.wait_only === true && Number.isInteger(count) && count > 0 && period > 0 && Number.isFinite(start + count * period)) continue;
+          const shown = new Set(meta.shown_iterations || [0]);
+          let visible = 0;
+          while (shown.has(visible)) visible += 1;
+          if (count === undefined || count > visible) blocked.push({ start: period > 0 ? start + period * visible : start, end: Infinity });
+        } else if (event.kind === "play") {
+          // The IR has no waveform end; t1 is only the RT command's blocking end.
+          blocked.push({ start, end: Infinity });
+        } else if (event.kind === "acquire") {
+          const acquisition = acquisitionEnds.get(meta.rt_packet_id);
+          blocked.push({ start, end: acquisition && acquisition.start === start ? Math.max(end, acquisition.end) : Infinity });
+        } else {
+          const annotation = event.kind === "underflow_warning" && meta.status === "possible_underflow";
+          blocked.push({ start, end: knownKinds.has(event.kind) || annotation ? end : Infinity });
+        }
+      }
+      const unchanged = subtract(observed, blocked);
+      common = common === undefined ? unchanged : intersect(common, unchanged);
+      if (!common.length) return scale;
+    }
+    const expandedGaps = Array.isArray(options.expandedGaps) ? options.expandedGaps : [];
+    let removed = 0;
+    for (const interval of common || []) {
+      if (interval.end - interval.start > 128) {
+        // Keep 16 ns beside every change, including changes on another sequencer.
+        const start = interval.start + 16;
+        const end = interval.end - 16;
+        if (expandedGaps.some((gap) => gap.start === start && gap.end === end)) continue;
+        const displayStart = start - removed;
+        const displayEnd = displayStart + 64;
+        gaps.push({ start, end, displayStart, displayEnd });
+        removed += end - start - 64;
+      }
+    }
+    return scale;
+  }
+
   const api = {
     buildQ1TimelineSharedModel,
+    buildWaitTimeScale,
     eventLabelToken,
     eventTimeValue,
   };

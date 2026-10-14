@@ -101,7 +101,9 @@ def critical_path_from_timeline(
     if diagnostics:
         reasons["analysis_incomplete"] = max(
             reasons["analysis_incomplete"],
-            sum(diagnostic.get("category") == "analysis_incomplete" for diagnostic in diagnostics),
+            sum(diagnostic.get("category") == "analysis_incomplete"
+                and (diagnostic.get("details") or {}).get("analysis_scope") != "rt_queue"
+                for diagnostic in diagnostics),
         )
         reasons["invalid_input"] = sum(diagnostic.get("severity") == "error" for diagnostic in diagnostics)
 
@@ -211,7 +213,7 @@ def _inspect_global_uncertainty(
             reasons["runtime_dependent_control_flow"] += 1
         elif kind == "loop_block":
             reasons["loop_summary"] += 1
-        elif kind == "analysis_incomplete":
+        elif kind == "analysis_incomplete" and meta.get("analysis_scope") != "rt_queue":
             reasons["analysis_incomplete"] += 1
 
 

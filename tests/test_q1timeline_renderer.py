@@ -351,7 +351,7 @@ def test_normal_mode_renders_q1_issue_as_expandable_detail_lane() -> None:
         r'<g class="[^"]*q1-issue-lane[^"]*"[^>]*data-lane="sequencer:seq0 / q1_issue"[^>]*data-lane-role="q1-issue"[^>]*data-parent-lane="sequencer:seq0"[^>]*hidden[^>]*style="display:none"',
         html,
     )
-    assert re.search(r'<text class="lane-label"[^>]*>Q1 issue</text>', html)
+    assert re.search(r'<text class="lane-label"[^>]*>Q1 core</text>', html)
     assert re.search(r'id="event-seq0-q1-wait"[^>]*class="[^"]*kind-q1_issue', html)
     assert re.search(r'id="event-seq0-q1-wait"[\s\S]*?<text class="event-label"[^>]*>wait_sync</text>', html)
     assert not re.search(r'id="event-seq0-q1-wait"[\s\S]*?<text class="event-label"[^>]*>wait_sync 4</text>', html)
@@ -389,7 +389,7 @@ def test_debug_mode_marks_q1_issue_lane_as_disclosure_lane() -> None:
         r'<g class="[^"]*q1-issue-lane[^"]*"[^>]*data-lane="sequencer:seq0 / debug.q1_issue"[^>]*data-lane-role="q1-issue"[^>]*data-parent-lane="sequencer:seq0"[^>]*hidden[^>]*style="display:none"',
         html,
     )
-    assert re.search(r'<text class="lane-label"[^>]*>Q1 issue</text>', html)
+    assert re.search(r'<text class="lane-label"[^>]*>Q1 core</text>', html)
 
 
 def test_flow_and_branch_labels_do_not_render_boxy_text_halos() -> None:

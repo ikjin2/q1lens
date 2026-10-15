@@ -119,6 +119,7 @@ class LatchedState:
     digital: tuple[Value, Value, Value] | None = None
     scope_enable: Value | None = None
     pending_since: dict[str, SourceLocation] = field(default_factory=dict)
+    pending_event_ids: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -556,8 +557,10 @@ def _execute_instruction(
         return
 
     if spec.category == "latched":
-        _execute_latched(state, instruction, symbols)
-        _emit_q1_issue(state, instruction, q1_t0, q1_t1, rt_packet_id)
+        pending_event = _execute_latched(state, instruction, symbols)
+        q1_issue_event = _emit_q1_issue(state, instruction, q1_t0, q1_t1, rt_packet_id)
+        if pending_event is not None:
+            pending_event.meta["q1_issue_event_id"] = q1_issue_event.id
         return
 
     if spec.category == "feedback":
@@ -614,6 +617,7 @@ def _execute_instruction(
         return
 
     if spec.category in {"rt", "sync"}:
+        event_start = len(state.events)
         _execute_rt_instruction(
             state,
             instruction,
@@ -624,6 +628,9 @@ def _execute_instruction(
             q1_t1,
             rt_packet_id,
         )
+        for event in state.events[event_start:]:
+            if event.meta.get("rt_packet_id") == rt_packet_id:
+                event.meta["q1_issue_event_id"] = q1_issue_event.id
 
 
 def _diagnose_analysis_incomplete_timing_effect(
@@ -3001,8 +3008,21 @@ def _branch_comparison_events(
     path: str,
 ) -> list[TimelineEvent]:
     transformed: list[TimelineEvent] = []
+    event_ids = {event.id: f"{event.id}:branch-{path}" for event in events}
     for event in events:
         meta = dict(event.meta)
+        _remap_latched_event_ids(meta, event_ids)
+        for key in ("first_iteration_event_ids", "event_ids"):
+            if key in meta:
+                meta[key] = [event_ids.get(event_id, event_id) for event_id in meta[key]]
+        if "preview_iteration_event_ids" in meta:
+            meta["preview_iteration_event_ids"] = {
+                iteration: [event_ids.get(event_id, event_id) for event_id in members]
+                for iteration, members in meta["preview_iteration_event_ids"].items()
+            }
+        if "preview_source_event_id" in meta:
+            source_id = meta["preview_source_event_id"]
+            meta["preview_source_event_id"] = event_ids.get(source_id, source_id)
         meta["branch_comparison_branch_id"] = branch_id
         meta["branch_comparison_path"] = path
         if isinstance(meta.get("rt_packet_id"), str):
@@ -3017,6 +3037,17 @@ def _branch_comparison_events(
             )
         )
     return transformed
+
+
+def _remap_latched_event_ids(meta: dict[str, Any], event_ids: dict[str, str]) -> None:
+    issue_id = meta.get("q1_issue_event_id")
+    if issue_id in event_ids:
+        meta["q1_issue_event_id"] = event_ids[issue_id]
+    if "applied_setter_event_ids" in meta:
+        meta["applied_setter_event_ids"] = {
+            field: event_ids.get(event_id, event_id)
+            for field, event_id in meta["applied_setter_event_ids"].items()
+        }
 
 
 def _branch_comparison_packets(
@@ -3449,9 +3480,11 @@ def _materialize_loop_iteration_preview(
     shown_iterations: list[int],
 ) -> list[TimelineEvent]:
     shifted_events: list[TimelineEvent] = []
+    event_ids = {event.id: f"{event.id}:loop-{loop_id}-iter-{iteration_index}" for event in preview_events}
     for event in preview_events:
         period = q1_period if event.kind == "q1_issue" else rt_period
         meta = dict(event.meta)
+        _remap_latched_event_ids(meta, event_ids)
         meta["loop_id"] = loop_id
         meta["loop_preview"] = loop_id
         meta["loop_iteration_index"] = iteration_index
@@ -3811,7 +3844,7 @@ def _latched_operand_value(op: str, arg: Arg, scope: SymbolTable, state: Analysi
     return value
 
 
-def _execute_latched(state: AnalysisState, instruction: Instr, symbols: SymbolTable) -> None:
+def _execute_latched(state: AnalysisState, instruction: Instr, symbols: SymbolTable) -> TimelineEvent | None:
     scope = _scope(symbols, state)
     field_name: str | None = None
     value: Any = None
@@ -3865,7 +3898,7 @@ def _execute_latched(state: AnalysisState, instruction: Instr, symbols: SymbolTa
     if field_name is not None:
         if field_name not in {"set_cond", "set_time_ref"}:
             state.latched_state.pending_since[field_name] = instruction.source
-        _emit_event(
+        event = _emit_event(
             state,
             lane="state.pending",
             kind="latched_state_pending",
@@ -3877,6 +3910,10 @@ def _execute_latched(state: AnalysisState, instruction: Instr, symbols: SymbolTa
             source=instruction.source,
             meta={"field": field_name, "value": _plain_value(value)},
         )
+        if field_name not in {"set_cond", "set_time_ref"}:
+            state.latched_state.pending_event_ids[field_name] = event.id
+        return event
+    return None
 
 
 def _execute_rt_instruction(
@@ -3915,8 +3952,10 @@ def _execute_rt_instruction(
         t1 = add_values(t0, duration)
         state.rt_time_ns = t1
 
+    pending_event_ids = dict(state.latched_state.pending_event_ids)
     applied_state = _consume_applied_state(state) if spec.applies_latched_state else {}
     packet = _append_packet(state, instruction, duration, q1_t0, q1_t1, t0, t1, rt_packet_id)
+    event_start = len(state.events)
 
     if instruction.op == "wait":
         duration_provenance = (
@@ -3986,6 +4025,11 @@ def _execute_rt_instruction(
             packet_id=packet.id,
             value=applied_state["marker"],
         )
+    for event in state.events[event_start:]:
+        if "applied_state" in event.meta:
+            event.meta["applied_setter_event_ids"] = {
+                field: pending_event_ids[field] for field in applied_state if field in pending_event_ids
+            }
 
 
 def _emit_play_events(
@@ -4221,7 +4265,7 @@ def _emit_q1_issue(
     q1_t0: Value,
     q1_t1: Value,
     rt_packet_id: str | None,
-) -> None:
+) -> TimelineEvent:
     meta: dict[str, Any] = {
         "op": instruction.op,
         "emits_rt_packet": rt_packet_id is not None,
@@ -4440,6 +4484,7 @@ def _consume_applied_state(state: AnalysisState) -> dict[str, Any]:
     if "scope_enable" in pending and state.latched_state.scope_enable is not None:
         applied["scope_enable"] = _plain_value(state.latched_state.scope_enable)
     pending.clear()
+    state.latched_state.pending_event_ids.clear()
     return applied
 
 

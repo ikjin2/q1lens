@@ -166,18 +166,29 @@
     return `sequencer:${sequencer}`;
   }
 
+  function eventLaneName(event) {
+    return String(event.lane || "").replace(/^branch_compare\.(taken|fallthrough)\./, "");
+  }
+
   function eventLane(event, options) {
     const sequencer = String(event.sequencer_id || "sequencer");
-    const base = laneBase(sequencer);
-    const lane = String(event.lane || "");
+    const parent = laneBase(sequencer);
+    const meta = event.meta || {};
+    const path = meta.branch_comparison_path;
+    const comparison = path === "taken" || path === "fallthrough";
+    const branch = comparison ? { branchComparisonPath: path, branchComparisonId: String(meta.branch_comparison_branch_id || "") } : {};
+    const base = comparison ? `${parent}:branch:${branch.branchComparisonId}:${path}` : parent;
+    const prefix = path === "taken" ? "Jump" : "Continue";
+    const lane = eventLaneName(event);
     if (event.kind === "q1_issue") {
       return {
         id: `${base}:q1_issue`,
-        label: "Q1 core",
+        label: comparison ? `${prefix} · Q1` : "Q1 core",
         kind: "q1-issue",
         role: "q1-issue",
-        parentGroupId: base,
+        parentGroupId: parent,
         sequencer,
+        ...branch,
         hidden: !(options && (options.layout === "instruction" || options.expandedQ1IssueSequencers && options.expandedQ1IssueSequencers.has(sequencer))),
       };
     }
@@ -185,31 +196,37 @@
       const path = playPathIndex(event);
       return {
         id: `${base}:${lane}`,
-        label: path === undefined ? lane.replace(/^rt\./, "") : `path${path}`,
+        label: `${comparison ? `${prefix} · ` : ""}${path === undefined ? lane.replace(/^rt\./, "") : `path${path}`}`,
         kind: "runtime-path",
-        parentGroupId: base,
+        parentGroupId: parent,
         sequencer,
+        ...branch,
       };
     }
     if (options.mode === "debug" && lane.startsWith("debug.")) {
       return {
         id: `${base}:${lane}`,
-        label: lane.replace(/^debug\./, "debug / "),
+        label: `${comparison ? `${prefix} · ` : ""}${lane.replace(/^debug\./, "debug / ")}`,
         kind: "debug",
-        parentGroupId: base,
+        parentGroupId: parent,
         sequencer,
+        ...branch,
       };
     }
     return {
       id: base,
-      label: sequencer,
-      kind: "runtime",
+      label: comparison ? `${prefix} · RT` : sequencer,
+      kind: comparison ? "branch-runtime" : "runtime",
       sequencer,
+      ...(comparison ? { parentGroupId: parent, ...branch } : {}),
     };
   }
 
   function shouldIncludeEvent(event, options) {
-    const lane = String(event.lane || "");
+    const lane = eventLaneName(event);
+    if (event.kind === "latched_state_pending") {
+      return false;
+    }
     if (event.kind === "q1_issue") {
       return true;
     }
@@ -220,11 +237,11 @@
   }
 
   function isPlayPathEvent(event) {
-    return Boolean(event && event.kind === "play" && /^rt\.path\d+$/.test(String(event.lane || "")));
+    return Boolean(event && event.kind === "play" && /^rt\.path\d+$/.test(eventLaneName(event)));
   }
 
   function playPathIndex(event) {
-    const laneMatch = String(event && event.lane || "").match(/^rt\.path(\d+)$/);
+    const laneMatch = eventLaneName(event || {}).match(/^rt\.path(\d+)$/);
     if (laneMatch) {
       return Number(laneMatch[1]);
     }
@@ -324,6 +341,8 @@
     return [
       event.sequencer_id || "sequencer",
       meta.rt_packet_id || "no-packet",
+      meta.branch_comparison_branch_id || "",
+      meta.branch_comparison_path || "",
       source.file || "",
       source.line || "",
       playMergeTimeKey(event, options),
@@ -388,10 +407,6 @@
     return channel ? `fb ch ${channel}` : "fb";
   }
 
-  function eventSequencer(event) {
-    return String(event && event.sequencer_id ? event.sequencer_id : "sequencer");
-  }
-
   function feedbackAnnotation(flow, eventById, options) {
     const fromEvent = eventById.get(String(flow && flow.from_event_id));
     const toEvent = eventById.get(String(flow && flow.to_event_id));
@@ -421,7 +436,7 @@
         flow,
       },
     };
-    if (eventSequencer(fromEvent) === eventSequencer(toEvent)) {
+    if (fromLane.id === toLane.id) {
       return {
         ...base,
         type: "feedback-inline",
@@ -493,6 +508,7 @@
     const eventOrder = new Map(events.map((event, index) => [String(event.id), index]));
     const positions = new Map();
     const startsByLane = new Map();
+    const offsetsByLane = new Map();
     const blockOrder = (block) => Math.min(...block.eventIds.map((id) => eventOrder.get(id) ?? events.length));
     let maxCount = 1;
     for (const lane of lanes) {
@@ -508,10 +524,27 @@
         }
       });
     }
+    // Both alternatives begin after the shared branch, not at instruction zero.
+    for (const lane of lanes.filter((item) => item.branchComparisonPath)) {
+      const anchor = events.find((event) => event.sequencer_id === lane.sequencer &&
+        (event.meta || {}).branch_id === lane.branchComparisonId && !(event.meta || {}).branch_comparison_path &&
+        event.kind === (lane.kind === "q1-issue" ? "q1_issue" : "branch_region"));
+      const offset = anchor ? (positions.get(String(anchor.id)) || {}).end || 0 : 0;
+      offsetsByLane.set(lane.id, offset);
+      for (const block of lane.blocks) {
+        block.start += offset;
+        for (const id of block.eventIds) {
+          const position = positions.get(id);
+          position.start += offset;
+          position.end += offset;
+        }
+      }
+      maxCount = Math.max(maxCount, offset + lane.blocks.length);
+    }
     function insertionPosition(laneId, time) {
       const starts = startsByLane.get(laneId) || [];
       const index = starts.findIndex((start) => start >= time);
-      return index < 0 ? starts.length : index;
+      return (offsetsByLane.get(laneId) || 0) + (index < 0 ? starts.length : index);
     }
     for (const annotation of annotations) {
       if (annotation.type === "loop-range") {
@@ -540,6 +573,86 @@
       }
     }
     return maxCount;
+  }
+
+  function buildQ1TimelineSelectionIndex(timelineIr) {
+    const events = Array.isArray(timelineIr && timelineIr.events) ? timelineIr.events : [];
+    const eventsById = new Map(events.map((event) => [String(event.id), event]));
+    const index = new Map(events.map((event) => [String(event.id), { relatedEventIds: new Set(), appliedEventIds: new Set() }]));
+    const packetKey = (event) => JSON.stringify([event.sequencer_id, (event.meta || {}).rt_packet_id]);
+    const sameSequencer = (left, right) => left && right && left.sequencer_id === right.sequencer_id;
+    const issuesByPacket = new Map();
+    for (const event of events) {
+      if (event.kind === "q1_issue" && (event.meta || {}).rt_packet_id !== undefined && !(event.meta || {}).preview_source_event_id) {
+        issuesByPacket.set(packetKey(event), event);
+      }
+    }
+    const nonCommandKinds = new Set([
+      "marker_state", "latched_state_applied", "rt_queue_enqueue", "rt_queue_dequeue", "q1_stall",
+      "sync_wait", "trigger_wait", "feedback_receive", "feedback_send", "trigger_receive", "acquisition_result",
+    ]);
+    const commands = events.filter((event) => {
+      if (!/^(?:branch_compare\.(?:taken|fallthrough)\.)*rt\./.test(String(event.lane || "")) || nonCommandKinds.has(event.kind)) return false;
+      const meta = event.meta || {};
+      if (!meta.preview_source_event_id) return true;
+      const issue = eventsById.get(String(meta.q1_issue_event_id));
+      const issueMeta = issue && issue.meta || {};
+      return issue && issue.kind === "q1_issue" && sameSequencer(issue, event) && issueMeta.preview_source_event_id &&
+        issueMeta.loop_preview === meta.loop_preview && issueMeta.loop_iteration_index === meta.loop_iteration_index;
+    });
+    const link = (left, right) => {
+      if (left === right) return;
+      index.get(left).relatedEventIds.add(right);
+      index.get(right).relatedEventIds.add(left);
+    };
+    for (const event of commands) {
+      const meta = event.meta || {};
+      const issue = meta.q1_issue_event_id !== undefined
+        ? eventsById.get(String(meta.q1_issue_event_id)) : issuesByPacket.get(packetKey(event));
+      if (issue && issue.kind === "q1_issue" && sameSequencer(issue, event)) {
+        link(String(issue.id), String(event.id));
+      }
+    }
+
+    // Select the first application only among explicit setter references, never by proximity or source lines.
+    const concreteStart = (event) => {
+      const value = event.t0 ?? event.t0_ns;
+      if (typeof value === "number") return value;
+      return value && (!value.kind || value.kind === "concrete") ? value.value ?? value.value_ns : undefined;
+    };
+    const firstApplications = new Map();
+    for (const event of commands) {
+      const meta = event.meta || {};
+      if (event.kind === "conditional_skip" || meta.conditional_skipped || ["wait", "wait_sync", "wait_trigger"].includes(event.kind)) continue;
+      for (const [field, setterId] of Object.entries(meta.applied_setter_event_ids || {})) {
+        if (!Object.prototype.hasOwnProperty.call(meta.applied_state || {}, field)) continue;
+        const setter = eventsById.get(String(setterId));
+        const setterMeta = setter && setter.meta || {};
+        const issue = eventsById.get(String(setterMeta.q1_issue_event_id));
+        if (!setter || setter.kind !== "latched_state_pending" || setterMeta.field !== field ||
+          !issue || issue.kind !== "q1_issue" || !sameSequencer(setter, event) || !sameSequencer(issue, event)) continue;
+        const key = JSON.stringify([event.sequencer_id, setterId, field, meta.branch_comparison_branch_id, meta.branch_comparison_path]);
+        const applicationKey = JSON.stringify([event.sequencer_id, meta.rt_packet_id ?? meta.q1_issue_event_id ?? event.id,
+          meta.loop_preview, meta.loop_iteration_index]);
+        const start = concreteStart(event);
+        const previous = firstApplications.get(key);
+        if (!previous || (Number.isFinite(start) && Number.isFinite(previous.start) && start < previous.start)) {
+          firstApplications.set(key, { issueId: String(issue.id), applicationKey, start, eventIds: [] });
+        }
+        const first = firstApplications.get(key);
+        if (first.applicationKey === applicationKey) first.eventIds.push(String(event.id));
+      }
+    }
+    for (const { issueId, eventIds } of firstApplications.values()) {
+      for (const eventId of eventIds) {
+        link(issueId, eventId);
+        for (const appliedId of eventIds) index.get(eventId).appliedEventIds.add(appliedId);
+        index.get(issueId).appliedEventIds.add(eventId);
+      }
+    }
+    return new Map(Array.from(index, ([id, entry]) => [id, {
+      relatedEventIds: [...entry.relatedEventIds], appliedEventIds: [...entry.appliedEventIds],
+    }]));
   }
 
   function buildQ1TimelineSharedModel(timelineIr, options = {}) {
@@ -583,7 +696,7 @@
         continue;
       }
       if (event.kind === "loop_block") {
-        if (instruction) ensureLane(eventLane(event, adapterOptions));
+        if (instruction || (event.meta || {}).branch_comparison_path) ensureLane(eventLane(event, adapterOptions));
         const annotation = loopAnnotation(event, adapterOptions);
         annotations.push(annotation);
         maxTime = Math.max(maxTime, annotation.end);
@@ -619,6 +732,22 @@
       );
     }
 
+    const comparisonGroups = new Map();
+    for (const lane of lanes.filter((item) => item.branchComparisonPath)) {
+      const key = JSON.stringify([lane.sequencer, lane.branchComparisonId]);
+      if (!comparisonGroups.has(key)) comparisonGroups.set(key, []);
+      comparisonGroups.get(key).push(lane);
+    }
+    const orderedLanes = lanes.flatMap((lane) => {
+      if (!lane.branchComparisonPath) return [lane];
+      const key = JSON.stringify([lane.sequencer, lane.branchComparisonId]);
+      const group = comparisonGroups.get(key) || [];
+      comparisonGroups.delete(key);
+      const rank = (item) => (item.branchComparisonPath === "taken" ? 0 : 4) +
+        ({ "branch-runtime": 0, "q1-issue": 1, "runtime-path": 2, debug: 3 }[item.kind] || 0);
+      return group.sort((left, right) => rank(left) - rank(right));
+    });
+    lanes.splice(0, lanes.length, ...orderedLanes);
     if (instruction) maxTime = applyInstructionLayout(lanes, annotations, events);
     const viewport = {
       start: 0,
@@ -836,6 +965,7 @@
 
   const api = {
     buildQ1TimelineSharedModel,
+    buildQ1TimelineSelectionIndex,
     buildWaitTimeScale,
     eventLabelToken,
     eventTimeValue,

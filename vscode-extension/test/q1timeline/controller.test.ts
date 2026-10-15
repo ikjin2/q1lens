@@ -2007,6 +2007,137 @@ describe("q1timeline controller", () => {
     });
   });
 
+  describe("branch selection restoration", () => {
+    function setup(vscode: any, TimelineController: any) {
+      const outputDir = mkdtempSync(join(tmpdir(), "q1-branch-selection-"));
+      const controller = new TimelineController(createContext());
+      const posted: any[] = [];
+      const branch = (id: string, branchId = "seq0:branch:4") => ({
+        id, kind: "q1_issue", sequencer_id: "seq0", lane: "q1.issue",
+        source: { file: join(outputDir, "seq0.q1asm"), line: 4, column: 1, raw: "jge R0,1,@target" },
+        meta: { branch_id: branchId },
+      });
+      let nextEvents: any[] = [branch("original")];
+      controller.projectUri = vscode.Uri.file(join(outputDir, "q1timeline.yml"));
+      controller.outputDir = outputDir;
+      controller.timelineIr = { events: nextEvents };
+      controller.panel = { webview: { html: "", cspSource: "vscode-resource:",
+        asWebviewUri: (uri: any) => uri, postMessage: (message: any) => posted.push(message) }, dispose() {} };
+      controller.execFile = async () => {
+        writeFileSync(join(outputDir, "timeline_ir.json"), JSON.stringify({ events: nextEvents }), "utf8");
+        writeFileSync(join(outputDir, "diagnostics.json"), "[]", "utf8");
+        writeFileSync(join(outputDir, "timeline.html"), "<html><head></head><body></body></html>", "utf8");
+        return { stdout: JSON.stringify({ schema_version: "0.2.0", status: "ok" }), stderr: "", exitCode: 0, elapsedMs: 1 };
+      };
+      controller.runRender = async () => ({ stdout: "", stderr: "", exitCode: 0, elapsedMs: 1 });
+      controller.openSourceForEvent = () => { throw new Error("Restoring a branch must not jump to source"); };
+      return { controller, branch, posted, setEvents: (events: any[]) => { nextEvents = events; },
+        highlights: () => posted.filter((message) => message.type === "highlightEventIds") };
+    }
+
+    it("restores the same branch once after the fresh webview is ready without a source jump", async () => {
+      const vscode = createMockVscode();
+      await withMockedVscode(vscode, async ({ TimelineController }) => {
+        const { controller, branch, setEvents, highlights } = setup(vscode, TimelineController);
+        setEvents([branch("fallback"), branch("original")]);
+        await controller.handleWebviewMessage({ type: "setBranchAssumption", branchId: "seq0:branch:4", path: "both", eventId: "original" });
+        assert.deepEqual(highlights(), [], "The replacement webview has not acknowledged readiness");
+        await controller.handleWebviewMessage({ type: "webviewReady" });
+        await controller.handleWebviewMessage({ type: "webviewReady" });
+        assert.deepEqual(highlights(), [{ type: "highlightEventIds", highlightEventIds: ["original"] }]);
+        assert.equal(controller.pendingBranchSelection, undefined);
+        controller.dispose();
+      });
+    });
+
+    it("rejects reused IDs with a changed identity and falls back only to the same branch source", async () => {
+      const vscode = createMockVscode();
+      await withMockedVscode(vscode, async ({ TimelineController }) => {
+        for (const change of [
+          (event: any) => { event.meta.branch_id = "another-branch"; },
+          (event: any) => { event.sequencer_id = "seq1"; },
+          (event: any) => { event.source.file = "another.q1asm"; },
+          (event: any) => { event.source.line = 9; },
+          (event: any) => { event.source.raw = "jge R1,2,@target"; },
+          (event: any) => { event.kind = "play"; },
+          (event: any) => { event.meta.diff_status = "removed"; },
+        ]) {
+          const { controller, branch, setEvents, highlights } = setup(vscode, TimelineController);
+          const reused = branch("original");
+          change(reused);
+          setEvents([reused, { ...branch("region"), kind: "branch_region" }, branch("current-q1")]);
+          await controller.setBranchAssumption("seq0:branch:4", "taken", "original");
+          await controller.handleWebviewMessage({ type: "webviewReady" });
+          assert.deepEqual(highlights(), [{ type: "highlightEventIds", highlightEventIds: ["current-q1"] }]);
+          controller.dispose();
+        }
+      });
+    });
+
+    it("falls back to a current branch region and never selects unrelated events on the same line", async () => {
+      const vscode = createMockVscode();
+      await withMockedVscode(vscode, async ({ TimelineController }) => {
+        for (const hasRegion of [true, false]) {
+          const { controller, branch, setEvents, highlights } = setup(vscode, TimelineController);
+          setEvents([
+            { ...branch("removed"), meta: { branch_id: "seq0:branch:4", diff_status: "removed" } },
+            branch("different-branch", "seq0:branch:9"),
+            { ...branch("runtime"), kind: "wait" },
+            ...(hasRegion ? [{ ...branch("region"), kind: "branch_region" }] : []),
+          ]);
+          await controller.setBranchAssumption("seq0:branch:4", "collapsed", "original");
+          await controller.handleWebviewMessage({ type: "webviewReady" });
+          assert.deepEqual(highlights(), hasRegion ? [{ type: "highlightEventIds", highlightEventIds: ["region"] }] : []);
+          assert.equal(controller.pendingBranchSelection, undefined);
+          controller.dispose();
+        }
+      });
+    });
+
+    it("keeps the latest queued branch request until its fresh analysis and readiness", async () => {
+      const vscode = createMockVscode();
+      await withMockedVscode(vscode, async ({ TimelineController }) => {
+        const { controller, branch, setEvents, highlights } = setup(vscode, TimelineController);
+        controller.timelineIr.events.push(branch("second", "seq0:branch:8"));
+        controller.analysisInFlight = true;
+        await controller.setBranchAssumption("seq0:branch:4", "taken", "original");
+        await controller.handleWebviewMessage({ type: "webviewReady" });
+        await controller.setBranchAssumption("seq0:branch:8", "fallthrough", "second");
+        await controller.handleWebviewMessage({ type: "webviewReady" });
+        assert.deepEqual(highlights(), []);
+        assert.equal(controller.analysisQueued, true);
+        setEvents([branch("fresh-first"), branch("fresh-second", "seq0:branch:8")]);
+        controller.analysisInFlight = false;
+        controller.analysisQueued = false;
+        await controller.runAnalysis();
+        assert.deepEqual(highlights(), []);
+        await controller.handleWebviewMessage({ type: "webviewReady" });
+        assert.deepEqual(highlights(), [{ type: "highlightEventIds", highlightEventIds: ["fresh-second"] }]);
+        controller.dispose();
+      });
+    });
+
+    it("drops restoration after source edits, project switches, failures, or a superseding analysis request", async () => {
+      const vscode = createMockVscode();
+      await withMockedVscode(vscode, async ({ TimelineController }) => {
+        for (const invalidate of [
+          (controller: any) => controller.invalidateSourceAnalysis(),
+          (controller: any) => controller.setProjectUri(vscode.Uri.file("C:\\another\\q1timeline.yml")),
+          (controller: any) => controller.clearPreviewAfterAnalyzerFailure("failed"),
+          (controller: any) => { controller.analysisRequestId += 1; },
+        ]) {
+          const { controller, highlights } = setup(vscode, TimelineController);
+          await controller.setBranchAssumption("seq0:branch:4", "both", "original");
+          invalidate(controller);
+          await controller.handleWebviewMessage({ type: "webviewReady" });
+          assert.deepEqual(highlights(), []);
+          assert.equal(controller.pendingBranchSelection, undefined);
+          controller.dispose();
+        }
+      });
+    });
+  });
+
   it("saves a raw comparison baseline only after a successful analysis", async () => {
     const vscode = createMockVscode();
     const root = mkdtempSync(join(tmpdir(), "q1-saved-baseline-"));

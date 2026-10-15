@@ -75,9 +75,11 @@ function parseWebviewMessage(message) {
     typeof message.branchId === "string" &&
     message.branchId.length > 0 &&
     VALID_BRANCH_ASSUMPTION_PATHS.has(message.path) &&
-    hasOnlyKeys(message, ["type", "branchId", "path"])
+    (message.eventId === undefined || (typeof message.eventId === "string" && message.eventId.trim().length > 0)) &&
+    hasOnlyKeys(message, ["type", "branchId", "path", "eventId"])
   ) {
-    return { valid: true, type: "setBranchAssumption", branchId: message.branchId, path: message.path };
+    return { valid: true, type: "setBranchAssumption", branchId: message.branchId, path: message.path,
+      ...(message.eventId === undefined ? {} : { eventId: message.eventId }) };
   }
 
   if (

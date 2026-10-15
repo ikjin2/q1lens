@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import date, datetime, time
+from itertools import product
 from pathlib import Path
 from typing import Any
 
@@ -100,25 +102,16 @@ def timeline_ir_from_states(
     )
     source_map = _source_map(events)
     simulated = bool(states) and all("simulation" in state.metadata for state in states)
-    feedback_flows = _simulation_feedback_flows(events) if simulated else _feedback_flows(events)
-    feedback_balance = _feedback_balance(events, feedback_flows)
+    if simulated:
+        feedback_flows = _simulation_feedback_flows(events)
+        feedback_balance = {"status": "simulated", "channels": {}}
+        generated_diagnostics = []
+    else:
+        feedback_flows, feedback_balance, generated_diagnostics = _analytical_feedback(events)
     alignment = {
         state.sequencer_id: _jsonable(state.metadata.get("alignment", {}))
         for state in states
     }
-    feedback_route_diagnostics = _feedback_route_mismatch_diagnostics(events, feedback_flows)
-    feedback_latency_diagnostics = _feedback_latency_diagnostics(events, feedback_flows)
-    feedback_balance_diagnostics = _feedback_balance_diagnostics(feedback_balance)
-    generated_diagnostics = [
-        *feedback_route_diagnostics,
-        *feedback_latency_diagnostics,
-        *feedback_balance_diagnostics,
-    ]
-    # Event-driven simulation already resolves actual arrivals and blocking.
-    # Analytical latency/balance heuristics must not contradict that trace.
-    if simulated:
-        generated_diagnostics = []
-        feedback_balance = {"status": "simulated", "channels": {}}
     if diagnostics is not None:
         diagnostics.extend(generated_diagnostics)
     serialized_diagnostics = [
@@ -274,6 +267,58 @@ def _source_map_sources(event: dict[str, Any]) -> list[dict[str, Any]]:
         if isinstance(source, dict) and "file" in source and "line" in source:
             sources.append(source)
     return sources
+
+
+def _analytical_feedback(events: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any], list[Diagnostic]]:
+    branch_ids = sorted({
+        str(entry["event"]["meta"]["branch_comparison_branch_id"])
+        for entry in _feedback_entries(events)
+        if entry["event"]["meta"].get("branch_comparison_branch_id")
+    })
+    # Independent sequencer comparisons multiply the alternatives. Keep feedback
+    # analysis bounded and explicitly unknown beyond sixteen combinations.
+    if len(branch_ids) > 4:
+        count = 2 ** len(branch_ids)
+        return [], {"status": "unknown", "channels": {}, "reason": "branch_comparison_limit", "alternative_count": count}, [
+            Diagnostic(
+                severity="info", category="analysis_incomplete",
+                message=f"Feedback analysis is unavailable for {count} branch combinations (limit: 16).",
+                details={"analysis_scope": "feedback", "reason": "branch_comparison_limit", "alternative_count": count},
+            )
+        ]
+    combined_flows: dict[tuple[str, str, str], dict[str, Any]] = {}
+    alternatives = []
+    diagnostics: list[Diagnostic] = []
+    for paths in product(("taken", "fallthrough"), repeat=len(branch_ids)):
+        assumptions = dict(zip(branch_ids, paths))
+        selected_events = [
+            event for event in events
+            if not event.get("meta", {}).get("branch_comparison_branch_id")
+            or assumptions.get(str(event["meta"]["branch_comparison_branch_id"])) == event["meta"].get("branch_comparison_path")
+        ] if branch_ids else events
+        flows = _feedback_flows(selected_events)
+        balance = _feedback_balance(selected_events, flows)
+        findings = [
+            *_feedback_route_mismatch_diagnostics(selected_events, flows),
+            *_feedback_latency_diagnostics(selected_events, flows),
+            *_feedback_balance_diagnostics(balance),
+        ]
+        if not branch_ids:
+            return flows, balance, findings
+        alternatives.append({"assumptions": assumptions, **balance})
+        label = paths[0].capitalize() if len(paths) == 1 else f"Comparison alternative {len(alternatives)}"
+        diagnostics.extend(replace(
+            diagnostic, message=f"{label}: {diagnostic.message}",
+            details={**diagnostic.details, "comparison_assumptions": assumptions},
+        ) for diagnostic in findings)
+        for flow in flows:
+            key = (flow["from_event_id"], flow["to_event_id"], flow["channel"])
+            if key not in combined_flows:
+                combined_flows[key] = {**flow, "id": f"feedback-flow-{len(combined_flows)}", "comparison_assumptions": []}
+            combined_flows[key]["comparison_assumptions"].append(assumptions)
+    # Flat counts would count mutually exclusive receives together and make a
+    # common-prefix payload appear consumed twice. Retain each scenario instead.
+    return list(combined_flows.values()), {"status": "comparison", "channels": {}, "alternatives": alternatives}, diagnostics
 
 
 def _feedback_flows(events: list[dict[str, Any]]) -> list[dict[str, Any]]:

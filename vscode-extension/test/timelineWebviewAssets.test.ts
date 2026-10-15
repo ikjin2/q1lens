@@ -1134,8 +1134,8 @@ describe("timeline webview assets", () => {
     assert.match(script, /if \(event\.shiftKey\) \{\s*beginTimelineSelectionDrag\(event\);\s*return;\s*\}/s);
     assert.match(script, /id = "q1timeline-zoom-selection-button"/);
     assert.match(script, /id = "q1timeline-zoom-event-button"/);
-    assert.match(script, /\["zoom", "zoom", "Zoom around branch"\]/);
-    assert.match(script, /zoomTimelineToEvent\(event\);\s*closeTimelineControlPopover\(\);/);
+    assert.match(script, /addTimelineControlAction\(popover, "zoom", "Zoom around branch"/);
+    assert.match(script, /zoomTimelineToEvent\(event\);\s*closeTimelineControlPopover\(true\);/);
   });
 
   it("clears shared timeline aria selection before selecting another block", () => {
@@ -1731,13 +1731,12 @@ describe("timeline webview assets", () => {
     assert.match(script, /function branchAssumptionIconName\(meta\)/);
     assert.match(script, /function branchSourceJumpLabel\(event\)/);
     assert.match(script, /Line \$\{line\}: \$\{raw\}/);
-    assert.match(script, /function branchPathSource\(event, path\)/);
-    assert.match(script, /function postSourceJump\(source\)/);
+    assert.match(script, /function branchPathDescriptor\(event, path\)/);
     assert.match(script, /chip\.setAttribute\("aria-label", branchSourceJumpLabel\(event\)\)/);
     assert.match(script, /chip\.innerHTML = timelineControlSvgIcon\(branchAssumptionIconName\(meta\)\)/);
     assert.doesNotMatch(script, /chip\.innerHTML = timelineControlSvgIcon\("branch"\)/);
     assert.doesNotMatch(script, /Branch path: condition/);
-    assert.match(script, /selectEventNode\(sourceNode\)/);
+    assert.match(script, /selectEventNode\(sourceNode, \{ notify: false \}\)/);
     assert.match(script, /openTimelineControlPopover\(chip, event, actionKind\)/);
     assert.match(script, /function installLoopLaneTimelineControls\(\)/);
     assert.match(script, /node\.classList\.add\("q1timeline-control-loop-lane"\)/);
@@ -1748,15 +1747,9 @@ describe("timeline webview assets", () => {
     assert.match(script, /document\.body\.append\(overlay\)/);
     assert.match(script, /chip\.getBoundingClientRect\(\)/);
     assert.match(script, /Math\.max\(8, Math\.min\(left,/);
-    assert.match(script, /\["taken", "taken", "Condition true: jump target"\]/);
-    assert.match(script, /\["fallthrough", "fallthrough", "Condition false: continue"\]/);
-    assert.doesNotMatch(script, /Compare true and false/);
-    assert.doesNotMatch(script, /\["both", "both"/);
-    assert.doesNotMatch(script, /Show taken path/);
-    assert.doesNotMatch(script, /Show fallthrough path/);
-    assert.match(script, /vscode\.postMessage\(\{ type: "setBranchAssumption", branchId, path \}\)/);
-    assert.match(script, /postSourceJump\(branchPathSource\(event, path\)\)/);
-    assert.match(script, /vscode\.postMessage\(\{ type: "sourceClick", file: source\.file, line: source\.line, column: source\.column \}\)/);
+    assert.match(script, /function renderBranchControls\(popover, event\)/);
+    assert.match(script, /vscode\.postMessage\(\{ type: "setBranchAssumption", branchId, path, eventId: String\(event.id\) \}\)/);
+    assert.doesNotMatch(script, /postSourceJump/);
     assert.match(script, /vscode\.postMessage\(\{ type: "setLoopPreview", loopKey, visibleIterations \}\)/);
     assert.match(css, /\.q1timeline-control-overlay\s*{/);
     assert.match(css, /\.q1timeline-control-chip\s*{/);
@@ -2342,6 +2335,7 @@ describe("timeline webview assets", () => {
       let selectedTimelineEventId = "previous";
       let selectedSourceEventIds = new Set();
       function renderSharedEventInspector() {}
+      function syncTimelineRelatedSelection() {}
       function ensureRelatedBlockSummaryNode() { return summary; }
       function zoomTimelineToEventRange() { throw new Error("Instruction highlight changed the real-time window"); }
       const hardwareView = { selectEvent() { throw new Error("Range highlight moved the hardware cursor"); } };

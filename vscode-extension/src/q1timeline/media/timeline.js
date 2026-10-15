@@ -5,6 +5,8 @@
   let sharedTimelineActive = false;
   let selectedTimelineEventId = undefined;
   let selectedSourceEventIds = new Set();
+  let timelineSelectionEvents;
+  let timelineSelectionIndex = new Map();
   let activeTimelineControlChip = undefined;
   let hardwareView;
   let hardwarePersistTimer;
@@ -195,6 +197,12 @@
     const eventId = eventNode.dataset.eventId;
     selectedTimelineEventId = eventId;
     selectedSourceEventIds.clear();
+    const relatedEventIds = syncTimelineRelatedSelection(eventId);
+    const hadFocus = document.activeElement === eventNode;
+    if (expandQ1IssueLanesForHighlight(relatedEventIds) && hadFocus) {
+      const replacement = findVisibleEventNodeByIds([eventId]);
+      if (replacement) replacement.focus({ preventScroll: true });
+    }
     if (hardwareView && options.syncHardware !== false) {
       hardwareView.selectEvent(eventId);
     }
@@ -212,6 +220,23 @@
       const eventIds = String(node.dataset.eventIds || "").split(/\s+/).filter(Boolean);
       node.classList.toggle("is-selected", selectedId !== "" && eventIds.includes(selectedId));
     }
+  }
+
+  function syncTimelineRelatedSelection(eventId) {
+    const adapter = window.q1timelineTimelineAdapter;
+    if (timelineSelectionEvents !== timelineIr.events && adapter && adapter.buildQ1TimelineSelectionIndex) {
+      timelineSelectionIndex = adapter.buildQ1TimelineSelectionIndex(timelineIr);
+      timelineSelectionEvents = timelineIr.events;
+    }
+    const relation = timelineSelectionIndex.get(String(eventId));
+    const relatedIds = new Set(relation ? relation.relatedEventIds : []);
+    const appliedIds = new Set(relation ? relation.appliedEventIds : []);
+    for (const node of document.querySelectorAll(".event[data-event-id]")) {
+      const ids = [node.dataset.eventId, ...String(node.dataset.eventIds || "").split(/\s+/)];
+      node.classList.toggle("is-instruction-related", ids.some((id) => relatedIds.has(id)));
+      node.classList.toggle("is-parameter-apply", ids.some((id) => appliedIds.has(id)));
+    }
+    return Array.from(relatedIds);
   }
 
   function eventNodeMatchesId(node, eventId) {
@@ -329,6 +354,7 @@
     if (!meta || !meta.assumed_branch_path) {
       return "";
     }
+    if (meta.assumed_branch_path === "not_taken") return "fallthrough";
     if (meta.assumed_branch_path === "taken" && meta.assumed_branch_taken === true) {
       return "taken";
     }
@@ -363,10 +389,7 @@
 
   function eventHasBranchControl(event) {
     const meta = event && event.meta && typeof event.meta === "object" ? event.meta : {};
-    if (event && event.kind === "branch_region" && (meta.branch_id || meta.branch_comparison_branch_id)) {
-      return true;
-    }
-    return Boolean(event && event.kind === "q1_issue" && (meta.branch_id || meta.branch_comparison_branch_id));
+    return Boolean(event && ["branch_region", "q1_issue"].includes(event.kind) && meta.branch_id);
   }
 
   function branchAssumptionIconName(meta) {
@@ -419,31 +442,85 @@
     return nodes.find((node) => String(node && node.id || "") === String(nodeId || ""));
   }
 
-  function branchPathSource(event, path) {
-    if (path === "taken" || path === "fallthrough") {
-      const expectedKind = path === "taken" ? "branch_taken" : "branch_fallthrough";
-      for (const sequencer of controlFlowGraphSequencers()) {
-        const edges = Array.isArray(sequencer && sequencer.edges) ? sequencer.edges : [];
-        for (const edge of edges) {
-          if (String(edge && edge.kind || "") !== expectedKind || !sameSourceLine(edge && edge.source, event && event.source)) {
-            continue;
-          }
-          const node = controlFlowGraphNode(sequencer, edge.to_node_id);
-          const source = normalizedSource(node && node.source);
-          if (source) {
-            return source;
-          }
-        }
-      }
+  function branchControlMeta(event) {
+    const own = event.meta || {};
+    if (event.kind === "q1_issue") return own;
+    const branchId = own.branch_id || own.branch_comparison_branch_id;
+    const events = timelineIr.events || [];
+    // A repeated branch can have different results at each occurrence.
+    for (let index = events.indexOf(event) - 1; index >= 0; index -= 1) {
+      const candidate = events[index];
+      const meta = candidate.meta || {};
+      if (candidate.kind === "q1_issue" && candidate.sequencer_id === event.sequencer_id &&
+          (meta.branch_id || meta.branch_comparison_branch_id) === branchId &&
+          sameSourceLine(candidate.source, event.source) &&
+          meta.loop_preview === own.loop_preview && meta.loop_iteration_index === own.loop_iteration_index &&
+          meta.branch_comparison_path === own.branch_comparison_path) return { ...meta, ...own };
     }
-    return normalizedSource(event && event.source);
+    return own;
   }
 
-  function postSourceJump(source) {
-    if (!source) {
-      return;
+  function branchPathDescriptor(event, path) {
+    const expectedKind = path === "taken" ? "branch_taken" : "branch_fallthrough";
+    for (const sequencer of controlFlowGraphSequencers()) {
+      if (String(sequencer.sequencer_id) !== String(event.sequencer_id)) continue;
+      for (const edge of sequencer.edges || []) {
+        if (edge.kind !== expectedKind || !sameSourceLine(edge.source, event.source)) continue;
+        const node = controlFlowGraphNode(sequencer, edge.to_node_id);
+        const label = edge.target_label || (node && (node.labels || [])[0]);
+        const line = node && node.source && node.source.line;
+        return { label: label ? `@${String(label).replace(/^@/, "")}` : line ? `L${line}` : "?",
+          edge, fromNode: controlFlowGraphNode(sequencer, edge.from_node_id), targetNode: node };
+      }
     }
-    vscode.postMessage({ type: "sourceClick", file: source.file, line: source.line, column: source.column });
+    const label = path === "taken" && (event.meta || {}).target_label;
+    return { label: label ? `@${String(label).replace(/^@/, "")}` : "?" };
+  }
+
+  function branchComparisonSupported(meta, target) {
+    return meta.branch_decision === "runtime_dependent" && !meta.branch_comparison_path &&
+      ["jge", "jlt"].includes(meta.op) && !String(meta.condition || "").endsWith("status flags") &&
+      Boolean(target.edge && target.targetNode && target.fromNode) &&
+      Number.isInteger(target.edge.target_pc) && Number.isInteger(target.fromNode.end_pc) &&
+      target.edge.target_pc > target.fromNode.end_pc;
+  }
+
+  function renderBranchControls(popover, event) {
+    const meta = branchControlMeta(event);
+    const branchId = String(meta.branch_id || meta.branch_comparison_branch_id || "");
+    const assumed = branchAssumptionLabel(meta);
+    const resolved = meta.branch_decision === "concrete" && typeof meta.branch_taken === "boolean";
+    const active = resolved ? (meta.branch_taken ? "taken" : "fallthrough") : assumed;
+    const jump = branchPathDescriptor(event, "taken");
+    const next = branchPathDescriptor(event, "fallthrough");
+    popover.classList.add("q1timeline-branch-popover");
+    popover.setAttribute("role", "dialog");
+    popover.setAttribute("aria-label", "Branch paths");
+    const status = document.createElement("div");
+    status.className = "q1timeline-branch-status";
+    status.textContent = resolved ? "Calculated path" : assumed === "both" ?
+      (Array.isArray(meta.comparison_paths) ? "Comparing both paths" : "Comparison unavailable") :
+      assumed === "taken" || assumed === "fallthrough" ? "Assumed path" : "Choose a path";
+    popover.append(status);
+    const choose = (path) => {
+      vscode.postMessage({ type: "setBranchAssumption", branchId, path, eventId: String(event.id) });
+      closeTimelineControlPopover(true);
+    };
+    for (const [path, label] of [["taken", `Jump · ${jump.label}`], ["fallthrough", `Continue · ${next.label}`]]) {
+      addTimelineControlAction(popover, path, label, () => choose(path), {
+        text: true, active: active === path, disabled: resolved || meta.branch_decision !== "runtime_dependent",
+      });
+    }
+    if (!resolved && meta.branch_decision === "runtime_dependent") {
+      if (branchComparisonSupported(meta, jump)) {
+        addTimelineControlAction(popover, "both", "Compare both", () => choose("both"), { text: true, active: active === "both" });
+      }
+      addTimelineControlAction(popover, "collapsed", "Collapse", () => choose("collapsed"), { text: true, active: active === "collapsed" });
+    }
+    addTimelineControlAction(popover, "zoom", "Zoom around branch", () => {
+      zoomTimelineToEvent(event);
+      closeTimelineControlPopover(true);
+    }, { text: true });
   }
 
   function timelineControlLoopVisibleIterations(meta) {
@@ -600,7 +677,8 @@
     positionTimelineControlPopover(popover, activeTimelineControlChip);
   }
 
-  function closeTimelineControlPopover() {
+  function closeTimelineControlPopover(restoreFocus = false) {
+    const chip = activeTimelineControlChip;
     const existing = document.getElementById("q1timeline-control-popover");
     if (existing) {
       existing.remove();
@@ -609,6 +687,7 @@
     for (const chip of document.querySelectorAll(".q1timeline-control-chip[aria-expanded='true'], .q1timeline-control-loop-lane[aria-expanded='true']")) {
       chip.setAttribute("aria-expanded", "false");
     }
+    if (restoreFocus && chip && document.body.contains(chip)) chip.focus();
   }
 
   function addTimelineControlAction(popover, iconName, label, onClick, options = {}) {
@@ -616,7 +695,9 @@
     button.type = "button";
     button.className = "q1timeline-control-action";
     button.innerHTML = timelineControlSvgIcon(iconName);
+    if (options.text) button.textContent = label;
     button.setAttribute("aria-label", label);
+    if (options.active !== undefined) button.setAttribute("aria-pressed", String(options.active));
     button.title = label;
     if (options.active) {
       button.classList.add("is-active");
@@ -652,27 +733,7 @@
     chip.setAttribute("aria-expanded", "true");
     activeTimelineControlChip = chip;
     if (actionKind === "branch") {
-      const branchId = String(meta.branch_id || meta.branch_comparison_branch_id || "");
-      const active = branchAssumptionLabel(meta);
-      for (const [path, iconName, label] of [
-        ["zoom", "zoom", "Zoom around branch"],
-      ]) {
-        addTimelineControlAction(popover, iconName, label, () => {
-          zoomTimelineToEvent(event);
-          closeTimelineControlPopover();
-        });
-      }
-      for (const [path, iconName, label] of [
-        ["taken", "taken", "Condition true: jump target"],
-        ["fallthrough", "fallthrough", "Condition false: continue"],
-        ["collapsed", "collapsed", "Clear branch override"],
-      ]) {
-        addTimelineControlAction(popover, iconName, label, () => {
-          vscode.postMessage({ type: "setBranchAssumption", branchId, path });
-          postSourceJump(branchPathSource(event, path));
-          closeTimelineControlPopover();
-        }, { active: active === path, danger: path === "collapsed" });
-      }
+      renderBranchControls(popover, event);
     } else if (actionKind === "loop") {
       const loopKey = String(meta.loop_preview_key || "");
       const visible = timelineControlLoopVisibleIterations(meta);
@@ -691,6 +752,17 @@
     }
     ensureTimelineControlOverlay().append(popover);
     positionTimelineControlPopover(popover, chip);
+    if (actionKind === "branch") {
+      popover.addEventListener("keydown", (keyEvent) => {
+        if (keyEvent.key === "Escape") {
+          keyEvent.preventDefault();
+          keyEvent.stopPropagation();
+          closeTimelineControlPopover(true);
+        }
+      });
+      const focus = popover.querySelector('button[aria-pressed="true"]:not(:disabled)') || popover.querySelector("button:not(:disabled)");
+      if (focus) focus.focus();
+    }
   }
 
   function addTimelineControlChip(sourceNode, event, actionKind, stackIndex = 0) {
@@ -708,7 +780,7 @@
     chip.className = "q1timeline-control-chip q1timeline-control-chip-branch";
     chip.dataset.eventId = String(event.id);
     chip.dataset.controlChipId = `${actionKind}:${event.id}`;
-    chip.setAttribute("aria-haspopup", "menu");
+    chip.setAttribute("aria-haspopup", "dialog");
     chip.setAttribute("aria-expanded", "false");
     chip.setAttribute("aria-label", branchSourceJumpLabel(event));
     chip.title = chip.getAttribute("aria-label");
@@ -722,7 +794,7 @@
     chip.addEventListener("click", (clickEvent) => {
       clickEvent.preventDefault();
       clickEvent.stopPropagation();
-      selectEventNode(sourceNode);
+      selectEventNode(sourceNode, { notify: false });
       openTimelineControlPopover(chip, event, actionKind);
     });
     track.append(chip);
@@ -974,6 +1046,7 @@
 
   function applySharedSelection(options) {
     if (options && options.preserveSelection === false) {
+      syncTimelineRelatedSelection(undefined);
       renderSharedEventInspector(null);
       return;
     }
@@ -982,6 +1055,7 @@
       selectEventNode(selectedNode, { notify: false, syncHardware: false });
       return;
     }
+    syncTimelineRelatedSelection(undefined);
     renderSharedEventInspector(null);
   }
 
@@ -1254,6 +1328,8 @@
       eventNode.classList.add("is-selected");
       const eventId = eventNode.dataset.eventId;
       selectedTimelineEventId = eventId;
+      const relatedEventIds = syncTimelineRelatedSelection(eventId);
+      expandQ1IssueLanesForHighlight(relatedEventIds);
       if (hardwareView && options.syncHardware !== false) {
         hardwareView.selectEvent(eventId);
       }
@@ -3814,6 +3890,7 @@
           selectEventNode(node, { notify: false, syncHardware: false });
         } else {
           selectedTimelineEventId = eventId;
+          syncTimelineRelatedSelection(eventId);
           renderSharedEventInspector(eventId);
         }
       },
@@ -3905,6 +3982,7 @@
     if (!event.data || event.data.type !== "highlightEventIds") {
       return;
     }
+    syncTimelineRelatedSelection(undefined);
     if (event.data.zoomToRange) {
       if (timelineLayout === "instruction") {
         const ids = new Set((event.data.highlightEventIds || []).map(String));
@@ -3957,6 +4035,7 @@
       selectEventNode(target, { notify: false });
       target.scrollIntoView({ block: "center", inline: "center" });
     } else {
+      syncTimelineRelatedSelection(undefined);
       const ids = new Set(highlightEventIds);
       document.querySelectorAll("[data-event-id]").forEach((node) => {
         node.classList.toggle("is-selected", ids.has(node.dataset.eventId));

@@ -445,6 +445,37 @@ body.instruction-view.mode-normal .event.normal-feedback-collapsed {
   opacity: 0.45;
 }
 
+.q1timeline-branch-popover {
+  flex-direction: column;
+  min-width: 180px;
+  max-width: min(300px, calc(100vw - 16px));
+}
+
+.q1timeline-branch-status {
+  padding: 4px 7px;
+  color: var(--vscode-descriptionForeground);
+  font-size: 11px;
+}
+
+.q1timeline-branch-popover .q1timeline-control-action {
+  width: 100%;
+  height: auto;
+  min-height: 28px;
+  padding: 4px 7px;
+  text-align: left;
+  justify-items: start;
+  overflow-wrap: anywhere;
+}
+
+.q1timeline-branch-popover .q1timeline-control-action:focus-visible {
+  outline: 2px solid var(--vscode-focusBorder);
+  outline-offset: -2px;
+}
+
+.q1timeline-branch-popover .q1timeline-control-action.is-active:disabled {
+  opacity: 1;
+}
+
 .q1-issue-lane.q1-issue-expanded {
   display: inline;
 }
@@ -509,6 +540,15 @@ body.vscode-dark .shared-timeline-stage .timeline-block.kind-q1_issue {
   border-style: dashed;
   color: var(--vscode-descriptionForeground);
   opacity: 0.72;
+}
+
+.shared-timeline-stage .timeline-block.is-instruction-related {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
+}
+
+.shared-timeline-stage .timeline-block.is-parameter-apply {
+  box-shadow: inset 3px 0 0 var(--vscode-focusBorder);
 }
 
 .shared-timeline-stage .timeline-block-branch_effect:hover,

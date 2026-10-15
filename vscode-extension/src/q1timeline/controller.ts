@@ -737,6 +737,7 @@ export class TimelineController {
     this.executionReplayOverride = undefined;
     this.parameterOverrides = new Map();
     this.pendingTarget = undefined;
+    this.pendingBranchSelection = undefined;
     this.projectRelatedPaths = new Set();
     this.lastSourceViewColumn = undefined;
     this.output = vscode.window.createOutputChannel("Q1ASM Timeline");
@@ -930,6 +931,7 @@ export class TimelineController {
     this.outputDir = q1timelineProjectOutputDir(target.projectFile);
     this.singleFileUri = undefined;
     this.singleFileMode = false;
+    this.pendingBranchSelection = undefined;
     this.pendingTarget = target;
     await this.openPreview({ preserveProject: true });
   }
@@ -1035,6 +1037,7 @@ export class TimelineController {
       this.panel.webview.onDidReceiveMessage((message) => this.handleWebviewMessage(message)),
       this.panel.onDidDispose(() => {
         this.cancelSourceRangeZoom();
+        this.pendingBranchSelection = undefined;
         this.webviewReady = false;
         this.disposePanelDisposables();
         this.panel = undefined;
@@ -1181,6 +1184,7 @@ export class TimelineController {
     if (!editor || !editor.document || !editor.document.uri || !editor.document.uri.fsPath) {
       return;
     }
+    this.pendingBranchSelection = undefined;
     this.pendingTarget = {
       q1asmFile: editor.document.uri.fsPath,
       line: (editor.selection?.active?.line ?? 0) + 1,
@@ -1201,6 +1205,7 @@ export class TimelineController {
     }
     const startLine = selection.start.line + 1;
     const endLine = Math.max(startLine, selection.end.line + (selection.end.character === 0 ? 0 : 1));
+    this.pendingBranchSelection = undefined;
     this.pendingTarget = { q1asmFile: sourceUri.fsPath, line: startLine, endLine, zoomToRange: true };
     const activeProjectUri = this.activeProjectUriForEditor(editor);
     if (activeProjectUri) {
@@ -1476,14 +1481,49 @@ export class TimelineController {
     });
   }
 
-  async setBranchAssumption(branchId, path) {
+  async setBranchAssumption(branchId, path, eventId) {
+    this.pendingBranchSelection = undefined;
+    const event = (this.timelineIr?.events || []).find((candidate) => String(candidate.id) === eventId);
+    if (event && this.projectUri && event.source?.file && Number.isInteger(event.source.line) && event.source.line > 0 &&
+        event.sequencer_id && this.branchSelectionEventMatches(event, {
+          branchId, sequencerId: event.sequencer_id, source: event.source,
+        })) {
+      this.pendingBranchSelection = {
+        eventId, branchId, sequencerId: event.sequencer_id, source: { ...event.source },
+        projectFile: this.projectUri.fsPath, sourceRevision: this.sourceRevision,
+      };
+      this.pendingTarget = undefined;
+    }
     this.branchAssumptionOverrides.set(branchId, path);
     this.lastAnalyzerTimelineIr = undefined;
     this.output.appendLine(`q1timeline branch assumption override: ${branchId}=${path}`);
     await this.runAnalysis();
   }
 
+  branchSelectionEventMatches(event, selection) {
+    const meta = event?.meta || {};
+    const source = event?.source;
+    return ["q1_issue", "branch_region"].includes(event?.kind) && meta.diff_status !== "removed" &&
+      (meta.branch_id || meta.branch_comparison_branch_id) === selection.branchId &&
+      event.sequencer_id === selection.sequencerId && source?.file &&
+      normalizedFsPath(this.resolveSourcePath(source.file)) === normalizedFsPath(this.resolveSourcePath(selection.source.file)) &&
+      source.line === selection.source.line && (source.column || 1) === (selection.source.column || 1) &&
+      (source.raw || "") === (selection.source.raw || "");
+  }
+
+  revealPendingBranchSelection() {
+    const selection = this.pendingBranchSelection;
+    this.pendingBranchSelection = undefined;
+    if (!selection || selection.projectFile !== this.projectUri?.fsPath ||
+        selection.sourceRevision !== this.sourceRevision || selection.analysisRequestId !== this.analysisRequestId) return;
+    const candidates = (this.timelineIr?.events || []).filter((event) => this.branchSelectionEventMatches(event, selection));
+    const event = candidates.find((candidate) => String(candidate.id) === selection.eventId) ||
+      candidates.find((candidate) => candidate.kind === "q1_issue") || candidates[0];
+    if (event) this.postWebviewMessage({ type: "highlightEventIds", highlightEventIds: [String(event.id)] });
+  }
+
   async setLoopPreview(loopKey, visibleIterations) {
+    this.pendingBranchSelection = undefined;
     if (visibleIterations <= 1) {
       this.loopPreviewOverrides.delete(loopKey);
       this.output.appendLine(`q1timeline loop preview override cleared: ${loopKey}`);
@@ -1973,6 +2013,10 @@ export class TimelineController {
     const sourceRevision = this.sourceRevision;
     const analysisProjectFile = this.projectUri.fsPath;
     const analysisRequestId = ++this.analysisRequestId;
+    if (this.pendingBranchSelection) {
+      this.pendingBranchSelection.analysisRequestId = analysisRequestId;
+      this.pendingBranchSelection.awaitingWebviewReady = false;
+    }
     this.setAnalysisStatus("analyzing", "Analyzing q1timeline project.");
     const configuration = this.config();
     const pythonPath = configuration.get("pythonPath", "python");
@@ -2359,6 +2403,9 @@ export class TimelineController {
     if (this.pendingTarget?.zoomToRange) {
       this.pendingTarget.awaitingWebviewReady = true;
     }
+    if (this.pendingBranchSelection?.analysisRequestId === this.analysisRequestId) {
+      this.pendingBranchSelection.awaitingWebviewReady = true;
+    }
     this.panel.webview.html = html;
     if (!this.pendingTarget?.zoomToRange) {
       await this.revealPendingTarget();
@@ -2368,6 +2415,7 @@ export class TimelineController {
 
   clearPreviewAfterAnalyzerFailure(message) {
     this.cancelSourceRangeZoom();
+    this.pendingBranchSelection = undefined;
     this.webviewReady = false;
     this.timelineIr = undefined;
     this.lastAnalyzerTimelineIr = undefined;
@@ -2443,7 +2491,9 @@ export class TimelineController {
       this.output.appendLine("q1timeline webview script ready.");
       if (this.pendingTarget?.zoomToRange && this.pendingTarget.awaitingWebviewReady) {
         await this.revealPendingTarget();
-      } else if (vscode.window.activeTextEditor?.selection?.isEmpty === false) {
+      } else if (this.pendingBranchSelection?.awaitingWebviewReady) {
+        this.revealPendingBranchSelection();
+      } else if (!this.pendingBranchSelection && vscode.window.activeTextEditor?.selection?.isEmpty === false) {
         this.followSourceEditor(vscode.window.activeTextEditor);
       }
       return;
@@ -2465,7 +2515,7 @@ export class TimelineController {
       return;
     }
     if (parsedMessage.type === "setBranchAssumption") {
-      await this.setBranchAssumption(parsedMessage.branchId, parsedMessage.path);
+      await this.setBranchAssumption(parsedMessage.branchId, parsedMessage.path, parsedMessage.eventId);
       return;
     }
     if (parsedMessage.type === "setLoopPreview") {
@@ -2540,6 +2590,7 @@ export class TimelineController {
   }
 
   async openSourceLocation(source, options = {}) {
+    this.pendingBranchSelection = undefined;
     this.cancelSourceRangeZoom();
     const sourcePath = this.resolveSourcePath(source.file);
     const line = Math.max(0, Number(source.line || 1) - 1);
@@ -2661,6 +2712,7 @@ export class TimelineController {
 
   invalidateSourceAnalysis() {
     this.sourceRevision += 1;
+    this.pendingBranchSelection = undefined;
     this.cancelSourceRangeZoom();
   }
 
@@ -2682,7 +2734,7 @@ export class TimelineController {
           current.start.line !== selection.start.line || current.start.character !== selection.start.character ||
           current.end.line !== selection.end.line || current.end.character !== selection.end.character ||
           this.panel !== panel || this.timelineIr !== timelineIr || !this.webviewReady ||
-          this.hardwareSourceReveal || this.pendingTarget || this.analysisInFlight || this.analysisQueued ||
+          this.hardwareSourceReveal || this.pendingTarget || this.pendingBranchSelection || this.analysisInFlight || this.analysisQueued ||
           this.sourceRevision !== this.analyzedSourceRevision || document.isDirty ||
           this.hasUnsavedProjectChanges() || !this.isProjectRelated(document.uri)) return;
       const startLine = selection.start.line + 1;
@@ -2812,6 +2864,7 @@ export class TimelineController {
 
   dispose() {
     this.cancelSourceRangeZoom();
+    this.pendingBranchSelection = undefined;
     this.webviewReady = false;
     if (this.changeTimer) {
       clearTimeout(this.changeTimer);

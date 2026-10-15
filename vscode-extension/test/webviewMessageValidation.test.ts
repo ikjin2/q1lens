@@ -72,6 +72,14 @@ describe("q1timeline webview message validation", () => {
     assert.equal(parseWebviewMessage({ type: "setBranchAssumption", branchId: "", path: "taken" }).valid, false);
     assert.equal(parseWebviewMessage({ type: "setBranchAssumption", branchId: "branch", path: "maybe" }).valid, false);
     assert.equal(parseWebviewMessage({ type: "setBranchAssumption", branchId: "branch", path: "taken", extra: true }).valid, false);
+    for (const eventId of [null, 4, "", " ", {}]) {
+      assert.equal(parseWebviewMessage({ type: "setBranchAssumption", branchId: "branch", path: "taken", eventId }).valid, false);
+    }
+  });
+
+  it("accepts an optional originating event for branch selection restoration", () => {
+    const message = { type: "setBranchAssumption", branchId: "branch", path: "both", eventId: "seq0:event:4" };
+    assert.deepEqual(parseWebviewMessage(message), { valid: true, ...message });
   });
 
   it("accepts source jump requests from timeline controls", () => {

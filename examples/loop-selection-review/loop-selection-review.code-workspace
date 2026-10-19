@@ -1,0 +1,27 @@
+{
+  "folders": [
+    { "name": "Loop selection examples", "path": "." },
+    { "name": "Verification report", "path": "../../output/loop-selection-review" }
+  ],
+  "settings": {
+    "files.associations": { "*.q1asm": "q1asm" },
+    "q1lens.q1timeline.executionMode": "project",
+    "q1lens.q1timeline.updateMode": "manual",
+    "q1lens.q1timeline.view.defaultMode": "debug",
+    "q1lens.q1timeline.pythonPath": "python"
+  },
+  "tasks": {
+    "version": "2.0.0",
+    "tasks": [
+      {
+        "label": "Q1Lens: Verify loop selection and build report",
+        "type": "process",
+        "command": "${config:q1lens.q1timeline.pythonPath}",
+        "args": ["${workspaceFolder:Loop selection examples}/verify-all.py"],
+        "options": { "cwd": "${workspaceFolder:Loop selection examples}/../.." },
+        "problemMatcher": [],
+        "group": { "kind": "test", "isDefault": true }
+      }
+    ]
+  }
+}

@@ -1,0 +1,6 @@
+move 3,R0
+nop
+body: wait 8
+loop R0,@body
+wait 4
+stop

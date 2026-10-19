@@ -1,0 +1,751 @@
+{
+  "cases": [
+    {
+      "id": "01-counted-inline",
+      "title_ko": "같은 줄 라벨의 카운터 루프",
+      "description_ko": "loop 명령으로 세 번 반복하며 앞뒤 일반 명령과 구분합니다.",
+      "manual_note_ko": "루프 요약은 3–4행 전체, 내부 wait와 loop 명령 블록은 각각 해당 한 점으로 이동해야 합니다.",
+      "playback": {
+        "max_steps": 100,
+        "status": "completed"
+      },
+      "checks": [
+        {
+          "mode": "analysis",
+          "name": "counted",
+          "source_end": 4,
+          "selected": [
+            3,
+            4
+          ]
+        },
+        {
+          "mode": "playback",
+          "name": "counted",
+          "source_end": 4,
+          "selected": [
+            3,
+            4
+          ]
+        }
+      ],
+      "points": [
+        {
+          "mode": "analysis",
+          "line": 3,
+          "op": "wait"
+        },
+        {
+          "mode": "playback",
+          "line": 4,
+          "op": "loop"
+        },
+        {
+          "mode": "playback",
+          "line": 5,
+          "op": "wait"
+        }
+      ],
+      "no_loop_modes": [],
+      "source": "01-counted-inline/program.q1asm",
+      "project": "01-counted-inline/q1timeline.yml"
+    },
+    {
+      "id": "02-standalone-comments-eof",
+      "title_ko": "분리 라벨·주석·파일 끝",
+      "description_ko": "라벨과 첫 명령 사이에 주석과 빈 줄이 있고 마지막 명령 뒤 개행이 없습니다.",
+      "manual_note_ko": "요약 선택에 2행 entry:와 6행 마지막 jmp를 포함해야 합니다. 분석은 무한 루프 요약, 재생은 정해진 단계에서 일시 정지합니다.",
+      "playback": {
+        "max_steps": 60,
+        "status": "paused"
+      },
+      "checks": [
+        {
+          "mode": "analysis",
+          "name": "standalone",
+          "source_end": 6,
+          "selected": [
+            2,
+            6
+          ]
+        },
+        {
+          "mode": "playback",
+          "name": "standalone",
+          "source_end": 6,
+          "selected": [
+            2,
+            6
+          ]
+        }
+      ],
+      "points": [
+        {
+          "mode": "analysis",
+          "line": 5,
+          "op": "wait"
+        },
+        {
+          "mode": "playback",
+          "line": 6,
+          "op": "jmp"
+        }
+      ],
+      "no_loop_modes": [],
+      "source": "02-standalone-comments-eof/program.q1asm",
+      "project": "02-standalone-comments-eof/q1timeline.yml"
+    },
+    {
+      "id": "03-nested-counted",
+      "title_ko": "중첩된 카운터 루프",
+      "description_ko": "각각 분리된 라벨을 가진 내부·외부 반복 범위를 검증합니다.",
+      "manual_note_ko": "내부 요약은 6–8행, 외부 요약은 3–9행입니다. 재생에서 내부 요약이 여러 번 생기면 모두 같은 소스 범위를 선택해야 합니다.",
+      "playback": {
+        "max_steps": 200,
+        "status": "completed"
+      },
+      "checks": [
+        {
+          "mode": "analysis",
+          "name": "inner",
+          "source_end": 8,
+          "selected": [
+            6,
+            8
+          ]
+        },
+        {
+          "mode": "analysis",
+          "name": "outer",
+          "source_end": 9,
+          "selected": [
+            3,
+            9
+          ]
+        },
+        {
+          "mode": "playback",
+          "name": "inner",
+          "source_end": 8,
+          "selected": [
+            6,
+            8
+          ]
+        },
+        {
+          "mode": "playback",
+          "name": "outer",
+          "source_end": 9,
+          "selected": [
+            3,
+            9
+          ]
+        }
+      ],
+      "points": [
+        {
+          "mode": "analysis",
+          "line": 7,
+          "op": "wait"
+        },
+        {
+          "mode": "playback",
+          "line": 4,
+          "op": "move"
+        }
+      ],
+      "no_loop_modes": [],
+      "source": "03-nested-counted/program.q1asm",
+      "project": "03-nested-counted/q1timeline.yml"
+    },
+    {
+      "id": "04-sub-jnz",
+      "title_ko": "sub + jnz의 암묵적 루프",
+      "description_ko": "전용 loop 명령 없이 플래그 조건으로 세 번 반복합니다.",
+      "manual_note_ko": "정적 분석은 알려진 역방향 조건 분기를 요약하지 않습니다. 재생에서 생성된 루프 요약만 3–5행 전체 선택을 검증합니다.",
+      "playback": {
+        "max_steps": 100,
+        "status": "completed"
+      },
+      "checks": [
+        {
+          "mode": "playback",
+          "name": "status-loop",
+          "source_end": 5,
+          "selected": [
+            3,
+            5
+          ]
+        }
+      ],
+      "points": [
+        {
+          "mode": "analysis",
+          "line": 3,
+          "op": "wait"
+        },
+        {
+          "mode": "playback",
+          "line": 5,
+          "op": "jnz"
+        }
+      ],
+      "no_loop_modes": [
+        "analysis"
+      ],
+      "source": "04-sub-jnz/program.q1asm",
+      "project": "04-sub-jnz/q1timeline.yml"
+    },
+    {
+      "id": "05-compare-jlt",
+      "title_ko": "레지스터 비교 jlt 루프",
+      "description_ko": "증가하는 카운터와 비교 분기로 세 번 반복합니다.",
+      "manual_note_ko": "정적 분석에는 루프 요약이 없습니다. 재생 요약의 범위는 3–6행이며 비교 명령 자체는 한 점 이동입니다.",
+      "playback": {
+        "max_steps": 100,
+        "status": "completed"
+      },
+      "checks": [
+        {
+          "mode": "playback",
+          "name": "comparison-loop",
+          "source_end": 6,
+          "selected": [
+            3,
+            6
+          ]
+        }
+      ],
+      "points": [
+        {
+          "mode": "analysis",
+          "line": 6,
+          "op": "jlt"
+        },
+        {
+          "mode": "playback",
+          "line": 4,
+          "op": "add"
+        }
+      ],
+      "no_loop_modes": [
+        "analysis"
+      ],
+      "source": "05-compare-jlt/program.q1asm",
+      "project": "05-compare-jlt/q1timeline.yml"
+    },
+    {
+      "id": "06-forever-label-jmp",
+      "title_ko": "라벨 jmp 무한 루프",
+      "description_ko": "앞쪽 일반 대기 다음에 무조건 역방향 점프로 반복합니다.",
+      "manual_note_ko": "loop 키워드가 없어도 요약은 2–3행 전체입니다. 앞쪽 1행은 루프 선택에 들어가면 안 됩니다. 재생은 제한 단계에서 멈춥니다.",
+      "playback": {
+        "max_steps": 60,
+        "status": "paused"
+      },
+      "checks": [
+        {
+          "mode": "analysis",
+          "name": "infinite-jump",
+          "source_end": 3,
+          "selected": [
+            2,
+            3
+          ]
+        },
+        {
+          "mode": "playback",
+          "name": "infinite-jump",
+          "source_end": 3,
+          "selected": [
+            2,
+            3
+          ]
+        }
+      ],
+      "points": [
+        {
+          "mode": "analysis",
+          "line": 1,
+          "op": "wait"
+        },
+        {
+          "mode": "playback",
+          "line": 3,
+          "op": "jmp"
+        }
+      ],
+      "no_loop_modes": [],
+      "source": "06-forever-label-jmp/program.q1asm",
+      "project": "06-forever-label-jmp/q1timeline.yml"
+    },
+    {
+      "id": "07-register-jmp",
+      "title_ko": "레지스터 대상 jmp",
+      "description_ko": "레지스터에 저장한 주소를 통해 분리 라벨로 돌아갑니다.",
+      "manual_note_ko": "정적 분석은 역방향 숫자 주소 분기를 요약하지 않습니다. 재생은 실제 반복을 감지하며 3행 body:부터 5행까지 선택해야 합니다.",
+      "playback": {
+        "max_steps": 60,
+        "status": "paused"
+      },
+      "checks": [
+        {
+          "mode": "playback",
+          "name": "register-loop",
+          "source_end": 5,
+          "selected": [
+            3,
+            5
+          ]
+        }
+      ],
+      "points": [
+        {
+          "mode": "analysis",
+          "line": 1,
+          "op": "move"
+        },
+        {
+          "mode": "playback",
+          "line": 5,
+          "op": "jmp"
+        }
+      ],
+      "no_loop_modes": [
+        "analysis"
+      ],
+      "source": "07-register-jmp/program.q1asm",
+      "project": "07-register-jmp/q1timeline.yml"
+    },
+    {
+      "id": "08-numeric-jmp",
+      "title_ko": "숫자 주소 jmp",
+      "description_ko": "명령 주소 0으로 직접 돌아가는 최소 반복입니다.",
+      "manual_note_ko": "소스 행 번호가 아닌 명령 주소 0입니다. 정적 요약은 없으며 재생 요약은 1–2행을 선택해야 합니다.",
+      "playback": {
+        "max_steps": 60,
+        "status": "paused"
+      },
+      "checks": [
+        {
+          "mode": "playback",
+          "name": "numeric-loop",
+          "source_end": 2,
+          "selected": [
+            1,
+            2
+          ]
+        }
+      ],
+      "points": [
+        {
+          "mode": "analysis",
+          "line": 2,
+          "op": "jmp"
+        },
+        {
+          "mode": "playback",
+          "line": 1,
+          "op": "wait"
+        }
+      ],
+      "no_loop_modes": [
+        "analysis"
+      ],
+      "source": "08-numeric-jmp/program.q1asm",
+      "project": "08-numeric-jmp/q1timeline.yml"
+    },
+    {
+      "id": "09-higher-address-target",
+      "title_ko": "소스 순서가 뒤집힌 반복",
+      "description_ko": "반복 대상은 아래에 있고 분기 판단은 위에 배치되어 있습니다.",
+      "manual_note_ko": "재생의 논리 경계는 8행→3행이지만 실제 반복 구성원은 2·3·8·9행입니다. 전체 선택은 2–9행이며 사이의 setup·stop도 연속 범위에 포함됩니다.",
+      "playback": {
+        "max_steps": 100,
+        "status": "completed"
+      },
+      "checks": [
+        {
+          "mode": "analysis",
+          "name": "static-backjump",
+          "source_end": 9,
+          "selected": [
+            2,
+            9
+          ]
+        },
+        {
+          "mode": "playback",
+          "name": "reversed-logical-bounds",
+          "source_end": 3,
+          "selected": [
+            2,
+            9
+          ]
+        }
+      ],
+      "points": [
+        {
+          "mode": "analysis",
+          "line": 8,
+          "op": "wait"
+        },
+        {
+          "mode": "playback",
+          "line": 9,
+          "op": "jmp"
+        }
+      ],
+      "no_loop_modes": [],
+      "source": "09-higher-address-target/program.q1asm",
+      "project": "09-higher-address-target/q1timeline.yml"
+    },
+    {
+      "id": "10-alternating-backedges",
+      "title_ko": "교대로 사용하는 복귀 분기",
+      "description_ko": "같은 헤더로 돌아오는 두 경로가 번갈아 실행됩니다.",
+      "manual_note_ko": "정적 요약은 첫 경로인 3–10행입니다. 재생에서는 11–12행 대체 경로까지 포함하여 3–12행을 선택해야 합니다.",
+      "playback": {
+        "max_steps": 200,
+        "status": "completed"
+      },
+      "checks": [
+        {
+          "mode": "analysis",
+          "name": "first-static-path",
+          "source_end": 10,
+          "selected": [
+            3,
+            10
+          ]
+        },
+        {
+          "mode": "playback",
+          "name": "both-observed-backedges",
+          "source_end": 10,
+          "selected": [
+            3,
+            12
+          ]
+        }
+      ],
+      "points": [
+        {
+          "mode": "analysis",
+          "line": 9,
+          "op": "jz"
+        },
+        {
+          "mode": "playback",
+          "line": 11,
+          "op": "wait"
+        }
+      ],
+      "no_loop_modes": [],
+      "source": "10-alternating-backedges/program.q1asm",
+      "project": "10-alternating-backedges/q1timeline.yml"
+    },
+    {
+      "id": "11-final-path-callee",
+      "title_ko": "마지막 반복의 별도 경로와 서브루틴",
+      "description_ko": "마지막 반복에서만 다른 latch와 파일 아래쪽 서브루틴을 실행합니다.",
+      "manual_note_ko": "논리 종료는 7행이지만 실제 실행한 구성원은 15행까지 있습니다. 요약 선택은 3–15행이며 사이의 비실행 행도 연속 범위 때문에 포함됩니다. 정적 요약은 없습니다.",
+      "playback": {
+        "max_steps": 200,
+        "status": "completed"
+      },
+      "checks": [
+        {
+          "mode": "playback",
+          "name": "observed-final-path",
+          "source_end": 7,
+          "selected": [
+            3,
+            15
+          ]
+        }
+      ],
+      "points": [
+        {
+          "mode": "analysis",
+          "line": 4,
+          "op": "cmp"
+        },
+        {
+          "mode": "playback",
+          "line": 14,
+          "op": "wait"
+        }
+      ],
+      "no_loop_modes": [
+        "analysis"
+      ],
+      "source": "11-final-path-callee/program.q1asm",
+      "project": "11-final-path-callee/q1timeline.yml"
+    },
+    {
+      "id": "12-top-guard-zero-time",
+      "title_ko": "상단 가드가 있는 Q1 전용 루프",
+      "description_ko": "RT 시간이 늘어나지 않는 nop·레지스터 연산 루프입니다.",
+      "manual_note_ko": "최종 실패한 가드는 재생 루프 반복 수에 더하지 않습니다. 0ns 반복이어도 감지된 요약의 선택 범위는 3–7행입니다. 정적 분석은 jmp를 무한 반복으로 압축합니다.",
+      "playback": {
+        "max_steps": 100,
+        "status": "completed"
+      },
+      "checks": [
+        {
+          "mode": "analysis",
+          "name": "zero-time-static",
+          "source_end": 7,
+          "selected": [
+            3,
+            7
+          ]
+        },
+        {
+          "mode": "playback",
+          "name": "zero-time-observed",
+          "source_end": 7,
+          "selected": [
+            3,
+            7
+          ]
+        }
+      ],
+      "points": [
+        {
+          "mode": "analysis",
+          "line": 3,
+          "op": "cmp"
+        },
+        {
+          "mode": "playback",
+          "line": 5,
+          "op": "nop"
+        }
+      ],
+      "no_loop_modes": [],
+      "source": "12-top-guard-zero-time/program.q1asm",
+      "project": "12-top-guard-zero-time/q1timeline.yml"
+    },
+    {
+      "id": "13-forward-jump-negative",
+      "title_ko": "앞으로만 이동하는 일반 점프",
+      "description_ko": "실행을 건너뛰는 jmp는 반복 요약이 되어서는 안 됩니다.",
+      "manual_note_ko": "두 모드 모두 루프 요약이 없어야 합니다. jmp와 대상 wait는 각각 한 점으로 이동합니다.",
+      "playback": {
+        "max_steps": 100,
+        "status": "completed"
+      },
+      "checks": [],
+      "points": [
+        {
+          "mode": "analysis",
+          "line": 1,
+          "op": "jmp"
+        },
+        {
+          "mode": "playback",
+          "line": 1,
+          "op": "jmp"
+        },
+        {
+          "mode": "playback",
+          "line": 3,
+          "op": "wait"
+        }
+      ],
+      "no_loop_modes": [
+        "analysis",
+        "playback"
+      ],
+      "source": "13-forward-jump-negative/program.q1asm",
+      "project": "13-forward-jump-negative/q1timeline.yml"
+    },
+    {
+      "id": "14-unknown-condition-negative",
+      "title_ko": "값을 모르는 조건의 기본 경로",
+      "description_ko": "정의하지 않은 R0 때문에 반복 여부를 알 수 없습니다.",
+      "manual_note_ko": "정적 분석은 역방향 미지원 영역으로 접고 재생은 기본 fallthrough를 택합니다. 관측하지 않은 반복을 임의의 루프 요약으로 만들면 안 됩니다.",
+      "playback": {
+        "max_steps": 100,
+        "status": "completed"
+      },
+      "checks": [],
+      "points": [
+        {
+          "mode": "analysis",
+          "line": 3,
+          "op": "jnz"
+        },
+        {
+          "mode": "playback",
+          "line": 3,
+          "op": "jnz"
+        }
+      ],
+      "no_loop_modes": [
+        "analysis",
+        "playback"
+      ],
+      "source": "14-unknown-condition-negative/program.q1asm",
+      "project": "14-unknown-condition-negative/q1timeline.yml"
+    },
+    {
+      "id": "15-unknown-target-blocked",
+      "title_ko": "대상 주소를 모르는 레지스터 점프",
+      "description_ko": "주소가 없는 R27로 점프하려고 하므로 재생이 차단됩니다.",
+      "manual_note_ko": "두 모드 모두 루프 요약이 없어야 합니다. 재생에서 차단된 jmp는 실행 이벤트가 없으므로 앞의 wait만 한 점 이동을 검사합니다.",
+      "playback": {
+        "max_steps": 100,
+        "status": "blocked"
+      },
+      "checks": [],
+      "points": [
+        {
+          "mode": "analysis",
+          "line": 2,
+          "op": "jmp"
+        },
+        {
+          "mode": "playback",
+          "line": 1,
+          "op": "wait"
+        }
+      ],
+      "no_loop_modes": [
+        "analysis",
+        "playback"
+      ],
+      "source": "15-unknown-target-blocked/program.q1asm",
+      "project": "15-unknown-target-blocked/q1timeline.yml"
+    },
+    {
+      "id": "16-nested-break-invocations",
+      "title_ko": "중첩 루프의 별도 내부 호출",
+      "description_ko": "내부 반복이 조건 분기로 빠져나온 뒤 외부 루프가 다시 호출합니다.",
+      "manual_note_ko": "정적 분석은 내부 jmp만 5–9행으로 압축합니다. 재생 내부 요약 두 개는 모두 5–9행, 외부 요약은 3–11행을 선택해야 합니다.",
+      "playback": {
+        "max_steps": 200,
+        "status": "completed"
+      },
+      "checks": [
+        {
+          "mode": "analysis",
+          "name": "static-inner",
+          "source_end": 9,
+          "selected": [
+            5,
+            9
+          ]
+        },
+        {
+          "mode": "playback",
+          "name": "inner-invocations",
+          "source_end": 9,
+          "selected": [
+            5,
+            9
+          ]
+        },
+        {
+          "mode": "playback",
+          "name": "outer-invocation",
+          "source_end": 11,
+          "selected": [
+            3,
+            11
+          ]
+        }
+      ],
+      "points": [
+        {
+          "mode": "analysis",
+          "line": 6,
+          "op": "sub"
+        },
+        {
+          "mode": "playback",
+          "line": 10,
+          "op": "wait"
+        }
+      ],
+      "no_loop_modes": [],
+      "source": "16-nested-break-invocations/program.q1asm",
+      "project": "16-nested-break-invocations/q1timeline.yml"
+    },
+    {
+      "id": "17-nested-forward-branch",
+      "title_ko": "중첩 루프 안의 순방향 조건 분기",
+      "description_ko": "내부·외부 반복 레일과 같은 RT 행의 조건 분기 버튼이 서로 겹치지 않는지 검증합니다.",
+      "manual_note_ko": "내부 요약은 5–9행, 외부 요약은 3–10행입니다. 두 반복 레일을 각각 클릭할 수 있어야 합니다. Analysis의 7행 jz 분기 버튼은 레일 아래로 내려간 분기 블록 곁에 붙어 있어야 하며 반복 레일을 가리면 안 됩니다. Q1 core의 jz와 wait 명령 블록은 한 점 이동을 유지합니다.",
+      "playback": {
+        "max_steps": 200,
+        "status": "completed"
+      },
+      "checks": [
+        {
+          "mode": "analysis",
+          "name": "inner-with-branch",
+          "source_end": 9,
+          "selected": [
+            5,
+            9
+          ]
+        },
+        {
+          "mode": "analysis",
+          "name": "outer-with-branch",
+          "source_end": 10,
+          "selected": [
+            3,
+            10
+          ]
+        },
+        {
+          "mode": "playback",
+          "name": "inner-with-branch",
+          "source_end": 9,
+          "selected": [
+            5,
+            9
+          ]
+        },
+        {
+          "mode": "playback",
+          "name": "outer-with-branch",
+          "source_end": 10,
+          "selected": [
+            3,
+            10
+          ]
+        }
+      ],
+      "points": [
+        {
+          "mode": "analysis",
+          "line": 7,
+          "op": "jz"
+        },
+        {
+          "mode": "analysis",
+          "line": 8,
+          "op": "wait"
+        },
+        {
+          "mode": "playback",
+          "line": 7,
+          "op": "jz"
+        },
+        {
+          "mode": "playback",
+          "line": 8,
+          "op": "wait"
+        }
+      ],
+      "no_loop_modes": [],
+      "source": "17-nested-forward-branch/program.q1asm",
+      "project": "17-nested-forward-branch/q1timeline.yml"
+    }
+  ]
+}

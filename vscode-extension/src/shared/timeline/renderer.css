@@ -1,3 +1,36 @@
+:root {
+  --q1asm-q1-color: #245fa8;
+  --q1asm-flow-color: #9a4c18;
+  --q1asm-latched-color: #176b7e;
+  --q1asm-rt-color: #27763c;
+  --q1asm-sync-color: #7251a3;
+  --q1asm-feedback-color: #ad316c;
+  --q1asm-directive-color: #826219;
+  --q1asm-arg-register-color: #315f8d;
+  --q1asm-arg-number-color: #755c28;
+  --q1asm-arg-symbol-color: #6f548e;
+  --q1asm-arg-label-color: #87522e;
+  --q1asm-arg-placeholder-color: #486b39;
+  --q1asm-unknown-color: #64748b;
+}
+
+body.vscode-dark,
+body.vscode-high-contrast {
+  --q1asm-q1-color: #80b7ff;
+  --q1asm-flow-color: #f4a261;
+  --q1asm-latched-color: #6ec6d9;
+  --q1asm-rt-color: #8bcf9a;
+  --q1asm-sync-color: #b9a7dc;
+  --q1asm-feedback-color: #ff6fb3;
+  --q1asm-directive-color: #dfc27d;
+  --q1asm-arg-register-color: #a9c8e8;
+  --q1asm-arg-number-color: #d6c7a1;
+  --q1asm-arg-symbol-color: #c2b5df;
+  --q1asm-arg-label-color: #d9b398;
+  --q1asm-arg-placeholder-color: #b4cca6;
+  --q1asm-unknown-color: #94a3b8;
+}
+
 .shared-timeline-stage {
   min-width: 0;
   overflow: auto;
@@ -372,7 +405,7 @@
 .shared-timeline-stage .timeline-block {
   position: absolute;
   z-index: 1;
-  top: 7px;
+  top: calc(7px + var(--timeline-loop-offset, 0px));
   box-sizing: border-box;
   display: flex;
   min-width: 0;
@@ -428,6 +461,15 @@
   color: var(--vscode-list-activeSelectionForeground);
 }
 
+.shared-timeline-stage .timeline-block.has-command-color {
+  background: color-mix(in srgb, var(--timeline-block-accent) 15%, transparent);
+  border-color: var(--timeline-block-accent);
+}
+
+.shared-timeline-stage .timeline-block.has-command-color .block-label {
+  color: var(--timeline-block-accent);
+}
+
 .shared-timeline-stage .timeline-block.is-compact {
   gap: 0;
   padding: 0;
@@ -448,6 +490,118 @@
 .shared-timeline-stage .timeline-block.is-tiny .block-label,
 .shared-timeline-stage .timeline-block.is-tiny .block-detail {
   display: none;
+}
+
+.shared-timeline-stage .lane-track .timeline-block.timeline-issue-marker {
+  width: 24px;
+  height: 24px;
+  top: calc(6px + var(--timeline-loop-offset, 0px));
+  border-width: 0;
+  box-shadow: inset 0 0 0 1px var(--timeline-block-accent, var(--vscode-descriptionForeground));
+  padding: 0;
+  justify-content: center;
+  color: var(--timeline-block-accent, var(--vscode-descriptionForeground));
+}
+
+.shared-timeline-stage .issue-packet-icon {
+  width: 18px;
+  max-width: 100%;
+  min-width: 0;
+  height: 18px;
+  flex: 0 1 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.2;
+  stroke-linejoin: round;
+}
+
+.shared-timeline-stage .timeline-issue-connections,
+.shared-timeline-stage .parameter-connector-layer {
+  position: absolute;
+  z-index: 2;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.shared-timeline-stage .issue-connector {
+  fill: none;
+  stroke: var(--vscode-focusBorder, #007acc);
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  opacity: 0.9;
+}
+
+.shared-timeline-stage .issue-connector-arrow,
+.shared-timeline-stage .issue-connector-origin {
+  fill: var(--vscode-focusBorder, #007acc);
+}
+
+.shared-timeline-stage .timeline-parameter-marker {
+  position: absolute;
+  z-index: 3;
+  top: calc(var(--timeline-loop-offset, 0px));
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--q1asm-latched-color, var(--vscode-descriptionForeground));
+  transform: translateX(-50%);
+  cursor: pointer;
+}
+
+.shared-timeline-stage .timeline-parameter-marker[data-parameter-role="applied"] {
+  top: calc(20px + var(--timeline-loop-offset, 0px));
+}
+
+.shared-timeline-stage .timeline-parameter-marker::before {
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  width: 8px;
+  height: 8px;
+  box-sizing: border-box;
+  border: 1.5px solid currentColor;
+  border-radius: 50%;
+  background: var(--vscode-editor-background);
+  content: "";
+}
+
+.shared-timeline-stage .timeline-parameter-marker.is-applied::before {
+  background: currentColor;
+}
+
+.shared-timeline-stage .timeline-parameter-marker.is-future {
+  opacity: 0.4;
+}
+
+.shared-timeline-stage .timeline-parameter-marker.is-time-unknown::before {
+  border-style: dotted;
+}
+
+.shared-timeline-stage .timeline-parameter-marker:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
+}
+
+.shared-timeline-stage .parameter-connector {
+  fill: none;
+  stroke: var(--q1asm-latched-color, var(--vscode-focusBorder));
+  stroke-width: 1.25;
+  stroke-dasharray: 3 3;
+  pointer-events: none;
+}
+
+.shared-timeline-stage .parameter-connection-label {
+  fill: var(--vscode-editor-foreground, var(--vscode-foreground));
+  stroke: var(--vscode-editor-background);
+  stroke-width: 3px;
+  paint-order: stroke;
+  font-size: 10px;
+  pointer-events: none;
 }
 
 .shared-timeline-stage .block-label {

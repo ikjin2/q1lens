@@ -1,4 +1,6 @@
 (function q1timelineAdapterFactory(root) {
+  const instructionColors = typeof module !== "undefined" && module.exports
+    ? require("../../shared/timeline/instructionColors.js") : root.q1asmInstructionColors;
   function topLevelAddends(expression) {
     const text = String(expression || "");
     const addends = [];
@@ -91,14 +93,8 @@
       return "wait";
     }
     if (event.kind === "q1_issue") {
-      const raw = String((event.source && event.source.raw) || "").trim();
-      if (raw) {
-        return raw.split(/\s+/, 1)[0];
-      }
-      const op = String((event.meta && event.meta.op) || "").trim();
-      if (op) {
-        return op;
-      }
+      const op = instructionColors.eventCommandToken(event);
+      if (op && op !== "q1_issue") return op;
     }
     if (event.kind === "acquire") {
       return "acq";
@@ -116,50 +112,6 @@
       return "mark";
     }
     return String(event.label || event.kind || "event");
-  }
-
-  function q1CommandToken(event, options = {}) {
-    const raw = String((event && event.source && event.source.raw) || "").split("#")[0].trim();
-    if (raw) {
-      return raw.split(/\s+/, 1)[0];
-    }
-    const op = String((event && event.meta && event.meta.op) || "").trim();
-    if (op) {
-      return op;
-    }
-    return eventLabelToken(event, options);
-  }
-
-  function q1CommandAccentColor(event, options = {}) {
-    const op = q1CommandToken(event, options).toLowerCase();
-    if (op === "play" || op === "play_pulse") {
-      return "#8bcf9a";
-    }
-    if (op === "wait" || op === "wait_sync" || op === "wait_trigger") {
-      return "#b9a7dc";
-    }
-    if (op === "acquire" || op.startsWith("acquire_")) {
-      return "#e2b36f";
-    }
-    if (op === "upd_param" || op === "upd_thres") {
-      return "#bfd87a";
-    }
-    if (op === "feedback_pop" || op === "feedback_com" || op === "fb" || op.startsWith("fb_")) {
-      return "#ff6fb3";
-    }
-    if (op === "set_mrk" || op === "set_marker" || op === "mark") {
-      return "#f0c36a";
-    }
-    if (op.startsWith("set_") || op === "reset_ph") {
-      return "#6ec6d9";
-    }
-    if (op === "loop" || op === "jmp" || /^j[a-z]+$/.test(op)) {
-      return "#f4a261";
-    }
-    if (["move", "add", "sub", "and", "or", "xor", "asl", "asr"].includes(op)) {
-      return "#80b7ff";
-    }
-    return "#8bcf9a";
   }
 
   function laneBase(sequencer) {
@@ -253,6 +205,7 @@
   function eventClassNames(event) {
     return [
       `kind-${event.kind || "event"}`,
+      `command-family-${instructionColors.commandFamily(instructionColors.eventCommandToken(event))}`,
       `confidence-${event.confidence || "unknown"}`,
       event.meta && event.meta.diff_status ? `diff-${event.meta.diff_status}` : "",
       event.kind === "feedback_pop" || event.kind === "feedback_com" ? "normal-feedback-collapsed" : "",
@@ -294,6 +247,8 @@
     const duration = Math.max(eventTimeValue(event.duration, end - start), end - start, 0);
     const source = event.source || {};
     const meta = event.meta || {};
+    const rawStart = options.timeBasis === "aligned" && meta.aligned_t0 !== undefined
+      ? meta.aligned_t0 : event.t0 ?? event.t0_ns;
     const eventIds = Array.isArray(meta.path_event_ids) ? meta.path_event_ids.map((eventId) => String(eventId)) : [String(event.id)];
     const detail = event.detail !== undefined ? String(event.detail) : displayValue(event.duration, duration ? `${duration} ns` : "");
     return {
@@ -304,9 +259,11 @@
       detail,
       kind: String(event.kind || "event"),
       visualKind: eventVisualKind(event),
-      accentColor: q1CommandAccentColor(event, options),
+      accentColor: instructionColors.commandAccentColor(instructionColors.eventCommandToken(event)),
       start,
       duration,
+      connectionStartKnown: Number.isFinite(rawStart) || Boolean(rawStart && typeof rawStart === "object" &&
+        (!rawStart.kind || rawStart.kind === "concrete") && Number.isFinite(rawStart.value ?? rawStart.value_ns)),
       title: eventTitle(event, start, end),
       search: [
         event.id,
@@ -620,13 +577,18 @@
   function buildQ1TimelineSelectionIndex(timelineIr) {
     const events = Array.isArray(timelineIr && timelineIr.events) ? timelineIr.events : [];
     const eventsById = new Map(events.map((event) => [String(event.id), event]));
-    const index = new Map(events.map((event) => [String(event.id), { relatedEventIds: new Set(), appliedEventIds: new Set() }]));
-    const packetKey = (event) => JSON.stringify([event.sequencer_id, (event.meta || {}).rt_packet_id]);
+    const index = new Map(events.map((event) => [String(event.id), { relatedEventIds: new Set(), appliedEventIds: new Set(), rtEventIds: new Set() }]));
+    const packetKey = (event) => {
+      const meta = event.meta || {};
+      return JSON.stringify([event.sequencer_id, meta.rt_packet_id, meta.branch_comparison_branch_id,
+        meta.branch_comparison_path, meta.loop_preview, meta.loop_iteration_index, meta.diff_status]);
+    };
     const sameSequencer = (left, right) => left && right && left.sequencer_id === right.sequencer_id;
     const issuesByPacket = new Map();
     for (const event of events) {
-      if (event.kind === "q1_issue" && (event.meta || {}).rt_packet_id !== undefined && !(event.meta || {}).preview_source_event_id) {
-        issuesByPacket.set(packetKey(event), event);
+      if (event.kind === "q1_issue" && (event.meta || {}).rt_packet_id != null && !(event.meta || {}).preview_source_event_id) {
+        const key = packetKey(event);
+        issuesByPacket.set(key, issuesByPacket.has(key) ? null : event);
       }
     }
     const nonCommandKinds = new Set([
@@ -653,6 +615,7 @@
         ? eventsById.get(String(meta.q1_issue_event_id)) : issuesByPacket.get(packetKey(event));
       if (issue && issue.kind === "q1_issue" && sameSequencer(issue, event)) {
         link(String(issue.id), String(event.id));
+        index.get(String(issue.id)).rtEventIds.add(String(event.id));
       }
     }
 
@@ -693,8 +656,97 @@
       }
     }
     return new Map(Array.from(index, ([id, entry]) => [id, {
-      relatedEventIds: [...entry.relatedEventIds], appliedEventIds: [...entry.appliedEventIds],
+      relatedEventIds: [...entry.relatedEventIds], appliedEventIds: [...entry.appliedEventIds], rtEventIds: [...entry.rtEventIds],
     }]));
+  }
+
+  function buildParameterChanges(events, selectionIndex, options) {
+    const byId = new Map(events.map((event) => [String(event.id), event]));
+    const changesById = new Map();
+    const concreteTime = (event, edge, basis = options.timeBasis) => {
+      const meta = event.meta || {};
+      const value = basis === "aligned" && meta[`aligned_${edge}`] !== undefined
+        ? meta[`aligned_${edge}`] : event[edge] ?? event[`${edge}_ns`];
+      if (typeof value === "number" && Number.isFinite(value)) return value;
+      if (value && (!value.kind || value.kind === "concrete") && Number.isFinite(value.value ?? value.value_ns)) return value.value ?? value.value_ns;
+      return undefined;
+    };
+    const valueDisplay = (value) => {
+      if (value === undefined || value === null) return "?";
+      if (Array.isArray(value)) return value.map(valueDisplay).join(", ");
+      if (typeof value === "object") return String(value.display ?? value.value ?? value.expr ?? "?");
+      return String(value);
+    };
+    const scopeKey = (event, baseline = false) => {
+      const meta = event.meta || {};
+      return JSON.stringify([event.sequencer_id, baseline ? undefined : meta.branch_comparison_branch_id,
+        baseline ? undefined : meta.branch_comparison_path, meta.diff_status === "removed" ? "removed" : undefined]);
+    };
+    const packetKey = (event) => {
+      const meta = event.meta || {};
+      return JSON.stringify([scopeKey(event), meta.rt_packet_id ?? event.id,
+        meta.loop_preview, meta.loop_iteration_index, concreteTime(event, "t0", "local")]);
+    };
+    const commands = events.filter((event) => /^(?:branch_compare\.(?:taken|fallthrough)\.)?rt\./.test(String(event.lane || "")) &&
+      !["wait", "wait_sync", "wait_trigger", "conditional_skip", "marker_state", "latched_state_applied"].includes(event.kind) &&
+      !event.meta?.conditional_skipped && event.meta?.applied_state);
+    const unknownFields = new Set(commands.flatMap((event) => concreteTime(event, "t0", "local") === undefined
+      ? Object.keys(event.meta.applied_state).map((field) => `${scopeKey(event)}:${field}`) : []));
+    const previousByEvent = new Map();
+    const previousByPacket = new Map();
+    const appliedValues = new Map();
+    for (const event of [...commands].sort((left, right) =>
+      (concreteTime(left, "t0", "local") ?? Infinity) - (concreteTime(right, "t0", "local") ?? Infinity))) {
+      const previous = new Map();
+      const time = concreteTime(event, "t0", "local");
+      for (const [field, value] of Object.entries(event.meta.applied_state)) {
+        const key = `${scopeKey(event)}:${field}`;
+        const baseline = `${scopeKey(event, true)}:${field}`;
+        const packet = `${packetKey(event)}:${field}`;
+        if (!previousByPacket.has(packet)) {
+          const before = appliedValues.get(key) || appliedValues.get(baseline);
+          previousByPacket.set(packet, time !== undefined && before && before.time < time &&
+            !unknownFields.has(key) && !unknownFields.has(baseline) ? valueDisplay(before.value) : "?");
+        }
+        previous.set(field, previousByPacket.get(packet));
+        if (time !== undefined) appliedValues.set(key, { time, value });
+      }
+      previousByEvent.set(String(event.id), previous);
+    }
+    const append = (id, change) => {
+      if (!changesById.has(id)) changesById.set(id, []);
+      changesById.get(id).push(change);
+    };
+    for (const setter of events.filter((event) => event.kind === "latched_state_pending")) {
+      const meta = setter.meta || {};
+      const issue = byId.get(String(meta.q1_issue_event_id));
+      if (!issue || issue.kind !== "q1_issue" || issue.sequencer_id !== setter.sequencer_id ||
+        !meta.field || ["set_cond", "set_time_ref"].includes(meta.field)) continue;
+      const groups = new Map();
+      for (const id of selectionIndex.get(String(issue.id))?.appliedEventIds || []) {
+        const applied = byId.get(id);
+        if (!applied || applied.meta?.applied_setter_event_ids?.[meta.field] !== setter.id) continue;
+        const key = packetKey(applied);
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(applied);
+      }
+      for (const group of groups.size ? groups.values() : [[]]) {
+        const applied = group[0];
+        const change = {
+          field: meta.field,
+          setterEventId: String(setter.id),
+          setterIssueId: String(issue.id),
+          setterTime: concreteTime(issue, "t1"),
+          applyTime: applied ? concreteTime(applied, "t0") : undefined,
+          applyEventIds: group.map((event) => String(event.id)),
+          previousDisplay: previousByEvent.get(String(applied?.id))?.get(meta.field) || "?",
+          valueDisplay: valueDisplay(applied ? applied.meta.applied_state[meta.field] : meta.value),
+        };
+        append(String(issue.id), change);
+        for (const event of group) append(String(event.id), change);
+      }
+    }
+    return changesById;
   }
 
   function buildQ1TimelineSharedModel(timelineIr, options = {}) {
@@ -777,6 +829,21 @@
 
     mergePacketStateBlocks(lanes, eventById, adapterOptions);
 
+    const selectionIndex = buildQ1TimelineSelectionIndex(timelineIr);
+    const parameterChanges = buildParameterChanges(allEvents, selectionIndex, adapterOptions);
+    for (const lane of lanes) {
+      for (const block of lane.blocks) {
+        const changes = new Set((block.eventIds || [block.eventId]).flatMap((id) => parameterChanges.get(id) || []));
+        if (changes.size) block.parameterChanges = [...changes];
+        const rtEventIds = selectionIndex.get(block.eventId)?.rtEventIds || [];
+        if (block.kind !== "q1_issue" || !rtEventIds.length) continue;
+        const event = eventById.get(block.eventId);
+        block.issueMarker = true;
+        block.rtEventIds = rtEventIds;
+        block.title = `Issue ${block.label} | Q1 instruction start: ${displayValue(event.t0 ?? event.t0_ns, "unknown")} (local) | Select to trace RT execution`;
+      }
+    }
+
     for (const flow of Array.isArray(timelineIr && timelineIr.feedback_flows) ? timelineIr.feedback_flows : []) {
       const annotation = feedbackAnnotation(flow, eventById, adapterOptions);
       if (!annotation) {
@@ -812,6 +879,7 @@
     };
     return {
       title: "Q1ASM Timeline",
+      layout: instruction ? "instruction" : "time",
       subtitle: instruction ? "Independent instruction order per lane; columns do not show simultaneous time" : `${lanes.length} lanes / ${events.length} events`,
       totalTime: maxTime,
       viewport,
@@ -895,7 +963,9 @@
       !expanded.has(String(event.meta.loop_preview_key || event.meta.loop_id || event.id))).flatMap((event) => event.meta.hidden_event_ids || []));
     const activity = events.filter((event) => !hidden.has(String(event.id)) &&
       !["wait", "wait_sync", "wait_trigger", "loop_block", "branch_region", "loop_iteration_preview", "control_flow_loop", "control_flow_branch", "latched_state_pending", "queue_depth", "slack", "analysis_incomplete"].includes(event.kind) &&
-      (event.kind !== "q1_issue" || event.meta?.playback_feedback_id || event.meta?.playback_branch_id));
+      // Analytical Q1 timestamps use an independent clock, not the RT interval being folded.
+      (event.kind !== "q1_issue" || timelineIr.execution?.[event.sequencer_id]?.timing_model !== "analytical" &&
+        (event.meta?.playback_feedback_id || event.meta?.playback_branch_id)));
     for (const event of events) {
       const meta = event.meta || {};
       const key = String(meta.loop_preview_key || meta.loop_id || event.id);
@@ -925,6 +995,8 @@
           const from = edge(item, "t0");
           const to = edge(item, "t1");
           if (!Number.isFinite(from)) { parts = []; break; }
+          // Activity outside the omitted interval must not leave an uncollapsed tail.
+          if (from >= end || Number.isFinite(to) && to <= start) continue;
           const left = from - 16;
           const right = Number.isFinite(to) ? to + 16 : Infinity;
           parts = parts.flatMap((part) => right <= part.start || left >= part.end ? [part] : [

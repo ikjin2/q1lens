@@ -33,6 +33,7 @@ async function mount(page, status = "completed", actualIr, initialState = {}, ho
   await page.addStyleTag({path: path.join(assets, "shared/timeline/renderer.css")});
   await page.addStyleTag({path: path.join(assets, "q1timeline/media/timeline.css")});
   await page.addStyleTag({path: path.join(assets, "q1timeline/media/hardwareView.css")});
+  await page.addScriptTag({path: path.join(assets, "shared/timeline/instructionColors.js")});
   await page.addScriptTag({path: path.join(assets, "shared/timeline/renderer.js")});
   await page.addScriptTag({path: path.join(assets, "q1timeline/media/timelineAdapter.js")});
   await page.addScriptTag({path: path.join(assets, "q1timeline/media/hardwareState.js")});
@@ -160,9 +161,16 @@ for (const execution of ["analysis", "playback"]) {
     expect(coreRange.width).toBeGreaterThan(rtRange.width * 4);
     expect(rtRange.x).toBeCloseTo(coreRange.x, 0);
     const updateBounds = await rt.locator(`.timeline-block[data-event-id="${update.id}"]`).boundingBox();
-    const lastIssue = await core.locator(`.timeline-block[data-event-id="${q1.at(-1).id}"]`).boundingBox();
+    const lastIssueNode = core.locator(`.timeline-block[data-event-id="${q1.at(-1).id}"]`);
+    const lastIssue = await lastIssueNode.boundingBox();
     expect(Math.abs(rtRange.x + rtRange.width - updateBounds.x - updateBounds.width)).toBeLessThan(3);
-    expect(Math.abs(coreRange.x + coreRange.width - lastIssue.x - lastIssue.width)).toBeLessThan(3);
+    if (await lastIssueNode.getAttribute("data-issue-marker") === "true") {
+      // The 0..24 ns selection includes the issue start; its icon has a fixed hit target, even on folded time.
+      expect(lastIssue.x).toBeGreaterThanOrEqual(coreRange.x - 1);
+      expect(lastIssue.x).toBeLessThan(coreRange.x + coreRange.width);
+    } else {
+      expect(Math.abs(coreRange.x + coreRange.width - lastIssue.x - lastIssue.width)).toBeLessThan(3);
+    }
     expect(await time.inputValue()).toBe(before);
     await page.screenshot({path: test.info().outputPath(`source-range-${execution}.png`), fullPage: true});
     await page.getByRole("button", {name: "Normal view", exact: true}).click();
@@ -317,12 +325,11 @@ test("collapsed wait loop preserves the first wait's end before a distinct repea
   expect(folded.waitGap.x - folded.block.x).toBeGreaterThan(10);
   expect(folded.block.x + folded.block.width - folded.waitGap.x - folded.waitGap.width).toBeGreaterThan(10);
   expect(folded.repeated.x).toBeCloseTo(folded.block.x + folded.block.width, 0);
-  expect(folded.after.x).toBeGreaterThanOrEqual(folded.repeated.x + folded.repeated.width);
+  expect(folded.after.x).toBeCloseTo(folded.repeated.x + folded.repeated.width, 0);
   const loopBounds = await row.locator('.timeline-loop-range').boundingBox();
   expect(folded.after.x).toBeCloseTo(loopBounds.x + loopBounds.width, 0);
   await expect(repeatFold).toHaveAttribute("data-time-start", String(waits[0].t1.value));
-  // The last 16 ns remain visible around the following update's boundary.
-  await expect(repeatFold).toHaveAttribute("data-time-end", String(loop.t1.value - 16));
+  await expect(repeatFold).toHaveAttribute("data-time-end", String(loop.t1.value));
   for (const wait of waits.slice(1)) await expect(row.locator(`.timeline-block[data-event-id="${wait.id}"]`)).toHaveCount(0);
   await page.screenshot({path: test.info().outputPath("wait-end-and-repeats.png"), fullPage: true});
   await waitToggle.click();
@@ -678,4 +685,254 @@ test("full golden execution compresses explicit waits and keeps nested loops fol
     expect(await page.evaluate(() => window.getSavedTimelineState().timelineExpandedGaps)).toEqual([]);
   }
   expect(await page.evaluate(() => document.getElementById("timeline-ir").textContent)).toEqual(original);
+});
+
+test("Q1 packet markers connect only their RT execution across selection, layout and folding", async ({page}) => {
+  const ir = {sequencers: [{id: "seq"}], playback: {status: "completed", steps: 4}, events: [
+    event("setter", "q1_issue", 4000, 4004, {op: "set_freq"}),
+    {...event("pending", "latched_state_pending", 4004, 4004,
+      {field: "frequency", value: 100, q1_issue_event_id: "setter"}), lane: "state.pending"},
+    event("issue", "q1_issue", 5004, 5008, {op: "play", rt_packet_id: "packet"}),
+    event("move", "q1_issue", 5008, 5012, {op: "move"}),
+    event("other-issue", "q1_issue", 8000, 8004, {op: "play", rt_packet_id: "other"}),
+    event("wait", "wait", 0, 10000),
+    ...[0, 1].map((path) => ({...event(`path${path}`, "play", 10000, 10100,
+      {path, rt_packet_id: "packet", q1_issue_event_id: "issue", applied_state: {frequency: 100},
+        applied_setter_event_ids: {frequency: "pending"}}), lane: `rt.path${path}`})),
+    event("other-rt", "play", 10100, 10200, {rt_packet_id: "other", q1_issue_event_id: "other-issue"}),
+  ]};
+  const saved = {timelineFoldStateVersion: 2, timelineFoldSnapshotId: "markers", timelineWaitsCollapsed: false};
+  const host = {playbackSnapshotId: "markers"};
+  await mount(page, "completed", ir, saved, host);
+  const marker = page.locator('.timeline-issue-marker[data-event-id="issue"]');
+  const rt = page.locator('.timeline-block[data-event-ids~="path0"]');
+  const other = page.locator('.timeline-block[data-event-id="other-rt"]');
+  const lines = page.locator('.issue-connector');
+  const time = page.getByRole("spinbutton", {name: "Selected time in nanoseconds"});
+  async function expectEndpoints() {
+    await expect(lines).toHaveCount(1);
+    await expect.poll(() => page.evaluate(() => {
+      const line = document.querySelector('.issue-connector');
+      if (!line) return Infinity;
+      const matrix = line.getScreenCTM();
+      const start = line.getPointAtLength(0).matrixTransform(matrix);
+      const end = line.getPointAtLength(line.getTotalLength()).matrixTransform(matrix);
+      const issue = document.querySelector('.timeline-issue-marker[data-event-id="issue"]').getBoundingClientRect();
+      const rt = document.querySelector('.timeline-block[data-event-ids~="path0"]').getBoundingClientRect();
+      return Math.max(Math.abs(start.x - issue.left), Math.abs(end.x - rt.left));
+    })).toBeLessThanOrEqual(1);
+  }
+  await expect(marker).toHaveAttribute("data-issue-marker", "true");
+  expect((await marker.getAttribute("data-rt-event-ids")).split(/\s+/).sort()).toEqual(["path0", "path1"]);
+  await expect(marker).toHaveText("");
+  await expect(marker).toHaveAccessibleName(/Issue play.*Q1 instruction start:.*5004/);
+  const markerBounds = await marker.boundingBox();
+  const nextBounds = await page.locator('.timeline-block[data-event-id="move"]').boundingBox();
+  expect(markerBounds.x + markerBounds.width).toBeLessThanOrEqual(nextBounds.x + 0.05);
+  await expect(rt).toHaveCount(1);
+  // Use instruction slots for pointer input when the full time extent makes a 4 ns issue subpixel.
+  await page.getByRole("button", {name: "Instruction", exact: true}).click();
+  await marker.click();
+  await expect(rt).toHaveClass(/is-instruction-related/);
+  await expect(page.locator('.timeline-block.is-instruction-related')).toHaveCount(1);
+  await expect(other).not.toHaveClass(/is-instruction-related/);
+  await expect(time).toHaveValue("5004");
+  await expectEndpoints();
+  await rt.click();
+  await expect(marker).toHaveClass(/is-instruction-related/);
+  await expect(page.locator('.timeline-issue-marker[data-event-id="other-issue"]')).not.toHaveClass(/is-instruction-related/);
+  await expectEndpoints();
+  await page.locator('.timeline-block[data-event-id="setter"]').click();
+  await expect(rt).toHaveClass(/is-parameter-apply/);
+  await expect(lines).toHaveCount(0);
+  await page.locator('.timeline-block[data-event-id="move"]').click();
+  await expect(lines).toHaveCount(0);
+  for (const key of ["Enter", "Space"]) {
+    await marker.focus();
+    await marker.press(key);
+    await expect(marker).toBeFocused();
+    await expect(marker).toHaveAttribute("aria-selected", "true");
+    await expectEndpoints();
+  }
+  for (const layout of ["Instruction", "Time scale"]) {
+    await page.getByRole("button", {name: layout, exact: true}).evaluate((button) => button.click());
+    await expect(marker).toBeFocused();
+    await expectEndpoints();
+  }
+  await page.setViewportSize({width: 1000, height: 1000});
+  await expect(marker).toBeFocused();
+  await expectEndpoints();
+  await page.locator('#q1timeline-wait-fold-button').evaluate((button) => button.click());
+  await expect(page.locator('#q1timeline-wait-fold-button')).toHaveAttribute("aria-pressed", "true");
+  await expect(marker).toBeFocused();
+  await expectEndpoints();
+  await expect(time).toHaveValue("5004");
+  await page.screenshot({path: test.info().outputPath("packet-marker-folded-connection.png"), fullPage: true});
+
+  await mount(page, "completed", ir, {...saved, timelineTimeBasis: "local", timelineWindow: {
+    min: 5005, max: 10200, fullMin: 0, fullMax: 10200, basis: "local",
+  }}, host);
+  await expect(marker).toHaveCount(0);
+  await rt.click();
+  await expect(rt).toHaveAttribute("aria-selected", "true");
+  await expect(lines).toHaveCount(0);
+  expect(await page.evaluate(() => JSON.parse(document.getElementById("timeline-ir").textContent))).toEqual(ir);
+});
+
+test("packet selection follows exact repeated play occurrences from a real playback trace", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const ir = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json", "from q1timeline.playback import PlaybackSession",
+    "session=PlaybackSession({'seq':('issue-loop.q1asm','wait_sync 4\\nmove 2,R0\\nagain:\\nplay 0,0,100\\nloop R0,@again\\nstop')})",
+    "session.run(budget_ms=1000,max_steps=30)", "print(json.dumps(session.snapshot()))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const issues = ir.events.filter((item) => item.kind === "q1_issue" && item.meta.op === "play");
+  expect(issues).toHaveLength(2);
+  expect(issues[0].source).toEqual(issues[1].source);
+  expect(issues[0].id).not.toEqual(issues[1].id);
+  const loop = ir.events.find((item) => item.kind === "loop_block");
+  await mount(page, ir.playback.status, ir);
+  await expect(page.locator(`.timeline-issue-marker[data-event-id="${issues[1].id}"]`)).toHaveCount(0);
+  await page.locator(`.timeline-loop-range[data-event-id="${loop.id}"]`).click();
+  await page.getByRole("button", {name: "Expand executed iterations", exact: true}).click();
+  for (const issue of issues) {
+    const targets = ir.events.filter((item) => item.kind === "play" && item.meta.q1_issue_event_id === issue.id);
+    expect(targets).toHaveLength(2);
+    const marker = page.locator(`.timeline-issue-marker[data-event-id="${issue.id}"]`);
+    const rt = page.locator(`.timeline-block[data-event-ids~="${targets[0].id}"]`);
+    expect((await marker.getAttribute("data-rt-event-ids")).split(/\s+/).sort()).toEqual(targets.map((item) => item.id).sort());
+    await marker.click();
+    await expect(page.locator('.timeline-block.is-instruction-related')).toHaveCount(1);
+    await expect(rt).toHaveClass(/is-instruction-related/);
+    await expect(page.locator('.issue-connector')).toHaveCount(1);
+    await expect(page.getByRole("spinbutton", {name: "Selected time in nanoseconds"})).toHaveValue(String(issue.t0.value));
+    await rt.click();
+    await expect(marker).toHaveClass(/is-instruction-related/);
+    await expect(page.locator('.timeline-issue-marker.is-instruction-related')).toHaveCount(1);
+    await expect(page.locator('.issue-connector')).toHaveCount(1);
+  }
+  await page.screenshot({path: test.info().outputPath("packet-markers-real-loop-occurrences.png"), fullPage: true});
+  expect(await page.evaluate(() => JSON.parse(document.getElementById("timeline-ir").textContent))).toEqual(ir);
+});
+
+test("latched parameter circles apply at the RT cursor boundary without adding a lane", async ({page}) => {
+  const ir = {sequencers: [{id: "seq"}], playback: {status: "completed", steps: 4}, events: [
+    event("initial", "upd_param", 0, 4, {applied_state: {frequency: 20}}),
+    event("setter", "q1_issue", 5000, 5004, {op: "set_freq"}),
+    {...event("pending", "latched_state_pending", 5000, 5000,
+      {field: "frequency", value: 50, q1_issue_event_id: "setter"}), lane: "state.pending"},
+    event("issue", "q1_issue", 5004, 5008, {op: "play", rt_packet_id: "packet"}),
+    event("move", "q1_issue", 5008, 5012, {op: "move"}),
+    event("wait", "wait", 4, 10000),
+    ...[0, 1].map((path) => ({...event(`path${path}`, "play", 10000, 10100,
+      {path, rt_packet_id: "packet", q1_issue_event_id: "issue", applied_state: {frequency: 50},
+        applied_setter_event_ids: {frequency: "pending"}}), lane: `rt.path${path}`})),
+  ]};
+  const saved = {timelineFoldStateVersion: 2, timelineFoldSnapshotId: "latched", timelineWaitsCollapsed: false};
+  const host = {playbackSnapshotId: "latched"};
+  await mount(page, "completed", ir, saved, host);
+  const pending = page.locator('.timeline-parameter-marker[data-parameter-role="pending"][data-event-id="setter"]');
+  const applied = page.locator('.timeline-parameter-marker[data-parameter-role="applied"]');
+  const setter = page.locator('.timeline-block[data-event-id="setter"]');
+  const rt = page.locator('.timeline-block[data-event-ids~="path0"]');
+  const time = page.getByRole("spinbutton", {name: "Selected time in nanoseconds"});
+  const lines = page.locator('.parameter-connector');
+  const rows = await page.locator('.timeline-row').evaluateAll((nodes) => nodes.map((node) => node.dataset.lane));
+  expect(rows).toContain("sequencer:seq:q1_issue");
+  expect(rows.every((lane) => !/gain|frequency|parameter|latched/i.test(lane))).toBe(true);
+  await expect(pending).toHaveCount(1);
+  await expect(applied).toHaveCount(1);
+  await expect(pending).toHaveAttribute("data-parameter-time", "5004");
+  await expect(applied).toHaveAttribute("data-parameter-time", "10000");
+  await expect(pending).toHaveText("");
+  await expect(applied).toHaveText("");
+  await expect(lines).toHaveCount(0);
+  for (const [cursor, isApplied] of [[5003, false], [5004, false], [9999, false], [10000, true], [10001, true], [9999, false]]) {
+    await time.fill(String(cursor));
+    await time.dispatchEvent("change");
+    if (isApplied) await expect(applied).toHaveClass(/is-applied/);
+    else await expect(applied).not.toHaveClass(/is-applied/);
+    await expect(pending).not.toHaveClass(/is-applied/);
+  }
+  await page.getByRole("button", {name: "Instruction", exact: true}).click();
+  await pending.click();
+  await expect(setter).toHaveAttribute("aria-selected", "true");
+  await expect(rt).toHaveClass(/is-parameter-apply/);
+  await expect(lines).toHaveCount(1);
+  await expect(page.locator('.issue-connector')).toHaveCount(0);
+  await expect(page.locator('.parameter-connection-label')).toContainText("20");
+  await expect(page.locator('.parameter-connection-label')).toContainText("50");
+  for (const key of ["Enter", "Space"]) {
+    await pending.focus();
+    await pending.press(key);
+    await expect(setter).toHaveAttribute("aria-selected", "true");
+    await expect(lines).toHaveCount(1);
+  }
+  for (const layout of ["Time scale", "Instruction"]) {
+    await page.getByRole("button", {name: layout, exact: true}).evaluate((button) => button.click());
+    await expect(lines).toHaveCount(1);
+    await time.fill("10000");
+    await time.dispatchEvent("change");
+    await expect(applied).toHaveClass(/is-applied/);
+  }
+  await page.setViewportSize({width: 1000, height: 1000});
+  // The RT instruction slot is now outside the horizontal viewport.
+  await expect(lines).toHaveCount(0);
+  await page.getByRole("button", {name: "Time scale", exact: true}).evaluate((button) => button.click());
+  await expect(lines).toHaveCount(1);
+  await page.locator('#q1timeline-wait-fold-button').evaluate((button) => button.click());
+  await expect(lines).toHaveCount(1);
+  await expect(applied).toHaveClass(/is-applied/);
+  await page.screenshot({path: test.info().outputPath("latched-parameter-applied.png"), fullPage: true});
+  await rt.click();
+  await expect(lines).toHaveCount(0);
+  await expect(page.locator('.issue-connector')).toHaveCount(1);
+  await page.locator('.timeline-block[data-event-id="move"]').click();
+  await expect(lines).toHaveCount(0);
+  await expect(page.locator('.parameter-connection-label')).toHaveCount(0);
+  expect(await page.locator('.timeline-row').evaluateAll((nodes) => nodes.map((node) => node.dataset.lane))).toEqual(rows);
+
+  await mount(page, "completed", ir, {...saved, timelineTimeBasis: "local", timelineWindow: {
+    min: 5005, max: 10100, fullMin: 0, fullMax: 10100, basis: "local",
+  }}, host);
+  await expect(pending).toHaveCount(0);
+  await rt.click();
+  await expect(lines).toHaveCount(0);
+  expect(await page.evaluate(() => JSON.parse(document.getElementById("timeline-ir").textContent))).toEqual(ir);
+});
+
+test("an older queued parameter applies while a newer setter remains independently pending", async ({page}) => {
+  const ir = {sequencers: [{id: "seq"}], playback: {status: "completed", steps: 4}, events: [
+    ...[1, 2].flatMap((index) => [event(`setter${index}`, "q1_issue", index * 4, index * 4 + 4, {op: "set_freq"}),
+      {...event(`pending${index}`, "latched_state_pending", index * 4 + 4, index * 4 + 4,
+        {field: "frequency", value: index * 100, q1_issue_event_id: `setter${index}`}), lane: "state.pending"},
+      event(`issue${index}`, "q1_issue", 12 + index * 4, 16 + index * 4, {op: "upd_param", rt_packet_id: `packet${index}`}),
+      event(`rt${index}`, "upd_param", 96 + index * 4, 100 + index * 4,
+        {rt_packet_id: `packet${index}`, q1_issue_event_id: `issue${index}`, applied_state: {frequency: index * 100},
+          applied_setter_event_ids: {frequency: `pending${index}`}})]),
+    event("wait", "wait", 0, 100),
+  ]};
+  await mount(page, "completed", ir, {timelineWaitsCollapsed: false});
+  await page.getByRole("button", {name: "Instruction", exact: true}).click();
+  const marker = (id) => page.locator(`.timeline-parameter-marker[data-event-id="${id}"]`);
+  const time = page.getByRole("spinbutton", {name: "Selected time in nanoseconds"});
+  await time.fill("100");
+  await time.dispatchEvent("change");
+  await expect(marker("rt1")).toHaveClass(/is-applied/);
+  await expect(marker("rt2")).not.toHaveClass(/is-applied/);
+  for (const index of [1, 2]) {
+    await marker(`setter${index}`).click();
+    await expect(page.locator('.parameter-connector')).toHaveCount(1);
+    await expect(page.locator(`.timeline-block[data-event-id="rt${index}"]`)).toHaveClass(/is-parameter-apply/);
+    await expect(page.locator(`.timeline-block[data-event-id="rt${index === 1 ? 2 : 1}"]`)).not.toHaveClass(/is-parameter-apply/);
+    const data = JSON.parse(await marker(`setter${index}`).getAttribute("data-parameter-changes"));
+    expect(data[0].applyEventIds).toEqual([`rt${index}`]);
+  }
+  await time.fill("104");
+  await time.dispatchEvent("change");
+  await expect(marker("rt2")).toHaveClass(/is-applied/);
+  await time.fill("103");
+  await time.dispatchEvent("change");
+  await expect(marker("rt2")).not.toHaveClass(/is-applied/);
+  expect(await page.evaluate(() => JSON.parse(document.getElementById("timeline-ir").textContent))).toEqual(ir);
 });

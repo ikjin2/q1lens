@@ -1,10 +1,13 @@
 (function (root, factory) {
-  const api = factory();
+  const instructionColors = typeof module === "object" && module.exports
+    ? require("../../../shared/timeline/instructionColors.js")
+    : root.q1asmInstructionColors;
+  const api = factory(instructionColors);
   if (typeof module === "object" && module.exports) {
     module.exports = api;
   }
   root.qbsTimelineModel = api;
-})(typeof globalThis !== "undefined" ? globalThis : window, function () {
+})(typeof globalThis !== "undefined" ? globalThis : window, function (instructionColors) {
   const LOGICAL_CONTROL_FLOW_STEP_DURATION = 1e-9;
   const BLOCK_STACK_TOP_PX = 7;
   const BLOCK_STACK_HEIGHT_PX = 22;
@@ -851,40 +854,7 @@
   }
 
   function q1asmOpcode(lineText) {
-    const uncommented = String(lineText || "").split("#")[0].trim();
-    return uncommented.split(/\s+/)[0] || "";
-  }
-
-  function q1CommandAccentColor(instruction) {
-    const op = String(instruction || "").toLowerCase();
-    if (op === "play" || op === "play_pulse") {
-      return "#8bcf9a";
-    }
-    if (op === "wait" || op === "wait_sync" || op === "wait_trigger") {
-      return "#b9a7dc";
-    }
-    if (op === "acquire" || op.startsWith("acquire_")) {
-      return "#e2b36f";
-    }
-    if (op === "upd_param" || op === "upd_thres") {
-      return "#bfd87a";
-    }
-    if (op === "feedback_pop" || op === "feedback_com" || op.startsWith("fb_")) {
-      return "#ff6fb3";
-    }
-    if (op === "set_mrk" || op === "set_marker") {
-      return "#f0c36a";
-    }
-    if (op.startsWith("set_") || op === "reset_ph") {
-      return "#6ec6d9";
-    }
-    if (op === "loop" || op === "jmp" || /^j[a-z]+$/.test(op)) {
-      return "#f4a261";
-    }
-    if (["move", "add", "sub", "and", "or", "xor", "asl", "asr"].includes(op)) {
-      return "#80b7ff";
-    }
-    return "#8bcf9a";
+    return instructionColors.commandToken(lineText);
   }
 
   function q1asmEventLineForMapping(mapping) {
@@ -1063,7 +1033,7 @@
     const line = q1timelineEventLine(event) || provenanceStartLine(mapping);
     const lineLabel = lineRangeLabel(line, line);
     const q1asmText = q1timelineEventRaw(event) || q1asmLineTextAt(q1asmTextForMapping(ir, mapping), line);
-    const instruction = q1asmOpcode(q1asmText) || event?.kind || event?.label || "Q1ASM";
+    const instruction = instructionColors.eventCommandToken({ ...event, source: { ...event?.source, raw: q1asmText } }) || event?.label || "Q1ASM";
     const eventId = event?.id || `${line}:${instruction}:${span.start}`;
     const leftRatio = (span.start - timelineStart) / timelineSpan;
     const widthRatio = (span.end - span.start) / timelineSpan;
@@ -1083,7 +1053,7 @@
       instruction,
       label: event?.label || instruction,
       detail: `L${lineLabel}`,
-      accentColor: q1CommandAccentColor(instruction),
+      accentColor: instructionColors.commandAccentColor(instruction),
       q1asmSourceMessage: {
         type: "openQ1AsmSource",
         sequencer: q1timelineEventSequencer(event) || mapping.sequencer,
@@ -1165,7 +1135,7 @@
       instruction,
       label: instruction,
       detail: `L${lineLabel}`,
-      accentColor: q1CommandAccentColor(instruction),
+      accentColor: instructionColors.commandAccentColor(instruction),
       q1asmSourceMessage: {
         type: "openQ1AsmSource",
         sequencer: mapping.sequencer,

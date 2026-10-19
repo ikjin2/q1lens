@@ -61,6 +61,9 @@ export class TimelinePanel {
       const sharedScriptUri = this.panel.webview.asWebviewUri(
         vscode.Uri.joinPath(this.extensionUri, "out", "src", "shared", "timeline", "renderer.js"),
       );
+      const instructionColorsScriptUri = this.panel.webview.asWebviewUri(
+        vscode.Uri.joinPath(this.extensionUri, "out", "src", "shared", "timeline", "instructionColors.js"),
+      );
       const cssUri = this.panel.webview.asWebviewUri(
         vscode.Uri.joinPath(this.extensionUri, "out", "src", "qbs", "webview", "assets", "timeline.css"),
       );
@@ -77,6 +80,7 @@ export class TimelinePanel {
         cssUri: cssUri.toString(),
         cspSource: this.panel.webview.cspSource,
         sharedScriptUri: sharedScriptUri.toString(),
+        instructionColorsScriptUri: instructionColorsScriptUri.toString(),
         modelScriptUri: modelScriptUri.toString(),
         scriptUri: scriptUri.toString(),
         nonce,

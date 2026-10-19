@@ -4,6 +4,7 @@ export interface WebviewHtmlInput {
   cssUri: string;
   cspSource: string;
   sharedScriptUri?: string;
+  instructionColorsScriptUri: string;
   modelScriptUri: string;
   scriptUri: string;
   nonce: string;
@@ -40,6 +41,7 @@ export function buildWebviewHtml(input: WebviewHtmlInput): string {
     <button id="refresh-button" type="button" aria-label="Refresh timeline">Refresh</button>
   </header>
   <main id="qbs-root" class="timeline-shell" aria-live="polite"></main>
+  <script nonce="${input.nonce}" src="${input.instructionColorsScriptUri}"></script>
   ${input.sharedScriptUri ? `<script nonce="${input.nonce}" src="${input.sharedScriptUri}"></script>` : ""}
   <script nonce="${input.nonce}" src="${input.modelScriptUri}"></script>
   <script nonce="${input.nonce}" src="${input.scriptUri}"></script>

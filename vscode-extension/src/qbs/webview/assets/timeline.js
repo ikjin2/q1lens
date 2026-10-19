@@ -3,6 +3,7 @@ const root = document.getElementById("qbs-root");
 const refreshButton = document.getElementById("refresh-button");
 const timelineModel = window.qbsTimelineModel;
 const sharedTimeline = window.q1lensSharedTimeline || {};
+const instructionColors = window.q1asmInstructionColors;
 
 let currentIr = null;
 let currentSourceContext = null;
@@ -289,6 +290,27 @@ function renderInlineQ1LaneToggle(lane) {
   return toggle;
 }
 
+function renderBlockLabel(block) {
+  const text = String(block.label || "");
+  const label = element("span", "block-label");
+  const tokens = block.accentColor ? instructionColors.sourceTokens(text) : [];
+  const command = tokens.find((token) => token.kind === "command");
+  if (!command || command.start !== 0 || command.family === "unknown") {
+    label.textContent = text;
+    return label;
+  }
+  let offset = 0;
+  for (const token of tokens) {
+    if (token.start > offset) label.appendChild(element("span", "", text.slice(offset, token.start)));
+    const node = element("span", token.kind === "command" ? "q1asm-opcode" : `q1asm-argument q1asm-argument-${token.kind}`, text.slice(token.start, token.end));
+    if (token.kind !== "command") node.style.color = instructionColors.argumentAccentColor(token.kind);
+    label.appendChild(node);
+    offset = token.end;
+  }
+  if (offset < text.length) label.appendChild(element("span", "", text.slice(offset)));
+  return label;
+}
+
 function renderBlock(block, selectedInspectorId) {
   const visualKind = block.visualKind || block.type;
   const selectionId = block.sourceBlockId || block.id;
@@ -310,6 +332,7 @@ function renderBlock(block, selectedInspectorId) {
   node.style.left = `${block.leftPercent}%`;
   node.style.width = `${block.widthPercent}%`;
   if (block.accentColor) {
+    node.classList.add("has-command-color");
     node.style.setProperty("--timeline-block-accent", block.accentColor);
   }
   node.setAttribute("aria-selected", block.selected ? "true" : "false");
@@ -338,7 +361,7 @@ function renderBlock(block, selectedInspectorId) {
   if (Number.isFinite(block.topPx)) {
     node.style.top = `${block.topPx}px`;
   }
-  node.appendChild(element("span", "block-label", block.label));
+  node.appendChild(renderBlockLabel(block));
   node.appendChild(element("span", "block-detail", block.detail || block.durationLabel || ""));
   return node;
 }
@@ -464,6 +487,28 @@ function renderInspectorBody(inspector) {
   return renderRows(inspector.rows || []);
 }
 
+function renderQ1asmSourceLine(raw) {
+  const text = raw || " ";
+  const code = element("code", "q1asm-line-text");
+  const tokens = instructionColors.sourceTokens(text);
+  if (!tokens.length) {
+    code.textContent = text;
+    return code;
+  }
+  let offset = 0;
+  for (const token of tokens) {
+    if (token.start > offset) code.appendChild(element("span", "", text.slice(offset, token.start)));
+    const value = text.slice(token.start, token.end);
+    const isCommand = token.kind === "command";
+    const node = element("span", isCommand ? "q1asm-opcode" : `q1asm-argument q1asm-argument-${token.kind}`, value);
+    node.style.color = isCommand ? instructionColors.commandAccentColor(value) : instructionColors.argumentAccentColor(token.kind);
+    code.appendChild(node);
+    offset = token.end;
+  }
+  if (offset < text.length) code.appendChild(element("span", "", text.slice(offset)));
+  return code;
+}
+
 function renderQ1asmDrilldown(drilldown) {
   const panel = element("div", "q1asm-drilldown");
   if (!drilldown) {
@@ -494,7 +539,7 @@ function renderQ1asmDrilldown(drilldown) {
     const row = element("div", "q1asm-line");
     row.dataset.highlighted = line.highlighted ? "true" : "false";
     row.appendChild(element("span", "q1asm-line-number", String(line.number)));
-    row.appendChild(element("code", "q1asm-line-text", line.text || " "));
+    row.appendChild(renderQ1asmSourceLine(line.text));
     lines.appendChild(row);
   }
   panel.appendChild(lines);

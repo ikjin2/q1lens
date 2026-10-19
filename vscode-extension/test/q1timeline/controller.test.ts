@@ -80,12 +80,17 @@ function createMockVscode() {
     },
     Range: class {
       constructor(public startLine: any, public startColumn: any, public endLine?: any, public endColumn?: any) {}
+      get start() { return typeof this.startLine === "number" ? { line: this.startLine, character: this.startColumn } : this.startLine; }
+      get end() { return typeof this.startLine === "number" ? { line: this.endLine, character: this.endColumn } : this.startColumn; }
     },
     Position: class {
       constructor(public line: number, public character: number) {}
     },
     Selection: class {
       constructor(public anchor: any, public active: any) {}
+      get start() { return this.anchor; }
+      get end() { return this.active; }
+      get isEmpty() { return this.anchor.line === this.active.line && this.anchor.character === this.active.character; }
     },
     TextEditorRevealType: { InCenter: 1 },
     Diagnostic: class {
@@ -162,6 +167,48 @@ function sourceSelection(startLine = 2, endLine = 4, endCharacter = 0, backwards
   const end = { line: endLine, character: endCharacter };
   return { start, end, anchor: backwards ? end : start, active: backwards ? start : end,
     isEmpty: startLine === endLine && endCharacter === 0 };
+}
+
+function loopSourceNavigation(vscode: any, TimelineController: any, lines: string[]) {
+  const sourcePath = "C:\\repo\\q1asm\\seq0.q1asm";
+  const posted: any[] = [];
+  const decorated: any[] = [];
+  const revealed: any[] = [];
+  let selectionHandler: any;
+  let activeHandler: any;
+  vscode.TextEditorSelectionChangeKind = { Keyboard: 1, Mouse: 2, Command: 3 };
+  vscode.window.onDidChangeTextEditorSelection = (handler: any) => { selectionHandler = handler; return { dispose() {} }; };
+  vscode.window.onDidChangeActiveTextEditor = (handler: any) => { activeHandler = handler; return { dispose() {} }; };
+  const document = {
+    uri: vscode.Uri.file(sourcePath), version: 1, isDirty: false, lineCount: lines.length,
+    lineAt(line: number) {
+      assert.ok(line >= 0 && line < lines.length, `line ${line} is outside the source document`);
+      return { text: lines[line], range: new vscode.Range(line, 0, line, lines[line].length) };
+    },
+  };
+  let selection: any = sourceSelection(0, 0, 0);
+  const editor = {
+    document, viewColumn: 1,
+    setDecorations(_type: any, ranges: any[]) { decorated.push(ranges); },
+    revealRange(range: any) { revealed.push(range); },
+    get selection() { return selection; },
+    set selection(value) { selection = value; selectionHandler({ textEditor: editor, kind: 3 }); },
+  };
+  vscode.workspace.textDocuments = [document];
+  vscode.window.visibleTextEditors = [editor];
+  vscode.window.activeTextEditor = editor;
+  vscode.window.showTextDocument = async () => { activeHandler(editor); return editor; };
+  const controller = new TimelineController(createContext());
+  controller.projectUri = vscode.Uri.file("C:\\repo\\q1timeline.yml");
+  controller.projectRelatedPaths = new Set([sourcePath]);
+  controller.panel = { webview: { postMessage: (message: any) => posted.push(message) }, dispose() {} };
+  controller.webviewReady = true;
+  return {
+    controller, editor, document, sourcePath, posted, decorated, revealed,
+    source: (line: number, extra: any = {}) => ({ file: sourcePath, line, column: 1, ...extra }),
+    selectionEvent: (kind?: number) => selectionHandler({ textEditor: editor, kind }),
+    activeEvent: () => activeHandler(editor),
+  };
 }
 
 async function withFakeTimers(callback: (clock: any) => Promise<void>) {
@@ -471,12 +518,14 @@ describe("q1timeline controller", () => {
       assert.match(html, /timeline\.css\?v=abc123/);
       assert.match(html, /renderer\.js\?v=abc123/);
       assert.match(html, /timelineAdapter\.js\?v=abc123/);
+      assert.match(html, /instructionColors\.js\?v=abc123/);
       assert.match(html, /hardwareView\.css\?v=abc123/);
       assert.match(html, /hardwareState\.js\?v=abc123/);
       assert.match(html, /hardwareView\.js\?v=abc123/);
       assert.match(html, /timeline\.js\?v=abc123/);
       assert.ok(html.indexOf("renderer.css?v=abc123") < html.indexOf("timeline.css?v=abc123"));
       assert.ok(html.indexOf("renderer.js?v=abc123") < html.indexOf("timelineAdapter.js?v=abc123"));
+      assert.ok(html.indexOf("instructionColors.js?v=abc123") < html.indexOf("timelineAdapter.js?v=abc123"));
       assert.ok(html.indexOf("timelineAdapter.js?v=abc123") < html.indexOf("hardwareState.js?v=abc123"));
       assert.ok(html.indexOf("hardwareState.js?v=abc123") < html.indexOf("hardwareView.js?v=abc123"));
       assert.ok(html.indexOf("hardwareView.js?v=abc123") < html.indexOf("timeline.js?v=abc123"));
@@ -2937,6 +2986,141 @@ describe("q1timeline controller", () => {
       );
       controller.dispose();
     });
+  });
+
+  it("selects full loop source lines including labels and the closing comment", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      for (const scenario of [
+        { lines: [".DEF COUNT 3", "move 3,R0", "body:", "# loop body", "", "  wait 4", "  loop R0,@body # closing comment", "stop"],
+          first: 6, last: 7, selectedFirst: 3, startMetadata: true },
+        { lines: ["move 3,R0", "body: wait 4", "loop R0,@body # end of file"],
+          first: 2, last: 3, selectedFirst: 2, startMetadata: false, textOnly: true },
+      ]) {
+        const setup = loopSourceNavigation(vscode, TimelineController, scenario.lines);
+        const { controller, source, editor, decorated, revealed } = setup;
+        if (scenario.textOnly) {
+          const lineAt = setup.document.lineAt;
+          setup.document.lineAt = (line) => ({ text: lineAt(line).text });
+        }
+        controller.timelineIr = {
+          source_map: { by_event_id: { loop: source(1) } },
+          events: [{ id: "loop", kind: "loop_block", source: source(scenario.first, { column: 3 }), meta: {
+            ...(scenario.startMetadata ? { source_start: source(scenario.first) } : {}), source_end: source(scenario.last),
+          } }],
+        };
+        await controller.openSourceForEvent("loop");
+        assert.deepEqual([editor.selection.start.line, editor.selection.start.character, editor.selection.end.line, editor.selection.end.character],
+          [scenario.selectedFirst - 1, 0, scenario.last - 1, scenario.lines[scenario.last - 1].length]);
+        assert.equal(editor.selection.isEmpty, false);
+        assert.equal(decorated.at(-1)[0], revealed.at(-1), "decoration and reveal must use the same full loop range");
+        assert.deepEqual([revealed.at(-1).start.line, revealed.at(-1).end.line], [scenario.selectedFirst - 1, scenario.last - 1]);
+        assert.deepEqual(setup.posted, [], "loop navigation must retain the clicked timeline event");
+        controller.dispose();
+      }
+    });
+  });
+
+  it("selects independent inner and outer loop extents for static and playback summaries", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      for (const playback of [false, true]) {
+        const lines = ["move 3,R0", "outer: wait 4", "move 2,R1", "inner:", "// inner body", "play 0,1,4", "loop R1,@inner", "loop R0,@outer # end"];
+        const { controller, source, editor } = loopSourceNavigation(vscode, TimelineController, lines);
+        controller.timelineIr = { events: [
+          { id: "inner", kind: "loop_block", source: source(6), meta: { playback, source_start: source(6), source_end: source(7) } },
+          { id: "outer", kind: "loop_block", source: source(2), meta: { playback, source_start: source(2), source_end: source(8) } },
+          { id: "opcode", kind: "q1_issue", source: source(7, { column: 4 }), meta: { op: "loop", source_start: source(6), source_end: source(7) } },
+        ] };
+        await controller.openSourceForEvent("inner");
+        assert.deepEqual([editor.selection.start.line, editor.selection.end.line, editor.selection.end.character], [3, 6, lines[6].length]);
+        await controller.openSourceForEvent("outer");
+        assert.deepEqual([editor.selection.start.line, editor.selection.end.line, editor.selection.end.character], [1, 7, lines[7].length]);
+        await controller.openSourceForEvent("opcode");
+        assert.equal(editor.selection.isEmpty, true, "the actual loop opcode keeps point navigation");
+        assert.deepEqual([editor.selection.active.line, editor.selection.active.character], [6, 3]);
+        controller.dispose();
+      }
+    });
+  });
+
+  it("unions reversed playback loop endpoints with explicit same-sequencer member sources", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const lines = ["move 3,R0", "latch: sub R0,1,R0", "jnz @body", "stop", "setup: move 1,R1", "jmp @body", "# gap", "body: wait 4", "jmp @latch # closing edge"];
+      const { controller, source, sourcePath, editor } = loopSourceNavigation(vscode, TimelineController, lines);
+      controller.timelineIr = {
+        source_map: { by_event_id: { loop: source(1) } },
+        events: [
+          { id: "loop", kind: "loop_block", sequencer_id: "seq0", source: source(8), meta: {
+            playback: true, source_start: source(8), source_end: source(3),
+            first_iteration_event_ids: ["latch"], playback_event_ids: ["branch", "body", "edge", "other-sequencer", "other-file"],
+          } },
+          ...[["latch", 2], ["branch", 3], ["body", 8], ["edge", 9]].map(([id, line]) => ({ id, sequencer_id: "seq0", source: source(line) })),
+          { id: "other-sequencer", sequencer_id: "seq1", source: source(1) },
+          { id: "other-file", sequencer_id: "seq0", source: { file: `${sourcePath}.other`, line: 20 } },
+          { id: "unrelated", sequencer_id: "seq0", source: source(1) },
+        ],
+      };
+      await controller.openSourceForEvent("loop");
+      assert.deepEqual([editor.selection.start.line, editor.selection.start.character, editor.selection.end.line, editor.selection.end.character],
+        [1, 0, 8, lines[8].length]);
+      controller.dispose();
+    });
+  });
+
+  it("keeps point navigation when loop source metadata is missing, malformed or crosses files", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const { controller, source, editor } = loopSourceNavigation(vscode, TimelineController,
+        ["move 3,R0", "body: wait 4", "loop R0,@body", "stop"]);
+      for (const meta of [
+        {}, { source_start: source(2) }, { source_start: source(0), source_end: source(3) },
+        { source_start: source(2), source_end: source(2.5) },
+        { source_start: { file: 4, line: 2 }, source_end: source(3) },
+        { source_start: source(2), source_end: { file: "other.q1asm", line: 3 } },
+      ]) {
+        controller.timelineIr = {
+          source_map: { by_event_id: { loop: source(4, { column: 3 }) } },
+          events: [{ id: "loop", kind: "loop_block", source: source(2), meta }],
+        };
+        await controller.openSourceForEvent("loop");
+        assert.equal(editor.selection.isEmpty, true);
+        assert.deepEqual([editor.selection.active.line, editor.selection.active.character], [3, 2]);
+      }
+      controller.dispose();
+    });
+  });
+
+  it("suppresses delayed full-loop source selection echoes without automatic timeline zoom", async () => {
+    const vscode = createMockVscode();
+    await withFakeTimers(async (clock) => withMockedVscode(vscode, async ({ TimelineController }) => {
+      const setup = loopSourceNavigation(vscode, TimelineController, ["move 3,R0", "body:", "wait 4", "loop R0,@body"]);
+      const { controller, source, sourcePath, editor, posted } = setup;
+      controller.timelineIr = {
+        source_map: { by_source: { [`${sourcePath}:3`]: ["wait"], [`${sourcePath}:4`]: ["opcode"] } },
+        events: [
+          { id: "loop", kind: "loop_block", source: source(3), meta: { source_start: source(3), source_end: source(4) } },
+          { id: "wait", source: source(3) }, { id: "opcode", source: source(4) },
+        ],
+      };
+      editor.selection = sourceSelection(2, 3, 1);
+      clock.advance(100);
+      await controller.openSourceForEvent("loop");
+      setup.activeEvent();
+      setup.selectionEvent(vscode.TextEditorSelectionChangeKind.Command);
+      setup.selectionEvent();
+      clock.advance(1000);
+      assert.deepEqual(posted, []);
+      assert.equal(controller.sourceRangeTimer, undefined);
+      assert.equal(editor.selection.isEmpty, false);
+
+      setup.selectionEvent(vscode.TextEditorSelectionChangeKind.Mouse);
+      clock.advance(250);
+      assert.equal(posted.length, 1, "manual source selection must still resume the selected-range behavior");
+      assert.equal(posted[0].zoomToRange, true);
+      controller.dispose();
+    }));
   });
 
   it("preserves an RT click through source reveal echoes and resumes manual source-follow", async () => {

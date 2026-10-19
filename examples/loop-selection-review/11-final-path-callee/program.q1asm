@@ -1,0 +1,15 @@
+move 3,R0
+nop
+body: wait 100
+cmp R0,1
+jz @last
+sub R0,1,R0
+jnz @body
+stop
+last: move @ret,R27
+jmp @callee
+ret: sub R0,1,R0
+jnz @body
+stop
+callee: wait 500
+jmp R27

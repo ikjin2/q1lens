@@ -2,11 +2,144 @@ from __future__ import annotations
 
 import re
 
+from q1timeline.q1asm.instruction_table import INSTRUCTION_TABLE
 from q1timeline.render.html import render_html
 
 
 def _ns(value: int) -> dict:
     return {"kind": "concrete", "value": value}
+
+
+def test_svg_command_families_cover_all_supported_instructions() -> None:
+    events = [
+        {
+            "id": op,
+            "sequencer_id": "seq0",
+            "lane": "debug.q1_issue",
+            "kind": "q1_issue",
+            "t0": _ns(index * 4),
+            "t1": _ns(index * 4 + 4),
+            "duration": _ns(4),
+            "label": op,
+            "confidence": "exact",
+            "source": {},
+            "meta": {"op": op.upper()},
+        }
+        for index, op in enumerate(INSTRUCTION_TABLE)
+    ]
+    html = render_html({"version": "0.1.0", "events": events}, default_mode="debug")
+
+    for op, spec in INSTRUCTION_TABLE.items():
+        if op.startswith("fb_"):
+            family = "feedback"
+        elif spec.category == "branch" or op == "stop":
+            family = "flow"
+        elif spec.category in {"classical", "control"}:
+            family = "q1"
+        else:
+            family = spec.category
+        match = re.search(rf'class="([^"]+)" data-event-id="{op}"', html)
+        assert match is not None, op
+        assert f"command-family-{family}" in match[1].split(), op
+
+
+def test_svg_families_follow_source_commands_and_preserve_synthetic_overlays() -> None:
+    cases = [
+        ("set", "q1_issue", "label: SET_SCOPE_EN 1", {}, "latched"),
+        ("feedback", "feedback_com", "FB_COM_DATA 0,1,4", {}, "feedback"),
+        ("acquire", "acquire", "acquire_weighed 0,0,0,0,4", {}, "rt"),
+        ("marker", "marker_state", "upd_param 4", {}, "rt"),
+        ("meta", "q1_issue", "wait 4", {"op": "wait_sync"}, "sync"),
+        ("loop", "loop_block", "body: play 0,0,4", {}, "flow"),
+        ("control-loop", "control_flow_loop", "play 0,0,4", {"op": "play"}, "flow"),
+        ("generated-feedback", "feedback_pop", "", {}, "feedback"),
+        ("unknown", "unknown_region", "play 0,0,4", {}, None),
+        ("underflow", "underflow_warning", "wait 4", {}, None),
+        ("incomplete", "analysis_incomplete", "fb_com_cfg 0,4", {}, None),
+        ("unrecognized", "q1_issue", "future_op 4", {}, None),
+    ]
+    events = [
+        {
+            "id": event_id,
+            "sequencer_id": "seq0",
+            "lane": "debug.q1_issue",
+            "kind": kind,
+            "t0": _ns(index * 4),
+            "t1": _ns(index * 4 + 4),
+            "duration": _ns(4),
+            "label": event_id,
+            "confidence": "unknown",
+            "source": {"raw": raw},
+            "meta": meta,
+        }
+        for index, (event_id, kind, raw, meta, _family) in enumerate(cases)
+    ]
+    html = render_html({"version": "0.1.0", "events": events}, default_mode="debug")
+
+    for event_id, _kind, _raw, _meta, family in cases:
+        match = re.search(rf'class="([^"]+)" data-event-id="{event_id}"', html)
+        assert match is not None, event_id
+        family_classes = [name for name in match[1].split() if name.startswith("command-family-")]
+        assert family_classes == ([f"command-family-{family}"] if family else []), event_id
+
+
+def test_svg_command_palette_uses_family_hues_without_kind_fill_overrides() -> None:
+    html = render_html({"version": "0.1.0", "events": []})
+
+    for family, light, dark in [
+        ("q1", "#245fa8", "#80b7ff"),
+        ("flow", "#9a4c18", "#f4a261"),
+        ("latched", "#176b7e", "#6ec6d9"),
+        ("rt", "#27763c", "#8bcf9a"),
+        ("sync", "#7251a3", "#b9a7dc"),
+        ("feedback", "#ad316c", "#ff6fb3"),
+    ]:
+        assert f"--q1asm-{family}-color: {light};" in html
+        assert f"--q1asm-{family}-color: {dark};" in html
+        assert f".command-family-{family} {{ --q1asm-command-color: var(--q1asm-{family}-color); }}" in html
+    assert "fill: var(--q1asm-event-fill" in html
+    assert "stroke: var(--q1asm-event-stroke" in html
+    assert re.search(r"\.feedback-flow\s*\{[^}]*stroke: var\(--q1asm-feedback-color\)", html)
+    for kind in ["play", "wait", "acquire", "upd_param", "feedback_pop", "control_flow_loop"]:
+        assert not re.search(rf"\.kind-{kind} rect\s*\{{[^}}]*fill:", html)
+    assert not re.search(r"\.branch-path-(?:taken|fallthrough) rect\s*\{[^}]*fill:", html)
+    assert ".kind-underflow_warning rect { fill: #e26d6d; }" in html
+    assert ".event.diagnostic-error rect { stroke: #dc2626;" in html
+
+
+def test_svg_labels_match_command_accents_without_recoloring_diagnostics() -> None:
+    rows = [
+        ("play", "play", {}),
+        ("underflow", "underflow_warning", {"status": "definite_underflow"}),
+        ("incomplete", "analysis_incomplete", {"status": "analysis_incomplete"}),
+    ]
+    events = [
+        {
+            "id": event_id, "sequencer_id": "seq0", "lane": "rt.play", "kind": kind,
+            "t0": _ns(index * 100), "t1": _ns(index * 100 + 100), "duration": _ns(100),
+            "label": kind, "confidence": "unknown", "source": {"raw": "play 0,0,100"}, "meta": meta,
+        }
+        for index, (event_id, kind, meta) in enumerate(rows)
+    ]
+    html = render_html({"version": "0.1.0", "events": events, "diagnostics": [
+        {"severity": "error", "category": "definite_underflow", "message": "Underflow", "related_events": ["play"]},
+    ]}, highlight_event_id="play")
+
+    play = re.search(r'class="([^"]+)" data-event-id="play"[^>]*>([\s\S]*?)</g>', html)
+    assert play is not None
+    assert {"command-family-rt", "is-selected", "has-diagnostic", "diagnostic-error"} <= set(play[1].split())
+    assert '<text class="event-label"' in play[2]
+    assert 'class="diagnostic-badge severity-error"' in play[2]
+    assert "--q1asm-event-label-color: var(--q1asm-command-color);" in html
+    assert re.search(r"\.event text\s*\{[^}]*fill: var\(--q1asm-event-label-color, #0f1720\)", html)
+    assert "var(--q1asm-command-color) 15%" in html
+    assert ".event.is-selected.has-diagnostic rect { stroke: #111827;" in html
+    assert re.search(r"\.event \.diagnostic-badge text,[\s\S]*?\{ fill: #ffffff;", html)
+    for event_id in ["underflow", "incomplete"]:
+        overlay = re.search(rf'class="([^"]+)" data-event-id="{event_id}"', html)
+        assert overlay is not None and "command-family-" not in overlay[1]
+    assert ".status-definite_underflow rect { fill: #c72c2c; }" in html
+    assert ".status-analysis_incomplete rect { fill: #8a8f98; stroke-dasharray: 5 3; }" in html
 
 
 def test_parameters_panel_is_collapsed_between_timeline_and_analysis_details() -> None:
@@ -323,7 +456,7 @@ def test_normal_mode_renders_q1_issue_as_expandable_detail_lane() -> None:
                     "label": "wait",
                     "confidence": "exact",
                     "source": {"file": "seq0.q1asm", "line": 1, "column": 1, "raw": "    wait_sync 4"},
-                    "meta": {"op": "wait"},
+                    "meta": {"op": "wait_sync"},
                 },
                 {
                     "id": "seq0:wait",
@@ -358,6 +491,30 @@ def test_normal_mode_renders_q1_issue_as_expandable_detail_lane() -> None:
     assert not re.search(r'id="event-seq0-q1-wait"[^>]*q1-dense-collapsed', html)
     assert '[data-lane-role="q1-issue"] { display: none; }' in html
     assert '[data-lane-role="q1-issue"].q1-issue-expanded { display: inline; }' in html
+
+
+def test_q1_issue_block_labels_use_the_command_after_source_labels() -> None:
+    rows = [
+        ("source", "entry : play 0,0,100 # wait", {}, "play"),
+        ("metadata", "entry: play 0,0,100", {"op": "wait"}, "wait"),
+        ("latched", "entry: set_mrk 1 // play", {}, "set_mrk"),
+        ("fallback", "entry : # play", {}, "fallback"),
+    ]
+    events = [
+        {
+            "id": event_id, "sequencer_id": "seq0", "lane": "debug.q1_issue", "kind": "q1_issue",
+            "t0": _ns(index * 100), "t1": _ns(index * 100 + 100), "duration": _ns(100),
+            "label": event_id, "confidence": "exact", "source": {"raw": raw}, "meta": meta,
+        }
+        for index, (event_id, raw, meta, _expected) in enumerate(rows)
+    ]
+    html = render_html({"version": "0.1.0", "events": events}, default_mode="debug")
+
+    for event_id, _raw, _meta, expected in rows:
+        event = re.search(rf'data-event-id="{event_id}"[^>]*>([\s\S]*?)</g>', html)
+        assert event is not None
+        assert re.search(rf'<text class="event-label"[^>]*>{expected}</text>', event[1])
+        assert not re.search(r'<text class="event-label"[^>]*>entry', event[1])
 
 
 def test_debug_mode_marks_q1_issue_lane_as_disclosure_lane() -> None:

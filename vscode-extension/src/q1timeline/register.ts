@@ -2,6 +2,7 @@ import * as path from "node:path";
 import type * as vscodeTypes from "vscode";
 import { Q1TimelineApi, Q1TimelineOpenTarget } from "./api";
 import { registerQ1asmQuickFixes } from "./q1asmQuickFix";
+import { registerQ1asmColors } from "./q1asmColors";
 
 export interface Q1TimelineControllerState {
   projectFile?: string;
@@ -30,6 +31,7 @@ export function registerQ1Timeline(context: vscodeTypes.ExtensionContext): Q1Tim
   const controller = new TimelineController(context);
 
   registerQ1asmQuickFixes(context, vscode);
+  registerQ1asmColors(context, vscode);
 
   context.subscriptions.push(
     vscode.commands.registerCommand("q1timeline.openPreview", (sourceUri?: vscodeTypes.Uri) => controller.openPreview({ sourceUri })),

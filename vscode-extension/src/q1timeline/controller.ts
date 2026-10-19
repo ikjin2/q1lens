@@ -154,6 +154,7 @@ export function injectWebviewAssetTags(html, webview, context, nonce) {
   const sharedCssUri = versionedWebviewAssetUri(webviewAssetUri(webview, context, "src", "shared", "timeline", "renderer.css"), nonce);
   const cssUri = versionedWebviewAssetUri(webviewAssetUri(webview, context, "src", "q1timeline", "media", "timeline.css"), nonce);
   const sharedJsUri = versionedWebviewAssetUri(webviewAssetUri(webview, context, "src", "shared", "timeline", "renderer.js"), nonce);
+  const instructionColorsJsUri = versionedWebviewAssetUri(webviewAssetUri(webview, context, "src", "shared", "timeline", "instructionColors.js"), nonce);
   const adapterJsUri = versionedWebviewAssetUri(webviewAssetUri(webview, context, "src", "q1timeline", "media", "timelineAdapter.js"), nonce);
   const hardwareCssUri = versionedWebviewAssetUri(webviewAssetUri(webview, context, "src", "q1timeline", "media", "hardwareView.css"), nonce);
   const hardwareStateUri = versionedWebviewAssetUri(webviewAssetUri(webview, context, "src", "q1timeline", "media", "hardwareState.js"), nonce);
@@ -162,6 +163,7 @@ export function injectWebviewAssetTags(html, webview, context, nonce) {
   const linkTag = `<link rel="stylesheet" href="${sharedCssUri}">\n<link rel="stylesheet" href="${cssUri}">\n<link rel="stylesheet" href="${hardwareCssUri}">`;
   const nonceAttribute = nonce ? ` nonce="${nonce}"` : "";
   const scriptTag = [
+    `<script${nonceAttribute} src="${instructionColorsJsUri}"></script>`,
     `<script${nonceAttribute} src="${sharedJsUri}"></script>`,
     `<script${nonceAttribute} src="${adapterJsUri}"></script>`,
     `<script${nonceAttribute} src="${hardwareStateUri}"></script>`,
@@ -2715,13 +2717,40 @@ export class TimelineController {
   }
 
   async openSourceForEvent(eventId) {
-    const source = lookupSourceForEvent(this.timelineIr, eventId);
+    let source = lookupSourceForEvent(this.timelineIr, eventId);
     if (!source) {
       this.output.appendLine(`q1timeline eventClick source not found: ${eventId}`);
       return;
     }
+    const event = this.timelineIr?.events?.find((candidate) => String(candidate.id) === String(eventId));
+    let sourceRange;
+    if (event?.kind === "loop_block") {
+      const start = event.meta?.source_start || event.source;
+      const end = event.meta?.source_end;
+      if (typeof start?.file === "string" && start.file && typeof end?.file === "string" && end.file &&
+          Number.isInteger(start.line) && start.line > 0 && Number.isInteger(end.line) && end.line > 0 &&
+          normalizedFsPath(this.resolveSourcePath(start.file)) === normalizedFsPath(this.resolveSourcePath(end.file))) {
+        source = start;
+        sourceRange = { startLine: Math.min(start.line, end.line), endLine: Math.max(start.line, end.line) };
+        const members = new Set([
+          ...(Array.isArray(event.meta.first_iteration_event_ids) ? event.meta.first_iteration_event_ids : []),
+          ...(Array.isArray(event.meta.playback_event_ids) ? event.meta.playback_event_ids : []),
+        ]);
+        const eventsById = new Map(this.timelineIr.events.map((candidate) => [String(candidate.id), candidate]));
+        for (const memberId of members) {
+          const member = eventsById.get(String(memberId));
+          const memberSource = member?.source;
+          if (member?.sequencer_id === event.sequencer_id && typeof memberSource?.file === "string" && memberSource.file &&
+              Number.isInteger(memberSource.line) && memberSource.line > 0 &&
+              normalizedFsPath(this.resolveSourcePath(memberSource.file)) === normalizedFsPath(this.resolveSourcePath(start.file))) {
+            sourceRange.startLine = Math.min(sourceRange.startLine, memberSource.line);
+            sourceRange.endLine = Math.max(sourceRange.endLine, memberSource.line);
+          }
+        }
+      }
+    }
     this.output.appendLine(`q1timeline eventClick: ${eventId} -> ${source.file}:${source.line || 1}`);
-    return this.openSourceLocation(source, { preserveHardwareCursor: true });
+    return this.openSourceLocation(source, { preserveHardwareCursor: true, ...(sourceRange ? { sourceRange } : {}) });
   }
 
   async openSourceForDiagnostic(diagnosticIndex) {
@@ -2746,9 +2775,23 @@ export class TimelineController {
       const showOptions = await this.sourceShowTextDocumentOptions(sourcePath, Boolean(existingDocument));
       const editor = await vscode.window.showTextDocument(document, showOptions);
       this.rememberSourceViewColumn(editor);
-      editor.selection = new vscode.Selection(position, position);
-      this.applySourceDecoration(editor, line);
-      editor.revealRange(new vscode.Range(position, position), vscode.TextEditorRevealType.InCenter);
+      let range;
+      if (options.sourceRange && options.sourceRange.endLine <= document.lineCount) {
+        let startLine = options.sourceRange.startLine - 1;
+        const endLine = options.sourceRange.endLine - 1;
+        for (let previous = startLine - 1; previous >= 0; previous -= 1) {
+          const code = document.lineAt(previous).text.split(/#|\/\//, 1)[0].trim();
+          if (!code) continue;
+          if (/^[A-Za-z_][A-Za-z0-9_]*\s*:$/.test(code)) startLine = previous;
+          else break;
+        }
+        const lastLine = document.lineAt(endLine);
+        const end = lastLine.range?.end || new vscode.Position(endLine, lastLine.text.length);
+        range = new vscode.Range(new vscode.Position(startLine, 0), end);
+      }
+      editor.selection = new vscode.Selection(range ? range.start : position, range ? range.end : position);
+      this.applySourceDecoration(editor, range || line);
+      editor.revealRange(range || new vscode.Range(position, position), vscode.TextEditorRevealType.InCenter);
       if (reveal) {
         reveal.position = editor.selection.active;
         reveal.opening = false;
@@ -2805,12 +2848,14 @@ export class TimelineController {
     }
   }
 
-  applySourceDecoration(editor, line) {
+  applySourceDecoration(editor, sourceRange) {
     this.clearSourceDecoration();
     if (!this.sourceSelectionDecoration || !editor || typeof editor.setDecorations !== "function") {
       return;
     }
-    const range = new vscode.Range(line, 0, line, Number.MAX_SAFE_INTEGER);
+    const range = typeof sourceRange === "number"
+      ? new vscode.Range(sourceRange, 0, sourceRange, Number.MAX_SAFE_INTEGER)
+      : sourceRange;
     editor.setDecorations(this.sourceSelectionDecoration, [range]);
     this.activeSourceDecorationEditor = editor;
   }

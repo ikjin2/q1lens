@@ -240,6 +240,8 @@
       node.classList.toggle("is-instruction-related", ids.some((id) => relatedIds.has(id)));
       node.classList.toggle("is-parameter-apply", ids.some((id) => appliedIds.has(id)));
     }
+    window.q1lensSharedTimeline?.renderIssueConnections?.(document.getElementById("timeline-root"), eventId);
+    window.q1lensSharedTimeline?.renderParameterConnections?.(document.getElementById("timeline-root"), eventId, hardwareView?.getState().time);
     return Array.from(relatedIds);
   }
 
@@ -1105,6 +1107,8 @@
       const right = displayTimelineTime(end);
       if ((right - left) / span < 0.001) continue;
       for (const [trackIndex, track] of tracks.entries()) {
+        // Keep issuance markers accessible; the shared fold controls remain on the ruler and RT rows.
+        if (track.classList.contains("lane-track-q1-issue")) continue;
         const marker = document.createElement("span");
         marker.className = `q1timeline-wait-fold${folded ? "" : " is-expanded"}${timelineIr.playback ? " is-playback-wait" : ""}`;
         marker.style.left = `${(left - display.min) / span * 100}%`;
@@ -1245,6 +1249,7 @@
     // The shared renderer replaces the standalone SVG. Remove it before
     // calculating folds so the first frame uses the same scale as later frames.
     root.querySelector(".timeline-svg")?.remove();
+    const focusedEventId = document.activeElement?.closest?.(".timeline-block")?.dataset.eventId;
     const previousStage = root.querySelector(".shared-timeline-stage");
     if (timelineLayout === "instruction" && previousStage && previousStage.dataset.instructionCount) {
       instructionView.leftOrdinal = previousStage.scrollLeft / instructionView.cellWidth;
@@ -1308,8 +1313,12 @@
         node.dataset.instructionIndex = String(index);
         // Use exact slots, without the time renderer's minimum width or rounded percentages.
         node.style.left = `calc(var(--instruction-cell-width) * ${index})`;
-        node.style.width = "var(--instruction-cell-width)";
+        node.style.width = node.dataset.issueMarker === "true"
+          ? "min(24px, var(--instruction-cell-width))" : "var(--instruction-cell-width)";
         node.classList.remove("is-tiny", "is-compact");
+      });
+      stage.querySelectorAll(".timeline-parameter-marker[data-instruction-index]").forEach((node) => {
+        node.style.left = `calc(var(--instruction-cell-width) * ${node.dataset.instructionIndex})`;
       });
       setInstructionView(stage, instructionView.cellWidth);
     }
@@ -1321,6 +1330,7 @@
     installTimelineControlChips();
     installTimelineMouseInteractions();
     applySharedSelection(options);
+    if (focusedEventId) findVisibleEventNodeByIds([focusedEventId])?.focus({ preventScroll: true });
     renderWaitFolds();
     renderPlaybackFolds();
     renderHardwareCursor();
@@ -3305,14 +3315,15 @@
 
   function q1IssueCommandToken(event) {
     const source = event && event.source && typeof event.source === "object" ? event.source : {};
-    const raw = String(source.raw || "").trim();
-    if (raw) {
-      return raw.split(/\s+/, 1)[0];
-    }
     const meta = event && event.meta && typeof event.meta === "object" ? event.meta : {};
     const op = String(meta.op || "").trim();
     if (op) {
       return op;
+    }
+    const raw = String(source.raw || "").split(/#|\/\//, 1)[0]
+      .replace(/^\s*[A-Za-z_][A-Za-z0-9_]*\s*:\s*/, "").trim();
+    if (raw) {
+      return raw.split(/\s+/, 1)[0];
     }
     return String((event && (event.label || event.kind)) || "");
   }
@@ -4062,6 +4073,7 @@
   }
 
   function renderHardwareCursor(state = hardwareView && hardwareView.getState()) {
+    window.q1lensSharedTimeline?.renderParameterConnections?.(document.getElementById("timeline-root"), selectedTimelineEventId, state?.time);
     if (timelineLayout === "instruction") return;
     if (!state || !Number.isFinite(state.time)) {
       return;

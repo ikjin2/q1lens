@@ -13,6 +13,15 @@ function createUri(fsPath: string) {
 
 function quickFixApi() {
   return {
+    DecorationRangeBehavior: { ClosedClosed: 1 },
+    window: {
+      visibleTextEditors: [],
+      createTextEditorDecorationType: () => ({ dispose: () => undefined }),
+      onDidChangeVisibleTextEditors: () => ({ dispose: () => undefined }),
+    },
+    workspace: {
+      onDidChangeTextDocument: () => ({ dispose: () => undefined }),
+    },
     CodeActionKind: { QuickFix: "quickfix" },
     languages: {
       registerCodeActionsProvider: () => ({ dispose: () => undefined }),

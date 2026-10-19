@@ -1,0 +1,12 @@
+move 2,R1
+nop
+outer: move 2,R0
+nop
+body: wait 4
+sub R0,1,R0
+nop
+jz @after
+jmp @body
+after: wait 100
+loop R1,@outer
+stop

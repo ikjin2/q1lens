@@ -1,0 +1,8 @@
+move 3,R0
+nop
+head: cmp R0,0
+jz @done
+nop
+sub R0,1,R0
+jmp @head
+done: stop

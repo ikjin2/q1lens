@@ -1,0 +1,11 @@
+sequencers:
+  - id: seq0
+    file: program.q1asm
+alignment:
+  mode: none
+analysis:
+  execution_mode: analysis
+  max_steps: 1000
+view:
+  default_mode: debug
+  show_q1_issue: true

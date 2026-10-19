@@ -1,0 +1,8 @@
+move 0,R0
+nop
+body: wait 8
+add R0,1,R0
+nop
+jlt R0,3,@body
+wait 4
+stop

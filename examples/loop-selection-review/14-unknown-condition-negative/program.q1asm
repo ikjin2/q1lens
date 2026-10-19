@@ -1,0 +1,4 @@
+body: wait 8
+sub R0,1,R0
+jnz @body
+stop

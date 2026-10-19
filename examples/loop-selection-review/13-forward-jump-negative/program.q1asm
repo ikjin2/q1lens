@@ -1,0 +1,4 @@
+jmp @done
+wait 100
+done: wait 8
+stop

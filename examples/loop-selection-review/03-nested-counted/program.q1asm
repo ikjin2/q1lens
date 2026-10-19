@@ -1,0 +1,10 @@
+move 2,R1
+nop
+outer:
+ move 2,R0
+ nop
+ inner:
+  wait 8
+ loop R0,@inner
+ loop R1,@outer
+stop

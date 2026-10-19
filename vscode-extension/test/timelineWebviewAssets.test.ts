@@ -256,6 +256,7 @@ function loadQ1TimelineZoomRuntime(script: string, events: any[], options: any =
     setState: (state: any) => { savedState = state; },
   };
   return Function("events", "full", "basis", "vscode", "scale", `
+    const window = {};
     const timelineEventsById = new Map(events.map(event => [String(event.id), event]));
     let timelineTimeBasis = basis;
     let timelineLayout = "time";
@@ -446,11 +447,11 @@ describe("timeline webview assets", () => {
     );
     assert.equal(
       model.lanes.flatMap((lane: any) => lane.blocks).find((block: any) => block.id === "seq0:play").accentColor,
-      "#8bcf9a",
+      "var(--q1asm-rt-color, #8bcf9a)",
     );
     assert.equal(
       model.lanes.flatMap((lane: any) => lane.blocks).find((block: any) => block.id === "seq0:q1").accentColor,
-      "#b9a7dc",
+      "var(--q1asm-sync-color, #b9a7dc)",
     );
 
     const expandedModel = adapter.buildQ1TimelineSharedModel({
@@ -1170,12 +1171,11 @@ describe("timeline webview assets", () => {
     assert.match(sharedRenderer, /!\(lane && lane\.hidden\)/);
     assert.match(sharedRenderer, /function feedbackEndpointAnchorY\(rowHeight\)/);
     assert.match(sharedRenderer, /return rowHeight - 4;/);
-    assert.match(sharedRenderer, /const chipCenterY = feedbackEndpointAnchorY\(rowHeight\)/);
     assert.match(sharedRenderer, /const visibleLanes = visibleTimelineLanes\(model\)/);
-    assert.match(sharedRenderer, /new Map\(visibleLanes\.map/);
-    assert.match(sharedRenderer, /visibleLanes\.length \* rowHeight/);
-    assert.match(sharedRenderer, /const y1 = fromLaneIndex \* rowHeight \+ chipCenterY/);
-    assert.match(sharedRenderer, /const y2 = toLaneIndex \* rowHeight \+ chipCenterY/);
+    assert.match(sharedRenderer, /const laneGeometryById = new Map/);
+    assert.match(sharedRenderer, /totalHeight = top \+ height/);
+    assert.match(sharedRenderer, /const y1 = fromLane\.top \+ feedbackEndpointAnchorY\(fromLane\.height\)/);
+    assert.match(sharedRenderer, /const y2 = toLane\.top \+ feedbackEndpointAnchorY\(toLane\.height\)/);
     assert.doesNotMatch(sharedRenderer, /fromLaneIndex \* rowHeight \+ 31/);
     assert.match(sharedRenderer, /const controlOffset = Math\.max\(Math\.abs\(y2 - y1\) \* 0\.45, 12\)/);
     assert.match(sharedRenderer, /path\.setAttribute\("d", `M \$\{x1\} \$\{y1\} C \$\{x1\} \$\{controlY1\} \$\{x2\} \$\{controlY2\} \$\{x2\} \$\{y2\}`\)/);
@@ -1202,9 +1202,9 @@ describe("timeline webview assets", () => {
     assert.match(sharedCss, /\.loop-range-cap\s*{[^}]*width:\s*3px;[^}]*opacity:\s*1;/s);
     assert.match(sharedCss, /\.timeline-block\s*{[^}]*background:\s*color-mix\(in srgb, var\(--timeline-block-accent, var\(--vscode-charts-yellow, var\(--vscode-charts-orange\)\)\) 12%, transparent\);/s);
     assert.match(sharedCss, /\.timeline-block\s*{[^}]*border-color:\s*color-mix\(in srgb, var\(--timeline-block-accent, var\(--vscode-panel-border\)\) 72%, transparent\);/s);
-    assert.match(q1TimelineCss, /body\.vscode-dark \.shared-timeline-stage \.timeline-block\.kind-q1_issue\s*{[^}]*background:\s*color-mix\(in srgb, #8bcf9a 16%, transparent\);/s);
-    assert.match(q1TimelineCss, /--q1timeline-feedback-accent:\s*#ff6fb3;/);
-    assert.match(q1TimelineCss, /body\.vscode-dark \.shared-timeline-stage \.timeline-block\.kind-feedback_pop,[\s\S]*body\.vscode-dark \.shared-timeline-stage \.timeline-block\.kind-fb_com_extra\s*{[^}]*background:\s*color-mix\(in srgb, var\(--q1timeline-feedback-accent\) 18%, transparent\);/s);
+    assert.match(sharedCss, /\.shared-timeline-stage \.timeline-block\.has-command-color\s*{[^}]*background:\s*color-mix\(in srgb, var\(--timeline-block-accent\) 15%, transparent\);/s);
+    assert.doesNotMatch(q1TimelineCss, /\.timeline-block\.kind-q1_issue\s*{/);
+    assert.match(q1TimelineCss, /--q1timeline-feedback-accent:\s*var\(--q1asm-feedback-color, #ad316c\);/);
     assert.match(q1TimelineCss, /body\.vscode-dark \.shared-timeline-stage \.feedback-connector\s*{[^}]*stroke:\s*var\(--q1timeline-feedback-accent\);[^}]*stroke-width:\s*2\.05;[^}]*opacity:\s*0\.82;/s);
     assert.match(q1TimelineCss, /body\.vscode-dark \.shared-timeline-stage \.feedback-bridge-arrowhead\s*{[^}]*opacity:\s*1;/s);
   });
@@ -1585,9 +1585,7 @@ describe("timeline webview assets", () => {
 
     assert.match(sharedCss, /\.shared-timeline-stage \.timeline-block\s*{[^}]*background:/s);
     assert.match(sharedCss, /\.shared-timeline-stage \.timeline-block\s*{[^}]*border-color:/s);
-    assert.match(q1TimelineCss, /\.shared-timeline-stage \.timeline-block\.kind-q1_issue\s*{/);
-    assert.match(q1TimelineCss, /\.shared-timeline-stage \.timeline-block\.kind-upd_param\s*,/);
-    assert.match(q1TimelineCss, /\.shared-timeline-stage \.timeline-block\.kind-upd_thres\s*{/);
+    assert.match(sharedCss, /\.shared-timeline-stage \.timeline-block\.has-command-color\s*{[^}]*border-color:\s*var\(--timeline-block-accent\);/s);
   });
 
   it("keeps q1timeline controls visible and reports when the webview script is ready", () => {
@@ -1905,6 +1903,7 @@ describe("timeline webview assets", () => {
 
   it("stacks overlapping branch controls at the same timeline position", () => {
     const script = readFileSync(join(__dirname, "..", "src", "q1timeline", "media", "timeline.js"), "utf-8");
+    const css = readFileSync(join(__dirname, "..", "src", "q1timeline", "media", "timeline.css"), "utf-8");
     const controls = loadQ1TimelineControlChipFunctions(script);
 
     const laneNode = { dataset: { lane: "sequencer:seq0" } };
@@ -1919,6 +1918,9 @@ describe("timeline webview assets", () => {
     assert.equal(controls.timelineControlChipTop(1), "18px");
     assert.match(script, /const chipStackCounts = new Map\(\)/);
     assert.match(script, /chip\.style\.top = timelineControlChipTop\(stackIndex\)/);
+    assert.match(script, /const track = sourceNode\.closest\("\.lane-track"\)/);
+    assert.match(script, /track\.append\(chip\)/);
+    assert.match(css, /\.q1timeline-control-chip\s*{[^}]*transform:\s*translateX\(-50%\) translateY\(var\(--timeline-loop-offset, 0px\)\);/s);
   });
 
   it("optimistically collapses loop previews when reset is clicked", () => {

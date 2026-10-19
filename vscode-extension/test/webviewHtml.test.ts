@@ -9,6 +9,7 @@ describe("webview html", () => {
       cssUri: "vscode-resource://timeline.css",
       cspSource: "vscode-resource://webview-csp",
       sharedScriptUri: "vscode-resource://shared-renderer.js",
+      instructionColorsScriptUri: "vscode-resource://instructionColors.js",
       modelScriptUri: "vscode-resource://timelineModel.js",
       scriptUri: "vscode-resource://timeline.js",
       nonce: "abc123",
@@ -19,6 +20,8 @@ describe("webview html", () => {
     assert.match(html, /vscode-resource:\/\/timeline.css/);
     assert.ok(html.indexOf("vscode-resource://shared-renderer.css") < html.indexOf("vscode-resource://timeline.css"));
     assert.ok(html.indexOf("vscode-resource://shared-renderer.js") < html.indexOf("vscode-resource://timelineModel.js"));
+    assert.ok(html.indexOf("vscode-resource://instructionColors.js") < html.indexOf("vscode-resource://shared-renderer.js"));
+    assert.ok(html.indexOf("vscode-resource://instructionColors.js") < html.indexOf("vscode-resource://timelineModel.js"));
     assert.match(html, /vscode-resource:\/\/timelineModel.js/);
     assert.doesNotMatch(html, /q1asmPreviewModel\.js/);
     assert.match(html, /nonce="abc123"/);
@@ -33,6 +36,7 @@ describe("webview html", () => {
       cssUri: "vscode-resource://timeline.css",
       cspSource: "vscode-resource://webview-csp",
       sharedScriptUri: "vscode-resource://shared-renderer.js",
+      instructionColorsScriptUri: "vscode-resource://instructionColors.js",
       modelScriptUri: "vscode-resource://timelineModel.js",
       scriptUri: "vscode-resource://timeline.js",
       nonce: "abc123",

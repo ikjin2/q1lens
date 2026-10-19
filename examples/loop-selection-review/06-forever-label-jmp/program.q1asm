@@ -1,0 +1,3 @@
+wait 4
+forever: wait 12
+jmp @forever

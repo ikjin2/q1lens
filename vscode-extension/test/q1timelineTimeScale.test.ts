@@ -374,7 +374,7 @@ describe("playback wait and repeat boundaries", () => {
     assert.deepEqual(bounds(waits), [{ start: 20, end: 65_523 }]);
     assert.deepEqual(scale.gaps.map(({ start, end, loopKeys }) => ({ start, end, loopKeys })), [
       { start: 20, end: 65_523, loopKeys: [] },
-      { start: 65_539, end: 196_593, loopKeys: ["loop"] },
+      { start: 65_539, end: 196_609, loopKeys: ["loop"] },
     ]);
     assert.equal(scale.toDisplay(65_539) - scale.toDisplay(65_523), 16);
     assert.equal(scale.toDisplay(65_539) - scale.toDisplay(4), 96);
@@ -445,10 +445,10 @@ describe("static compact loop time folding", () => {
     assert.deepEqual(bounds(waits), [{ start: 20, end: 65_523 }]);
     assert.deepEqual(scale.gaps.map(({ start, end, loopKeys }) => ({ start, end, loopKeys })), [
       { start: 20, end: 65_523, loopKeys: [] },
-      { start: 65_539, end: 196_593, loopKeys: ["disabled-loop"] },
+      { start: 65_539, end: 196_609, loopKeys: ["disabled-loop"] },
     ]);
     assert.equal(scale.toDisplay(65_539) - scale.toDisplay(65_523), 16);
-    assert.equal(scale.toDisplay(196_613), 184);
+    assert.equal(scale.toDisplay(196_613), 168);
     assert.equal(scale.toDisplay(196_613) - scale.toDisplay(196_609), 4);
     for (const time of [0, 4, 20, 30_000, 65_523, 65_539, 100_000, 196_593, 196_609, 196_613]) {
       closeTo(scale.fromDisplay(scale.toDisplay(time)), time);
@@ -461,7 +461,7 @@ describe("static compact loop time folding", () => {
       event("upd_param", 196_600, 196_604)] };
     const { waits, scale } = combined(ir);
     assert.deepEqual(bounds(waits), [{ start: 20, end: 65_520 }]);
-    assert.deepEqual(bounds(scale), [{ start: 20, end: 65_520 }, { start: 65_536, end: 196_584 }]);
+    assert.deepEqual(bounds(scale), [{ start: 20, end: 65_520 }, { start: 65_536, end: 196_600 }]);
     assert.equal(scale.toDisplay(65_536) - scale.toDisplay(65_520), 16);
   });
 
@@ -486,7 +486,7 @@ describe("static compact loop time folding", () => {
     ] };
     const { scale } = combined(ir, { timeBasis: "aligned" });
     assert.deepEqual(bounds(scale), [
-      { start: 520, end: 66_023 }, { start: 66_039, end: 100_484 }, { start: 100_516, end: 197_093 },
+      { start: 520, end: 66_023 }, { start: 66_039, end: 100_484 }, { start: 100_516, end: 197_109 },
     ]);
     assert.equal(scale.toDisplay(100_516) - scale.toDisplay(100_484), 32);
     for (const time of [504, 66_039, 100_484, 100_500, 100_516, 197_113]) {
@@ -501,10 +501,20 @@ describe("static compact loop time folding", () => {
     const { scale } = combined(ir);
     assert.deepEqual(bounds(scale), [
       { start: 16, end: 984 }, { start: 1000, end: 2000 },
-      { start: 2016, end: 2984 }, { start: 3000, end: 5984 },
+      { start: 2016, end: 2984 }, { start: 3000, end: 6000 },
     ]);
     for (const time of [0, 16, 984, 1000, 1500, 2000, 2016, 2984, 3000, 5000, 6004]) {
       closeTo(scale.fromDisplay(scale.toDisplay(time)), time);
     }
+  });
+
+  it("places a stop immediately after all omitted short nested iterations", () => {
+    const ir = {events: [event("wait", 0, 8), loop("inner", 0, 8, 2),
+      loop("outer", 0, 16, 2), event("stop", 32)]};
+    const scale = buildTimelineTimeScale(ir);
+    assert.deepEqual(bounds(scale), [{ start: 8, end: 16 }, { start: 16, end: 32 }]);
+    closeTo(scale.toDisplay(32), scale.gaps[1].displayEnd);
+    closeTo(scale.toDisplay(32), 10.4);
+    for (const time of [0, 8, 12, 16, 24, 32]) closeTo(scale.fromDisplay(scale.toDisplay(time)), time);
   });
 });

@@ -1,5 +1,8 @@
+body {
+  --q1timeline-feedback-accent: var(--q1asm-feedback-color, #ad316c);
+}
+
 body.vscode-dark {
-  --q1timeline-feedback-accent: #ff6fb3;
   background: #1e1e1e !important;
   background-color: #1e1e1e !important;
 }
@@ -25,6 +28,7 @@ body.vscode-dark {
 
 .shared-timeline-stage .q1timeline-playback-fold {
   position: absolute;
+  box-sizing: border-box;
   top: 0;
   bottom: 0;
   z-index: 3;
@@ -411,7 +415,7 @@ body.instruction-view.mode-normal .event.normal-feedback-collapsed {
   color: var(--vscode-editor-foreground);
   cursor: pointer;
   opacity: 0.82;
-  transform: translateX(-50%);
+  transform: translateX(-50%) translateY(var(--timeline-loop-offset, 0px));
 }
 
 .q1timeline-control-chip:hover,
@@ -632,46 +636,9 @@ body.vscode-dark .event.kind-unknown_region > rect {
   fill: #aab2bd;
 }
 
-body.vscode-dark .kind-play rect {
-  fill: #8bcf9a;
-}
-
-body.vscode-dark .kind-wait rect {
-  fill: #cdbb96;
-}
-
-body.vscode-dark .kind-wait_sync rect,
-body.vscode-dark .kind-wait_trigger rect {
-  fill: #b9a7dc;
-}
-
-body.vscode-dark .kind-acquire rect {
-  fill: #e2b36f;
-}
-
-body.vscode-dark .kind-upd_param rect,
-body.vscode-dark .kind-upd_thres rect {
-  fill: #bfd87a;
-}
-
-body.vscode-dark .shared-timeline-stage .timeline-block.kind-upd_param,
-body.vscode-dark .shared-timeline-stage .timeline-block.kind-upd_thres {
-  background: color-mix(in srgb, #bfd87a 16%, transparent);
-  border-color: color-mix(in srgb, #bfd87a 55%, transparent);
-}
-
-body.vscode-dark .kind-marker_state rect {
-  fill: #8bcf9a;
-}
-
-body.vscode-dark .shared-timeline-stage .timeline-block.kind-q1_issue {
-  background: color-mix(in srgb, #8bcf9a 16%, transparent);
-  border-color: color-mix(in srgb, #8bcf9a 55%, transparent);
-}
-
 .shared-timeline-stage .timeline-block-branch_effect {
-  background: color-mix(in srgb, var(--vscode-charts-orange) 9%, transparent);
-  border-color: color-mix(in srgb, var(--vscode-charts-orange) 50%, transparent);
+  background: color-mix(in srgb, var(--timeline-block-accent) 15%, transparent);
+  border-color: var(--timeline-block-accent);
   border-style: dashed;
   color: var(--vscode-descriptionForeground);
   opacity: 0.72;
@@ -691,41 +658,6 @@ body.vscode-dark .shared-timeline-stage .timeline-block.kind-q1_issue {
   opacity: 1;
 }
 
-body.vscode-dark .kind-feedback_pop rect,
-body.vscode-dark .kind-feedback_com rect,
-body.vscode-dark .kind-fb_acq_iq_id rect,
-body.vscode-dark .kind-fb_acq_iq_shift rect,
-body.vscode-dark .kind-fb_acq_tb_id rect,
-body.vscode-dark .kind-fb_acq_tb_cfg rect,
-body.vscode-dark .kind-fb_acq_tb_valid rect,
-body.vscode-dark .kind-fb_acq_tb_extra rect,
-body.vscode-dark .kind-fb_llp_tags_id rect,
-body.vscode-dark .kind-fb_llp_ttls_id rect,
-body.vscode-dark .kind-fb_tdc_tags_id rect,
-body.vscode-dark .kind-fb_tdc_tdelta_id rect,
-body.vscode-dark .kind-fb_com_cfg rect,
-body.vscode-dark .kind-fb_com_extra rect {
-  fill: var(--q1timeline-feedback-accent);
-}
-
-body.vscode-dark .shared-timeline-stage .timeline-block.kind-feedback_pop,
-body.vscode-dark .shared-timeline-stage .timeline-block.kind-feedback_com,
-body.vscode-dark .shared-timeline-stage .timeline-block.kind-fb_acq_iq_id,
-body.vscode-dark .shared-timeline-stage .timeline-block.kind-fb_acq_iq_shift,
-body.vscode-dark .shared-timeline-stage .timeline-block.kind-fb_acq_tb_id,
-body.vscode-dark .shared-timeline-stage .timeline-block.kind-fb_acq_tb_cfg,
-body.vscode-dark .shared-timeline-stage .timeline-block.kind-fb_acq_tb_valid,
-body.vscode-dark .shared-timeline-stage .timeline-block.kind-fb_acq_tb_extra,
-body.vscode-dark .shared-timeline-stage .timeline-block.kind-fb_llp_tags_id,
-body.vscode-dark .shared-timeline-stage .timeline-block.kind-fb_llp_ttls_id,
-body.vscode-dark .shared-timeline-stage .timeline-block.kind-fb_tdc_tags_id,
-body.vscode-dark .shared-timeline-stage .timeline-block.kind-fb_tdc_tdelta_id,
-body.vscode-dark .shared-timeline-stage .timeline-block.kind-fb_com_cfg,
-body.vscode-dark .shared-timeline-stage .timeline-block.kind-fb_com_extra {
-  background: color-mix(in srgb, var(--q1timeline-feedback-accent) 18%, transparent);
-  border-color: color-mix(in srgb, var(--q1timeline-feedback-accent) 68%, transparent);
-}
-
 .shared-timeline-stage .feedback-inline-capsule {
   color: var(--q1timeline-feedback-accent, var(--vscode-descriptionForeground));
   background: transparent;
@@ -734,6 +666,10 @@ body.vscode-dark .shared-timeline-stage .timeline-block.kind-fb_com_extra {
 
 .shared-timeline-stage .feedback-endpoint {
   border-color: color-mix(in srgb, var(--q1timeline-feedback-accent, #cf9bd8) 66%, transparent);
+}
+
+.shared-timeline-stage .feedback-connector {
+  stroke: var(--q1timeline-feedback-accent);
 }
 
 body.vscode-dark .shared-timeline-stage .feedback-endpoint {
@@ -787,31 +723,13 @@ body.vscode-dark .shared-timeline-stage .feedback-bridge-arrowhead {
   opacity: 1;
 }
 
-body.vscode-dark .kind-loop_block rect {
-  fill: #aacd88;
+.shared-timeline-stage .timeline-loop-range {
+  color: var(--q1asm-flow-color);
 }
 
-body.vscode-dark .shared-timeline-stage .timeline-block.kind-loop_block {
-  background: color-mix(in srgb, #aacd88 16%, transparent);
-  border-color: color-mix(in srgb, #aacd88 55%, transparent);
-}
-
-body.vscode-dark .shared-timeline-stage .timeline-loop-range {
-  color: #aacd88;
-}
-
-body.vscode-dark .shared-timeline-stage .timeline-loop-range:hover,
-body.vscode-dark .shared-timeline-stage .timeline-loop-range.is-selected {
+.shared-timeline-stage .timeline-loop-range:hover,
+.shared-timeline-stage .timeline-loop-range.is-selected {
   color: var(--vscode-focusBorder);
-}
-
-body.vscode-dark .kind-loop_iteration_preview rect {
-  fill: #cfe4bc;
-}
-
-body.vscode-dark .shared-timeline-stage .timeline-block.kind-loop_iteration_preview {
-  background: color-mix(in srgb, #cfe4bc 18%, transparent);
-  border-color: color-mix(in srgb, #cfe4bc 55%, transparent);
 }
 
 .branch-marker-condition {

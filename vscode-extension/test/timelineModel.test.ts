@@ -980,7 +980,7 @@ describe("timelineModel", () => {
       instruction: "play",
       label: "play",
       detail: "L3",
-      accentColor: "#8bcf9a",
+      accentColor: "var(--q1asm-rt-color, #8bcf9a)",
       q1asmSourceMessage: {
         type: "openQ1AsmSource",
         sequencer: "cluster0_module4_seq0",
@@ -991,6 +991,89 @@ describe("timelineModel", () => {
       leftPercent: 33.333,
       widthPercent: 66.667,
     });
+  });
+
+  it("uses shared instruction family colors for inline Q1 previews, including formerly uncolored commands", () => {
+    const { buildTimelineModel } = loadModel();
+    const cases = [
+      ["muls32h", "q1", "#80b7ff"],
+      ["stop", "flow", "#f4a261"],
+      ["set_scope_en", "latched", "#6ec6d9"],
+      ["latch_rst", "rt", "#8bcf9a"],
+      ["wait_sync", "sync", "#b9a7dc"],
+      ["fb_acq_tb_valid", "feedback", "#ff6fb3"],
+      ["future_instruction", "unknown", "#94a3b8"],
+    ];
+    for (const [instruction, family, color] of cases) {
+      const payload: any = ir();
+      payload.q1asm_provenance[0].instruction = instruction;
+      const model = buildTimelineModel(payload, "pulse:cz", undefined, {
+        expandedGroups: ["target:q0_q1"],
+        expandedInlineQ1Lanes: ["inline-q1:q0_q1:flux / cz"],
+      });
+      const block = model.lanes.find((lane: { kind: string }) => lane.kind === "q1").blocks[0];
+      assert.equal(block.instruction, instruction);
+      assert.equal(block.accentColor, `var(--q1asm-${family}-color, ${color})`);
+    }
+  });
+
+  it("recognizes labeled Q1ASM commands when coloring inline previews", () => {
+    const { buildTimelineModel } = loadModel();
+    const payload: any = ir();
+    payload.q1asm_by_sequencer = { cluster0_module4_seq0: "\n\nplay : FB_POP_DATA R0 # feedback\n" };
+    const model = buildTimelineModel(payload, "pulse:cz", undefined, {
+      expandedGroups: ["target:q0_q1"],
+      expandedInlineQ1Lanes: ["inline-q1:q0_q1:flux / cz"],
+    });
+    const block = model.lanes.find((lane: { kind: string }) => lane.kind === "q1").blocks[0];
+    assert.equal(block.instruction, "FB_POP_DATA");
+    assert.equal(block.accentColor, "var(--q1asm-feedback-color, #ff6fb3)");
+  });
+
+  it("matches Q1 timeline command metadata and generated aliases when inline preview source is missing", () => {
+    const { buildTimelineModel } = loadModel();
+    const cases = [
+      { kind: "feedback_pop", meta: { op: "fb_pop_data" }, instruction: "fb_pop_data", family: "feedback", color: "#ff6fb3" },
+      { kind: "feedback_com", meta: {}, instruction: "fb_com_data", family: "feedback", color: "#ff6fb3" },
+      { kind: "feedback_receive", meta: {}, instruction: "fb_pop_data", family: "feedback", color: "#ff6fb3" },
+      { kind: "marker_state", meta: {}, instruction: "play", family: "rt", color: "#8bcf9a" },
+      { kind: "sync_wait", meta: {}, instruction: "wait_sync", family: "sync", color: "#b9a7dc" },
+      { kind: "wait", meta: { op: "wait_sync" }, raw: "wait 4", instruction: "wait_sync", family: "sync", color: "#b9a7dc" },
+      { kind: "branch_region", meta: { op: "play" }, raw: "play 0,0,4", instruction: "loop", family: "flow", color: "#f4a261" },
+    ];
+    for (const item of cases) {
+      const payload: any = ir();
+      payload.q1timeline_ir = { events: [{
+        id: "event", kind: item.kind, label: "compact", meta: item.meta,
+        sequencer_id: "cluster0_module4_seq0", lane: "rt.control",
+        source: { line: 3, raw: item.raw },
+        t0: { value: 44 }, t1: { value: 48 }, duration: { value: 4 },
+      }] };
+      const model = buildTimelineModel(payload, "pulse:cz", undefined, {
+        expandedGroups: ["target:q0_q1"], expandedInlineQ1Lanes: ["inline-q1:q0_q1:flux / cz"],
+      });
+      const block = model.lanes.find((lane: { kind: string }) => lane.kind === "q1").blocks[0];
+      assert.equal(block.instruction, item.instruction, item.kind);
+      assert.equal(block.accentColor, `var(--q1asm-${item.family}-color, ${item.color})`, item.kind);
+      assert.equal(block.label, "compact");
+    }
+  });
+
+  it("uses mapped Q1ASM text as the command source when an event omits raw source and metadata", () => {
+    const { buildTimelineModel } = loadModel();
+    const payload: any = ir();
+    payload.q1asm_by_sequencer = { cluster0_module4_seq0: "\n\nacquire_weighed 0,0,0,0,4\n" };
+    payload.q1timeline_ir = { events: [{
+      id: "event", kind: "acquire", label: "acq", sequencer_id: "cluster0_module4_seq0", lane: "rt.acquire",
+      source: { line: 3 }, t0: { value: 44 }, t1: { value: 48 }, duration: { value: 4 },
+    }] };
+    const model = buildTimelineModel(payload, "pulse:cz", undefined, {
+      expandedGroups: ["target:q0_q1"], expandedInlineQ1Lanes: ["inline-q1:q0_q1:flux / cz"],
+    });
+    const block = model.lanes.find((lane: { kind: string }) => lane.kind === "q1").blocks[0];
+    assert.equal(block.instruction, "acquire_weighed");
+    assert.equal(block.accentColor, "var(--q1asm-rt-color, #8bcf9a)");
+    assert.equal(block.label, "acq");
   });
 
   it("expands inline Q1 preview for every block in a symbolic lane", () => {
@@ -1456,7 +1539,9 @@ describe("timelineModel", () => {
 
     assert.deepEqual(q1Blocks.map((block: { label: string }) => block.label), ["play", "wait"]);
     assert.deepEqual(q1Blocks.map((block: { line: number }) => block.line), [1, 2]);
-    assert.deepEqual(q1Blocks.map((block: { accentColor: string }) => block.accentColor), ["#8bcf9a", "#b9a7dc"]);
+    assert.deepEqual(q1Blocks.map((block: { accentColor: string }) => block.accentColor), [
+      "var(--q1asm-rt-color, #8bcf9a)", "var(--q1asm-rt-color, #8bcf9a)",
+    ]);
     assert.equal(q1Blocks[0].leftPercent, 33.333);
     assert.equal(q1Blocks[0].widthPercent, 6.061);
     assert.equal(q1Blocks[1].leftPercent, 39.394);

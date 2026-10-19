@@ -1,0 +1,13 @@
+move 4,R0
+move 0,R1
+body: wait 8
+sub R0,1,R0
+jz @done
+xor R1,1,R1
+nop
+cmp R1,0
+jz @even
+jmp @body
+even: wait 4
+jmp @body
+done: stop

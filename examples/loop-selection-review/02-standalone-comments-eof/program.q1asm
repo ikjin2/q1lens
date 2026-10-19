@@ -1,0 +1,6 @@
+# Standalone target; final instruction has no trailing newline.
+entry:
+# Comment between label and body.
+
+    wait 8
+    jmp @entry

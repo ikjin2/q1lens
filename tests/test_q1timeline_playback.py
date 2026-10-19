@@ -196,9 +196,13 @@ def test_indirect_loop_survives_an_unrelated_register_equal_to_jump_continuation
 def test_loop_backedge_can_target_a_higher_instruction_address() -> None:
     source = ("jmp @setup\nlatch: sub R0,1,R0\njnz R27\nstop\n"
               "setup: move @body,R27\nmove 3,R0\nnop\nbody: wait 8\njmp @latch")
-    loop, = finish(session(source))["playback"]["loops"]
+    ir = finish(session(source))
+    loop, = ir["playback"]["loops"]
     assert loop["source_start"]["line"] == 8 and loop["source_end"]["line"] == 3
     assert loop["count"] == 3 and loop["complete"]
+    by_id = {event["id"]: event for event in ir["events"]}
+    member_lines = {by_id[event_id]["source"]["line"] for event_id in loop["playback_event_ids"]}
+    assert member_lines == {2, 3, 8, 9}  # Logical target/latch bounds alone omit physical loop code.
 
 
 def test_alternating_backedges_form_one_loop_and_pending_new_path_stays_visible() -> None:

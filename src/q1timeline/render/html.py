@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from q1timeline.diagnostic_catalog import describe_diagnostic
-from q1timeline.q1asm.instruction_table import STATUS_BRANCH_OPS
+from q1timeline.q1asm.instruction_table import INSTRUCTION_TABLE, STATUS_BRANCH_OPS
 
 
 DEBUG_LANES = {
@@ -426,8 +426,8 @@ def _loop_bracket_svgs(
     search_text = escape(_search_text(event), quote=True)
     selected_class = " is-selected" if str(event.get("id")) == highlight_event_id else ""
     loop_diagnostics = diagnostic_overlays_by_event.get(str(event.get("id", "")), [])
-    start_classes = _with_diagnostic_classes(f"loop-bracket loop-bracket-start{selected_class}", loop_diagnostics)
-    end_classes = _with_diagnostic_classes(f"loop-bracket loop-bracket-end{selected_class}", loop_diagnostics)
+    start_classes = _with_diagnostic_classes(f"loop-bracket loop-bracket-start command-family-flow{selected_class}", loop_diagnostics)
+    end_classes = _with_diagnostic_classes(f"loop-bracket loop-bracket-end command-family-flow{selected_class}", loop_diagnostics)
     diagnostic_attributes = " ".join(_diagnostic_data_attributes(loop_diagnostics))
     if diagnostic_attributes:
         diagnostic_attributes = f" {diagnostic_attributes}"
@@ -520,7 +520,7 @@ def _branch_marker_svgs(
     confidence_attr = escape(confidence, quote=True)
     marker_diagnostics = diagnostic_overlays_by_event.get(str(event.get("id", "")), [])
     marker_classes = _with_diagnostic_classes(
-        f"branch-marker branch-marker-unresolved{confidence_class}{selected_class}",
+        f"branch-marker branch-marker-unresolved command-family-flow{confidence_class}{selected_class}",
         marker_diagnostics,
     )
     diagnostic_attributes = " ".join(_diagnostic_data_attributes(marker_diagnostics))
@@ -828,14 +828,16 @@ def _event_label_token(event: dict[str, Any]) -> str:
 
 
 def _q1_issue_command_token(event: dict[str, Any]) -> str:
-    source = event.get("source", {}) if isinstance(event.get("source"), dict) else {}
-    raw = str(source.get("raw", "")).strip()
-    if raw:
-        return raw.split(None, 1)[0]
     meta = event.get("meta", {}) if isinstance(event.get("meta"), dict) else {}
-    op = str(meta.get("op", "")).strip()
+    op = str(meta.get("op") or "").strip()
     if op:
         return op
+    source = event.get("source", {}) if isinstance(event.get("source"), dict) else {}
+    raw = re.split(r"#|//", str(source.get("raw", "")), maxsplit=1)[0].strip()
+    raw = re.sub(r"^[A-Za-z_][A-Za-z0-9_]*\s*:\s*", "", raw)
+    command = re.match(r"[A-Za-z_][A-Za-z0-9_]*\b", raw)
+    if command:
+        return command.group()
     return _event_display_label(event)
 
 
@@ -2151,6 +2153,9 @@ def _event_classes(event: dict[str, Any], *, confidence: Any, kind: Any, selecte
     if selected:
         classes.append("is-selected")
     classes.extend([f"confidence-{_class_token(confidence)}", f"kind-{_class_token(kind)}"])
+    family = _event_command_family(event)
+    if family:
+        classes.append(f"command-family-{family}")
     status = event.get("meta", {}).get("status") if isinstance(event.get("meta"), dict) else None
     if status:
         classes.append(f"status-{_class_token(status)}")
@@ -2161,6 +2166,34 @@ def _event_classes(event: dict[str, Any], *, confidence: Any, kind: Any, selecte
     if branch_comparison_path:
         classes.append(f"branch-path-{_class_token(branch_comparison_path)}")
     return " ".join(classes)
+
+
+def _event_command_family(event: dict[str, Any]) -> str | None:
+    kind = str(event.get("kind", ""))
+    if kind in {"unknown_region", "underflow_warning", "analysis_incomplete"}:
+        return None
+    if kind in {"loop_block", "loop_iteration_preview", "branch_region", "control_flow_loop", "control_flow_branch"}:
+        return "flow"
+    meta = event.get("meta") if isinstance(event.get("meta"), dict) else {}
+    source = event.get("source") if isinstance(event.get("source"), dict) else {}
+    raw = re.sub(r"^[A-Za-z_][A-Za-z0-9_]*\s*:\s*", "", str(source.get("raw", "")).strip())
+    op = str(meta.get("op") or (raw.split(None, 1)[0] if raw else "")).strip().lower()
+    if not op:
+        if kind in {"feedback_pop", "feedback_com"}:
+            return "feedback"
+        if kind == "marker_state":
+            return "rt"
+        op = kind
+    spec = INSTRUCTION_TABLE.get(op)
+    if spec is None:
+        return None
+    if op.startswith("fb_"):
+        return "feedback"
+    if spec.category == "branch" or op == "stop":
+        return "flow"
+    if spec.category in {"classical", "control"}:
+        return "q1"
+    return spec.category
 
 
 def _is_normal_feedback_collapsed_kind(kind: Any) -> bool:
@@ -2373,9 +2406,18 @@ def _json_script(value: dict[str, Any]) -> str:
 def _css() -> str:
     return """
 body { margin: 0; font-family: Arial, sans-serif; color: var(--vscode-foreground, #17202a); }
+body { --q1asm-q1-color: #245fa8; --q1asm-flow-color: #9a4c18; --q1asm-latched-color: #176b7e; --q1asm-rt-color: #27763c; --q1asm-sync-color: #7251a3; --q1asm-feedback-color: #ad316c; --q1asm-event-background: var(--vscode-editor-background, #ffffff); }
 body.vscode-light { color-scheme: light; }
 body.vscode-dark { color-scheme: dark; background: #1e1e1e !important; background-color: #1e1e1e !important; }
+body.vscode-dark, body.vscode-high-contrast { --q1asm-q1-color: #80b7ff; --q1asm-flow-color: #f4a261; --q1asm-latched-color: #6ec6d9; --q1asm-rt-color: #8bcf9a; --q1asm-sync-color: #b9a7dc; --q1asm-feedback-color: #ff6fb3; --q1asm-event-background: var(--vscode-editor-background, #1e1e1e); }
 body.vscode-high-contrast { color-scheme: dark; }
+.command-family-q1 { --q1asm-command-color: var(--q1asm-q1-color); }
+.command-family-flow { --q1asm-command-color: var(--q1asm-flow-color); }
+.command-family-latched { --q1asm-command-color: var(--q1asm-latched-color); }
+.command-family-rt { --q1asm-command-color: var(--q1asm-rt-color); }
+.command-family-sync { --q1asm-command-color: var(--q1asm-sync-color); }
+.command-family-feedback { --q1asm-command-color: var(--q1asm-feedback-color); }
+[class*="command-family-"] { --q1asm-event-fill: color-mix(in srgb, var(--q1asm-command-color) 15%, var(--q1asm-event-background)); --q1asm-event-stroke: color-mix(in srgb, var(--q1asm-command-color) 65%, var(--q1asm-event-background)); --q1asm-event-label-color: var(--q1asm-command-color); }
 header { display: flex; align-items: center; justify-content: space-between; padding: 14px 18px; border-bottom: 1px solid var(--vscode-panel-border, #d8dee6); }
 h1 { font-size: 18px; margin: 0; font-weight: 700; }
 h2 { font-size: 14px; margin: 0 0 6px; }
@@ -2486,9 +2528,9 @@ body.vscode-high-contrast .event-inspector { border-color: var(--vscode-contrast
 .lane-label, .tick-label { fill: var(--vscode-descriptionForeground, #4b5563); font-size: 12px; }
 .sequencer-label { fill: var(--vscode-foreground, #17202a); font-size: 12px; font-weight: 700; }
 .lane-rule, .grid { stroke: #d7dde4; stroke-width: 1; }
-.event rect { stroke: rgba(0, 0, 0, 0.38); stroke-width: 1; fill: #cdbb96; }
+.event rect { stroke: var(--q1asm-event-stroke, rgba(0, 0, 0, 0.38)); stroke-width: 1; fill: var(--q1asm-event-fill, #cdbb96); }
 body.vscode-high-contrast .event rect { stroke: var(--vscode-contrastActiveBorder, #ffffff); stroke-width: 2; }
-.event text { pointer-events: none; fill: #0f1720; font-size: 11px; }
+.event text { pointer-events: none; fill: var(--q1asm-event-label-color, #0f1720); font-size: 11px; }
 .event.is-selected rect { stroke: #111827; stroke-width: 2; }
 .event.is-filtered { display: none; }
 .event.lod-small rect { stroke-width: 1.5; }
@@ -2499,9 +2541,9 @@ body.vscode-high-contrast .event rect { stroke: var(--vscode-contrastActiveBorde
 .event.is-inactive-path rect { opacity: 0.45; }
 .loop-bracket { cursor: pointer; }
 .loop-bracket-hitbox { fill: none; stroke: none; pointer-events: all; }
-.loop-bracket-guide { stroke: #32613a; stroke-width: 1.2; stroke-dasharray: 3 4; opacity: 0.5; pointer-events: none; }
-.loop-bracket-stem, .loop-bracket-cap { stroke: #32613a; stroke-width: 2.2; stroke-linecap: square; pointer-events: none; }
-.loop-bracket text { fill: #32613a; font-size: 11px; font-weight: 700; paint-order: normal; stroke: none; stroke-width: 0; pointer-events: none; }
+.loop-bracket-guide { stroke: var(--q1asm-flow-color); stroke-width: 1.2; stroke-dasharray: 3 4; opacity: 0.5; pointer-events: none; }
+.loop-bracket-stem, .loop-bracket-cap { stroke: var(--q1asm-flow-color); stroke-width: 2.2; stroke-linecap: square; pointer-events: none; }
+.loop-bracket text { fill: var(--q1asm-flow-color); font-size: 11px; font-weight: 700; paint-order: normal; stroke: none; stroke-width: 0; pointer-events: none; }
 .loop-bracket.is-selected .loop-bracket-stem,
 .loop-bracket.is-selected .loop-bracket-cap,
 .loop-bracket.is-related .loop-bracket-stem,
@@ -2527,14 +2569,14 @@ body.vscode-high-contrast .event rect { stroke: var(--vscode-contrastActiveBorde
 .loop-bracket.is-related.has-diagnostic .loop-bracket-cap { stroke: #2563eb; }
 .branch-marker { cursor: pointer; }
 .branch-marker-hitbox { fill: none; stroke: none; pointer-events: all; }
-.branch-marker-guide { stroke: #b45309; stroke-width: 1.1; stroke-dasharray: 2 5; opacity: 0.45; pointer-events: none; }
-.branch-marker-diamond { fill: #fde68a; stroke: #b45309; stroke-width: 1.8; pointer-events: none; }
-.branch-marker.confidence-symbolic .branch-marker-diamond { fill: #f7d774; stroke-dasharray: 5 3; }
-.branch-marker.confidence-assumed .branch-marker-diamond { fill: #b8c2cc; stroke-dasharray: 4 3; }
-.branch-marker.confidence-unknown .branch-marker-diamond { fill: #c9ced6; stroke-dasharray: 2 2; }
-.branch-marker.confidence-runtime_dependent .branch-marker-diamond { fill: #e5a0a0; stroke-dasharray: 6 2; }
-.branch-marker text { fill: #92400e; font-size: 11px; font-weight: 700; paint-order: normal; stroke: none; stroke-width: 0; pointer-events: none; }
-.branch-marker-path-icon { fill: none; stroke: #92400e; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; pointer-events: none; }
+.branch-marker-guide { stroke: var(--q1asm-flow-color); stroke-width: 1.1; stroke-dasharray: 2 5; opacity: 0.45; pointer-events: none; }
+.branch-marker-diamond { fill: var(--q1asm-event-fill, #fde68a); stroke: var(--q1asm-flow-color); stroke-width: 1.8; pointer-events: none; }
+.branch-marker.confidence-symbolic .branch-marker-diamond { stroke-dasharray: 5 3; }
+.branch-marker.confidence-assumed .branch-marker-diamond { stroke-dasharray: 4 3; }
+.branch-marker.confidence-unknown .branch-marker-diamond { stroke-dasharray: 2 2; }
+.branch-marker.confidence-runtime_dependent .branch-marker-diamond { stroke-dasharray: 6 2; }
+.branch-marker text { fill: var(--q1asm-flow-color); font-size: 11px; font-weight: 700; paint-order: normal; stroke: none; stroke-width: 0; pointer-events: none; }
+.branch-marker-path-icon { fill: none; stroke: var(--q1asm-flow-color); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; pointer-events: none; }
 .branch-marker-path-icon-taken { stroke: #6d28d9; }
 .branch-marker-path-icon-fallthrough { stroke: #475569; }
 .branch-marker-path-icon-both { stroke: #0369a1; }
@@ -2567,9 +2609,9 @@ body.vscode-high-contrast .event rect { stroke: var(--vscode-contrastActiveBorde
 .diagnostic-badge text,
 .event .diagnostic-badge text,
 .branch-marker .diagnostic-badge text { fill: #ffffff; font-size: 9px; font-weight: 700; text-anchor: middle; paint-order: normal; stroke: none; pointer-events: none; }
-.control-flow-connector { fill: none; stroke: #32613a; stroke-width: 2; opacity: 0.78; pointer-events: none; }
+.control-flow-connector { fill: none; stroke: var(--q1asm-flow-color); stroke-width: 2; opacity: 0.78; pointer-events: none; }
 .control-flow-connector.is-related { stroke: #2563eb; stroke-width: 3; opacity: 1; }
-#control-flow-arrow path { fill: #32613a; }
+#control-flow-arrow path { fill: var(--q1asm-flow-color); }
 .event-inspector { margin: 0 16px 16px; padding: 10px 12px; border: 1px solid var(--vscode-panel-border, #d8dee6); }
 .event-inspector dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 10px; margin: 0; }
 .event-inspector dt { color: var(--vscode-descriptionForeground, #374151); font-weight: 700; }
@@ -2580,28 +2622,15 @@ body.vscode-high-contrast .event rect { stroke: var(--vscode-contrastActiveBorde
 .branch-actions-title { font-weight: 700; color: var(--vscode-foreground, #17202a); }
 .branch-actions-condition { color: var(--vscode-descriptionForeground, #374151); }
 .branch-actions-status { color: var(--vscode-descriptionForeground, #4b5563); }
-.event.confidence-symbolic > rect { fill: #f7d774; stroke-dasharray: 5 3; }
-.event.confidence-assumed > rect { fill: #b8c2cc; stroke-dasharray: 4 3; }
-.event.confidence-unknown > rect { fill: #c9ced6; stroke-dasharray: 2 2; }
-.event.confidence-runtime_dependent > rect { fill: #e5a0a0; stroke-dasharray: 6 2; }
-.kind-play rect { fill: #8bcf9a; }
-.kind-wait rect { fill: #cdbb96; }
-.kind-acquire rect { fill: #e2b36f; }
-.kind-wait_sync rect, .kind-wait_trigger rect { fill: #b9a7dc; }
-.kind-upd_param rect, .kind-upd_thres rect { fill: #bfd87a; }
-.kind-marker_state rect { fill: #8bcf9a; }
-.kind-feedback_pop rect, .kind-feedback_com rect,
-.kind-fb_acq_iq_id rect, .kind-fb_acq_iq_shift rect,
-.kind-fb_acq_tb_id rect, .kind-fb_acq_tb_cfg rect, .kind-fb_acq_tb_valid rect, .kind-fb_acq_tb_extra rect,
-.kind-fb_llp_tags_id rect, .kind-fb_llp_ttls_id rect,
-.kind-fb_tdc_tags_id rect, .kind-fb_tdc_tdelta_id rect,
-.kind-fb_com_cfg rect, .kind-fb_com_extra rect { fill: #cf9bd8; }
-.kind-loop_block rect { fill: #aacd88; stroke-width: 2; }
-.kind-control_flow_loop rect { fill: #aacd88; stroke: #32613a; stroke-width: 2; }
-.kind-control_flow_branch rect { fill: #fde68a; stroke: #b45309; stroke-width: 2; stroke-dasharray: 7 4; }
-.branch-path-taken rect { fill: #9dd8b3; stroke: #23754a; stroke-width: 2; }
-.branch-path-fallthrough rect { fill: #f4c17d; stroke: #9a5b17; stroke-width: 2; }
-.kind-loop_iteration_preview rect { fill: #cfe4bc; stroke-dasharray: 4 2; }
+.event.confidence-symbolic > rect { fill: var(--q1asm-event-fill, #f7d774); stroke-dasharray: 5 3; }
+.event.confidence-assumed > rect { fill: var(--q1asm-event-fill, #b8c2cc); stroke-dasharray: 4 3; }
+.event.confidence-unknown > rect { fill: var(--q1asm-event-fill, #c9ced6); stroke-dasharray: 2 2; }
+.event.confidence-runtime_dependent > rect { fill: var(--q1asm-event-fill, #e5a0a0); stroke-dasharray: 6 2; }
+.kind-loop_block rect, .kind-control_flow_loop rect { stroke-width: 2; }
+.kind-control_flow_branch rect { stroke-width: 2; stroke-dasharray: 7 4; }
+.branch-path-taken rect { stroke-width: 2; }
+.branch-path-fallthrough rect { stroke-width: 2; stroke-dasharray: 5 3; }
+.kind-loop_iteration_preview rect { stroke-dasharray: 4 2; }
 .kind-unknown_region rect { fill: #aab2bd; stroke-dasharray: 2 2; }
 .kind-underflow_warning rect { fill: #e26d6d; }
 .kind-analysis_incomplete rect { fill: #8a8f98; }
@@ -2610,8 +2639,8 @@ body.vscode-high-contrast .event rect { stroke: var(--vscode-contrastActiveBorde
 .status-analysis_incomplete rect { fill: #8a8f98; stroke-dasharray: 5 3; }
 .status-not_detected_under_current_assumptions rect { fill: #9bb7a5; }
 .time-cursor { stroke: #dc2626; stroke-width: 1; pointer-events: none; }
-.feedback-flow { fill: none; stroke: #d28be2; stroke-width: 1.8; stroke-dasharray: 5 3; pointer-events: stroke; }
-#feedback-arrow path { fill: #d28be2; }
+.feedback-flow { fill: none; stroke: var(--q1asm-feedback-color); stroke-width: 1.8; stroke-dasharray: 5 3; pointer-events: stroke; }
+#feedback-arrow path { fill: var(--q1asm-feedback-color); }
 .feedback-flow-label { fill: var(--vscode-foreground, #17202a); font-size: 10px; font-weight: 700; paint-order: normal; stroke: none; stroke-width: 0; }
 .feedback-flow-group.has-diagnostic .feedback-flow { stroke: #d97706; stroke-width: 2.7; stroke-dasharray: 7 3; opacity: 0.98; }
 .feedback-flow-group.diagnostic-error .feedback-flow { stroke: #dc2626; stroke-width: 3; }
@@ -2619,24 +2648,9 @@ body.vscode-high-contrast .event rect { stroke: var(--vscode-contrastActiveBorde
 .feedback-flow-group.diagnostic-error .feedback-flow-label { fill: #b91c1c; }
 body.vscode-dark .lane-rule, body.vscode-dark .grid { stroke: #353941; }
 body.vscode-dark main { background: #1e1e1e !important; background-color: #1e1e1e !important; }
-body.vscode-dark .event rect { stroke: rgba(0, 0, 0, 0.38); fill: #cdbb96; }
 body.vscode-dark .event.diff-shifted rect { stroke: #d28be2; }
-body.vscode-dark .event.confidence-assumed > rect { fill: #aab2bd; }
-body.vscode-dark .event.confidence-unknown > rect { fill: #aab2bd; }
-body.vscode-dark .kind-play rect { fill: #8bcf9a; }
-body.vscode-dark .kind-wait rect { fill: #cdbb96; }
-body.vscode-dark .kind-wait_sync rect, body.vscode-dark .kind-wait_trigger rect { fill: #b9a7dc; }
-body.vscode-dark .kind-acquire rect { fill: #e2b36f; }
-body.vscode-dark .kind-upd_param rect, body.vscode-dark .kind-upd_thres rect { fill: #bfd87a; }
-body.vscode-dark .kind-marker_state rect { fill: #8bcf9a; }
-body.vscode-dark .kind-feedback_pop rect, body.vscode-dark .kind-feedback_com rect,
-body.vscode-dark .kind-fb_acq_iq_id rect, body.vscode-dark .kind-fb_acq_iq_shift rect,
-body.vscode-dark .kind-fb_acq_tb_id rect, body.vscode-dark .kind-fb_acq_tb_cfg rect, body.vscode-dark .kind-fb_acq_tb_valid rect, body.vscode-dark .kind-fb_acq_tb_extra rect,
-body.vscode-dark .kind-fb_llp_tags_id rect, body.vscode-dark .kind-fb_llp_ttls_id rect,
-body.vscode-dark .kind-fb_tdc_tags_id rect, body.vscode-dark .kind-fb_tdc_tdelta_id rect,
-body.vscode-dark .kind-fb_com_cfg rect, body.vscode-dark .kind-fb_com_extra rect { fill: #cf9bd8; }
-body.vscode-dark .kind-loop_block rect { fill: #aacd88; }
-body.vscode-dark .kind-loop_iteration_preview rect { fill: #cfe4bc; }
+body.vscode-dark .event.confidence-assumed > rect { fill: var(--q1asm-event-fill, #aab2bd); }
+body.vscode-dark .event.confidence-unknown > rect { fill: var(--q1asm-event-fill, #aab2bd); }
 body.vscode-dark .kind-unknown_region rect { fill: #aab2bd; }
 body.mode-normal .debug-lane { display: none; }
 body.mode-debug .debug-lane { display: inline; }

@@ -376,6 +376,17 @@ button:disabled {
   color: var(--vscode-editor-foreground);
 }
 
+.timeline-block-q1.has-command-color,
+.timeline-block-q1.has-command-color[aria-selected="true"] {
+  background: color-mix(in srgb, var(--timeline-block-accent) 15%, transparent);
+  border-color: var(--timeline-block-accent);
+  color: var(--vscode-editor-foreground);
+}
+
+.timeline-block-q1.has-command-color .block-label {
+  color: var(--timeline-block-accent);
+}
+
 .timeline-block[data-related] {
   border-style: dashed;
   box-shadow: inset 0 0 0 1px var(--vscode-focusBorder);

@@ -6,22 +6,25 @@
       "include": "#comments"
     },
     {
+      "include": "#templates"
+    },
+    {
+      "include": "#instructions"
+    },
+    {
       "include": "#labels"
     },
     {
       "include": "#directives"
     },
     {
-      "include": "#instructions"
+      "include": "#symbols"
     },
     {
       "include": "#registers"
     },
     {
       "include": "#numbers"
-    },
-    {
-      "include": "#templates"
     }
   ],
   "repository": {
@@ -40,48 +43,109 @@
     "labels": {
       "patterns": [
         {
+          "match": "^\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*:",
+          "captures": {
+            "1": {
+              "name": "entity.name.label.q1asm"
+            }
+          }
+        },
+        {
           "name": "entity.name.label.q1asm",
-          "match": "^\\s*([A-Za-z_][A-Za-z0-9_]*):"
+          "match": "(?<![\\w@$])@[A-Za-z_][A-Za-z0-9_]*(?![\\w@$])"
         }
       ]
     },
     "directives": {
       "patterns": [
         {
-          "name": "keyword.control.directive.q1asm",
-          "match": "\\.[A-Za-z_][A-Za-z0-9_]*\\b"
+          "match": "(?i)^\\s*(\\.def)\\b(?!\\s*:)(?:[ \\t]+([A-Za-z_][A-Za-z0-9_]*))?",
+          "captures": {
+            "1": {
+              "name": "keyword.control.directive.q1asm"
+            },
+            "2": {
+              "name": "constant.other.symbol.q1asm"
+            }
+          }
         }
       ]
     },
     "instructions": {
       "patterns": [
         {
-          "name": "entity.name.function.q1asm",
-          "match": "\\b(acquire|acquire_digital|acquire_timetags|acquire_ttl|acquire_weighed|acquire_weighted|play|play_pulse)\\b"
+          "match": "(?i)^\\s*(?:([A-Za-z_][A-Za-z0-9_]*)\\s*:\\s*)?(add|and|asl|asr|cmp|illegal|lsl|lsr|move|muls16|muls32|muls32h|muls32l|mulu16|mulu32|mulu32h|mulu32l|nop|not|or|sub|sw_req|test|xor)\\b(?!\\s*:)",
+          "captures": {
+            "1": {
+              "name": "entity.name.label.q1asm"
+            },
+            "2": {
+              "name": "keyword.other.q1.q1asm"
+            }
+          }
         },
         {
-          "name": "constant.language.timing.q1asm",
-          "match": "\\b(wait|wait_sync|wait_trigger)\\b"
+          "match": "(?i)^\\s*(?:([A-Za-z_][A-Za-z0-9_]*)\\s*:\\s*)?(ja|jae|jb|jbe|jg|jge|jl|jle|jlt|jmp|jno|jns|jnz|jo|js|jz|loop|stop)\\b(?!\\s*:)",
+          "captures": {
+            "1": {
+              "name": "entity.name.label.q1asm"
+            },
+            "2": {
+              "name": "keyword.control.flow.q1asm"
+            }
+          }
         },
         {
-          "name": "string.other.feedback.q1asm",
-          "match": "\\b(fb_acq_iq_id|fb_acq_iq_shift|fb_acq_tb_cfg|fb_acq_tb_extra|fb_acq_tb_id|fb_acq_tb_mock|fb_acq_tb_valid|fb_cmd|fb_com_cfg|fb_com_data|fb_com_extra|fb_llp_tags_id|fb_llp_ttls_id|fb_pop_data|fb_pull_data|fb_tdc_tags_id|fb_tdc_tdelta_id)\\b"
+          "match": "(?i)^\\s*(?:([A-Za-z_][A-Za-z0-9_]*)\\s*:\\s*)?(reset_netzero|reset_ph|set_awg_gain|set_awg_offs|set_cond|set_digital|set_freq|set_mrk|set_ph|set_ph_delta|set_scope_en|set_time_ref)\\b(?!\\s*:)",
+          "captures": {
+            "1": {
+              "name": "entity.name.label.q1asm"
+            },
+            "2": {
+              "name": "storage.modifier.latched.q1asm"
+            }
+          }
         },
         {
-          "name": "storage.modifier.state.q1asm",
-          "match": "\\b(latch_rst|reset_netzero|reset_ph|set_awg_gain|set_awg_offs|set_cond|set_digital|set_freq|set_latch_en|set_mrk|set_ph|set_ph_delta|set_scope_en|set_time_ref|upd_param|upd_thres)\\b"
+          "match": "(?i)^\\s*(?:([A-Za-z_][A-Za-z0-9_]*)\\s*:\\s*)?(acquire|acquire_digital|acquire_timetags|acquire_ttl|acquire_weighed|acquire_weighted|latch_rst|play|play_pulse|set_latch_en|upd_param|upd_thres|wait)\\b(?!\\s*:)",
+          "captures": {
+            "1": {
+              "name": "entity.name.label.q1asm"
+            },
+            "2": {
+              "name": "entity.name.function.rt.q1asm"
+            }
+          }
         },
         {
-          "name": "keyword.control.flow.q1asm",
-          "match": "\\b(ja|jae|jb|jbe|jg|jge|jl|jle|jlt|jmp|jno|jns|jnz|jo|js|jz|loop|stop)\\b"
+          "match": "(?i)^\\s*(?:([A-Za-z_][A-Za-z0-9_]*)\\s*:\\s*)?(wait_sync|wait_trigger)\\b(?!\\s*:)",
+          "captures": {
+            "1": {
+              "name": "entity.name.label.q1asm"
+            },
+            "2": {
+              "name": "constant.language.sync.q1asm"
+            }
+          }
         },
         {
-          "name": "keyword.operator.alu.q1asm",
-          "match": "\\b(add|and|asl|asr|cmp|lsl|lsr|move|muls16|muls32|muls32h|muls32l|mulu16|mulu32|mulu32h|mulu32l|not|or|sub|test|xor)\\b"
-        },
+          "match": "(?i)^\\s*(?:([A-Za-z_][A-Za-z0-9_]*)\\s*:\\s*)?(fb_acq_iq_id|fb_acq_iq_shift|fb_acq_tb_cfg|fb_acq_tb_extra|fb_acq_tb_id|fb_acq_tb_mock|fb_acq_tb_valid|fb_cmd|fb_com_cfg|fb_com_data|fb_com_extra|fb_llp_tags_id|fb_llp_ttls_id|fb_pop_data|fb_pull_data|fb_tdc_tags_id|fb_tdc_tdelta_id)\\b(?!\\s*:)",
+          "captures": {
+            "1": {
+              "name": "entity.name.label.q1asm"
+            },
+            "2": {
+              "name": "string.other.feedback.q1asm"
+            }
+          }
+        }
+      ]
+    },
+    "symbols": {
+      "patterns": [
         {
-          "name": "support.constant.system.q1asm",
-          "match": "\\b(illegal|nop|sw_req)\\b"
+          "name": "constant.other.symbol.q1asm",
+          "match": "(?<![\\w@$])\\$[A-Za-z_][A-Za-z0-9_]*(?![\\w@$])"
         }
       ]
     },
@@ -89,7 +153,7 @@
       "patterns": [
         {
           "name": "variable.other.register.q1asm",
-          "match": "\\bR\\d+\\b"
+          "match": "(?i)(?<![\\w@$])R(?:0x[0-9a-f]+|0|[1-9]\\d*)(?![\\w@$])"
         }
       ]
     },
@@ -97,7 +161,7 @@
       "patterns": [
         {
           "name": "constant.numeric.q1asm",
-          "match": "\\b-?(?:0[xX][0-9A-Fa-f]+|0[bB][01]+|\\d+)\\b"
+          "match": "(?<![\\w@$+.-])-?(?:0[xX][0-9A-Fa-f]+|0|[1-9]\\d*)(?![\\w@$+.-])"
         }
       ]
     },
@@ -105,7 +169,13 @@
       "patterns": [
         {
           "name": "constant.other.placeholder.q1asm",
-          "match": "\\{[A-Za-z_][A-Za-z0-9_]*\\}"
+          "begin": "\\{",
+          "end": "\\}|(?=#|$)",
+          "patterns": [
+            {
+              "include": "#templates"
+            }
+          ]
         }
       ]
     }

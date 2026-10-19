@@ -1,0 +1,9 @@
+jmp @setup
+latch: sub R0,1,R0
+jnz R27
+stop
+setup: move @body,R27
+move 3,R0
+nop
+body: wait 8
+jmp @latch

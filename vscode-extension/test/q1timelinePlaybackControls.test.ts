@@ -205,6 +205,34 @@ describe("executed loop time scale", () => {
     assert.equal(buildTimelineTimeScale(ir, {expandedPlaybackLoops: ["parent", "child"]}).gaps.length, 0);
   });
 
+  it("folds short nested repetitions up to the following stop without boundary padding", () => {
+    const ir = {playback: {}, events: [
+      playbackEvent("before", "upd_param", 0, 4),
+      loop("parent", 4, 20, 36), loop("child", 4, 12, 20),
+      playbackEvent("stop", "stop", 36, 36),
+    ]};
+    const scale = buildTimelineTimeScale(ir);
+    assert.deepEqual(scale.gaps.map((gap: any) => [gap.start, gap.end]), [[12, 20], [20, 36]]);
+    close(scale.toDisplay(36), scale.gaps[1].displayEnd);
+    close(scale.toDisplay(36), 14.4);
+    const parentExpanded = buildTimelineTimeScale(ir, {expandedPlaybackLoops: ["parent"]});
+    assert.deepEqual(parentExpanded.gaps.map((gap: any) => [gap.start, gap.end]), [[12, 20]]);
+    close(parentExpanded.toDisplay(36), 28.8);
+    close(buildTimelineTimeScale(ir, {expandedPlaybackLoops: ["parent", "child"]}).toDisplay(36), 36);
+  });
+
+  it("does not let an analytical branch's independent Q1 clock block RT repetitions", () => {
+    const parent = loop("parent", 0, 16, 32);
+    const branch = playbackEvent("branch", "q1_issue", 20, 44, {op: "loop", playback_branch_id: "branch:1"});
+    const ir = {playback: {}, execution: {seq: {timing_model: "analytical"}},
+      events: [parent, branch, playbackEvent("stop", "stop", 32, 32)]};
+    const scale = buildTimelineTimeScale(ir);
+    assert.deepEqual(scale.gaps.map((gap: any) => [gap.start, gap.end]), [[16, 32]]);
+    close(scale.toDisplay(32), 17.6);
+    assert.equal(buildTimelineTimeScale({...ir, execution: {seq: {timing_model: "event_driven"}}}).gaps.length, 0);
+    assert.equal(buildTimelineTimeScale({...ir, execution: {}}).gaps.length, 0, "Unspecified clocks stay protected");
+  });
+
   it("combines wait folds with loop folds without making the wait toggle expand loops", () => {
     const ir = loopTrace();
     const both = buildTimelineTimeScale(ir, {waitGaps: [{start: 150, end: 500}]});

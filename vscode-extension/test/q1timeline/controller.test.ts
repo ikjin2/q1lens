@@ -195,6 +195,236 @@ async function withFakeTimers(callback: (clock: any) => Promise<void>) {
 }
 
 describe("q1timeline controller", () => {
+  function playbackController(TimelineController, vscode, request) {
+    const controller = new TimelineController(createContext());
+    const posted = [];
+    const published = [];
+    const calls = [];
+    let disposed = 0;
+    const client = { request: async (message) => { calls.push(message); return request(message); }, dispose: () => disposed++ };
+    controller.projectUri = vscode.Uri.file("C:\\repo\\q1timeline.yml");
+    controller.outputDir = "C:\\repo\\.q1timeline";
+    controller.panel = { webview: { postMessage: (message) => posted.push(message) }, dispose() {} };
+    controller.createPlaybackClient = () => client;
+    controller.publishPlaybackSnapshot = async (ir) => { controller.timelineIr = ir; published.push(ir); };
+    return { controller, client, calls, posted, published, disposed: () => disposed };
+  }
+
+  it("pauses between execution slices and resumes the same session", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      let release;
+      let runs = 0;
+      const paused = { status: "paused", can_resume: true, steps: 10 };
+      const completed = { status: "completed", can_resume: false, steps: 20 };
+      const setup = playbackController(TimelineController, vscode, async (message) => {
+        if (message.command === "run" && ++runs === 1) return new Promise((resolve) => { release = resolve; });
+        if (message.command === "run") return { playback: completed };
+        return { ir: { events: [], playback: runs === 1 ? paused : completed } };
+      });
+      const first = setup.controller.runPlayback();
+      setup.controller.pauseExecution();
+      release({ playback: paused });
+      await first;
+      assert.equal(runs, 1);
+      assert.equal(setup.controller.executionState.status, "paused");
+      assert.equal(setup.controller.playbackClient, setup.client);
+      await setup.controller.runPlayback();
+      assert.equal(runs, 2);
+      assert.equal(setup.published.length, 2);
+      assert.equal(setup.controller.executionState.status, "completed");
+      assert.equal(setup.disposed(), 0);
+      assert.deepEqual(setup.calls[0], { command: "run", budget_ms: 100, max_steps: 1000 });
+      setup.controller.dispose();
+      assert.equal(setup.disposed(), 1);
+    });
+  });
+
+  it("stops a play action at its wall-clock budget while retaining resumable state", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const state = { status: "paused", can_resume: true, steps: 20 };
+      const setup = playbackController(TimelineController, vscode, async (message) =>
+        message.command === "run" ? { playback: state } : { ir: { events: [], playback: state } });
+      const realNow = Date.now;
+      let now = 0;
+      Date.now = () => (now += 2500);
+      try { await setup.controller.runPlayback(); } finally { Date.now = realNow; }
+      assert.equal(setup.calls.filter((call) => call.command === "run").length, 2);
+      assert.equal(setup.controller.executionState.can_resume, true);
+      assert.equal(setup.published.length, 1);
+      setup.controller.dispose();
+    });
+  });
+
+  it("keeps manual fold state for mode changes but starts each calculated trace collapsed", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const state = { status: "completed", can_resume: false, steps: 4 };
+      const setup = playbackController(TimelineController, vscode, async (message) =>
+        message.command === "run" ? { playback: state } : { ir: { events: [], playback: state } });
+      assert.equal(setup.controller.webviewInitialState().playbackSnapshotId, undefined);
+      await setup.controller.runPlayback();
+      const first = setup.controller.webviewInitialState().playbackSnapshotId;
+      assert.equal(typeof first, "string");
+      assert.ok(first.length > 0);
+      await setup.controller.setViewMode("debug");
+      assert.equal(setup.controller.webviewInitialState().playbackSnapshotId, first);
+      await setup.controller.runPlayback();
+      assert.notEqual(setup.controller.webviewInitialState().playbackSnapshotId, first);
+      setup.controller.resetPlayback();
+      assert.equal(setup.controller.webviewInitialState().playbackSnapshotId, undefined);
+      setup.controller.dispose();
+    });
+  });
+
+  it("changes only a verified execution occurrence and recalculates one path", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const state = { status: "completed", can_resume: false, steps: 4 };
+      const setup = playbackController(TimelineController, vscode, async (message) =>
+        message.command === "run" ? { playback: state } : { ir: { events: [], playback: state } });
+      setup.controller.playbackClient = setup.client;
+      setup.controller.timelineIr = { events: [{ id: "e3", meta: { playback_branch_id: "seq:step:2" } }] };
+      await setup.controller.setExecutionBranch("e3", "seq:step:1", "taken");
+      await setup.controller.setExecutionBranch("e3", "seq:step:2", "both");
+      assert.equal(setup.calls.length, 0);
+      await setup.controller.setExecutionBranch("e3", "seq:step:2", "taken");
+      assert.deepEqual(setup.calls.map((call) => call.command), ["choose", "run", "snapshot"]);
+      assert.deepEqual(setup.calls[0], { command: "choose", branch_id: "seq:step:2", path: "taken" });
+      assert.equal(setup.published.length, 1);
+      setup.controller.dispose();
+    });
+  });
+
+  it("discards execution results when source changes during a slice", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      let release;
+      const setup = playbackController(TimelineController, vscode, () => new Promise((resolve) => { release = resolve; }));
+      const running = setup.controller.runPlayback();
+      setup.controller.invalidateSourceAnalysis();
+      release({ playback: { status: "completed", can_resume: false, steps: 4 } });
+      await running;
+      assert.equal(setup.disposed(), 1);
+      assert.equal(setup.published.length, 0);
+      assert.equal(setup.calls.length, 1);
+      assert.equal(setup.controller.executionState.status, "idle");
+      setup.controller.dispose();
+    });
+  });
+
+  it("changes a verified feedback occurrence, preserving unknown separately from zero", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const state = { status: "completed", can_resume: false, steps: 4 };
+      const ir = { events: [
+        { id: "i", meta: { playback_feedback_id: "seq:feedback:1" } },
+        { id: "q", meta: { playback_feedback_id: "seq:feedback:2" } },
+      ], playback: state };
+      const setup = playbackController(TimelineController, vscode, async (message) =>
+        message.command === "run" ? { playback: state } : { ir });
+      setup.controller.playbackClient = setup.client;
+      setup.controller.timelineIr = ir;
+      const message = { type: "setExecutionFeedback", eventId: "i", feedbackId: "seq:feedback:1", value: null, delayNs: 0 };
+      await setup.controller.handleWebviewMessage({ ...message, eventId: "q" });
+      await setup.controller.handleWebviewMessage({ ...message, delayNs: -1 });
+      setup.controller.playbackInFlight = true;
+      await setup.controller.handleWebviewMessage(message);
+      setup.controller.playbackInFlight = false;
+      assert.equal(setup.calls.length, 0);
+      await setup.controller.handleWebviewMessage(message);
+      await setup.controller.handleWebviewMessage({ ...message, eventId: "q", feedbackId: "seq:feedback:2", value: 0, delayNs: 1000 });
+      assert.deepEqual(setup.calls.filter((call) => call.command === "set_feedback"), [
+        { command: "set_feedback", feedback_id: "seq:feedback:1", value: null, delay_ns: 0 },
+        { command: "set_feedback", feedback_id: "seq:feedback:2", value: 0, delay_ns: 1000 },
+      ]);
+      assert.deepEqual(setup.calls.map((call) => call.command), ["set_feedback", "run", "snapshot", "set_feedback", "run", "snapshot"]);
+      assert.equal(setup.published.length, 2);
+      setup.controller.dispose();
+    });
+  });
+
+  it("drops feedback edits when source changes before replay starts", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      let release;
+      const setup = playbackController(TimelineController, vscode, () => new Promise((resolve) => { release = resolve; }));
+      setup.controller.playbackClient = setup.client;
+      setup.controller.timelineIr = { events: [{ id: "i", meta: { playback_feedback_id: "seq:feedback:1" } }] };
+      const edit = setup.controller.setExecutionFeedback("i", "seq:feedback:1", 12, 500);
+      setup.controller.invalidateSourceAnalysis();
+      release({ ir: { events: [] } });
+      await edit;
+      assert.equal(setup.calls.length, 1);
+      assert.equal(setup.published.length, 0);
+      assert.equal(setup.disposed(), 1);
+      setup.controller.dispose();
+    });
+  });
+
+  it("keeps the existing preview on playback failure and refuses unsaved sources", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const setup = playbackController(TimelineController, vscode, () => { throw new Error("worker exited"); });
+      const previousIr = { events: [{ id: "previous" }] };
+      setup.controller.timelineIr = previousIr;
+      setup.controller.hasUnsavedProjectChanges = () => true;
+      await setup.controller.runPlayback();
+      assert.equal(setup.calls.length, 0);
+      assert.equal(setup.controller.executionState.status, "blocked");
+      setup.controller.hasUnsavedProjectChanges = () => false;
+      await setup.controller.runPlayback();
+      assert.equal(setup.controller.timelineIr, previousIr);
+      assert.equal(setup.controller.executionState.status, "error");
+      assert.equal(setup.disposed(), 1);
+      setup.controller.dispose();
+    });
+  });
+
+  it("does not overwrite analyzer files or publish a snapshot invalidated during rendering", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      const outputDir = mkdtempSync(join(tmpdir(), "q1lens-playback-render-"));
+      controller.projectUri = vscode.Uri.file(join(outputDir, "q1timeline.yml"));
+      controller.outputDir = outputDir;
+      controller.panel = { webview: { postMessage() {} }, dispose() {} };
+      const client = { dispose() {} };
+      controller.playbackClient = client;
+      for (const name of ["timeline_ir.json", "timeline.html", "diagnostics.json"]) writeFileSync(join(outputDir, name), "newer analysis");
+      let refreshed = false;
+      controller.refreshWebview = async () => { refreshed = true; };
+      controller.runRender = async (_python, _args, _ir, html) => {
+        controller.invalidateSourceAnalysis();
+        writeFileSync(html, "old playback");
+      };
+      await controller.publishPlaybackSnapshot({ events: [], playback: { status: "paused" } }, client);
+      assert.equal(refreshed, false);
+      assert.equal(controller.analyzedSourceRevision, 0);
+      for (const name of ["timeline_ir.json", "timeline.html", "diagnostics.json"]) {
+        assert.equal(readFileSync(join(outputDir, name), "utf8"), "newer analysis");
+      }
+      controller.dispose();
+    });
+  });
+
+  it("keeps execution controls busy until the resulting timeline is published", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const completed = { status: "completed", can_resume: false, steps: 2 };
+      const setup = playbackController(TimelineController, vscode, async (message) =>
+        message.command === "run" ? { playback: completed } : { ir: { events: [], playback: completed } });
+      setup.controller.publishPlaybackSnapshot = async () => {
+        assert.equal(setup.controller.playbackInFlight, true);
+        assert.equal(setup.controller.executionState.status, "running");
+      };
+      await setup.controller.runPlayback();
+      assert.equal(setup.controller.executionState.status, "completed");
+      setup.controller.dispose();
+    });
+  });
+
   it("does not warn for supported legacy and current analyzer releases", async () => {
     const vscode = createMockVscode();
     const warnings: string[] = [];
@@ -2705,6 +2935,55 @@ describe("q1timeline controller", () => {
           "seq0:loop:main.q1asm:2-8=3",
         ],
       );
+      controller.dispose();
+    });
+  });
+
+  it("preserves an RT click through source reveal echoes and resumes manual source-follow", async () => {
+    const vscode = createMockVscode();
+    vscode.TextEditorSelectionChangeKind = { Keyboard: 1, Mouse: 2, Command: 3 };
+    const posted: any[] = [];
+    let selectionHandler: any;
+    let activeHandler: any;
+    vscode.window.onDidChangeTextEditorSelection = (handler: any) => { selectionHandler = handler; return { dispose() {} }; };
+    vscode.window.onDidChangeActiveTextEditor = (handler: any) => { activeHandler = handler; return { dispose() {} }; };
+    const sourcePath = "C:\\repo\\golden_section.q1asm";
+    const document = { uri: vscode.Uri.file(sourcePath) };
+    let selection: any = { active: { line: 0, character: 0 } };
+    const editor = {
+      document, viewColumn: 2, setDecorations() {}, revealRange() {},
+      get selection() { return selection; },
+      set selection(value) { selection = value; selectionHandler({ textEditor: editor, kind: vscode.TextEditorSelectionChangeKind.Command }); },
+    };
+    vscode.workspace.openTextDocument = async () => document;
+    vscode.window.showTextDocument = async () => { activeHandler(editor); return editor; };
+
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      controller.projectUri = vscode.Uri.file("C:\\repo\\q1timeline.yml");
+      controller.projectRelatedPaths = new Set([sourcePath]);
+      controller.panel = { webview: { postMessage: (message: any) => posted.push(message) }, dispose() {} };
+      const source = { file: sourcePath, line: 7, column: 9 };
+      controller.timelineIr = {
+        source_map: { by_source: { [`${sourcePath}:7`]: ["golden_section:e5", "golden_section:e6"] } },
+        events: [
+          { id: "golden_section:e5", kind: "q1_issue", t0: 20, t1: 24, source, meta: { op: "fb_acq_iq_id" } },
+          { id: "golden_section:e6", kind: "fb_acq_iq_id", t0: 0, t1: 12, source, meta: { q1_issue_event_id: "golden_section:e5" } },
+        ],
+      };
+
+      await controller.openSourceForEvent("golden_section:e6");
+      assert.equal(editor.selection.active.line, 6);
+      assert.equal(editor.selection.active.character, 8);
+      assert.deepEqual(posted, [], "RT source navigation must not replace its selection or viewport with the Q1 issue");
+      activeHandler(editor);
+      selectionHandler({ textEditor: editor, kind: vscode.TextEditorSelectionChangeKind.Command });
+      selectionHandler({ textEditor: editor });
+      assert.deepEqual(posted, [], "delayed source echoes must preserve the clicked RT event too");
+
+      selectionHandler({ textEditor: editor, kind: vscode.TextEditorSelectionChangeKind.Mouse });
+      assert.deepEqual(posted, [{ type: "highlightEventIds", highlightEventIds: ["golden_section:e5", "golden_section:e6"] }],
+        "a direct source click must still reveal the source's timeline events");
       controller.dispose();
     });
   });

@@ -66,7 +66,7 @@
       q1: [], rt: [], registers: new Map(), registerWrites: new Map(), pending: new Map(), applied: new Map(),
       awg: new Map(), acquisitions: [], bins: new Map(), binOrder: [],
       queue: [], stalls: [], rtWaits: [], communications: [], acquisitionResults: new Map(), resultEvents: [],
-      q1Risks: [], rtRisks: [], warnings: new Set(), steps: [], range: { min: 0, max: 0 },
+      q1Risks: [], rtRisks: [], outputRisks: [], warnings: new Set(), steps: [], range: { min: 0, max: 0 },
     };
   }
 
@@ -76,8 +76,11 @@
   }
 
   function addRisk(series, event, time, clock, message, inclusive = false) {
-    if (time !== undefined) series[`${clock}Risks`].push({ time, message, event, inclusive });
-    else series.warnings.add(message);
+    if (time !== undefined) {
+      const risk = { time, message, event, inclusive };
+      series[`${clock}Risks`].push(risk);
+      if (clock === "rt" && (event.meta || {}).output_state_unknown !== false) series.outputRisks.push(risk);
+    } else series.warnings.add(message);
   }
 
   function buildSeries(index, events, history, basis) {
@@ -99,7 +102,9 @@
       const end = eventTime(index, event, basis, "t1");
       if (time !== undefined) series.steps.push(time);
       if (end !== undefined) series.steps.push(end);
-      if (event.confidence === "assumed" || meta.assumed_branch_path) {
+      const feedbackAssumed = meta.feedback_assumption || (meta.feedback_assumptions || []).length;
+      if (feedbackAssumed) series.warnings.add("State depends on assumed feedback values or timing.");
+      if (meta.assumed_branch_path || (meta.branch_assumptions || []).length || event.confidence === "assumed" && !feedbackAssumed) {
         series.warnings.add("State follows the analyzer's branch assumptions.");
       }
       if (event.kind === "underflow_warning") {
@@ -180,7 +185,7 @@
           series.warnings.add("Some acquisition targets are unresolved.");
         }
       }
-      if (event.kind === "loop_block" && meta.count !== 1) {
+      if (event.kind === "loop_block" && !meta.playback && meta.count !== 1) {
         const firstIds = meta.first_iteration_event_ids || [];
         const firstIssues = firstIds.map((id) => index.eventsById.get(String(id))).filter((item) => item && item.kind === "q1_issue");
         const issueEnds = firstIssues.map((item) => eventTime(index, item, basis, "t1")).filter(Number.isFinite);
@@ -231,7 +236,7 @@
       series.steps.push(time);
     }
     const sort = (items) => items.sort((left, right) => left.time - right.time);
-    for (const key of ["q1", "rt", "acquisitions", "q1Risks", "rtRisks", "queue", "stalls", "rtWaits", "communications", "resultEvents"]) sort(series[key]);
+    for (const key of ["q1", "rt", "acquisitions", "q1Risks", "rtRisks", "outputRisks", "queue", "stalls", "rtWaits", "communications", "resultEvents"]) sort(series[key]);
     for (const key of ["registers", "pending", "applied", "awg", "acquisitionResults"]) for (const items of series[key].values()) sort(items);
     for (const bin of series.bins.values()) {
       sort(bin.history);
@@ -246,7 +251,7 @@
   function buildExecutionTrace(index, sequencerId, events, series, basis) {
     const unavailable = (reason) => ({ instructions: [], sourceLines: [], reason });
     const execution = index.execution[sequencerId];
-    if (!execution || !["concrete", "simulation"].includes(execution.mode)) return unavailable("No execution trace is recorded. Generate a concrete or simulation trace to replay instructions.");
+    if (!execution || !["concrete", "simulation", "playback"].includes(execution.mode)) return unavailable("No execution trace is recorded. Generate an execution trace to replay instructions.");
     if (!index.hasRegisterHistory) return unavailable("Register history is unavailable. Generate a new execution trace to inspect registers.");
     const issues = events.filter((event) => event.kind === "q1_issue" && !isPreview(event));
     if (!issues.length) return unavailable("No recorded instructions. Refresh in concrete or simulation execution mode.");
@@ -475,6 +480,7 @@
     const series = getSeries(index, sequencerId, basis) || createSeries();
     const q1Risk = latest(series.q1Risks, time);
     const rtRisk = latest(series.rtRisks, time);
+    const outputRisk = latest(series.outputRisks, time);
     const warnings = new Set(series.warnings);
     if (q1Risk) warnings.add(q1Risk.message);
     if (rtRisk) warnings.add(rtRisk.message);
@@ -486,7 +492,7 @@
     const fields = new Set(["frequency", "phase", "phase_delta", "awg_gain", "awg_offset", "marker", ...series.pending.keys(), ...series.applied.keys()]);
     const parameters = Array.from(fields, (field) => {
       const pending = valueAt(series.pending.get(field), time, q1Risk);
-      return { field, pending: pending && (pending.consumedAt === undefined || pending.consumedAt > time) ? pending : null, applied: valueAt(series.applied.get(field), time, rtRisk) };
+      return { field, pending: pending && (pending.consumedAt === undefined || pending.consumedAt > time) ? pending : null, applied: valueAt(series.applied.get(field), time, outputRisk) };
     });
     const total = upperBound(series.binOrder, time);
     const offset = Math.max(0, Math.floor(Number(binOptions.offset) || 0));
@@ -505,9 +511,9 @@
       sequencerId: String(sequencerId), time, range: series.range, warnings: Array.from(warnings), execution: index.execution[String(sequencerId)] || null,
       q1: coreStateAt(series, "q1", time, q1Risk), rt: coreStateAt(series, "rt", time, rtRisk), registers, parameters,
       simulation: simulationAt(index, sequencerId, series, time, basis),
-      awg: Array.from(series.awg, ([path, items]) => ({ path, ...stateAt(items, time, rtRisk) })),
-      acquisition: stateAt(series.acquisitions, time, rtRisk),
-      bins: { total, records, partial: Boolean(rtRisk), offset, limit },
+      awg: Array.from(series.awg, ([path, items]) => ({ path, ...stateAt(items, time, outputRisk) })),
+      acquisition: stateAt(series.acquisitions, time, outputRisk),
+      bins: { total, records, partial: Boolean(outputRisk), offset, limit },
     };
   }
 

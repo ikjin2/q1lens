@@ -46,7 +46,7 @@ function loadInstructionRuntime(options: { count?: number; clientWidth?: number;
     return stage;
   }
   const names = ["clamp", "instructionPlotWidth", "setInstructionView", "fitInstructionSelection", "handleInstructionWheel", "installTimelineMouseInteractions", "renderSharedTimelineIfAvailable", "setTimelineLayout", "timelineControlChipLeft"];
-  const noops = ["renderTimelineLayoutToggle", "renderTimelineWindowStatus", "renderTimeBasisToggle", "installSharedQ1IssueControls", "syncSharedSequencerFoldControls", "installTimelineControlChips", "applySharedSelection", "renderWaitFolds", "renderHardwareCursor"];
+  const noops = ["renderTimelineLayoutToggle", "renderTimelineWindowStatus", "renderTimeBasisToggle", "installSharedQ1IssueControls", "syncSharedSequencerFoldControls", "installTimelineControlChips", "applySharedSelection", "renderWaitFolds", "renderPlaybackFolds", "renderHardwareCursor"];
   return Function("createStage", "adapter", "count", `
     let stage = createStage(count);
     let instructionView = { cellWidth: 112, leftOrdinal: 0 };
@@ -54,6 +54,7 @@ function loadInstructionRuntime(options: { count?: number; clientWidth?: number;
     let selectedTimelineEventId = "rt-4";
     const selectedSourceEventIds = new Set(["rt-4", "q1-9"]);
     const expandedQ1IssueSequencers = new Set();
+    const expandedPlaybackLoops = new Set();
     const realState = { window: { min: 400000, max: 401000 }, selection: { start: 400200, end: 400400 }, cursor: 400300 };
     const revealed = [];
     const timelineIr = { events: Array.from({ length: count }, (_, index) => ({
@@ -61,7 +62,7 @@ function loadInstructionRuntime(options: { count?: number; clientWidth?: number;
     })).concat(Array.from({ length: Math.ceil(count / 2) }, (_, index) => ({
       id: "q1-" + index, kind: "q1_issue", sequencer_id: "Control", t0: index * 4, t1: (index + 1) * 4,
     }))) };
-    const root = { querySelector: () => stage };
+    const root = { querySelector: selector => selector === ".shared-timeline-stage" ? stage : undefined };
     const document = { getElementById: () => root };
     const window = { q1timelineTimelineAdapter: adapter, q1lensSharedTimeline: {
       renderTimeline(_root, model) {

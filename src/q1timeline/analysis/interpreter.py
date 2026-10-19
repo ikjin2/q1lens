@@ -131,6 +131,8 @@ class AnalysisState:
     pc: int = 0
     registers: SymbolTable = field(default_factory=dict)
     latched_state: LatchedState = field(default_factory=LatchedState)
+    conditional_enable: Value = field(default_factory=lambda: Concrete(0))
+    conditional_time_unknown: bool = False
     q1_time_ns: Value = field(default_factory=lambda: Concrete(0))
     rt_time_ns: Value = field(default_factory=lambda: Concrete(0))
     loop_stack: list[Any] = field(default_factory=list)
@@ -292,7 +294,7 @@ def _run_concrete_program(
 def _concrete_instruction_ready(
     state: AnalysisState, instruction: Instr, symbols: SymbolTable,
     spec: InstructionSpec, has_invalid_arguments: bool, diagnostic_start: int,
-    *, supported_ops: set[str] | None = None,
+    *, supported_ops: set[str] | None = None, allow_symbolic_operands: bool = False,
 ) -> bool:
     diagnostics = state.diagnostics[diagnostic_start:]
     errors = [item for item in diagnostics if (item.severity == "error" and item.category != "unresolved_symbol") or item.category == "register_not_ready"]
@@ -300,7 +302,8 @@ def _concrete_instruction_ready(
         reason = errors[0].message
         _end_concrete_execution(state, "error", reason, instruction)
         return False
-    if instruction.op not in (_CONCRETE_OPS if supported_ops is None else supported_ops):
+    if (instruction.op not in (_CONCRETE_OPS if supported_ops is None else supported_ops)
+            and not _set_cond_is_disabled(state, instruction, symbols)):
         status = "error" if spec.category == "unknown" or instruction.op == "illegal" else "blocked"
         _end_concrete_execution(state, status, f"{instruction.op} has no supported concrete execution semantics.", instruction)
         return False
@@ -316,12 +319,15 @@ def _concrete_instruction_ready(
             )
             return False
     scope = _scope(symbols, state)
+    condition_disabled = _set_cond_is_disabled(state, instruction, symbols)
     destinations = _register_destination_argument_indexes(instruction.op)
     for index, arg in enumerate(instruction.args):
-        if index in destinations:
+        if index in destinations or (condition_disabled and index in {1, 2}):
             continue
         value = resolve_arg_value(arg, scope)
         if not isinstance(value, Concrete):
+            if allow_symbolic_operands and arg.kind != "label":
+                continue
             status = "error" if arg.kind == "label" else "blocked"
             _end_concrete_execution(state, status, f"Operand {arg.raw} is unresolved: {value}.", instruction)
             return False
@@ -330,10 +336,14 @@ def _concrete_instruction_ready(
         return False
     if spec.category == "latched":
         for index, role, lower, upper in _official_operand_ranges(instruction.op):
+            if condition_disabled and index in {1, 2}:
+                continue
             arg = instruction.args[index]
             if _register_name(arg, state) is None:
                 continue
             value = _latched_operand_value(instruction.op, arg, scope, state)
+            if allow_symbolic_operands and not isinstance(value, Concrete):
+                continue
             if not lower <= value.value <= upper:
                 _end_concrete_execution(
                     state, "blocked",
@@ -353,6 +363,8 @@ def _concrete_instruction_ready(
     if instruction.op in {"asl", "asr", "lsl", "lsr"}:
         _, shift_arg = _docs_ordered_binary_args(instruction, state)
         shift = resolve_arg_value(shift_arg, scope)
+        if allow_symbolic_operands and not isinstance(shift, Concrete):
+            return True
         if not 0 <= shift.value <= 32:
             _end_concrete_execution(state, "blocked", "Shift count is outside the supported range 0..32.", instruction)
             return False
@@ -527,11 +539,15 @@ def _execute_instruction(
     symbols: SymbolTable,
     waveform_names: dict[int, str],
     acquisition_names: dict[int, str],
+    *,
+    allow_symbolic_operands: bool = False,
 ) -> None:
     spec, has_invalid_arguments, diagnostic_start = _validate_instruction(state, instruction, symbols)
 
     if state.execution_mode == "concrete" and not _concrete_instruction_ready(
         state, instruction, symbols, spec, has_invalid_arguments, diagnostic_start,
+        supported_ops=(_CONCRETE_OPS | {instruction.op}) if allow_symbolic_operands and instruction.op != "illegal" else None,
+        allow_symbolic_operands=allow_symbolic_operands,
     ):
         return
 
@@ -545,7 +561,7 @@ def _execute_instruction(
         _emit_q1_issue(state, instruction, q1_t0, q1_t1, rt_packet_id)
         return
 
-    _diagnose_analysis_incomplete_timing_effect(state, instruction, spec)
+    _diagnose_analysis_incomplete_timing_effect(state, instruction, spec, symbols)
 
     if spec.category == "unknown":
         _emit_q1_issue(state, instruction, q1_t0, q1_t1, rt_packet_id)
@@ -561,6 +577,8 @@ def _execute_instruction(
         q1_issue_event = _emit_q1_issue(state, instruction, q1_t0, q1_t1, rt_packet_id)
         if pending_event is not None:
             pending_event.meta["q1_issue_event_id"] = q1_issue_event.id
+            if instruction.op == "set_cond":
+                q1_issue_event.meta["conditional_enabled"] = pending_event.meta["conditional_enabled"]
         return
 
     if spec.category == "feedback":
@@ -589,8 +607,9 @@ def _execute_instruction(
             t1=state.rt_time_ns,
             duration=Concrete(0),
             label=instruction.op,
-            confidence="exact",
+            confidence=_confidence_for_timing(Concrete(0), state.rt_time_ns, state.rt_time_ns),
             source=instruction.source,
+            meta={"output_state_unknown": False} if state.conditional_time_unknown else None,
         )
         state.stopped = True
         return
@@ -617,6 +636,8 @@ def _execute_instruction(
         return
 
     if spec.category in {"rt", "sync"}:
+        if state.conditional_enable != Concrete(0):
+            q1_issue_event.meta["conditional_execution_unknown"] = True
         event_start = len(state.events)
         _execute_rt_instruction(
             state,
@@ -637,8 +658,9 @@ def _diagnose_analysis_incomplete_timing_effect(
     state: AnalysisState,
     instruction: Instr,
     spec: InstructionSpec,
+    symbols: SymbolTable,
 ) -> None:
-    if spec.timing_effect_status != "analysis_incomplete":
+    if spec.timing_effect_status != "analysis_incomplete" or _set_cond_is_disabled(state, instruction, symbols):
         return
     state.diagnostics.append(
         Diagnostic(
@@ -649,6 +671,11 @@ def _diagnose_analysis_incomplete_timing_effect(
             details={"op": instruction.op},
         )
     )
+
+
+def _set_cond_is_disabled(state: AnalysisState, instruction: Instr, symbols: SymbolTable) -> bool:
+    return (instruction.op == "set_cond" and bool(instruction.args)
+            and resolve_arg_value(instruction.args[0], _scope(symbols, state)) == Concrete(0))
 
 
 def _diagnose_unresolved_register_operands(
@@ -1423,7 +1450,6 @@ def _is_packed_feedback_register_form(instruction: Instr) -> bool:
 
 def _range_lower_bound_is_validated_elsewhere(op: str, operand_role: str) -> bool:
     return (op, operand_role) in {
-        ("set_cond", "else_duration"),
         ("fb_com_cfg", "bit_position"),
         ("fb_com_cfg", "payload_length"),
         ("fb_acq_tb_cfg", "bit_position"),
@@ -3230,6 +3256,29 @@ def _emit_compact_loop(
         event.meta.setdefault("loop_iteration_index", 0)
 
     t0, t1, duration = _loop_timing(preview_events, current_rt_time=state.rt_time_ns)
+    has_hidden_iterations = forever or not isinstance(count, Concrete) or count.value > 1
+    written_registers: set[str] = set()
+    body_instructions = [state.instructions_by_pc[pc] for pc in range(start_pc, instruction.pc + 1)]
+    if has_hidden_iterations:
+        for body_instruction in body_instructions:
+            written_registers.update(_register_write_operands(body_instruction, state))
+            if body_instruction.op == "loop" and body_instruction.args:
+                body_counter = _register_name(body_instruction.args[0], state)
+                if body_counter is not None:
+                    written_registers.add(body_counter)
+    condition_setters = [item for item in body_instructions if item.op == "set_cond" and item.args]
+    condition_varies = bool(condition_setters and _register_name(condition_setters[-1].args[0], state) in written_registers)
+    conditional_loop_timing_unknown = False
+    for body_instruction in body_instructions:
+        if body_instruction.op == "set_cond" and body_instruction.args:
+            condition_varies = _register_name(body_instruction.args[0], state) in written_registers
+        elif condition_varies and get_instruction_spec(body_instruction.op).category in {"rt", "sync"}:
+            conditional_loop_timing_unknown = True
+    if conditional_loop_timing_unknown:
+        # Later iterations may gate RT work differently from the first one.
+        duration = Unknown(f"conditional execution in compact loop {loop_id}")
+        t1 = add_values(t0, duration)
+        state.conditional_time_unknown = True
     q1_period = _loop_q1_period(preview_events, q1_issue_event)
     q1_body_period = _loop_q1_body_period(q1_period, first_loop_edge_runtime_ns)
     loop_preview_key = _loop_preview_key(state, start_instruction.source, instruction.source)
@@ -3238,6 +3287,8 @@ def _emit_compact_loop(
     visible_iteration_count = max(visible_iteration_count, min_visible)
     if not forever and isinstance(count, Concrete):
         visible_iteration_count = min(visible_iteration_count, max(1, count.value))
+    if conditional_loop_timing_unknown:
+        visible_iteration_count = 1
     shown_iterations = list(range(visible_iteration_count))
     preview_policy = "first_iteration_only" if visible_iteration_count == 1 else "requested_iterations"
     count_display = "forever" if forever else _display_count(count)
@@ -3270,7 +3321,7 @@ def _emit_compact_loop(
         t1=t1,
         duration=duration,
         label=f"loop {loop_id} {count_display if forever else 'x' + str(count_display)}",
-        confidence="exact" if forever else _confidence_for_value(count),
+        confidence="unknown" if state.conditional_time_unknown else "exact" if forever else _confidence_for_value(count),
         source=start_instruction.source,
         meta={
             "loop_id": loop_id,
@@ -3308,7 +3359,7 @@ def _emit_compact_loop(
         t1=t1,
         duration=duration,
         label=f"{loop_id} iteration 0 preview",
-        confidence="exact" if forever else _confidence_for_value(count),
+        confidence="unknown" if state.conditional_time_unknown else "exact" if forever else _confidence_for_value(count),
         source=start_instruction.source,
         meta={
             "loop_id": loop_id,
@@ -3348,7 +3399,7 @@ def _emit_compact_loop(
             t1=_shift_value(t1, duration, iteration_index),
             duration=duration,
             label=f"{loop_id} iteration {iteration_index} preview",
-            confidence="exact" if forever else _confidence_for_value(count),
+            confidence="unknown" if state.conditional_time_unknown else "exact" if forever else _confidence_for_value(count),
             source=start_instruction.source,
             meta={
                 "loop_id": loop_id,
@@ -3371,16 +3422,7 @@ def _emit_compact_loop(
     # Only the first iteration is interpreted; later previews copy events without
     # executing their arithmetic. Do not expose those copies as register writes.
     _flush_pending_register_writes(state, completed_issue_index=state.q1_issue_index + 1)
-    has_hidden_iterations = forever or not isinstance(count, Concrete) or count.value > 1
     if has_hidden_iterations:
-        written_registers: set[str] = set()
-        for pc in range(start_pc, instruction.pc + 1):
-            body_instruction = state.instructions_by_pc[pc]
-            written_registers.update(_register_write_operands(body_instruction, state))
-            if body_instruction.op == "loop" and body_instruction.args:
-                body_counter = _register_name(body_instruction.args[0], state)
-                if body_counter is not None:
-                    written_registers.add(body_counter)
         reason = f"register writes in compact loop {loop_id} are not expanded"
         _invalidate_register_history(
             state,
@@ -3393,6 +3435,8 @@ def _emit_compact_loop(
         for register in written_registers:
             state.registers[register] = Unknown(reason)
             state.register_provenance.pop(register, None)
+        if condition_varies:
+            state.conditional_enable = Unknown(reason)
     if not forever:
         _advance_compact_loop_fallthrough_state(
             state,
@@ -3894,6 +3938,9 @@ def _execute_latched(state: AnalysisState, instruction: Instr, symbols: SymbolTa
     elif instruction.op in {"set_cond", "set_time_ref"}:
         field_name = instruction.op
         value = [resolve_arg_value(arg, scope) for arg in instruction.args]
+        if instruction.op == "set_cond":
+            value = tuple(value)
+            state.conditional_enable = value[0]
 
     if field_name is not None:
         if field_name not in {"set_cond", "set_time_ref"}:
@@ -3912,6 +3959,10 @@ def _execute_latched(state: AnalysisState, instruction: Instr, symbols: SymbolTa
         )
         if field_name not in {"set_cond", "set_time_ref"}:
             state.latched_state.pending_event_ids[field_name] = event.id
+        elif field_name == "set_cond":
+            event.meta["conditional_enabled"] = (
+                bool(state.conditional_enable.value) if isinstance(state.conditional_enable, Concrete) else None
+            )
         return event
     return None
 
@@ -3933,6 +3984,23 @@ def _execute_rt_instruction(
     t1: Value | None = state.rt_time_ns
     duration_arg: Arg | None = None
     duration_arg_index = rt_duration_arg_for_instruction(spec, instruction)
+
+    if state.conditional_enable != Concrete(0):
+        # Q1 still issues the command, but trigger state determines whether RT
+        # executes it or substitutes the else duration. Neither outcome is known.
+        state.conditional_time_unknown = True
+        duration = Unknown("conditional_execution")
+        t1 = add_values(t0, duration)
+        packet = _append_packet(state, instruction, duration, q1_t0, q1_t1, t0, t1, rt_packet_id)
+        _emit_event(
+            state, lane="rt.unknown", kind="unknown_region", t0=t0, t1=None,
+            duration=duration, label=f"conditional {instruction.op}", confidence="unknown",
+            source=instruction.source,
+            meta={"reason": "conditional_execution_unknown", "op": instruction.op,
+                  "rt_packet_id": packet.id, "output_state_unknown": spec.applies_latched_state},
+        )
+        state.rt_time_ns = t1
+        return
 
     if duration_arg_index is not None and duration_arg_index < len(instruction.args):
         duration_arg = instruction.args[duration_arg_index]
@@ -4026,6 +4094,8 @@ def _execute_rt_instruction(
             value=applied_state["marker"],
         )
     for event in state.events[event_start:]:
+        if state.conditional_time_unknown:
+            event.meta["output_state_unknown"] = spec.applies_latched_state
         if "applied_state" in event.meta:
             event.meta["applied_setter_event_ids"] = {
                 field: pending_event_ids[field] for field in applied_state if field in pending_event_ids
@@ -4180,7 +4250,7 @@ def _emit_marker_state_event(
         t1=t1,
         duration=duration,
         label=f"marker {value}",
-        confidence=_confidence_for_value(state.latched_state.marker),
+        confidence=_confidence_for_value((state.latched_state.marker, t0, t1)),
         source=instruction.source,
         meta={"field": "marker", "value": value, "rt_packet_id": packet_id},
     )
@@ -4200,6 +4270,8 @@ def _emit_feedback_annotation(
         "op": instruction.op,
         "q1_issue_event_id": q1_issue_event.id,
     }
+    if state.conditional_time_unknown:
+        meta["output_state_unknown"] = False
     feedback = _feedback_flow_metadata(instruction, direction="receive", scope=_scope(symbols, state))
     if feedback:
         meta["feedback"] = feedback
@@ -4213,7 +4285,7 @@ def _emit_feedback_annotation(
         t1=state.rt_time_ns,
         duration=Concrete(0),
         label=label,
-        confidence="exact",
+        confidence=_confidence_for_timing(Concrete(0), state.rt_time_ns, state.rt_time_ns),
         source=instruction.source,
         meta=meta,
     )
@@ -4254,6 +4326,9 @@ def _append_packet(
         rt_t0=rt_t0,
         rt_t1=rt_t1,
         confidence=_confidence_for_timing(duration, rt_t0, rt_t1),
+        meta={"conditional_time_unknown": True,
+              "output_state_unknown": get_instruction_spec(instruction.op).applies_latched_state}
+        if state.conditional_time_unknown else {},
     )
     state.rt_packets.append(packet)
     return packet
@@ -4301,6 +4376,8 @@ def _emit_event(
     meta: dict[str, Any] | None = None,
 ) -> TimelineEvent:
     event_meta = dict(meta or {})
+    if state.conditional_time_unknown and kind != "q1_issue":
+        event_meta["conditional_time_unknown"] = True
     if state.current_resolved_args and "resolved_args" not in event_meta:
         event_meta["resolved_args"] = state.current_resolved_args
     event = TimelineEvent(

@@ -1,0 +1,4 @@
+# Intentional error: else_duration must be 0..65535 ns.
+                set_cond        1,1,0,-1
+                upd_param       4
+                stop

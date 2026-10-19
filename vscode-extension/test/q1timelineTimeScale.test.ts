@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 
-type Gap = { start: number; end: number; displayStart: number; displayEnd: number };
+type Gap = { start: number; end: number; displayStart: number; displayEnd: number; loopKeys?: string[] };
 type TimeScale = { gaps: Gap[]; toDisplay: (time: number) => number; fromDisplay: (time: number) => number };
-const { buildWaitTimeScale } = require("../src/q1timeline/media/timelineAdapter.js") as {
-  buildWaitTimeScale: (ir: any, options?: { timeBasis?: string; expandedGaps?: { start: number; end: number }[] }) => TimeScale;
+type ScaleOptions = { timeBasis?: string; expandedGaps?: { start: number; end: number }[]; expandedPlaybackLoops?: string[] };
+const { buildWaitTimeScale, buildTimelineTimeScale } = require("../src/q1timeline/media/timelineAdapter.js") as {
+  buildWaitTimeScale: (ir: any, options?: ScaleOptions) => TimeScale;
+  buildTimelineTimeScale: (ir: any, options?: ScaleOptions & { waitGaps?: Gap[] }) => TimeScale;
 };
 
 function event(kind: string, start: number, end = start, extra: Record<string, unknown> = {}) {
@@ -208,6 +210,34 @@ describe("Q1 timeline wait folding", () => {
     assert.deepEqual(bounds(buildWaitTimeScale({ events })), [{ start: 16, end: 984 }]);
   });
 
+  it("keeps long waits foldable after disabled conditional execution", () => {
+    const events = [zeroState(),
+      event("latched_state_pending", 4, 4, { meta: { field: "set_cond", value: "0,0,0,4", conditional_enabled: false } }),
+      event("q1_issue", 0, 4, { meta: { op: "set_cond", conditional_enabled: false } }),
+      event("wait", 4, 65_539), event("stop", 65_539),
+    ];
+    const before = JSON.stringify(events);
+    assert.deepEqual(bounds(buildWaitTimeScale({ events })), [{ start: 20, end: 65_523 }]);
+    for (const conditional_enabled of [true, null]) {
+      const conditional = { ...events[1], meta: { field: "set_cond", conditional_enabled } };
+      assert.deepEqual(buildWaitTimeScale({ events: [events[0], conditional, ...events.slice(2)] }).gaps, []);
+    }
+    assert.equal(JSON.stringify(events), before);
+  });
+
+  it("does not recover a concrete wait clock when a conditional region is later disabled", () => {
+    const unknown = { kind: "unknown", display: "unknown(conditional_execution)" };
+    const events = [event("wait", 0, 1000),
+      event("unknown_region", 1000, 1000, { t1: null, duration: unknown, confidence: "unknown",
+        meta: { reason: "conditional_execution_unknown", conditional_time_unknown: true } }),
+      event("latched_state_pending", 1000, 1000, { t0: unknown, t1: unknown,
+        meta: { field: "set_cond", conditional_enabled: false, conditional_time_unknown: true } }),
+      event("wait", 1000, 66_535, { t0: unknown, t1: unknown, duration: { kind: "concrete", value: 65_535 },
+        meta: { conditional_time_unknown: true } }),
+    ];
+    assert.deepEqual(buildWaitTimeScale({ events }).gaps, []);
+  });
+
   it("keeps interior point transitions visible even when the endpoint values match", () => {
     const scale = buildWaitTimeScale({
       alignment: { q0: exactAlignment(), q1: exactAlignment() },
@@ -245,8 +275,8 @@ describe("Q1 timeline wait folding", () => {
       ],
     };
     const scale = buildWaitTimeScale(ir);
-    assert.deepEqual(bounds(scale), [{ start: 32, end: 399_976 }]);
-    assert.equal(scale.toDisplay(399_992), 112);
+    assert.deepEqual(bounds(scale), [{ start: 32, end: 65_532 }, { start: 393_224, end: 399_976 }]);
+    assert.equal(scale.toDisplay(399_992), 327_868);
     assert.equal(scale.toDisplay(399_996) - scale.toDisplay(399_992), 4);
     closeTo(scale.fromDisplay(scale.toDisplay(200_000)), 200_000);
     loopMeta.wait_only = false;
@@ -315,6 +345,166 @@ describe("Q1 timeline wait folding", () => {
     for (const timeBasis of ["aligned", "local"]) {
       assert.deepEqual(bounds(buildWaitTimeScale({ events, alignment, execution }, { timeBasis })), [{ start: 20, end: 988 }]);
       assert.deepEqual(buildWaitTimeScale({ events, alignment, execution: { q0: execution.q0 } }, { timeBasis }).gaps, []);
+    }
+  });
+});
+
+describe("playback wait and repeat boundaries", () => {
+  function loop(id: string, start: number, firstEnd: number, end: number, hidden: string[]) {
+    return event("loop_block", start, end, { id, meta: {
+      playback: true, loop_preview_key: id, first_iteration_end: firstEnd, hidden_event_ids: hidden,
+    } });
+  }
+  function combined(ir: any, options: ScaleOptions = {}) {
+    const waits = buildWaitTimeScale(ir, options);
+    return { waits, scale: buildTimelineTimeScale(ir, { ...options, waitGaps: waits.gaps }) };
+  }
+
+  it("keeps the end of the first 65535 ns wait outside the repeated interval", () => {
+    const ir = { playback: {}, events: [
+      event("upd_param", 0, 4),
+      event("wait", 4, 65_539, { id: "first" }),
+      event("wait", 65_539, 131_074, { id: "second" }),
+      event("wait", 131_074, 196_609, { id: "third" }),
+      loop("loop", 4, 65_539, 196_609, ["second", "third"]),
+      event("upd_param", 196_609, 196_613),
+    ] };
+    const before = JSON.stringify(ir);
+    const { waits, scale } = combined(ir);
+    assert.deepEqual(bounds(waits), [{ start: 20, end: 65_523 }]);
+    assert.deepEqual(scale.gaps.map(({ start, end, loopKeys }) => ({ start, end, loopKeys })), [
+      { start: 20, end: 65_523, loopKeys: [] },
+      { start: 65_539, end: 196_593, loopKeys: ["loop"] },
+    ]);
+    assert.equal(scale.toDisplay(65_539) - scale.toDisplay(65_523), 16);
+    assert.equal(scale.toDisplay(65_539) - scale.toDisplay(4), 96);
+    assert.equal(scale.toDisplay(196_613) - scale.toDisplay(196_609), 4);
+    for (const time of [0, 4, 20, 30_000, 65_523, 65_539, 100_000, 196_593, 196_609, 196_613]) {
+      closeTo(scale.fromDisplay(scale.toDisplay(time)), time);
+    }
+    const expanded = combined(ir, { expandedPlaybackLoops: ["loop"] });
+    assert.deepEqual(bounds(expanded.waits), [{ start: 20, end: 196_593 }]);
+    assert.ok(expanded.scale.gaps.every((gap) => !gap.loopKeys?.length));
+    assert.equal(JSON.stringify(ir), before);
+  });
+
+  it("keeps a nested child's wait end when its parent expands", () => {
+    const ir = { playback: {}, events: [
+      event("wait", 0, 1000, { id: "first" }),
+      event("wait", 1000, 2000, { id: "child-hidden" }),
+      event("wait", 2000, 3000, { id: "tail" }),
+      event("wait", 3000, 6000, { id: "parent-hidden" }),
+      loop("child", 0, 1000, 2000, ["child-hidden"]),
+      loop("parent", 0, 3000, 6000, ["parent-hidden"]),
+    ] };
+    const collapsed = combined(ir);
+    assert.deepEqual(bounds(collapsed.waits), [{ start: 16, end: 984 }, { start: 2016, end: 2984 }]);
+    const parentExpanded = combined(ir, { expandedPlaybackLoops: ["parent"] });
+    assert.deepEqual(bounds(parentExpanded.waits), [{ start: 16, end: 984 }, { start: 2016, end: 5984 }]);
+    assert.equal(parentExpanded.scale.toDisplay(1000) - parentExpanded.scale.toDisplay(984), 16);
+    assert.deepEqual(parentExpanded.scale.gaps.filter((gap) => gap.loopKeys?.length).map((gap) => gap.loopKeys), [["child"]]);
+    assert.deepEqual(bounds(combined(ir, { expandedPlaybackLoops: ["parent", "child"] }).waits), [{ start: 16, end: 5984 }]);
+  });
+
+  it("preserves the same wait end on aligned peer sequencers", () => {
+    const ir = { playback: {}, alignment: { q0: exactAlignment(500), q1: exactAlignment(500) }, events: [
+      event("wait", 4, 65_539, { id: "first" }),
+      event("wait", 65_539, 196_609, { id: "hidden" }),
+      loop("loop", 4, 65_539, 196_609, ["hidden"]),
+      event("wait", 4, 196_609, { sequencer_id: "q1", id: "peer" }),
+    ] };
+    const { waits, scale } = combined(ir, { timeBasis: "aligned" });
+    assert.deepEqual(bounds(waits), [{ start: 520, end: 66_023 }]);
+    assert.equal(scale.toDisplay(66_039) - scale.toDisplay(66_023), 16);
+    for (const time of [504, 520, 66_023, 66_039, 100_000, 197_109]) {
+      closeTo(scale.fromDisplay(scale.toDisplay(time)), time);
+    }
+  });
+});
+
+describe("static compact loop time folding", () => {
+  function loop(id: string, start: number, period: number, count: number, extra: Record<string, unknown> = {}) {
+    return event("loop_block", start, start + period, { id, meta: {
+      loop_preview_key: id, count, period: { kind: "concrete", value: period },
+      preview_policy: "first_iteration_only", shown_iterations: [0], visible_iteration_count: 1, ...extra,
+    } });
+  }
+  function combined(ir: any, options: ScaleOptions = {}) {
+    const waits = buildWaitTimeScale(ir, options);
+    return { waits, scale: buildTimelineTimeScale(ir, { ...options, waitGaps: waits.gaps }) };
+  }
+
+  it("folds the omitted disabled-example iterations while retaining its final RT update", () => {
+    const ir = { alignment: { q0: exactAlignment() }, events: [
+      event("latched_state_pending", 0, 0, { meta: { field: "set_cond", conditional_enabled: false } }),
+      event("upd_param", 0, 4), event("wait", 4, 65_539), loop("disabled-loop", 4, 65_535, 3),
+      event("upd_param", 196_609, 196_613), event("stop", 196_613),
+    ] };
+    const before = JSON.stringify(ir);
+    const { waits, scale } = combined(ir);
+    assert.deepEqual(bounds(waits), [{ start: 20, end: 65_523 }]);
+    assert.deepEqual(scale.gaps.map(({ start, end, loopKeys }) => ({ start, end, loopKeys })), [
+      { start: 20, end: 65_523, loopKeys: [] },
+      { start: 65_539, end: 196_593, loopKeys: ["disabled-loop"] },
+    ]);
+    assert.equal(scale.toDisplay(65_539) - scale.toDisplay(65_523), 16);
+    assert.equal(scale.toDisplay(196_613), 184);
+    assert.equal(scale.toDisplay(196_613) - scale.toDisplay(196_609), 4);
+    for (const time of [0, 4, 20, 30_000, 65_523, 65_539, 100_000, 196_593, 196_609, 196_613]) {
+      closeTo(scale.fromDisplay(scale.toDisplay(time)), time);
+    }
+    assert.equal(JSON.stringify(ir), before);
+  });
+
+  it("keeps a proven wait-only first iteration separate from its omitted repetitions", () => {
+    const ir = { events: [event("wait", 4, 65_536), loop("loop", 4, 65_532, 3, { wait_only: true }),
+      event("upd_param", 196_600, 196_604)] };
+    const { waits, scale } = combined(ir);
+    assert.deepEqual(bounds(waits), [{ start: 20, end: 65_520 }]);
+    assert.deepEqual(bounds(scale), [{ start: 20, end: 65_520 }, { start: 65_536, end: 196_584 }]);
+    assert.equal(scale.toDisplay(65_536) - scale.toDisplay(65_520), 16);
+  });
+
+  it("starts after every requested visible iteration and rejects unresolved loop extents", () => {
+    const compact: any = loop("loop", 4, 65_535, 3, {
+      preview_policy: "requested_iterations", shown_iterations: [0, 1], visible_iteration_count: 2,
+    });
+    assert.deepEqual(bounds(buildTimelineTimeScale({ events: [compact] })), [{ start: 131_074, end: 196_609 }]);
+    for (const item of [
+      { ...compact, confidence: "unknown" },
+      { ...compact, meta: { ...compact.meta, count: "forever" } },
+      { ...compact, meta: { ...compact.meta, period: { kind: "unknown" } } },
+      { ...compact, meta: { ...compact.meta, visible_iteration_count: 3 } },
+    ]) assert.deepEqual(buildTimelineTimeScale({ events: [item] }).gaps, []);
+  });
+
+  it("preserves aligned peer activity inside an omitted static interval", () => {
+    const ir = { alignment: { q0: exactAlignment(500), q1: exactAlignment(500) }, events: [
+      event("wait", 4, 65_539), loop("loop", 4, 65_535, 3), event("upd_param", 196_609, 196_613),
+      event("wait", 4, 196_609, { sequencer_id: "q1" }),
+      event("marker_state", 100_000, 100_000, { sequencer_id: "q1" }),
+    ] };
+    const { scale } = combined(ir, { timeBasis: "aligned" });
+    assert.deepEqual(bounds(scale), [
+      { start: 520, end: 66_023 }, { start: 66_039, end: 100_484 }, { start: 100_516, end: 197_093 },
+    ]);
+    assert.equal(scale.toDisplay(100_516) - scale.toDisplay(100_484), 32);
+    for (const time of [504, 66_039, 100_484, 100_500, 100_516, 197_113]) {
+      closeTo(scale.fromDisplay(scale.toDisplay(time)), time);
+    }
+    assert.deepEqual(buildTimelineTimeScale({ ...ir, alignment: { q0: exactAlignment(), q1: { confidence: "unknown" } } }).gaps, []);
+  });
+
+  it("keeps nested omissions separate without subtracting repeated time twice", () => {
+    const ir = { events: [event("wait", 0, 1000), loop("child", 0, 1000, 2, { wait_only: true }),
+      event("wait", 2000, 3000), loop("parent", 0, 3000, 2), event("upd_param", 6000, 6004)] };
+    const { scale } = combined(ir);
+    assert.deepEqual(bounds(scale), [
+      { start: 16, end: 984 }, { start: 1000, end: 2000 },
+      { start: 2016, end: 2984 }, { start: 3000, end: 5984 },
+    ]);
+    for (const time of [0, 16, 984, 1000, 1500, 2000, 2016, 2984, 3000, 5000, 6004]) {
+      closeTo(scale.fromDisplay(scale.toDisplay(time)), time);
     }
   });
 });

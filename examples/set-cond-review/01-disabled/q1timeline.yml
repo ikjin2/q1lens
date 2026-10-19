@@ -1,0 +1,12 @@
+sequencers:
+  - id: disabled
+    module: QCM0
+    file: disabled.q1asm
+alignment:
+  mode: none
+analysis:
+  execution_mode: analysis
+  max_steps: 1000
+view:
+  default_mode: debug
+  show_q1_issue: true

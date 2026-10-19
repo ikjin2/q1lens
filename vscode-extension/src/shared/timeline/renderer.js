@@ -304,6 +304,8 @@
     const right = Math.max(start, end);
     const span = viewportDuration(viewport);
     const overlay = element("div", "time-selection");
+    overlay.dataset.timeStart = String(left);
+    overlay.dataset.timeEnd = String(right);
     overlay.style.left = `${pct(timeCoordinate(left, viewport) - timeCoordinate(viewport.start, viewport), span)}%`;
     overlay.style.width = `${pct(timeCoordinate(right, viewport) - timeCoordinate(left, viewport), span)}%`;
     return overlay;
@@ -400,7 +402,7 @@
     row.appendChild(label);
 
     const track = element("div", `lane-track lane-track-${lane.kind || "default"}`);
-    const selection = renderSelectionOverlay(model.selectionRange, model.viewport);
+    const selection = renderSelectionOverlay(lane.selectionRange === undefined ? model.selectionRange : lane.selectionRange, model.viewport);
     if (selection) {
       track.appendChild(selection);
     }

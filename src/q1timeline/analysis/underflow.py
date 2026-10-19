@@ -111,7 +111,9 @@ def _queue_packets(state: AnalysisState):
         if event.kind != "q1_issue" or not isinstance(event.t0, Concrete):
             continue
         boundary_reason = None
-        if event.meta.get("op") in {"fb_pop_data", "fb_pull_data"}:
+        if event.meta.get("conditional_execution_unknown"):
+            boundary_reason = "conditional_execution_unknown"
+        elif event.meta.get("op") in {"fb_pop_data", "fb_pull_data"}:
             boundary_reason = "feedback_arrival_unknown"
         elif event.meta.get("branch_decision") == "runtime_dependent":
             boundary_reason = "runtime_branch_unknown"

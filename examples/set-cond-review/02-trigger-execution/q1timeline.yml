@@ -1,0 +1,20 @@
+sequencers:
+  - id: trigger_demo
+    module: QCM0
+    file: trigger_execution.q1asm
+alignment:
+  mode: none
+analysis:
+  execution_mode: simulation
+  max_steps: 1000
+simulation:
+  startup_delay_ns: 200
+  max_time_ns: 1000
+  inputs:
+    triggers:
+      - target: trigger_demo
+        time_ns: 230
+        address: 1
+view:
+  default_mode: debug
+  show_q1_issue: true

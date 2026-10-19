@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.2
+
+- Add bounded Run playback with automatic branch choices and editable feedback value and arrival-time assumptions.
+- Display Compare both branches in parallel Jump/Continue rows and show latched settings where RT instructions apply them.
+- Detect repeated execution, collapse loops by default, and fold long waits with matching time-axis compression.
+- Keep loop counts in the loop bar and limit expansion to the fold icon.
+- Preserve Q1/RT lane selection independently when selecting source lines, and keep RT block navigation in its lane.
+- Correct disabled and unresolved set_cond handling, queue-aware timing, and initial framing of folded timelines.
+- Pair with Python package 0.2.2 and add set_cond review examples.
+
 ## 0.2.1
 
 - Fold unchanged wait intervals across sequencers, with visible duration markers and per-interval expand/collapse controls.

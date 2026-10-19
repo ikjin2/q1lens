@@ -224,7 +224,7 @@
 
   function shouldIncludeEvent(event, options) {
     const lane = eventLaneName(event);
-    if (event.kind === "latched_state_pending") {
+    if (["latched_state_pending", "control_flow_loop", "control_flow_branch"].includes(event.kind)) {
       return false;
     }
     if (event.kind === "q1_issue") {
@@ -284,7 +284,8 @@
     if (event && event.kind === "branch_region") {
       return `Branch effect (${branchPathLabel(event)}) | ${displayValue(event.t0, start)} -> ${displayValue(event.t1, end)}`;
     }
-    return event.title || `${event.label || event.kind || event.id} | ${displayValue(event.t0, start)} -> ${displayValue(event.t1, end)}`;
+    const endFallback = event.meta && event.meta.conditional_time_unknown ? "unknown" : end;
+    return event.title || `${event.label || event.kind || event.id} | ${displayValue(event.t0, start)} -> ${displayValue(event.t1, endFallback)}`;
   }
 
   function eventBlock(event, options = {}) {
@@ -402,6 +403,46 @@
     return Array.from(byKey.values()).filter((group) => group.length > 1);
   }
 
+  function mergePacketStateBlocks(lanes, eventById, options) {
+    const stateKinds = new Set(["marker_state", "latched_state_applied"]);
+    const nonCommandKinds = new Set([
+      ...stateKinds, "rt_queue_enqueue", "rt_queue_dequeue", "q1_stall", "sync_wait", "trigger_wait",
+      "feedback_receive", "feedback_send", "trigger_receive", "acquisition_result",
+    ]);
+    const timeKey = (event, edge) => {
+      const meta = event.meta || {};
+      const value = options.timeBasis === "aligned" && meta[`aligned_${edge}`] !== undefined
+        ? meta[`aligned_${edge}`] : event[edge] ?? event[`${edge}_ns`];
+      return value && typeof value === "object" ? value.value ?? value.value_ns ?? value.expr ?? value.display ?? value : value;
+    };
+    const packetKey = (event) => {
+      const meta = event.meta || {};
+      return meta.rt_packet_id === undefined || meta.rt_packet_id === null ? undefined : JSON.stringify([
+        event.sequencer_id, meta.rt_packet_id, timeKey(event, "t0"), timeKey(event, "t1"),
+        meta.branch_comparison_branch_id, meta.branch_comparison_path, meta.loop_preview, meta.loop_iteration_index,
+      ]);
+    };
+    const commands = new Map();
+    for (const lane of lanes) {
+      for (const block of lane.blocks) {
+        const event = eventById.get(block.eventId);
+        if (!event || nonCommandKinds.has(event.kind) || !eventLaneName(event).startsWith("rt.")) continue;
+        const key = packetKey(event);
+        if (key !== undefined && !commands.has(key)) commands.set(key, block);
+      }
+    }
+    for (const lane of lanes) {
+      lane.blocks = lane.blocks.filter((block) => {
+        if (!stateKinds.has(block.kind)) return true;
+        const command = commands.get(packetKey(eventById.get(block.eventId)));
+        if (!command) return true;
+        command.eventIds.push(...block.eventIds.filter((id) => !command.eventIds.includes(id)));
+        command.search += ` ${block.search}`;
+        return false;
+      });
+    }
+  }
+
   function feedbackVisibleLabel(flow) {
     const channel = String(flow && flow.channel !== undefined ? flow.channel : "").trim();
     return channel ? `fb ch ${channel}` : "fb";
@@ -470,7 +511,7 @@
     const start = eventEdgeTime(event, "t0", options);
     const end = eventEdgeTime(event, "t1", options, start);
     const meta = event && event.meta && typeof event.meta === "object" ? event.meta : {};
-    const loopId = String(meta.loop_id || event.id || "loop");
+    const loopId = meta.playback ? "loop" : String(meta.loop_id || event.id || "loop");
     const count = loopCountLabel(event);
     const firstIterationEventIds = Array.isArray(meta.first_iteration_event_ids)
       ? meta.first_iteration_event_ids.map((eventId) => String(eventId))
@@ -483,7 +524,7 @@
       eventIds: [String(event.id), ...firstIterationEventIds],
       start,
       end,
-      label: [loopId, count].filter(Boolean).join(" "),
+      label: meta.playback ? count.replace(/^x/, "×") : [loopId, count].filter(Boolean).join(" "),
       title: String(event.label || `loop ${loopId}`),
       domain: {
         eventId: event.id,
@@ -513,7 +554,8 @@
     let maxCount = 1;
     for (const lane of lanes) {
       if (lane.kind === "runtime") lane.label = `${lane.sequencer || lane.label} · RT`;
-      lane.blocks.sort((left, right) => left.start - right.start || blockOrder(left) - blockOrder(right));
+      const conditionalTimeUnknown = lane.blocks.some((block) => block.domain.meta.conditional_time_unknown);
+      lane.blocks.sort((left, right) => (conditionalTimeUnknown ? 0 : left.start - right.start) || blockOrder(left) - blockOrder(right));
       startsByLane.set(lane.id, lane.blocks.map((block) => block.start));
       maxCount = Math.max(maxCount, lane.blocks.length);
       lane.blocks.forEach((block, index) => {
@@ -657,7 +699,20 @@
 
   function buildQ1TimelineSharedModel(timelineIr, options = {}) {
     const mode = options.mode === "debug" ? "debug" : "normal";
-    const events = Array.isArray(timelineIr && timelineIr.events) ? timelineIr.events : [];
+    const allEvents = Array.isArray(timelineIr && timelineIr.events) ? timelineIr.events : [];
+    const expandedPlaybackLoops = new Set(options.expandedPlaybackLoops || []);
+    const hiddenPlaybackEventIds = new Set();
+    if (timelineIr && timelineIr.playback) {
+      for (const event of allEvents) {
+        const meta = event.meta || {};
+        if (event.kind === "loop_block" && meta.playback && !expandedPlaybackLoops.has(String(meta.loop_preview_key || meta.loop_id || event.id))) {
+          for (const id of meta.hidden_event_ids || []) hiddenPlaybackEventIds.add(String(id));
+        }
+      }
+    }
+    const events = allEvents.filter((event) => !hiddenPlaybackEventIds.has(String(event.id)) &&
+      (options.layout === "instruction" || !event.meta?.conditional_time_unknown ||
+        Number.isFinite(eventEdgeTime(event, "t0", options, Number.NaN))));
     const eventById = new Map(events.map((event) => [String(event.id), event]));
     const lanes = [];
     const laneById = new Map();
@@ -696,13 +751,13 @@
         continue;
       }
       if (event.kind === "loop_block") {
-        if (instruction || (event.meta || {}).branch_comparison_path) ensureLane(eventLane(event, adapterOptions));
+        if (instruction || (event.meta || {}).branch_comparison_path || (event.meta || {}).playback) ensureLane(eventLane(event, adapterOptions));
         const annotation = loopAnnotation(event, adapterOptions);
         annotations.push(annotation);
         maxTime = Math.max(maxTime, annotation.end);
         continue;
       }
-      if (mode !== "debug" && event.kind === "loop_iteration_preview") {
+      if (event.kind === "loop_iteration_preview") {
         continue;
       }
       if (mergedPlayEventIds.has(String(event.id))) {
@@ -719,6 +774,8 @@
       maxTime = Math.max(maxTime, block.start + Math.max(block.duration, 1));
       ensureLane(eventLane(event, adapterOptions)).blocks.push(block);
     }
+
+    mergePacketStateBlocks(lanes, eventById, adapterOptions);
 
     for (const flow of Array.isArray(timelineIr && timelineIr.feedback_flows) ? timelineIr.feedback_flows : []) {
       const annotation = feedbackAnnotation(flow, eventById, adapterOptions);
@@ -771,9 +828,8 @@
     };
   }
 
-  function buildWaitTimeScale(timelineIr, options = {}) {
-    const gaps = [];
-    const scale = {
+  function timeScaleFromGaps(gaps) {
+    return {
       gaps,
       toDisplay(time) {
         let removed = 0;
@@ -798,6 +854,113 @@
         return time + removed;
       },
     };
+  }
+
+  function staticLoopHiddenInterval(event) {
+    const meta = event.meta || {};
+    if (event.kind !== "loop_block" || event.confidence !== "exact" ||
+      !["first_iteration_only", "requested_iterations"].includes(meta.preview_policy)) return undefined;
+    const concrete = (value) => typeof value === "number" && Number.isFinite(value) ? value :
+      value?.kind === "concrete" && typeof value.value === "number" && Number.isFinite(value.value) ? value.value : NaN;
+    const count = concrete(meta.count);
+    const period = concrete(meta.period);
+    const visible = Math.max(Number(meta.visible_iteration_count) || 1,
+      ...(meta.shown_iterations || [0]).filter((index) => Number.isInteger(index) && index >= 0).map((index) => index + 1));
+    const start = concrete(event.t0) + visible * period;
+    const end = concrete(event.t0) + count * period;
+    return Number.isInteger(count) && Number.isInteger(visible) && count > visible && period > 0 &&
+      Number.isFinite(start) && Number.isFinite(end) && Number.isFinite(concrete(event.t1)) ? { start, end } : undefined;
+  }
+
+  function buildTimelineTimeScale(timelineIr, options = {}) {
+    const concrete = (value) => typeof value === "number" && Number.isFinite(value) ? value :
+      value?.kind === "concrete" && typeof value.value === "number" && Number.isFinite(value.value) ? value.value : NaN;
+    const edge = (event, name) => {
+      const local = concrete(event[name]);
+      if (options.timeBasis !== "aligned") return local;
+      const aligned = event.meta && event.meta[`aligned_${name}`];
+      return aligned !== undefined ? concrete(aligned) : local + concrete(timelineIr.alignment?.[event.sequencer_id]?.offset ?? 0);
+    };
+    const intervals = [];
+    const expanded = new Set(options.expandedPlaybackLoops || []);
+    const events = timelineIr && timelineIr.events || [];
+    const sequencers = new Set([...(timelineIr?.sequencers || []).map((sequencer) => String(sequencer.id)), ...events.map((event) => String(event.sequencer_id))]);
+    const offsets = [...sequencers].map((id) => timelineIr.alignment && timelineIr.alignment[id]);
+    const sharedClock = [...sequencers].every((id) => timelineIr.execution?.[id]?.timing_model === "event_driven");
+    const commonClock = sequencers.size <= 1 || [...sequencers].every((id) => events.some((event) => String(event.sequencer_id) === id)) && offsets.every((alignment) => alignment && alignment.confidence === "exact" &&
+      !alignment.unaligned && Number.isFinite(concrete(alignment.offset)) &&
+      (alignment.mode === "first_wait_sync" || String(alignment.mode).startsWith("manual:") || alignment.mode === "none" && sharedClock)) &&
+      (options.timeBasis === "aligned" || new Set(offsets.map((alignment) => concrete(alignment.offset))).size === 1);
+    const hidden = new Set(events.filter((event) => event.kind === "loop_block" && event.meta?.playback &&
+      !expanded.has(String(event.meta.loop_preview_key || event.meta.loop_id || event.id))).flatMap((event) => event.meta.hidden_event_ids || []));
+    const activity = events.filter((event) => !hidden.has(String(event.id)) &&
+      !["wait", "wait_sync", "wait_trigger", "loop_block", "branch_region", "loop_iteration_preview", "control_flow_loop", "control_flow_branch", "latched_state_pending", "queue_depth", "slack", "analysis_incomplete"].includes(event.kind) &&
+      (event.kind !== "q1_issue" || event.meta?.playback_feedback_id || event.meta?.playback_branch_id));
+    for (const event of events) {
+      const meta = event.meta || {};
+      const key = String(meta.loop_preview_key || meta.loop_id || event.id);
+      if (!commonClock || event.kind !== "loop_block" || expanded.has(key)) continue;
+      let firstEnd;
+      let localEnd;
+      if (timelineIr.playback) {
+        if (!meta.playback || !meta.hidden_event_ids?.length) continue;
+        firstEnd = concrete(meta.first_iteration_end);
+        localEnd = concrete(event.t1);
+      } else {
+        const omitted = staticLoopHiddenInterval(event);
+        if (!omitted) continue;
+        firstEnd = omitted.start;
+        localEnd = omitted.end;
+      }
+      const times = [event.t0, event.t1, firstEnd, localEnd];
+      if (options.timeBasis === "aligned") times.push(...[meta.aligned_t0, meta.aligned_t1].filter((time) => time !== undefined));
+      if (times.some((time) => typeof time !== "number" && (!time || time.kind !== "concrete"))) continue;
+      const localStart = eventTimeValue(event.t0, Number.NaN);
+      const offset = edge(event, "t0") - localStart;
+      const start = firstEnd + offset;
+      const end = localEnd + offset;
+      if (Number.isFinite(start) && Number.isFinite(end) && end > start) {
+        let parts = [{ start, end, loopKeys: [key] }];
+        for (const item of activity) {
+          const from = edge(item, "t0");
+          const to = edge(item, "t1");
+          if (!Number.isFinite(from)) { parts = []; break; }
+          const left = from - 16;
+          const right = Number.isFinite(to) ? to + 16 : Infinity;
+          parts = parts.flatMap((part) => right <= part.start || left >= part.end ? [part] : [
+            ...(left > part.start ? [{ ...part, end: left }] : []),
+            ...(right < part.end ? [{ ...part, start: right }] : []),
+          ]);
+        }
+        intervals.push(...parts);
+      }
+    }
+    intervals.push(...(options.waitGaps || []).map(({ start, end }) => ({ start, end, loopKeys: [] })));
+    // A single transform keeps simultaneous events on every sequencer aligned.
+    // Overlapping/nested omissions must not subtract the same time twice.
+    const merged = [];
+    for (const interval of intervals.sort((a, b) => a.start - b.start || a.end - b.end)) {
+      const last = merged[merged.length - 1];
+      if (last && interval.start < last.end) {
+        last.end = Math.max(last.end, interval.end);
+        last.loopKeys = [...new Set([...last.loopKeys, ...interval.loopKeys])];
+      } else merged.push({ ...interval });
+    }
+    let removed = 0;
+    const gaps = merged.map((interval) => {
+      const duration = interval.end - interval.start;
+      // Keep a nonzero break so pointer positions still map to real times.
+      const width = interval.loopKeys.length ? Math.min(64, duration / 10) : 64;
+      const displayStart = interval.start - removed;
+      removed += duration - width;
+      return { ...interval, displayStart, displayEnd: displayStart + width };
+    });
+    return timeScaleFromGaps(gaps);
+  }
+
+  function buildWaitTimeScale(timelineIr, options = {}) {
+    const gaps = [];
+    const scale = timeScaleFromGaps(gaps);
     function concreteTime(value) {
       if (typeof value === "number" && Number.isFinite(value)) return value;
       if (value && typeof value === "object" && (!value.kind || value.kind === "concrete")) {
@@ -862,7 +1025,16 @@
     }
     // Local clocks with different origins cannot establish simultaneous unchanged time.
     if (options.timeBasis !== "aligned" && new Set(offsets.values()).size > 1) return scale;
-    const ignoredKinds = new Set(["q1_issue", "queue_depth", "slack", "analysis_incomplete", "latched_state_pending", "rt_queue_enqueue", "rt_queue_dequeue", "q1_stall", "loop_iteration_preview"]);
+    const playback = Boolean(timelineIr.playback);
+    const expandedLoops = new Set(options.expandedPlaybackLoops || []);
+    const hidden = new Set(playback ? events.filter((event) => event.kind === "loop_block" && event.meta?.playback &&
+      !expandedLoops.has(String(event.meta.loop_preview_key || event.meta.loop_id || event.id))).flatMap((event) => event.meta.hidden_event_ids || []) : []);
+    const ignoredKinds = new Set(["queue_depth", "slack", "analysis_incomplete", "latched_state_pending", "rt_queue_enqueue", "rt_queue_dequeue", "q1_stall", "loop_iteration_preview", "control_flow_loop", "control_flow_branch"]);
+    if (!playback) ignoredKinds.add("q1_issue");
+    else {
+      ignoredKinds.add("loop_block");
+      ignoredKinds.add("branch_region");
+    }
     const waitKinds = new Set(["wait", "wait_sync", "wait_trigger"]);
     const knownKinds = new Set(["upd_param", "latched_state_applied", "marker_state", "branch_region", "feedback_com", "feedback_pop", "feedback_receive", "feedback_send", "acquisition_result", "fb_acq_tb_id", "fb_acq_iq_id", "fb_acq_tb_valid", "fb_acq_tb_cfg", "fb_acq_iq_shift"]);
     if (events.some((event) => event.sequencer_id === undefined && !ignoredKinds.has(event.kind))) return scale;
@@ -877,9 +1049,14 @@
       const offset = options.timeBasis === "aligned" ? offsets.get(id) : 0;
       const records = [];
       for (const event of events) {
-        // Static set_cond is unresolved: subsequent wait timing may be conditional.
-        const unresolvedCondition = event.kind === "latched_state_pending" && event.meta && event.meta.field === "set_cond";
+        // An enabled or unresolved static condition can change subsequent RT timing.
+        const unresolvedCondition = event.kind === "latched_state_pending" && event.meta &&
+          event.meta.field === "set_cond" && event.meta.conditional_enabled !== false;
         if (String(event.sequencer_id) !== id || (ignoredKinds.has(event.kind) && !unresolvedCondition)) continue;
+        // Hidden repetitions have their own loop fold. Including their waits here
+        // would merge across the visible first wait's end and erase its end cap.
+        if (playback && (hidden.has(String(event.id)) || event.kind === "q1_issue" &&
+          !event.meta?.playback_feedback_id && !event.meta?.playback_branch_id)) continue;
         const localStart = concreteTime(event.t0 ?? event.t0_ns);
         const localEnd = concreteTime(event.t1 ?? event.t1_ns);
         if (localStart === undefined || localEnd === undefined || localEnd < localStart) return scale;
@@ -891,6 +1068,17 @@
       }
       records.sort((a, b) => a.start - b.start);
       if (!records.length) return scale;
+      if (playback) {
+        // Compress explicit waiting in this assumed path, not presumed physical idle.
+        // Visible Q1 controls, RT commands and feedback boundaries stay outside
+        // the omission; ordinary Q1 blocks use the same reversible time scale.
+        const waits = merge(records.filter(({ event }) => waitKinds.has(event.kind)).map(({ start, end }) => ({ start, end })));
+        const activity = records.filter(({ event }) => !waitKinds.has(event.kind)).map(({ start, end }) => ({ start, end }));
+        const unchanged = subtract(waits, activity);
+        common = common === undefined ? unchanged : intersect(common, unchanged);
+        if (!common.length) return scale;
+        continue;
+      }
       const waitLoops = records.flatMap(({ event, start }) => {
         const meta = event.meta || {};
         const count = concreteTime(meta.count);
@@ -942,7 +1130,14 @@
           blocked.push({ start, end: knownKinds.has(event.kind) || annotation ? end : Infinity });
         }
       }
-      const unchanged = subtract(observed, blocked);
+      // Omitted static iterations have their own loop fold. Preserve the last
+      // visible wait's end instead of letting one unchanged gap swallow it.
+      const omitted = records.flatMap(({ event }) => {
+        const key = String(event.meta?.loop_preview_key || event.meta?.loop_id || event.id);
+        const interval = !expandedLoops.has(key) && staticLoopHiddenInterval(event);
+        return interval ? [{ start: interval.start + offset, end: interval.end + offset }] : [];
+      });
+      const unchanged = subtract(subtract(observed, blocked), omitted);
       common = common === undefined ? unchanged : intersect(common, unchanged);
       if (!common.length) return scale;
     }
@@ -966,6 +1161,7 @@
   const api = {
     buildQ1TimelineSharedModel,
     buildQ1TimelineSelectionIndex,
+    buildTimelineTimeScale,
     buildWaitTimeScale,
     eventLabelToken,
     eventTimeValue,

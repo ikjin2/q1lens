@@ -91,6 +91,7 @@ describe("instruction replay trace", () => {
     assert.equal(hardware.registerAt(index, "seq0", "R0", 7), null);
     assert.equal(hardware.registerAt(index, "seq0", "R0", 8).value.value, 1);
     assert.equal(trace.instructions[2].writes[0].time, 16);
+    assert.ok(!hardware.snapshot(index, "seq0", 16).warnings.some((message: string) => message.includes("Collapsed loop")));
     assert.equal(index.execution.seq0.status, "blocked");
     ir.events = new Proxy([], { get() { throw new Error("Replay rescanned input events"); } });
     assert.equal(hardware.executionTrace(index, "seq0"), trace);
@@ -100,6 +101,36 @@ describe("instruction replay trace", () => {
     const trace = hardware.executionTrace(hardware.createIndex(replayFixture()), "seq0", "aligned");
     assert.deepEqual(trace.instructions.map((item: any) => item.end), [-16, -12, -8]);
     assert.equal(trace.instructions[0].writes[0].time, -12);
+  });
+
+  it("keeps every executed playback occurrence available behind compact timeline loops", () => {
+    const ir = replayFixture();
+    ir.playback = {status: "blocked"};
+    ir.execution.seq0.mode = "playback";
+    ir.events.push(event("loop", "loop_block", 0, 12, 5, {playback: true, hidden_event_ids: ["second", "third"]}));
+    const index = hardware.createIndex(ir);
+    const trace = hardware.executionTrace(index, "seq0");
+    assert.equal(trace.reason, null);
+    assert.deepEqual(trace.instructions.map((item: any) => item.event.id), ["first", "second", "third"]);
+    assert.equal(trace.instructions[2].writes[0].time, 16);
+    const project = projectReplayFixture();
+    for (const execution of Object.values(project.execution) as any[]) execution.mode = "playback";
+    assert.ok(hardware.projectExecutionTrace(hardware.createIndex(project)).reason, "separate path execution must not imply a shared simulation clock");
+  });
+
+  it("identifies feedback assumptions without misreporting them as branch assumptions", () => {
+    const ir = replayFixture();
+    const first = ir.events.find((item: any) => item.id === "first");
+    first.confidence = "assumed";
+    first.meta.feedback_assumption = {value: null, delay_ns: 0, source: "default"};
+    const second = ir.events.find((item: any) => item.id === "second");
+    second.confidence = "assumed";
+    second.meta.feedback_assumptions = ["receive:first"];
+    const warnings = hardware.snapshot(hardware.createIndex(ir), "seq0", 16).warnings;
+    assert.ok(warnings.includes("State depends on assumed feedback values or timing."));
+    assert.ok(!warnings.some((message: string) => message.includes("branch assumptions")));
+    second.meta.branch_assumptions = [{branch_id: "branch:1", assumed_branch_path: "fallthrough"}];
+    assert.ok(hardware.snapshot(hardware.createIndex(ir), "seq0", 16).warnings.some((message: string) => message.includes("branch assumptions")));
   });
 
   it("does not invent replay from static, ambiguous, or untimed traces", () => {
@@ -564,6 +595,63 @@ describe("hardware state cursor model", () => {
     const state = hardware.snapshot(hardware.createIndex(ir), "seq0", 24);
     assert.equal(state.parameters.find((item: any) => item.field === "frequency").pending.value, 400);
     assert.ok(state.warnings.some((message: string) => message.includes("possible underflow")));
+  });
+
+  it("separates conditional RT timing from held output state and preserves known Q1 state", () => {
+    for (const output_state_unknown of [false, true]) {
+      const ir = fixture();
+      const unknown = { kind: "unknown", display: "unknown(conditional_execution)" };
+      ir.events.push(
+        event("new-setting", "latched_state_pending", 124, 124, 9, { field: "frequency", value: 999 }),
+        event("q9", "q1_issue", 24, 28, 9, { op: "set_freq" }),
+        event("q10", "q1_issue", 28, 32, 10, { op: output_state_unknown ? "play" : "wait" }),
+        { ...event("conditional", "unknown_region", 124, null, 10, {
+          rt_packet_id: "conditional-packet", reason: "conditional_execution_unknown", conditional_time_unknown: true,
+          output_state_unknown,
+        }), confidence: "unknown", duration: unknown },
+        event("q11", "q1_issue", 32, 36, 11, { op: "set_cond", conditional_enabled: false }),
+        { ...event("disabled", "latched_state_pending", 124, 124, 11, {
+          field: "set_cond", value: "0,0,0,4", conditional_enabled: false, conditional_time_unknown: true,
+        }), t0: unknown, t1: unknown },
+        { ...event("later-wait", "wait", 124, 128, 12, {
+          rt_packet_id: "later-packet", conditional_time_unknown: true, output_state_unknown: false,
+        }), t0: unknown, t1: unknown },
+      );
+      const before = JSON.stringify(ir);
+      const index = hardware.createIndex(ir);
+      for (const basis of ["local", "aligned"]) {
+        const offset = basis === "aligned" ? -20 : 0;
+        assert.equal(hardware.snapshot(index, "seq0", 123 + offset, basis).parameters.find((item: any) => item.field === "frequency").applied.value, 120);
+        const state = hardware.snapshot(index, "seq0", 124 + offset, basis);
+        const frequency = state.parameters.find((item: any) => item.field === "frequency");
+        assert.equal(state.rt.status, "unknown");
+        assert.notEqual(state.q1.status, "unknown");
+        assert.equal(state.registers[0].value.value, 1);
+        assert.equal(frequency.pending.value, 999);
+        assert.equal(frequency.applied.known, !output_state_unknown);
+        assert.equal(frequency.applied.value, output_state_unknown ? null : 120);
+        assert.equal(state.awg[0].status === "unknown", output_state_unknown);
+        assert.equal(state.bins.partial, output_state_unknown);
+        assert.equal(state.bins.total, 2);
+        assert.equal(hardware.eventTime(index, ir.events.at(-1), basis), undefined);
+      }
+      assert.equal(JSON.stringify(ir), before);
+    }
+  });
+
+  it("does not invalidate Hardware state for disabled conditional execution", () => {
+    const ir = fixture();
+    ir.events.push(
+      event("disabled", "latched_state_pending", 124, 124, 9, { field: "set_cond", value: "0,0,0,4", conditional_enabled: false }),
+      event("q9", "q1_issue", 24, 28, 9, { op: "set_cond", conditional_enabled: false }),
+      event("wait", "wait", 124, 65_659, 10, { rt_packet_id: "p5" }),
+    );
+    const state = hardware.snapshot(hardware.createIndex(ir), "seq0", 1000);
+    assert.equal(state.rt.status, "active");
+    assert.equal(state.rt.event.id, "wait");
+    assert.equal(state.parameters.find((item: any) => item.field === "frequency").applied.value, 120);
+    assert.equal(state.bins.partial, false);
+    assert.deepEqual(state.warnings, []);
   });
 
   it("invalidates pre-branch applied parameters when comparing both branch paths", () => {

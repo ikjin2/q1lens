@@ -188,7 +188,11 @@
     if (!isTimelineEventVisible(eventNode)) {
       return;
     }
-    document.querySelectorAll('.event.is-selected, .event[aria-selected="true"]').forEach((node) => {
+    if (selectedSourceEventIds.size) {
+      timelineSelectionRange = undefined;
+      document.querySelectorAll(".shared-timeline-stage .time-selection").forEach((node) => node.remove());
+    }
+    document.querySelectorAll('.event.is-selected, .event[aria-selected="true"], .shared-timeline-stage .timeline-block[aria-selected="true"]').forEach((node) => {
       node.classList.remove("is-selected");
       node.setAttribute("aria-selected", "false");
     });
@@ -350,6 +354,21 @@
     return expandQ1IssueLanesForHighlight(loopPreviewEventIds(meta));
   }
 
+  function visiblePlaybackEvent(event) {
+    if (!event || !timelineIr.playback) return event;
+    const loops = (timelineIr.events || []).filter((item) => item.kind === "loop_block" && item.meta?.playback &&
+      !expandedPlaybackLoops.has(String(item.meta.loop_preview_key || item.meta.loop_id || item.id)));
+    const containers = loops.filter((item) => (item.meta.hidden_event_ids || []).includes(String(event.id)));
+    const loop = containers.find((item) => !loops.some((parent) => (parent.meta.hidden_event_ids || []).includes(String(item.id)))) || containers[0];
+    if (!loop) return event;
+    if (timelineLayout === "instruction") {
+      const first = (loop.meta.first_iteration_event_ids || []).map((id) => timelineEventsById.get(String(id)));
+      return first.find((item) => item?.kind === event.kind && sameSourceLine(item.source, event.source)) ||
+        first.find((item) => item?.kind === event.kind) || loop;
+    }
+    return loop;
+  }
+
   function branchAssumptionLabel(meta) {
     if (!meta || !meta.assumed_branch_path) {
       return "";
@@ -389,7 +408,13 @@
 
   function eventHasBranchControl(event) {
     const meta = event && event.meta && typeof event.meta === "object" ? event.meta : {};
-    return Boolean(event && ["branch_region", "q1_issue"].includes(event.kind) && meta.branch_id);
+    if (timelineIr.playback && meta.playback_branch_id && branchControlMeta(event).op === "jmp") return false;
+    return Boolean(event && ["branch_region", "q1_issue"].includes(event.kind) && (meta.branch_id || meta.playback_branch_id));
+  }
+
+  function eventHasFeedbackControl(event) {
+    return Boolean(timelineIr.playback && event && event.kind === "q1_issue" &&
+      event.meta && event.meta.playback_feedback_id && event.meta.feedback_assumption);
   }
 
   function branchAssumptionIconName(meta) {
@@ -445,14 +470,14 @@
   function branchControlMeta(event) {
     const own = event.meta || {};
     if (event.kind === "q1_issue") return own;
-    const branchId = own.branch_id || own.branch_comparison_branch_id;
+    const branchId = own.playback_branch_id || own.branch_id || own.branch_comparison_branch_id;
     const events = timelineIr.events || [];
     // A repeated branch can have different results at each occurrence.
     for (let index = events.indexOf(event) - 1; index >= 0; index -= 1) {
       const candidate = events[index];
       const meta = candidate.meta || {};
       if (candidate.kind === "q1_issue" && candidate.sequencer_id === event.sequencer_id &&
-          (meta.branch_id || meta.branch_comparison_branch_id) === branchId &&
+          (meta.playback_branch_id || meta.branch_id || meta.branch_comparison_branch_id) === branchId &&
           sameSourceLine(candidate.source, event.source) &&
           meta.loop_preview === own.loop_preview && meta.loop_iteration_index === own.loop_iteration_index &&
           meta.branch_comparison_path === own.branch_comparison_path) return { ...meta, ...own };
@@ -487,10 +512,11 @@
 
   function renderBranchControls(popover, event) {
     const meta = branchControlMeta(event);
-    const branchId = String(meta.branch_id || meta.branch_comparison_branch_id || "");
+    const playback = Boolean(timelineIr.playback && meta.playback_branch_id);
+    const branchId = String(playback ? meta.playback_branch_id : meta.branch_id || meta.branch_comparison_branch_id || "");
     const assumed = branchAssumptionLabel(meta);
     const resolved = meta.branch_decision === "concrete" && typeof meta.branch_taken === "boolean";
-    const active = resolved ? (meta.branch_taken ? "taken" : "fallthrough") : assumed;
+    const active = (resolved || playback) && typeof meta.branch_taken === "boolean" ? (meta.branch_taken ? "taken" : "fallthrough") : assumed;
     const jump = branchPathDescriptor(event, "taken");
     const next = branchPathDescriptor(event, "fallthrough");
     popover.classList.add("q1timeline-branch-popover");
@@ -498,20 +524,23 @@
     popover.setAttribute("aria-label", "Branch paths");
     const status = document.createElement("div");
     status.className = "q1timeline-branch-status";
-    status.textContent = resolved ? "Calculated path" : assumed === "both" ?
+    status.textContent = playback && meta.branch_decision === "default" ? "Default path" : playback && meta.branch_decision === "assumed" ? "Chosen path" : resolved ? "Calculated path" : assumed === "both" ?
       (Array.isArray(meta.comparison_paths) ? "Comparing both paths" : "Comparison unavailable") :
       assumed === "taken" || assumed === "fallthrough" ? "Assumed path" : "Choose a path";
+    if (playback && meta.branch_decision === "default") status.title = "Condition unknown. Continue is assumed until you choose another path.";
     popover.append(status);
     const choose = (path) => {
-      vscode.postMessage({ type: "setBranchAssumption", branchId, path, eventId: String(event.id) });
+      vscode.postMessage({ type: playback ? "setExecutionBranch" : "setBranchAssumption", branchId, path, eventId: String(event.id) });
       closeTimelineControlPopover(true);
     };
     for (const [path, label] of [["taken", `Jump · ${jump.label}`], ["fallthrough", `Continue · ${next.label}`]]) {
       addTimelineControlAction(popover, path, label, () => choose(path), {
-        text: true, active: active === path, disabled: resolved || meta.branch_decision !== "runtime_dependent",
+        text: true, active: active === path,
+        disabled: playback ? timelineExecutionState.status === "running" : resolved || meta.branch_decision !== "runtime_dependent",
+        ...(playback ? { title: `${label}. Assume this path for this occurrence and recompute what follows.` } : {}),
       });
     }
-    if (!resolved && meta.branch_decision === "runtime_dependent") {
+    if (!playback && !resolved && meta.branch_decision === "runtime_dependent") {
       if (branchComparisonSupported(meta, jump)) {
         addTimelineControlAction(popover, "both", "Compare both", () => choose("both"), { text: true, active: active === "both" });
       }
@@ -521,6 +550,77 @@
       zoomTimelineToEvent(event);
       closeTimelineControlPopover(true);
     }, { text: true });
+  }
+
+  function renderFeedbackControls(popover, event) {
+    const meta = event.meta;
+    const assumption = meta.feedback_assumption;
+    popover.classList.add("q1timeline-feedback-popover");
+    popover.setAttribute("role", "dialog");
+    popover.setAttribute("aria-label", "Feedback assumption");
+    const form = document.createElement("form");
+    const heading = document.createElement("div");
+    heading.className = "q1timeline-branch-status";
+    heading.textContent = "≈ Assumed feedback";
+    const makeInput = (label, name, value) => {
+      const field = document.createElement("label");
+      field.textContent = label;
+      const input = document.createElement("input");
+      input.name = name;
+      input.type = "number";
+      input.step = "1";
+      input.value = value === null || value === undefined ? "" : String(value);
+      input.disabled = timelineExecutionState.status === "running";
+      field.append(input);
+      form.append(field);
+      return input;
+    };
+    form.append(heading);
+    const value = makeInput("Value", "value", assumption.value);
+    value.placeholder = "Unknown";
+    value.min = "-2147483648";
+    value.max = "4294967295";
+    const delay = makeInput("Additional wait (ns)", "delayNs", assumption.delay_ns);
+    delay.min = "0";
+    delay.max = "9007199254740991";
+    delay.required = true;
+    const hint = document.createElement("div");
+    hint.id = "q1timeline-feedback-hint";
+    hint.className = "q1timeline-feedback-hint";
+    hint.textContent = "Empty value = unknown. 0 ns = already received.";
+    value.setAttribute("aria-describedby", hint.id);
+    delay.setAttribute("aria-describedby", hint.id);
+    form.append(hint);
+    const apply = document.createElement("button");
+    apply.type = "submit";
+    apply.className = "q1timeline-control-action";
+    apply.textContent = "Apply";
+    apply.title = "Use these assumptions for this occurrence and recompute.";
+    const validate = () => {
+      const numericValue = value.value === "" ? null : Number(value.value);
+      const numericDelay = Number(delay.value);
+      const validValue = !value.validity.badInput && (numericValue === null ||
+        Number.isInteger(numericValue) && numericValue >= -2147483648 && numericValue <= 4294967295);
+      const validDelay = !delay.validity.badInput && delay.value !== "" && Number.isSafeInteger(numericDelay) && numericDelay >= 0;
+      value.setCustomValidity(validValue ? "" : "Enter a 32-bit integer (-2147483648 to 4294967295), or leave empty for unknown.");
+      delay.setCustomValidity(validDelay ? "" : "Enter a non-negative whole number of nanoseconds.");
+      apply.disabled = timelineExecutionState.status === "running" || !validValue || !validDelay;
+      return { value: numericValue, delayNs: numericDelay };
+    };
+    value.addEventListener("input", validate);
+    delay.addEventListener("input", validate);
+    form.append(apply);
+    form.addEventListener("submit", (submitEvent) => {
+      submitEvent.preventDefault();
+      submitEvent.stopPropagation();
+      const values = validate();
+      if (apply.disabled || !form.reportValidity()) return;
+      vscode.postMessage({ type: "setExecutionFeedback", eventId: String(event.id),
+        feedbackId: String(meta.playback_feedback_id), ...values });
+      closeTimelineControlPopover(true);
+    });
+    validate();
+    popover.append(form);
   }
 
   function timelineControlLoopVisibleIterations(meta) {
@@ -684,6 +784,7 @@
       existing.remove();
     }
     activeTimelineControlChip = undefined;
+    if (chip) chip.setAttribute("aria-expanded", "false");
     for (const chip of document.querySelectorAll(".q1timeline-control-chip[aria-expanded='true'], .q1timeline-control-loop-lane[aria-expanded='true']")) {
       chip.setAttribute("aria-expanded", "false");
     }
@@ -698,7 +799,7 @@
     if (options.text) button.textContent = label;
     button.setAttribute("aria-label", label);
     if (options.active !== undefined) button.setAttribute("aria-pressed", String(options.active));
-    button.title = label;
+    button.title = options.title || label;
     if (options.active) {
       button.classList.add("is-active");
     }
@@ -734,6 +835,20 @@
     activeTimelineControlChip = chip;
     if (actionKind === "branch") {
       renderBranchControls(popover, event);
+    } else if (actionKind === "feedback") {
+      renderFeedbackControls(popover, event);
+    } else if (actionKind === "loop" && meta.playback) {
+      popover.classList.add("q1timeline-playback-loop-popover");
+      const loopKey = String(meta.loop_preview_key || meta.loop_id || event.id);
+      const expanded = expandedPlaybackLoops.has(loopKey);
+      addTimelineControlAction(popover, expanded ? "reset" : "next", expanded ? "Collapse executed iterations" : "Expand executed iterations", () => {
+        if (expanded) expandedPlaybackLoops.delete(loopKey);
+        else expandedPlaybackLoops.add(loopKey);
+        timelineTimeScales.clear();
+        writePersistedWebviewState({ expandedPlaybackLoops: Array.from(expandedPlaybackLoops) });
+        closeTimelineControlPopover();
+        renderSharedTimelineIfAvailable();
+      }, { text: true, active: expanded, disabled: !(meta.hidden_event_ids || []).length });
     } else if (actionKind === "loop") {
       const loopKey = String(meta.loop_preview_key || "");
       const visible = timelineControlLoopVisibleIterations(meta);
@@ -752,7 +867,7 @@
     }
     ensureTimelineControlOverlay().append(popover);
     positionTimelineControlPopover(popover, chip);
-    if (actionKind === "branch") {
+    if (actionKind === "branch" || actionKind === "feedback") {
       popover.addEventListener("keydown", (keyEvent) => {
         if (keyEvent.key === "Escape") {
           keyEvent.preventDefault();
@@ -760,7 +875,7 @@
           closeTimelineControlPopover(true);
         }
       });
-      const focus = popover.querySelector('button[aria-pressed="true"]:not(:disabled)') || popover.querySelector("button:not(:disabled)");
+      const focus = popover.querySelector("input:not(:disabled)") || popover.querySelector('button[aria-pressed="true"]:not(:disabled)') || popover.querySelector("button:not(:disabled)");
       if (focus) focus.focus();
     }
   }
@@ -772,23 +887,25 @@
       return;
     }
     const isBranch = actionKind === "branch";
-    if (!isBranch) {
+    const isFeedback = actionKind === "feedback";
+    if (!isBranch && !isFeedback) {
       return;
     }
     const chip = document.createElement("button");
     chip.type = "button";
-    chip.className = "q1timeline-control-chip q1timeline-control-chip-branch";
+    chip.className = `q1timeline-control-chip q1timeline-control-chip-${actionKind}`;
     chip.dataset.eventId = String(event.id);
     chip.dataset.controlChipId = `${actionKind}:${event.id}`;
     chip.setAttribute("aria-haspopup", "dialog");
     chip.setAttribute("aria-expanded", "false");
-    chip.setAttribute("aria-label", branchSourceJumpLabel(event));
-    chip.title = chip.getAttribute("aria-label");
+    chip.setAttribute("aria-label", isFeedback ? `Edit feedback assumption · ${branchSourceJumpLabel(event)}` : branchSourceJumpLabel(event));
+    chip.title = isFeedback ? `Assumed feedback: ${meta.feedback_assumption.value ?? "unknown"}, additional wait ${meta.feedback_assumption.delay_ns} ns. Click to edit.` : chip.getAttribute("aria-label");
     chip.style.left = timelineControlChipLeft(sourceNode);
     chip.style.top = timelineControlChipTop(stackIndex);
     chip.dataset.stackIndex = String(stackIndex);
-    chip.innerHTML = timelineControlSvgIcon(branchAssumptionIconName(meta));
-    if (branchAssumptionLabel(meta)) {
+    if (isFeedback) chip.textContent = "≈";
+    else chip.innerHTML = timelineControlSvgIcon(branchAssumptionIconName(meta));
+    if (isBranch && branchAssumptionLabel(meta)) {
       chip.dataset.state = branchAssumptionLabel(meta);
     }
     chip.addEventListener("click", (clickEvent) => {
@@ -818,6 +935,7 @@
       const event = timelineEventsById.get(String(node.dataset.eventId));
       const meta = event && event.meta && typeof event.meta === "object" ? event.meta : {};
       node.classList.remove("q1timeline-control-loop-lane");
+      node.classList.toggle("is-playback-loop", Boolean(meta.playback));
       delete node.dataset.controlChipId;
       node.removeAttribute("role");
       node.removeAttribute("aria-haspopup");
@@ -833,8 +951,8 @@
         node.setAttribute("role", "button");
         node.setAttribute("aria-haspopup", "menu");
         node.setAttribute("aria-expanded", "false");
-        node.setAttribute("aria-label", "Loop preview options");
-        node.title = node.getAttribute("aria-label");
+        node.setAttribute("aria-label", meta.playback ? "Executed loop options" : "Loop preview options");
+        node.title = meta.playback ? `${meta.count} executed iterations. Click to expand or collapse.` : node.getAttribute("aria-label");
         node.tabIndex = 0;
       }
       if (node.dataset.timelineControlLoopInstalled !== "true") {
@@ -858,11 +976,12 @@
     const chipStackCounts = new Map();
     for (const node of branchNodes) {
       const event = timelineEventsById.get(String(node.dataset.eventId));
-      if (event && eventHasBranchControl(event)) {
+      const actionKind = eventHasFeedbackControl(event) ? "feedback" : event && eventHasBranchControl(event) ? "branch" : undefined;
+      if (actionKind) {
         const stackKey = timelineControlChipStackKey(node);
         const stackIndex = chipStackCounts.get(stackKey) || 0;
         chipStackCounts.set(stackKey, stackIndex + 1);
-        addTimelineControlChip(node, event, "branch", stackIndex);
+        addTimelineControlChip(node, event, actionKind, stackIndex);
       }
     }
     installLoopLaneTimelineControls();
@@ -929,7 +1048,7 @@
   }
 
   function toggleTimelineGap(gap) {
-    const scale = timelineTimeScale();
+    const scale = timelineWaitTimeScale();
     const folded = scale && scale.gaps.some((item) => item.start === gap.start && item.end === gap.end);
     const full = fullTimelineWindow();
     if (folded) {
@@ -937,7 +1056,7 @@
         fullMin: full.min, fullMax: full.max });
     } else {
       if (!timelineWaitsCollapsed) {
-        timelineExpandedGaps = timelineTimeScale(true).gaps.map((item) => ({ start: item.start, end: item.end,
+        timelineExpandedGaps = timelineWaitTimeScale(true).gaps.map((item) => ({ start: item.start, end: item.end,
           basis: timelineTimeBasis, fullMin: full.min, fullMax: full.max }));
         timelineWaitsCollapsed = true;
       }
@@ -950,7 +1069,7 @@
   }
 
   function toggleTimelineFolds() {
-    const scale = timelineTimeScale();
+    const scale = timelineWaitTimeScale();
     timelineWaitsCollapsed = !(scale && scale.gaps.length);
     timelineExpandedGaps = [];
     timelineTimeScales.clear();
@@ -960,13 +1079,14 @@
 
   function renderWaitFolds() {
     if (timelineLayout === "instruction") return;
-    const scale = timelineTimeScale();
-    const candidates = timelineTimeScale(true);
+    const scale = timelineWaitTimeScale();
+    const candidates = timelineWaitTimeScale(true);
     const button = document.getElementById("q1timeline-wait-fold-button");
     if (button) {
       const unavailable = !candidates || !candidates.gaps.length;
       const collapsed = Boolean(scale && scale.gaps.length);
-      setIconOnlyToolbarButton(button, "foldWaits", unavailable ? "No unchanged interval shared by all sequencers" : collapsed ? "Expand all unchanged intervals" : "Fold all unchanged intervals");
+      const intervals = timelineIr.playback ? "wait intervals" : "unchanged intervals";
+      setIconOnlyToolbarButton(button, "foldWaits", unavailable ? `No ${intervals} shared by all sequencers` : `${collapsed ? "Expand" : "Fold"} all ${intervals}`);
       button.disabled = unavailable;
       button.setAttribute("aria-pressed", String(collapsed));
     }
@@ -977,6 +1097,7 @@
     const tracks = Array.from(document.querySelectorAll(".shared-timeline-stage .ruler, .shared-timeline-stage .lane-track"));
     for (const gap of candidates.gaps) {
       if (gap.end <= current.min || gap.start >= current.max) continue;
+      if (timelineTimeScale()?.gaps.some((item) => item.loopKeys?.length && item.start < gap.end && item.end > gap.start)) continue;
       const folded = Boolean(scale && scale.gaps.some((item) => item.start === gap.start && item.end === gap.end));
       const start = Math.max(gap.start, current.min);
       const end = Math.min(gap.end, current.max);
@@ -985,7 +1106,7 @@
       if ((right - left) / span < 0.001) continue;
       for (const [trackIndex, track] of tracks.entries()) {
         const marker = document.createElement("span");
-        marker.className = `q1timeline-wait-fold${folded ? "" : " is-expanded"}`;
+        marker.className = `q1timeline-wait-fold${folded ? "" : " is-expanded"}${timelineIr.playback ? " is-playback-wait" : ""}`;
         marker.style.left = `${(left - display.min) / span * 100}%`;
         marker.style.width = `${(right - left) / span * 100}%`;
         marker.dataset.timeStart = String(gap.start);
@@ -997,7 +1118,8 @@
         toggle.dataset.timeStart = String(gap.start);
         toggle.dataset.timeEnd = String(gap.end);
         toggle.dataset.trackIndex = String(trackIndex);
-        toggle.title = `${folded ? "Folded" : "Expanded at full duration:"} ${formatWindowValue(gap.end - gap.start)} ns (${formatWindowValue(gap.start)}..${formatWindowValue(gap.end)} ns). Click to ${folded ? "expand" : "collapse"} only this interval across all sequencers. No Q1ASM state changes occur here; constant output or marker levels may remain active.`;
+        const description = timelineIr.playback ? "Display compression of an executed wait. Acquisition or output may remain active; assumptions are unchanged." : "No Q1ASM state changes occur here; constant output or marker levels may remain active.";
+        toggle.title = `${folded ? "Folded" : "Expanded at full duration:"} ${formatWindowValue(gap.end - gap.start)} ns (${formatWindowValue(gap.start)}..${formatWindowValue(gap.end)} ns). Click to ${folded ? "expand" : "collapse"} only this interval across all sequencers. ${description}`;
         toggle.setAttribute("aria-label", `${folded ? "Expand" : "Collapse"} ${duration} interval across all sequencers (${formatWindowValue(gap.start)}..${formatWindowValue(gap.end)} ns)`);
         toggle.setAttribute("aria-expanded", String(!folded));
         if (folded) {
@@ -1024,6 +1146,55 @@
         });
         marker.append(toggle);
         track.appendChild(marker);
+      }
+    }
+  }
+
+  function renderPlaybackFolds() {
+    if (timelineLayout === "instruction") return;
+    const current = currentTimelineWindow();
+    const display = timelineDisplayWindow(current);
+    const span = Math.max(1e-9, display.max - display.min);
+    const tracks = document.querySelectorAll(".shared-timeline-stage .ruler, .shared-timeline-stage .lane-track");
+    const loops = new Map(timelineIr.events.filter((event) => event.kind === "loop_block")
+      .map((event) => [String(event.meta.loop_preview_key || event.meta.loop_id || event.id), event]));
+    for (const gap of timelineTimeScale()?.gaps || []) {
+      if (!gap.loopKeys?.length || gap.end <= current.min || gap.start >= current.max) continue;
+      const loop = loops.get(gap.loopKeys[0]);
+      for (const track of tracks) {
+        const marker = document.createElement("span");
+        marker.className = "q1timeline-playback-fold";
+        marker.dataset.timeStart = String(gap.start);
+        marker.dataset.timeEnd = String(gap.end);
+        marker.style.left = `${(displayTimelineTime(Math.max(gap.start, current.min)) - display.min) / span * 100}%`;
+        marker.style.width = `${(displayTimelineTime(Math.min(gap.end, current.max)) - displayTimelineTime(Math.max(gap.start, current.min))) / span * 100}%`;
+        if (track.classList.contains("ruler") || track.closest(".timeline-row-runtime")) {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.textContent = "//";
+          const interval = `${formatWindowValue(gap.start)}..${formatWindowValue(gap.end)} ns`;
+          button.title = `Repeated iterations folded: ${interval}. ${loop?.meta.playback ? "Click to expand." : "Click for loop preview options."}`;
+          button.setAttribute("aria-label", loop?.meta.playback ? `Expand repeated interval ${interval}` : `Loop preview options for repeated interval ${interval}`);
+          if (loop && !loop.meta.playback) {
+            button.dataset.controlChipId = `loop:${loop.id}`;
+            button.setAttribute("aria-haspopup", "menu");
+            button.setAttribute("aria-expanded", "false");
+          }
+          button.addEventListener("pointerdown", (event) => event.stopPropagation());
+          button.addEventListener("click", (event) => {
+            event.stopPropagation();
+            if (loop && !loop.meta.playback) {
+              openTimelineControlPopover(button, loop, "loop");
+              return;
+            }
+            for (const key of gap.loopKeys) expandedPlaybackLoops.add(key);
+            timelineTimeScales.clear();
+            writePersistedWebviewState({ expandedPlaybackLoops: Array.from(expandedPlaybackLoops) });
+            renderSharedTimelineIfAvailable();
+          });
+          marker.append(button);
+        }
+        track.append(marker);
       }
     }
   }
@@ -1071,6 +1242,9 @@
       return false;
     }
     currentTimelineWindow();
+    // The shared renderer replaces the standalone SVG. Remove it before
+    // calculating folds so the first frame uses the same scale as later frames.
+    root.querySelector(".timeline-svg")?.remove();
     const previousStage = root.querySelector(".shared-timeline-stage");
     if (timelineLayout === "instruction" && previousStage && previousStage.dataset.instructionCount) {
       instructionView.leftOrdinal = previousStage.scrollLeft / instructionView.cellWidth;
@@ -1081,6 +1255,7 @@
       layout: timelineLayout,
       timeBasis: timelineTimeBasis,
       expandedQ1IssueSequencers: Array.from(expandedQ1IssueSequencers || []),
+      expandedPlaybackLoops: Array.from(expandedPlaybackLoops),
     });
     if (timelineLayout !== "instruction") {
       model.viewport = sharedTimelineViewport();
@@ -1095,7 +1270,16 @@
     }
     for (const annotation of model.annotations || []) {
       const eventIds = Array.isArray(annotation.eventIds) ? annotation.eventIds.map((eventId) => String(eventId)) : [];
-      annotation.selected = selectedTimelineEventId !== undefined && eventIds.includes(String(selectedTimelineEventId));
+      annotation.selected = selectedTimelineEventId !== undefined && eventIds.includes(String(selectedTimelineEventId)) ||
+        selectedSourceEventIds.has(String(annotation.eventId));
+    }
+    if (model.selectionRange && selectedSourceEventIds.size) {
+      for (const lane of model.lanes || []) {
+        const spans = lane.blocks.filter((block) => block.selected).map((block) => ({ start: block.start, end: block.start + block.duration }));
+        spans.push(...model.annotations.filter((annotation) => annotation.type === "loop-range" && annotation.laneId === lane.id &&
+          selectedSourceEventIds.has(String(annotation.eventId))).map((annotation) => ({ start: annotation.start, end: annotation.end })));
+        lane.selectionRange = spans.length ? { start: Math.min(...spans.map((span) => span.start)), end: Math.max(...spans.map((span) => span.end)) } : null;
+      }
     }
     window.q1lensSharedTimeline.renderTimeline(root, model, {
       onBlockClick: (_block, node, event) => {
@@ -1138,6 +1322,7 @@
     installTimelineMouseInteractions();
     applySharedSelection(options);
     renderWaitFolds();
+    renderPlaybackFolds();
     renderHardwareCursor();
     return true;
   }
@@ -1483,6 +1668,10 @@
   }
 
   const state = initialState();
+  let timelineExecutionState = state.executionState || timelineIr.playback || { status: "idle" };
+  const savedFoldState = readPersistedWebviewState();
+  const currentFoldState = savedFoldState.timelineFoldStateVersion === 2 && savedFoldState.timelineFoldSnapshotId === state.playbackSnapshotId;
+  const expandedPlaybackLoops = new Set(currentFoldState && Array.isArray(savedFoldState.expandedPlaybackLoops) ? savedFoldState.expandedPlaybackLoops : []);
   const initialUnsavedChanges = Boolean(state.hasUnsavedChanges);
   const initialUpdateMode = state.updateMode || "onSave";
   const initialViewMode = state.viewMode || "normal";
@@ -1491,11 +1680,13 @@
   let timelineTimeBasis = initialTimelineTimeBasis();
   let timelineLayout = readPersistedWebviewState().timelineLayout === "instruction" ? "instruction" : "time";
   let instructionView = { cellWidth: 112, leftOrdinal: 0 };
-  let timelineWaitsCollapsed = readPersistedWebviewState().timelineWaitsCollapsed !== false;
-  let timelineExpandedGaps = (Array.isArray(readPersistedWebviewState().timelineExpandedGaps)
+  let timelineWaitsCollapsed = !currentFoldState || savedFoldState.timelineWaitsCollapsed !== false;
+  let timelineExpandedGaps = (currentFoldState && Array.isArray(readPersistedWebviewState().timelineExpandedGaps)
     ? readPersistedWebviewState().timelineExpandedGaps : []).filter((gap) => gap &&
       ["local", "aligned"].includes(gap.basis) && [gap.start, gap.end, gap.fullMin, gap.fullMax].every(Number.isFinite) && gap.end > gap.start);
   const timelineTimeScales = new Map();
+  if (!currentFoldState) writePersistedWebviewState({ timelineFoldStateVersion: 2, timelineFoldSnapshotId: state.playbackSnapshotId,
+    timelineWaitsCollapsed: true, expandedPlaybackLoops: [], timelineExpandedGaps: [] });
   let timelineZoom = 1;
   let timelineWindow = undefined;
   let timelineDrag = undefined;
@@ -1729,6 +1920,8 @@
 
   function toolbarSvgIcon(name) {
     const icons = {
+      play: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 11 7-11 7z"/></svg>',
+      pause: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14M16 5v14"/></svg>',
       foldWaits: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 8h6l-3 8h6l-3-8h6l-3 8h9"/></svg>',
       refresh: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/></svg>',
       sync: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 0 1-15.4 6.4"/><path d="M3 12A9 9 0 0 1 18.4 5.6"/><path d="M3 19v-5h5"/><path d="M21 5v5h-5"/></svg>',
@@ -1765,12 +1958,51 @@
     node.innerHTML = toolbarSvgIcon(iconName);
   }
 
+  function renderExecutionControls() {
+    const button = document.getElementById("q1timeline-execution-button");
+    const indicator = document.getElementById("q1timeline-execution-status");
+    if (!button || !indicator) return;
+    const execution = timelineExecutionState || { status: "idle" };
+    const running = execution.status === "running";
+    const labels = { idle: "Ready", running: "Running", paused: "Paused", blocked: "Blocked", completed: "Completed", limit: "Instruction limit reached", error: "Execution stopped" };
+    const details = [labels[execution.status] || "Ready"];
+    if (Number.isFinite(execution.steps)) details.push(`${execution.steps} instructions`);
+    if (execution.reason) details.push(execution.reason);
+    const completed = execution.status === "completed";
+    const cannotResume = ["blocked", "limit"].includes(execution.status) && execution.can_resume === false;
+    const label = running ? "Pause execution" : completed ? "Execution complete" : cannotResume ? labels[execution.status] : "Run execution";
+    setIconOnlyToolbarButton(button, running ? "pause" : "play", label);
+    button.disabled = completed || cannotResume;
+    if (completed) button.title = "Execution complete. Change a branch or feedback assumption to recalculate.";
+    if (cannotResume) button.title = `${execution.reason || labels[execution.status]} Change a branch or feedback assumption to recalculate.`;
+    button.setAttribute("aria-pressed", String(running));
+    indicator.dataset.executionStatus = execution.status || "idle";
+    indicator.title = details.join(" · ");
+    indicator.setAttribute("aria-label", indicator.title);
+  }
+
+  function requestExecutionControl() {
+    if (timelineExecutionState.status === "completed" ||
+        ["blocked", "limit"].includes(timelineExecutionState.status) && timelineExecutionState.can_resume === false) return;
+    vscode.postMessage({ type: "executionControl", action: timelineExecutionState.status === "running" ? "pause" : "play" });
+  }
+
   function ensureToolbarNode() {
     let node = document.getElementById("q1timeline-toolbar");
     if (!node) {
       node = document.createElement("div");
       node.id = "q1timeline-toolbar";
       node.className = "q1timeline-toolbar";
+      const executionButton = document.createElement("button");
+      executionButton.id = "q1timeline-execution-button";
+      executionButton.type = "button";
+      executionButton.addEventListener("click", requestExecutionControl);
+      node.append(executionButton);
+      const executionStatus = document.createElement("span");
+      executionStatus.id = "q1timeline-execution-status";
+      executionStatus.className = "q1timeline-execution-status";
+      executionStatus.setAttribute("role", "status");
+      node.append(executionStatus);
       const refreshButton = document.createElement("button");
       refreshButton.id = "q1timeline-refresh-button";
       refreshButton.type = "button";
@@ -2487,7 +2719,7 @@
     return geometry.left + ((displayTimelineTime(time) - display.min) / span) * (geometry.right - geometry.left);
   }
 
-  function timelineTimeScale(includeExpanded = false) {
+  function timelineWaitTimeScale(includeExpanded = false) {
     const adapter = window.q1timelineTimelineAdapter;
     if ((!timelineWaitsCollapsed && !includeExpanded) || timelineSvg() || !adapter || !adapter.buildWaitTimeScale) return undefined;
     const key = `${timelineTimeBasis}:${includeExpanded ? "all" : "folded"}`;
@@ -2495,7 +2727,22 @@
       const full = fullTimelineWindow();
       const expandedGaps = includeExpanded ? [] : timelineExpandedGaps.filter((gap) => gap.basis === timelineTimeBasis &&
         timelineExtentMatches({ min: gap.fullMin, max: gap.fullMax }, full));
-      timelineTimeScales.set(key, adapter.buildWaitTimeScale(timelineIr, { timeBasis: timelineTimeBasis, expandedGaps }));
+      timelineTimeScales.set(key, adapter.buildWaitTimeScale(timelineIr, { timeBasis: timelineTimeBasis, expandedGaps,
+        expandedPlaybackLoops: Array.from(expandedPlaybackLoops) }));
+    }
+    return timelineTimeScales.get(key);
+  }
+
+  function timelineTimeScale() {
+    const adapter = window.q1timelineTimelineAdapter;
+    if (timelineSvg() || !adapter || !adapter.buildTimelineTimeScale) return timelineWaitTimeScale();
+    const key = `${timelineTimeBasis}:combined`;
+    if (!timelineTimeScales.has(key)) {
+      timelineTimeScales.set(key, adapter.buildTimelineTimeScale(timelineIr, {
+        timeBasis: timelineTimeBasis,
+        expandedPlaybackLoops: Array.from(expandedPlaybackLoops),
+        waitGaps: timelineWaitTimeScale()?.gaps || [],
+      }));
     }
     return timelineTimeScales.get(key);
   }
@@ -3401,6 +3648,7 @@
   }
 
   function zoomTimelineToEvent(event) {
+    event = visiblePlaybackEvent(event);
     if (timelineLayout === "instruction") {
       const node = event && findVisibleEventNodeByIds([String(event.id)]);
       if (node) node.scrollIntoView({ block: "nearest", inline: "nearest" });
@@ -3425,6 +3673,7 @@
   }
 
   function zoomTimelineToHighlightedEvent(event) {
+    event = visiblePlaybackEvent(event);
     if (!event) {
       return;
     }
@@ -3445,9 +3694,9 @@
   function sourceRangeTimelineBounds(eventIds) {
     const events = Array.from(new Set(eventIds.map(String))).map((id) => timelineEventsById.get(id))
       .filter((event) => event && event.meta?.diff_status !== "removed");
-    const rtEvents = events.filter((event) => !eventIsQ1Issue(event) && !String(event.lane || "").startsWith("debug.") &&
-      !["loop_block", "loop_iteration_preview", "branch_region"].includes(event.kind));
-    const selected = rtEvents.length ? rtEvents : events.filter(eventIsQ1Issue);
+    const timedEvents = events.filter((event) => eventIsQ1Issue(event) || (!String(event.lane || "").startsWith("debug.") &&
+      !["loop_block", "loop_iteration_preview", "branch_region", "control_flow_loop", "control_flow_branch"].includes(event.kind)));
+    const selected = [...new Set(timedEvents.map(visiblePlaybackEvent))];
     if (!selected.length) return undefined;
     let start = Infinity;
     let end = -Infinity;
@@ -3465,29 +3714,23 @@
       start = Math.min(start, times[0]);
       end = Math.max(end, times[1]);
     }
-    return { start, end, eventIds: selected.map((event) => String(event.id)), clock: rtEvents.length ? "RT" : "Q1 core" };
+    const hasQ1 = selected.some(eventIsQ1Issue);
+    const hasRT = selected.some((event) => !eventIsQ1Issue(event));
+    return { start, end, eventIds: selected.map((event) => String(event.id)), clock: selected.some((event) => event.kind === "loop_block") ? "Loop" : hasQ1 && hasRT ? "Q1 core + RT" : hasQ1 ? "Q1 core" : "RT" };
   }
 
   function zoomTimelineToEventRange(eventIds) {
     const range = sourceRangeTimelineBounds(eventIds);
     if (!range) return undefined;
-    const full = fullTimelineWindow();
-    const padding = Math.max(1, (range.end - range.start) * 0.05);
-    const window = timelineWindowForRange(range.start - padding, range.end + padding, full, 4);
+    const start = displayTimelineTime(range.start);
+    const end = displayTimelineTime(range.end);
+    const padding = Math.max(1, (end - start) * 0.05);
+    const window = timelineWindowForRange(start - padding, end + padding, timelineDisplayWindow(fullTimelineWindow()), 4);
     if (!window) return undefined;
-    const scale = timelineTimeScale();
-    if (scale) {
-      for (const gap of scale.gaps) {
-        if (gap.end <= window.min || gap.start >= window.max) continue;
-        timelineExpandedGaps.push({ start: gap.start, end: gap.end, basis: timelineTimeBasis,
-          fullMin: full.min, fullMax: full.max });
-      }
-      timelineTimeScales.clear();
-      writePersistedWebviewState({ timelineExpandedGaps });
-    }
     timelineSelectionRange = { start: range.start, end: range.end };
     selectedTimelineEventId = undefined;
-    setTimelineWindow(window.min, window.max);
+    selectedSourceEventIds = new Set(range.eventIds);
+    setTimelineWindow(realTimelineTime(window.min), realTimelineTime(window.max));
     return range;
   }
 
@@ -3638,6 +3881,7 @@
   }
 
   function applyTimelineSelectionRange(start, end) {
+    selectedSourceEventIds.clear();
     timelineSelectionRange = { start, end };
     applyTimelineScale();
   }
@@ -3657,10 +3901,10 @@
       pointerId: event.pointerId,
       start,
     };
-    applyTimelineSelectionRange(start, start);
     if (typeof container.setPointerCapture === "function" && event.pointerId !== undefined) {
       container.setPointerCapture(event.pointerId);
     }
+    applyTimelineSelectionRange(start, start);
     container.style.cursor = "crosshair";
     event.preventDefault();
     document.addEventListener("pointermove", updateTimelineSelectionDrag);
@@ -3883,11 +4127,12 @@
         if (scope === "project") setTimelineTimeBasis("local");
       },
       onSelectEvent(eventId, selectionOptions = {}) {
-        const event = timelineEventsById.get(String(eventId));
+        const event = visiblePlaybackEvent(timelineEventsById.get(String(eventId)));
         if (!selectionOptions.replay) zoomTimelineToHighlightedEvent(event);
-        const node = findVisibleEventNodeByIds([eventId]);
+        const node = findVisibleEventNodeByIds([event && event.id || eventId]);
         if (node) {
           selectEventNode(node, { notify: false, syncHardware: false });
+          if (event && event.id !== eventId) renderSharedEventInspector(eventId);
         } else {
           selectedTimelineEventId = eventId;
           syncTimelineRelatedSelection(eventId);
@@ -3925,6 +4170,7 @@
   }
 
   ensureToolbarNode();
+  renderExecutionControls();
   renderComparisonStatus(state.comparison);
   renderAlignmentPolicy(initialAlignmentPolicy);
   renderTimeBasisToggle();
@@ -3966,6 +4212,12 @@
   });
 
   window.addEventListener("message", (event) => {
+    if (event.data && event.data.type === "setExecutionState") {
+      timelineExecutionState = event.data.state || { status: "idle" };
+      renderExecutionControls();
+      if (timelineExecutionState.status === "running") closeTimelineControlPopover();
+      return;
+    }
     if (event.data && event.data.type === "setComparison") {
       renderComparisonStatus(event.data.comparison);
       return;
@@ -3985,7 +4237,7 @@
     syncTimelineRelatedSelection(undefined);
     if (event.data.zoomToRange) {
       if (timelineLayout === "instruction") {
-        const ids = new Set((event.data.highlightEventIds || []).map(String));
+        const ids = new Set((event.data.highlightEventIds || []).map((id) => visiblePlaybackEvent(timelineEventsById.get(String(id)))?.id || String(id)));
         selectedSourceEventIds = ids;
         const selected = [];
         document.querySelectorAll(".shared-timeline-stage .timeline-block[data-event-id]").forEach((node) => {
@@ -4013,26 +4265,32 @@
         if (details) details.open = true;
         return;
       }
-      if (range.clock === "Q1 core") expandQ1IssueLanesForHighlight(range.eventIds);
+      expandQ1IssueLanesForHighlight(range.eventIds);
       const ids = new Set(range.eventIds);
       selectedSourceEventIds = ids;
       document.querySelectorAll("[data-event-id]").forEach((node) => {
-        const selected = ids.has(node.dataset.eventId);
+        const selected = node.classList.contains("timeline-annotation") ? ids.has(node.dataset.eventId) :
+          (node.dataset.eventIds || node.dataset.eventId || "").split(/\s+/).some((id) => ids.has(id));
         node.classList.toggle("is-selected", selected);
         node.setAttribute("aria-selected", String(selected));
       });
       const source = event.data.sourceRange;
       const label = source ? `${String(source.file).split(/[\\/]/).pop()}:${source.startLine}–${source.endLine}` : "Selected code";
-      summary.textContent = `${label} · ${range.clock} ${formatWindowValue(range.start)}..${formatWindowValue(range.end)} ns · analyzed occurrences · linear time`;
+      summary.textContent = `${label} · ${range.clock} ${formatWindowValue(range.start)}..${formatWindowValue(range.end)} ns · analyzed occurrences · folds preserved`;
       return;
     }
     const highlightEventIds = prioritizedHighlightEventIds(event.data.highlightEventIds || []);
     expandQ1IssueLanesForHighlight(highlightEventIds);
     const highlightedEvent = highlightedEventForIds(highlightEventIds);
-    zoomTimelineToHighlightedEvent(highlightedEvent);
-    const target = findVisibleEventNodeByIds(highlightEventIds);
+    const visibleEvent = visiblePlaybackEvent(highlightedEvent);
+    zoomTimelineToHighlightedEvent(visibleEvent);
+    const target = findVisibleEventNodeByIds(visibleEvent ? [visibleEvent.id, ...highlightEventIds] : highlightEventIds);
     if (target) {
-      selectEventNode(target, { notify: false });
+      selectEventNode(target, { notify: false, syncHardware: visibleEvent === highlightedEvent });
+      if (visibleEvent !== highlightedEvent && highlightedEvent) {
+        if (hardwareView) hardwareView.selectEvent(highlightedEvent.id);
+        renderSharedEventInspector(highlightedEvent.id);
+      }
       target.scrollIntoView({ block: "center", inline: "center" });
     } else {
       syncTimelineRelatedSelection(undefined);

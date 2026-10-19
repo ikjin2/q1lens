@@ -1,0 +1,19 @@
+# Simulation inputs: trigger address 1 at 230 ns; RT starts at 200 ns.
+                set_mrk         1
+                set_freq        4000000  # 1 MHz (0.25 Hz units).
+                upd_param       4
+                set_latch_en    1,4
+
+                set_cond        1,1,0,40
+# Q1 always runs, even when the following RT update is skipped.
+                move            7,R0
+                set_mrk         3
+                set_freq        8000000  # 2 MHz.
+                upd_param       16       # False at 208 ns: skip until 248 ns.
+                upd_param       16       # True at 248 ns: apply marker 3 / 2 MHz.
+
+                set_cond        0,0,0,4
+                set_mrk         2
+                set_freq        12000000 # 3 MHz.
+                upd_param       16       # Unconditional at 264 ns.
+                stop

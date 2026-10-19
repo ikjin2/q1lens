@@ -45,7 +45,7 @@
 
   function executionLabel(execution) {
     if (!execution) return "Static analysis";
-    const parts = [execution.mode === "simulation" ? "Event-driven simulation" : execution.mode === "concrete" ? "Concrete execution" : statusLabel(execution.mode), statusLabel(execution.status)];
+    const parts = [execution.mode === "simulation" ? "Event-driven simulation" : execution.mode === "concrete" ? "Concrete execution" : execution.mode === "playback" ? "Path execution" : statusLabel(execution.mode), statusLabel(execution.status)];
     if (Number.isFinite(execution.steps)) parts.push(`${execution.steps}${Number.isFinite(execution.max_steps) ? ` / ${execution.max_steps}` : ""} instructions`);
     if (execution.reason) parts.push(execution.reason);
     return parts.join(" · ");
@@ -781,7 +781,7 @@
       find('[data-action="next"]').title = `Next state change · ${stepScope}`;
       renderNavigation();
       find('[data-action="replay-toggle"]').setAttribute("aria-expanded", String(replayOpen && state.level === "detail"));
-      text(values["trace-kind"], sequencers.some((seq) => index.simulation[seq.id]) ? "SIMULATED TRACE" : "ANALYZED TRACE");
+      text(values["trace-kind"], sequencers.some((seq) => index.simulation[seq.id]) ? "SIMULATED TRACE" : sequencers.some((seq) => index.execution[seq.id]?.mode === "playback") ? "PATH EXECUTION" : "ANALYZED TRACE");
       if (state.level !== "detail") {
         const warnings = renderOverview();
         values.warnings.hidden = warnings.length === 0;
@@ -802,7 +802,7 @@
       if (replayOpen) { sourceTarget = undefined; if (notifyChange) notify(); return; }
       const known = snapshot.registers.filter((register) => register.known).length;
       text(values.execution, executionLabel(snapshot.execution));
-      text(values["trace-kind"], snapshot.simulation ? "SIMULATED TRACE" : "ANALYZED TRACE");
+      text(values["trace-kind"], snapshot.simulation ? "SIMULATED TRACE" : snapshot.execution?.mode === "playback" ? "PATH EXECUTION" : "ANALYZED TRACE");
       text(values["timing-note"], snapshot.simulation ? "Q1 registers advance independently of RT execution. Timing uses an event-driven model of queues and configured inputs. Signal and result sources identify modeled values, supplied traces, or supplied measurements." : "Q1 registers advance independently of RT execution. Timing is analytical; RT queue stalls are not modeled. Values are computed from the program, not measured on hardware.");
       values.execution.classList.toggle("is-incomplete", !!snapshot.execution && snapshot.execution.status !== "completed");
       renderInstruction();

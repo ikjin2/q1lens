@@ -220,7 +220,7 @@ artifacts:
 
 ### Review and execution workflows
 
-The following workflows are available in the Q1Lens 0.2.0 Python package and
+The following workflows are available in the Q1Lens 0.2.2 Python package and
 VS Code extension. The Desktop workbench is a development app run from the
 source checkout; this release does not include a Desktop installer.
 
@@ -261,6 +261,42 @@ CLI. In VS Code, `q1lens.q1timeline.executionMode: project` follows the project
 configuration; explicit execution modes use `q1lens.q1timeline.maxSteps`.
 Concrete mode executes sequencers independently. Missing inputs produce
 `blocked` and long-running programs produce `step_limit`, retaining a partial trace.
+
+The Q1ASM timeline's Play button calculates one path for up to five seconds.
+Pause retains the session, and Play resumes it. Unknown conditional branches
+default to Continue; their controls identify this assumption. After a run, choose
+Jump or Continue on a branch occurrence to recalculate with that choice. Executed
+loops can be expanded to inspect every recorded iteration; collapsing them also
+compresses the shared time axis. New playback results start with loops and long
+waits folded. Selecting source instructions highlights their visible loop or
+representative without unfolding it; expand explicitly to inspect hidden
+iterations. Manual expansion survives view-mode changes.
+
+Long waits in playback use display-only time compression, including when an
+acquisition's end or feedback value is unknown. The duration labels and raw times
+stay unchanged, and the ruler, cursor and lanes share the same compressed axis.
+A compressed wait does not assert that the hardware is idle.
+
+Playback assumes each `fb_pop_data` receipt is already available (additional wait
+`0 ns`) with an unknown value. Click its Q1 block's `≈` marker to set a value and
+additional wait for that occurrence, then Apply to recalculate. An empty value
+remains unknown; `0` is an explicit assumed value. Earlier choices are retained,
+and later choices are cleared when a receipt or branch changes. Assumed values
+and their downstream effects stay marked as assumptions. Waiting delays Q1 and
+subsequent packet issue times; it does not move already queued RT work.
+
+This path uses analytical timing, with queue checks under the receipt assumptions;
+it does not simulate shared Q1/RT clocks or feed queue backpressure into register
+execution. Other unavailable external timing and the recorded-event limit retain
+a partial trace. Source edits or Refresh reset the session. Project execution-mode
+settings remain unchanged.
+
+`set_cond 0,...` disables conditional execution and can pass through Play and
+concrete execution. Active or unresolved `set_cond` needs trigger-counter inputs
+at each RT instruction, so Play retains a partial trace there. Static analysis
+marks conditional RT timing and affected outputs unknown rather than treating
+them as unconditional execution; turning the condition off does not recover an
+already unknown elapsed time.
 
 Use `execution_mode: simulation` for shared Q1/RT timing, finite queues,
 synchronization and configured feedback inputs. Optional numerical signal models

@@ -1,0 +1,15 @@
+sequencers:
+  - id: changing_condition
+    module: QCM0
+    file: changing_condition.q1asm
+alignment:
+  mode: none
+analysis:
+  execution_mode: analysis
+  max_steps: 1000
+simulation:
+  startup_delay_ns: 200
+  max_time_ns: 1000
+view:
+  default_mode: debug
+  show_q1_issue: true

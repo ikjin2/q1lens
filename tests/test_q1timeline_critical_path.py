@@ -158,8 +158,8 @@ def test_missing_sync_participant_remains_path_uncertainty() -> None:
         ("wait 8\nfake_op 4\nstop\n", "analysis_incomplete", "analysis_incomplete", 8),
         ("wait 8\nplay 1\nstop\n", "invalid_argument_count", "invalid_input", 8),
         (
-            "set_cond 1,1,0,4\nplay 0,1,40\nset_cond 0,0,0,4\nstop\n",
-            "analysis_incomplete", "analysis_incomplete", 40,
+            "wait 8\nset_cond 1,1,0,4\nplay 0,1,40\nset_cond 0,0,0,4\nstop\n",
+            "analysis_incomplete", "analysis_incomplete", 8,
         ),
     ],
 )

@@ -112,7 +112,7 @@ def test_unknown_duration_does_not_fabricate_an_application_link() -> None:
 
 
 def test_control_latches_do_not_get_output_application_links() -> None:
-    state = analyze("set_cond 1,1,0,4\nset_time_ref\nupd_param 4\nstop")
+    state = analyze("set_cond 0,1,0,4\nset_time_ref\nupd_param 4\nstop")
     assert len(events(state, "latched_state_pending")) == 2
     assert all("q1_issue_event_id" in event.meta for event in events(state, "latched_state_pending"))
     assert "applied_setter_event_ids" not in events(state, "upd_param")[0].meta

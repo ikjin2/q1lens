@@ -20,16 +20,52 @@ body.vscode-dark {
   bottom: 0;
   z-index: 3;
   box-sizing: border-box;
-  border-inline: 1px dashed var(--vscode-charts-purple, #7955ad);
-  background: repeating-linear-gradient(120deg, transparent 0 4px, color-mix(in srgb, var(--vscode-charts-purple, #7955ad) 12%, transparent) 4px 6px);
   pointer-events: none;
+}
+
+.shared-timeline-stage .q1timeline-playback-fold {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  z-index: 3;
+  border-inline: 1px dashed var(--vscode-charts-green, #78a65a);
+  pointer-events: none;
+}
+
+.q1timeline-playback-fold button {
+  position: absolute;
+  top: 7px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 0 2px;
+  height: 22px;
+  max-width: 100%;
+  box-sizing: border-box;
+  white-space: nowrap;
+  overflow: hidden;
+  border: 0;
+  border-radius: 2px;
+  background: transparent;
+  color: var(--vscode-foreground);
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 2px;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.ruler .q1timeline-playback-fold button {
+  top: 21px;
+  height: 18px;
 }
 
 .shared-timeline-stage .q1timeline-fold-toggle {
   position: absolute;
   top: 7px;
-  left: 0;
-  width: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+  width: max-content;
+  max-width: 100%;
   height: 22px;
   box-sizing: border-box;
   display: flex;
@@ -37,10 +73,10 @@ body.vscode-dark {
   align-items: center;
   justify-content: center;
   gap: 0;
-  padding: 0;
-  border: 1px solid var(--vscode-charts-purple, #7955ad);
+  padding: 0 2px;
+  border: 0;
   border-radius: 2px;
-  background: var(--vscode-editor-background, #fff);
+  background: transparent;
   color: var(--vscode-editor-foreground, #3c2859);
   font-size: 10px;
   line-height: 10px;
@@ -53,10 +89,10 @@ body.vscode-dark {
   font-weight: 800;
   font-size: 13px;
   letter-spacing: 2px;
-  color: var(--vscode-charts-purple, #7955ad);
+  color: inherit;
 }
 
-.shared-timeline-stage .q1timeline-fold-toggle:hover {
+.shared-timeline-stage .is-expanded .q1timeline-fold-toggle:hover {
   border-color: var(--vscode-focusBorder, #007acc);
   background: var(--vscode-editorHoverWidget-background, #f0ebf7);
 }
@@ -75,8 +111,22 @@ body.vscode-dark {
   padding: 0 5px;
 }
 
+.shared-timeline-stage .ruler .q1timeline-wait-fold .q1timeline-fold-toggle {
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.shared-timeline-stage .ruler .q1timeline-wait-fold:not(.is-expanded) .q1timeline-fold-toggle {
+  width: max-content;
+  padding: 0 2px;
+}
+
+.shared-timeline-stage .q1timeline-wait-fold:not(.is-expanded) .q1timeline-fold-duration {
+  display: none;
+}
+
 .shared-timeline-stage .q1timeline-wait-fold.is-expanded {
-  border-inline-style: solid;
+  border-inline: 1px solid var(--vscode-charts-purple, #7955ad);
   background: color-mix(in srgb, var(--vscode-charts-purple, #7955ad) 5%, transparent);
 }
 
@@ -87,6 +137,8 @@ body.vscode-dark {
   max-width: 100%;
   flex-direction: row;
   padding: 0 6px;
+  border: 1px solid var(--vscode-charts-purple, #7955ad);
+  background: var(--vscode-editor-background, #fff);
 }
 
 .shared-timeline-stage .is-expanded .q1timeline-fold-duration {
@@ -238,6 +290,29 @@ body.instruction-view.mode-normal .event.normal-feedback-collapsed {
   color: var(--vscode-descriptionForeground);
 }
 
+.q1timeline-execution-status {
+  width: 7px;
+  height: 7px;
+  margin-right: 4px;
+  border-radius: 50%;
+  background: var(--vscode-descriptionForeground);
+}
+
+.q1timeline-execution-status[data-execution-status="running"],
+.q1timeline-execution-status[data-execution-status="completed"] {
+  background: var(--vscode-testing-iconPassed, #73c991);
+}
+
+.q1timeline-execution-status[data-execution-status="paused"],
+.q1timeline-execution-status[data-execution-status="blocked"],
+.q1timeline-execution-status[data-execution-status="limit"] {
+  background: var(--vscode-editorWarning-foreground, #cca700);
+}
+
+.q1timeline-execution-status[data-execution-status="error"] {
+  background: var(--vscode-editorError-foreground, #f14c4c);
+}
+
 .q1timeline-toolbar-button svg,
 .q1timeline-toolbar-status svg {
   width: 15px;
@@ -350,10 +425,29 @@ body.instruction-view.mode-normal .event.normal-feedback-collapsed {
   color: var(--vscode-charts-blue);
 }
 
+.q1timeline-control-chip-feedback {
+  color: var(--vscode-charts-yellow, #cca700);
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1;
+}
+
 .q1timeline-control-loop-lane {
   cursor: pointer;
   outline: none;
   pointer-events: auto;
+}
+
+.shared-timeline-stage .timeline-loop-range.is-playback-loop {
+  pointer-events: auto;
+  z-index: 4;
+}
+
+.shared-timeline-stage .timeline-loop-range.is-playback-loop .loop-range-label,
+.shared-timeline-stage .q1timeline-control-loop-lane .loop-range-label {
+  max-width: calc(100% - 16px);
+  padding: 0 4px;
+  opacity: 1;
 }
 
 .q1timeline-control-loop-lane::before {
@@ -362,6 +456,7 @@ body.instruction-view.mode-normal .event.normal-feedback-collapsed {
   border: 1px solid transparent;
   border-radius: 5px;
   content: "";
+  pointer-events: none;
 }
 
 .q1timeline-control-loop-lane:hover::before,
@@ -445,7 +540,9 @@ body.instruction-view.mode-normal .event.normal-feedback-collapsed {
   opacity: 0.45;
 }
 
-.q1timeline-branch-popover {
+.q1timeline-branch-popover,
+.q1timeline-playback-loop-popover,
+.q1timeline-feedback-popover {
   flex-direction: column;
   min-width: 180px;
   max-width: min(300px, calc(100vw - 16px));
@@ -457,7 +554,9 @@ body.instruction-view.mode-normal .event.normal-feedback-collapsed {
   font-size: 11px;
 }
 
-.q1timeline-branch-popover .q1timeline-control-action {
+.q1timeline-branch-popover .q1timeline-control-action,
+.q1timeline-playback-loop-popover .q1timeline-control-action,
+.q1timeline-feedback-popover .q1timeline-control-action {
   width: 100%;
   height: auto;
   min-height: 28px;
@@ -474,6 +573,42 @@ body.instruction-view.mode-normal .event.normal-feedback-collapsed {
 
 .q1timeline-branch-popover .q1timeline-control-action.is-active:disabled {
   opacity: 1;
+}
+
+.q1timeline-feedback-popover form {
+  display: grid;
+  gap: 8px;
+  padding: 3px;
+  min-width: 220px;
+}
+
+.q1timeline-feedback-popover label {
+  display: grid;
+  gap: 4px;
+}
+
+.q1timeline-feedback-popover input {
+  min-width: 0;
+  padding: 4px 6px;
+  border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+  border-radius: 3px;
+  color: var(--vscode-input-foreground, var(--vscode-editor-foreground));
+  background: var(--vscode-input-background, var(--vscode-editor-background));
+  font: inherit;
+}
+
+.q1timeline-feedback-popover input:focus {
+  outline: 1px solid var(--vscode-focusBorder);
+}
+
+.q1timeline-feedback-popover input:invalid {
+  border-color: var(--vscode-errorForeground, #f48771);
+}
+
+.q1timeline-feedback-hint {
+  max-width: 240px;
+  color: var(--vscode-descriptionForeground);
+  font-size: 11px;
 }
 
 .q1-issue-lane.q1-issue-expanded {

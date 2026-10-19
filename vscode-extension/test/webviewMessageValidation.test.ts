@@ -2,6 +2,40 @@ import assert from "node:assert/strict";
 import { parseWebviewMessage } from "../src/q1timeline/webviewMessageValidation";
 
 describe("q1timeline webview message validation", () => {
+  it("accepts unknown or 32-bit feedback values and nonnegative integral receive delays", () => {
+    for (const value of [null, 0, -2147483648, 4294967295]) {
+      const message = { type: "setExecutionFeedback", eventId: "seq:e4", feedbackId: "seq:feedback:3", value, delayNs: 1000 };
+      assert.deepEqual(parseWebviewMessage(message), { valid: true, ...message });
+    }
+    const valid = { type: "setExecutionFeedback", eventId: "seq:e4", feedbackId: "seq:feedback:3", value: null, delayNs: 0 };
+    assert.deepEqual(parseWebviewMessage(valid), { valid: true, ...valid });
+    for (const change of [
+      { value: undefined }, { value: "0" }, { value: true }, { value: NaN }, { value: 0.5 },
+      { value: -2147483649 }, { value: 4294967296 },
+      { delayNs: -1 }, { delayNs: 0.5 }, { delayNs: Infinity }, { delayNs: "0" }, { delayNs: Number.MAX_SAFE_INTEGER + 1 },
+      { eventId: "" }, { feedbackId: " " }, { extra: true },
+    ]) assert.equal(parseWebviewMessage({ ...valid, ...change }).valid, false);
+  });
+
+  it("accepts bounded execution controls and single-path occurrence choices", () => {
+    for (const action of ["play", "pause"]) {
+      const message = { type: "executionControl", action };
+      assert.deepEqual(parseWebviewMessage(message), { valid: true, ...message });
+    }
+    for (const path of ["taken", "fallthrough"]) {
+      const message = { type: "setExecutionBranch", eventId: "seq:e3", branchId: "seq:step:2", path };
+      assert.deepEqual(parseWebviewMessage(message), { valid: true, ...message });
+    }
+    for (const message of [
+      { type: "executionControl", action: "run" },
+      { type: "executionControl", action: "play", budget_ms: 600000 },
+      { type: "setExecutionBranch", eventId: "seq:e3", branchId: "seq:step:2", path: "both" },
+      { type: "setExecutionBranch", eventId: "seq:e3", branchId: "seq:step:2", path: "collapsed" },
+      { type: "setExecutionBranch", eventId: "", branchId: "seq:step:2", path: "taken" },
+      { type: "setExecutionBranch", eventId: "seq:e3", branchId: " ", path: "taken" },
+    ]) assert.equal(parseWebviewMessage(message).valid, false);
+  });
+
   it("accepts the webview ready handshake", () => {
     assert.deepEqual(parseWebviewMessage({ type: "webviewReady" }), { valid: true, type: "webviewReady" });
   });

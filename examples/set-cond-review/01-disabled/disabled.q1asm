@@ -1,0 +1,15 @@
+# Play should complete: disabled conditions never skip RT instructions.
+                move            0,R3
+                move            3,R0
+                set_cond        0,1,7,20
+# R4/R5 are unknown but unused while enable R3 is zero.
+                set_cond        R3,R4,R5,20
+                set_mrk         1
+                upd_param       4
+
+long_wait:      wait            65535
+                loop            R0,@long_wait
+
+                set_mrk         3
+                upd_param       4
+                stop

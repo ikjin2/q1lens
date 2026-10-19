@@ -325,13 +325,15 @@ class _Runtime:
             core._execute_classical(state, instruction, seq.symbols)
         elif spec.category == "latched":
             if instruction.op == "set_cond":
-                values = tuple(resolve_arg_value(arg, scope).value for arg in instruction.args)
-                if values[2] > 5:
+                resolved = tuple(resolve_arg_value(arg, scope) for arg in instruction.args)
+                # Readiness permits unknown mask/operator only when disabled.
+                values = tuple(value.value if isinstance(value, Concrete) else 0 for value in resolved)
+                if values[0] and values[2] > 5:
                     self.fail(seq, "blocked", "Conditional operators 6 and 7 have no supported semantics.", instruction)
                     return
                 seq.condition = values
                 self.emit(seq, "latched_state_pending", state.q1_time_ns.value, instruction=instruction,
-                          meta={"field": "condition", "value": list(values)}, lane="state.pending")
+                          meta={"field": "condition", "value": core._plain_value(resolved)}, lane="state.pending")
             else:
                 old_rt = state.rt_time_ns
                 state.rt_time_ns = state.q1_time_ns

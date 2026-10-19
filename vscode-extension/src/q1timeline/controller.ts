@@ -33,6 +33,7 @@ const {
 } = require("./sourceMapLookup");
 const updatePolicy = require("./updatePolicy");
 const { parseWebviewMessage } = require("./webviewMessageValidation");
+const { PlaybackClient } = require("./playbackClient");
 const { q1timelineProjectOutputDir } = require("./register");
 
 const COMPARISON_BASELINE_FILENAME = "comparison-baseline.json";
@@ -735,6 +736,11 @@ export class TimelineController {
     this.branchAssumptionOverrides = new Map();
     this.loopPreviewOverrides = new Map();
     this.executionReplayOverride = undefined;
+    this.playbackClient = undefined;
+    this.playbackInFlight = false;
+    this.playbackRunning = false;
+    this.playbackSnapshotId = undefined;
+    this.executionState = { status: "idle", can_resume: true, steps: 0 };
     this.parameterOverrides = new Map();
     this.pendingTarget = undefined;
     this.pendingBranchSelection = undefined;
@@ -1036,6 +1042,7 @@ export class TimelineController {
     this.panelDisposables.push(
       this.panel.webview.onDidReceiveMessage((message) => this.handleWebviewMessage(message)),
       this.panel.onDidDispose(() => {
+        this.resetPlayback();
         this.cancelSourceRangeZoom();
         this.pendingBranchSelection = undefined;
         this.webviewReady = false;
@@ -1330,6 +1337,123 @@ export class TimelineController {
     return ["--execution-mode", mode, "--max-steps", String(configuration.get("maxSteps", 10000))];
   }
 
+  setExecutionState(state) {
+    this.executionState = state;
+    this.postWebviewMessage({ type: "setExecutionState", state });
+  }
+
+  resetPlayback() {
+    const client = this.playbackClient;
+    const wasActive = Boolean(client || this.executionState?.status !== "idle");
+    this.playbackClient = undefined;
+    this.playbackRunning = false;
+    this.playbackSnapshotId = undefined;
+    client?.dispose();
+    this.executionState = { status: "idle", can_resume: true, steps: 0 };
+    if (wasActive) this.setExecutionState(this.executionState);
+  }
+
+  createPlaybackClient() {
+    const configuration = this.config();
+    const args = ["-u", "-m", "q1timeline.playback", "--project", this.projectUri.fsPath];
+    for (const [name, value] of this.parameterOverrides) args.push("--set-param", `${name}=${value}`);
+    return new PlaybackClient(configuration.get("pythonPath", "python"),
+      prependPythonArgs(configuration.get("pythonArgs", []), args), {
+        cwd: this.projectRootCwd(),
+        env: { ...process.env, ...this.normaliseAnalyzerEnv(configuration.get("analyzer.env", {})) },
+        onStderr: (text) => this.output.appendLine(`Playback: ${text}`),
+      });
+  }
+
+  pauseExecution() {
+    this.playbackRunning = false;
+  }
+
+  async setExecutionBranch(eventId, branchId, path) {
+    if (!this.playbackClient || this.playbackInFlight || !["taken", "fallthrough"].includes(path)) return;
+    const event = this.timelineIr?.events?.find((item) => item.id === eventId);
+    if (event?.meta?.playback_branch_id !== branchId) return;
+    await this.runPlayback({ command: "choose", branch_id: branchId, path });
+  }
+
+  async setExecutionFeedback(eventId, feedbackId, value, delayNs) {
+    if (!this.playbackClient || this.playbackInFlight) return;
+    const event = this.timelineIr?.events?.find((item) => item.id === eventId);
+    if (event?.meta?.playback_feedback_id !== feedbackId) return;
+    await this.runPlayback({ command: "set_feedback", feedback_id: feedbackId, value, delay_ns: delayNs });
+  }
+
+  async runPlayback(update) {
+    if (!this.panel || !this.projectUri || !this.outputDir || this.analysisInFlight || this.playbackInFlight) return;
+    if (this.hasUnsavedProjectChanges()) {
+      this.setExecutionState({ status: "blocked", can_resume: false, reason: "Save the source before calculating its execution." });
+      return;
+    }
+    const sourceRevision = this.sourceRevision;
+    let client;
+    this.playbackInFlight = true;
+    this.playbackRunning = true;
+    this.cancelSourceRangeZoom();
+    this.pendingBranchSelection = undefined;
+    this.setExecutionState({ ...this.executionState, status: "running", reason: "Calculating for up to 5 seconds." });
+    try {
+      client = this.playbackClient || (this.playbackClient = this.createPlaybackClient());
+      if (update) await client.request(update);
+      const deadline = Date.now() + 5000;
+      while (this.playbackClient === client && this.playbackRunning) {
+        const result = await client.request({ command: "run", budget_ms: 100, max_steps: 1000 });
+        if (this.playbackClient !== client || this.sourceRevision !== sourceRevision) return;
+        const state = result.playback;
+        if (!state || typeof state.can_resume !== "boolean") throw new Error("Invalid playback state response.");
+        this.setExecutionState({ ...state, status: "running" });
+        if (!state.can_resume || Date.now() >= deadline) break;
+      }
+      if (this.playbackClient !== client || this.sourceRevision !== sourceRevision) return;
+      const result = await client.request({ command: "snapshot" });
+      if (this.playbackClient !== client || this.sourceRevision !== sourceRevision) return;
+      if (!isTimelineIr(result.ir) || !result.ir.playback) throw new Error("Invalid playback timeline response.");
+      this.playbackSnapshotId = crypto.randomUUID();
+      await this.publishPlaybackSnapshot(result.ir, client);
+      if (this.playbackClient === client && this.sourceRevision === sourceRevision) this.setExecutionState(result.ir.playback);
+    } catch (error) {
+      if (client && this.playbackClient !== client) return;
+      this.output.appendLine(`Playback failed: ${error.message}`);
+      this.playbackClient?.dispose();
+      this.playbackClient = undefined;
+      this.setExecutionState({ status: "error", can_resume: true, reason: error.message });
+    } finally {
+      this.playbackInFlight = false;
+      this.playbackRunning = false;
+    }
+  }
+
+  async publishPlaybackSnapshot(ir, client) {
+    const requestId = ++this.analysisRequestId;
+    const sourceRevision = this.sourceRevision;
+    const configuration = this.config();
+    const irPath = path.join(this.outputDir, `playback-${requestId}.json`);
+    const htmlPath = path.join(this.outputDir, `playback-${requestId}.html`);
+    const isCurrent = () => this.playbackClient === client && this.sourceRevision === sourceRevision && this.isCurrentAnalysis(requestId);
+    try {
+      await fsPromises.mkdir(this.outputDir, { recursive: true });
+      if (!isCurrent()) return;
+      await fsPromises.writeFile(irPath, JSON.stringify(ir));
+      if (!isCurrent()) return;
+      await this.runRender(configuration.get("pythonPath", "python"), configuration.get("pythonArgs", []),
+        irPath, htmlPath, configuration.get("analyzer.timeoutMs", 30000), this.projectRootCwd(),
+        this.normaliseAnalyzerEnv(configuration.get("analyzer.env", {})), this.viewMode(), requestId);
+      if (!isCurrent()) return;
+      const html = await fsPromises.readFile(htmlPath, "utf-8");
+      if (!isCurrent()) return;
+      this.lastAnalyzerTimelineIr = undefined;
+      this.comparison = { mode: "none" };
+      this.setAnalysisStatus("idle", "Execution calculated.");
+      if (await this.refreshWebview({ ir, html, isCurrent }) && isCurrent()) this.analyzedSourceRevision = sourceRevision;
+    } finally {
+      await Promise.all([irPath, htmlPath].map((file) => fsPromises.rm(file, { force: true }).catch(() => {})));
+    }
+  }
+
   async prepareExecutionReplay(sequencerId, scope = "sequencer") {
     if (!this.panel || !this.projectUri || !this.outputDir) {
       return;
@@ -1557,6 +1681,10 @@ export class TimelineController {
 
   async rerenderCurrentTimelineMode(mode) {
     if (!this.projectUri || !this.outputDir) {
+      return;
+    }
+    if (this.timelineIr?.playback && this.playbackClient) {
+      if (!this.playbackInFlight) await this.publishPlaybackSnapshot(this.timelineIr, this.playbackClient);
       return;
     }
     if (this.analysisInFlight) {
@@ -2001,6 +2129,7 @@ export class TimelineController {
     if (!this.projectUri || !this.outputDir) {
       return Promise.resolve();
     }
+    this.resetPlayback();
     if (this.analysisInFlight) {
       this.analysisQueued = true;
       this.analysisRequestId += 1;
@@ -2368,16 +2497,17 @@ export class TimelineController {
     });
   }
 
-  async refreshWebview() {
+  async refreshWebview(snapshot) {
+    if (snapshot && !snapshot.isCurrent()) return;
     this.cancelSourceRangeZoom();
     this.webviewReady = false;
     try {
-      this.timelineIr = await this.readJson("timeline_ir.json");
+      this.timelineIr = snapshot ? snapshot.ir : await this.readJson("timeline_ir.json");
     } catch (error) {
       this.applyFallbackDiagnostic(`Invalid analyzer TimelineIR JSON: ${error.message}`);
       return;
     }
-    const diagnostics = await this.loadDiagnostics();
+    const diagnostics = snapshot ? this.applyDiagnostics(snapshot.ir.diagnostics || []) : await this.loadDiagnostics();
     this.setAnalyzerDiagnostics(diagnostics);
     this.setDiagnosticSummary(summarizeDiagnostics(diagnostics));
     if (!this.panel) {
@@ -2386,7 +2516,7 @@ export class TimelineController {
     const htmlPath = path.join(this.outputDir, "timeline.html");
     let html;
     try {
-      html = await fsPromises.readFile(htmlPath, "utf-8");
+      html = snapshot ? snapshot.html : await fsPromises.readFile(htmlPath, "utf-8");
       this.lastPreviewHtml = html;
     } catch (error) {
       if (!error || error.code !== "ENOENT") {
@@ -2397,7 +2527,7 @@ export class TimelineController {
     }
     const nonce = webviewNonce();
     html = stripExecutableInlineScripts(html);
-    html = injectWebviewState(html, this.webviewInitialState());
+    html = injectWebviewState(html, { ...this.webviewInitialState(), ...(snapshot ? { executionState: snapshot.ir.playback } : {}) });
     html = injectWebviewAssetTags(html, this.panel.webview, this.context, nonce);
     html = injectContentSecurityPolicy(html, contentSecurityPolicy(this.panel.webview, nonce));
     if (this.pendingTarget?.zoomToRange) {
@@ -2407,7 +2537,7 @@ export class TimelineController {
       this.pendingBranchSelection.awaitingWebviewReady = true;
     }
     this.panel.webview.html = html;
-    if (!this.pendingTarget?.zoomToRange) {
+    if (!snapshot && !this.pendingTarget?.zoomToRange) {
       await this.revealPendingTarget();
     }
     return Boolean(this.timelineIr);
@@ -2482,6 +2612,19 @@ export class TimelineController {
       this.refreshPreview();
       return;
     }
+    if (parsedMessage.type === "executionControl") {
+      if (parsedMessage.action === "pause") this.pauseExecution();
+      else await this.runPlayback();
+      return;
+    }
+    if (parsedMessage.type === "setExecutionBranch") {
+      await this.setExecutionBranch(parsedMessage.eventId, parsedMessage.branchId, parsedMessage.path);
+      return;
+    }
+    if (parsedMessage.type === "setExecutionFeedback") {
+      await this.setExecutionFeedback(parsedMessage.eventId, parsedMessage.feedbackId, parsedMessage.value, parsedMessage.delayNs);
+      return;
+    }
     if (parsedMessage.type === "prepareExecutionReplay") {
       await this.prepareExecutionReplay(parsedMessage.sequencerId, parsedMessage.scope);
       return;
@@ -2493,7 +2636,7 @@ export class TimelineController {
         await this.revealPendingTarget();
       } else if (this.pendingBranchSelection?.awaitingWebviewReady) {
         this.revealPendingBranchSelection();
-      } else if (!this.pendingBranchSelection && vscode.window.activeTextEditor?.selection?.isEmpty === false) {
+      } else if (!this.timelineIr?.playback && !this.pendingBranchSelection && vscode.window.activeTextEditor?.selection?.isEmpty === false) {
         this.followSourceEditor(vscode.window.activeTextEditor);
       }
       return;
@@ -2578,7 +2721,7 @@ export class TimelineController {
       return;
     }
     this.output.appendLine(`q1timeline eventClick: ${eventId} -> ${source.file}:${source.line || 1}`);
-    return this.openSourceLocation(source);
+    return this.openSourceLocation(source, { preserveHardwareCursor: true });
   }
 
   async openSourceForDiagnostic(diagnosticIndex) {
@@ -2692,7 +2835,7 @@ export class TimelineController {
       const position = editor.selection?.active;
       const sameTarget = normalizedFsPath(editor.document?.uri?.fsPath) === reveal.path && position?.line === reveal.position.line && position?.character === reveal.position.character;
       // showTextDocument and assigning selection can echo after the await returns.
-      // Keep a hardware value's readable time until the user navigates the source.
+      // Keep the timeline event or hardware value's readable time until the user navigates the source.
       if (!manual && (reveal.opening || sameTarget)) return;
       this.hardwareSourceReveal = undefined;
     }
@@ -2711,6 +2854,7 @@ export class TimelineController {
   }
 
   invalidateSourceAnalysis() {
+    this.resetPlayback();
     this.sourceRevision += 1;
     this.pendingBranchSelection = undefined;
     this.cancelSourceRangeZoom();
@@ -2840,6 +2984,8 @@ export class TimelineController {
       parameterProjectFile: this.projectUri?.fsPath,
       parameterOverrideNames: Array.from(this.parameterOverrides.keys()),
       comparison: this.comparison,
+      executionState: this.executionState,
+      playbackSnapshotId: this.playbackSnapshotId,
     };
   }
 
@@ -2863,6 +3009,7 @@ export class TimelineController {
   }
 
   dispose() {
+    this.resetPlayback();
     this.cancelSourceRangeZoom();
     this.pendingBranchSelection = undefined;
     this.webviewReady = false;

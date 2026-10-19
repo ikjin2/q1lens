@@ -1,0 +1,9 @@
+sequencers:
+  - id: invalid_else
+    module: QCM0
+    file: invalid_else.q1asm
+alignment:
+  mode: none
+analysis:
+  execution_mode: simulation
+  max_steps: 1000

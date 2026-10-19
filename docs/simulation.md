@@ -45,8 +45,13 @@ Display alignment does not change execution.
 entries. The pull form reads its first register as the requested ID. Empty input
 queues can stall Q1 while RT continues and may underflow. Trigger counters start
 disabled, use threshold one without inversion, and require `set_latch_en`.
-`wait_trigger` accepts arrivals at or after its RT start. `set_cond` selects RT
-execution using the modeled counters. These assumptions are retained in the IR.
+`wait_trigger` accepts arrivals at or after its RT start. `set_cond` checks the
+modeled counters before each RT instruction. A false condition skips that
+instruction and its output effects, consuming `else_duration`; Q1 instructions
+continue normally. `set_cond 0,...` disables this check. Operators 0–5 are modeled;
+6/7 block execution only when the condition is enabled. `else_duration` must be
+in 0–65535 ns. These assumptions are retained in the IR; other trigger thresholds
+and inversion settings are not modeled.
 
 An acquisition input is consumed once by a matching sequencer/acquisition/bin.
 It takes precedence over a physical model result. `fb_acq_tb_id` emits a payload

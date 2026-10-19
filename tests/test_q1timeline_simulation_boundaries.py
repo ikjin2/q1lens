@@ -219,6 +219,16 @@ def test_condition_uses_all_selected_trigger_bits(addresses, expected, operator)
     assert state.rt_time_ns == Concrete(216 if expected[operator] else 232)
 
 
+@pytest.mark.parametrize("enabled", [0, 1])
+def test_negative_condition_else_duration_is_rejected_before_rt_execution(enabled: int) -> None:
+    state, = run(f"set_cond {enabled},0,0,-1\nupd_param 4\nset_cond 0,0,0,4\nupd_param 4\nstop")
+    assert status(state) == "error"
+    assert any(diagnostic.category == "invalid_argument_value"
+               and diagnostic.details.get("operand_role") == "else_duration" for diagnostic in state.diagnostics)
+    assert not state.rt_packets
+    assert all(event.t1.value >= event.t0.value for event in state.events)
+
+
 def test_latch_reset_and_disabled_interval_control_count_lifetime() -> None:
     state, = run(
         "set_latch_en 1,4\nwait 4\nset_cond 1,1,0,4\nupd_param 4\n"

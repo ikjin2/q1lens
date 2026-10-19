@@ -42,6 +42,8 @@ class _Queue:
     ready_ns: int | None = None
     blocked: bool = False
     rt_started: bool = False
+    rt_waiting: bool = False
+    underflow_suspended: bool = False
     sync: RtPacket | None = None
 
 
@@ -109,7 +111,7 @@ def replay_queues(
             queue = queues[name]
             duration = queue.sync.duration.value
             queue.sync = None
-            schedule(time + duration, 1, name, "rt")
+            schedule(time + (duration or 4), 1, name, "rt")
 
     for name, queue in queues.items():
         if queue.packets:
@@ -135,23 +137,29 @@ def replay_queues(
             if queue.index < len(queue.packets):
                 gap = queue.packets[queue.index].q1_issue_t0.value - packet.q1_issue_t1.value
                 issue_at(name, time + gap)
-            if not queue.rt_started:
+            if not queue.rt_started or queue.rt_waiting:
                 queue.rt_started = True
+                queue.rt_waiting = False
                 schedule(time, 1, name, "rt")
         else:
             if not queue.pending:
-                if queue.index < len(queue.packets):
+                if queue.underflow_suspended:
+                    queue.rt_waiting = True
+                elif queue.index < len(queue.packets):
                     packet = queue.packets[queue.index]
                     queue.result.failure = QueueTimingFailure(packet, queue.ready_ns, time, time - queue.ready_ns)
                 continue
             packet, enqueued = queue.pending.popleft()
             queue.result.records.append(QueueTimingRecord(packet, enqueued, time, len(queue.pending)))
+            # A zero duration suspends the guard, but the next pop is still
+            # attempted after 4 ns. Any nonzero duration restores the guard.
+            queue.underflow_suspended = packet.duration.value == 0
             if queue.blocked:
                 issue_at(name, time)
             if packet.op == "wait_sync":
                 queue.sync = packet
             else:
-                schedule(time + packet.duration.value, 1, name, "rt")
+                schedule(time + (packet.duration.value or 4), 1, name, "rt")
         release_sync(time)
 
     for name, queue in queues.items():

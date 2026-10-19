@@ -25,12 +25,13 @@ function graph(sequencer = "seq", target = "pulse") {
     edges: [{ kind: "branch_taken", source, target_label: target, target_pc: 7, from_node_id: "from", to_node_id: "to" },
       { kind: "branch_fallthrough", source, from_node_id: "from", to_node_id: "next" }] };
 }
-function load(events: any[], sequencers = [graph()]) {
+function load(events: any[], sequencers = [graph()], playback?: any) {
   const script = readFileSync(join(__dirname, "..", "src/q1timeline/media/timeline.js"), "utf8");
   const names = ["eventHasBranchControl", "branchAssumptionLabel", "normalizedSource", "sameSourceLine", "controlFlowGraphSequencers",
     "controlFlowGraphNode", "branchControlMeta", "branchPathDescriptor", "branchComparisonSupported", "renderBranchControls"];
   return Function("timelineIr", `
     const actions = [], messages = [], status = [];
+    const timelineExecutionState = timelineIr.playback || {status: "idle"};
     const document = { createElement: () => ({}) };
     const vscode = { postMessage: message => messages.push(message) };
     let restoredFocus = false;
@@ -44,7 +45,7 @@ function load(events: any[], sequencers = [graph()]) {
         return {actions, messages, status, restoredFocus: () => restoredFocus};
       }
     };
-  `)({ events, control_flow_graph: { sequencers } });
+  `)({ events, control_flow_graph: { sequencers }, ...(playback ? {playback} : {}) });
 }
 
 describe("Q1 branch controls", () => {
@@ -124,6 +125,45 @@ describe("Q1 branch controls", () => {
     const result = load([issue]).render(issue);
     assert.deepEqual(result.status, ["Assumed path"]);
     assert.equal(result.actions[1].options.active, true);
+  });
+
+  it("allows changing a calculated playback branch without offering parallel paths", () => {
+    const issue = event("known", {playback_branch_id: "branch:occurrence:3", branch_decision: "concrete", branch_taken: false});
+    const result = load([issue], [graph()], {status: "completed"}).render(issue);
+    assert.deepEqual(result.actions.map((action: any) => action.label), ["Jump · @pulse", "Continue · L3", "Zoom around branch"]);
+    assert.deepEqual(result.actions.slice(0, 2).map((action: any) => action.options.disabled), [false, false]);
+    assert.equal(result.actions[1].options.active, true);
+    assert.match(result.actions[0].options.title, /this occurrence.*recompute/);
+    result.actions[0].click();
+    assert.deepEqual(result.messages, [{type: "setExecutionBranch", branchId: "branch:occurrence:3", eventId: "known", path: "taken"}]);
+  });
+
+  it("marks an unknown playback condition as the default Continue path", () => {
+    const issue = event("default", {playback_branch_id: "branch:0", branch_decision: "default", branch_taken: false,
+      assumed_branch_path: "fallthrough", assumption_source: "default"});
+    const result = load([issue], [graph()], {status: "completed"}).render(issue);
+    assert.deepEqual(result.status, ["Default path"]);
+    assert.equal(result.actions[1].options.active, true);
+    assert.equal(result.actions[0].options.disabled, false);
+  });
+
+  it("matches playback branch markers by occurrence and prevents changes while running", () => {
+    const first = event("first", {playback_branch_id: "branch:0", branch_decision: "concrete", branch_taken: false});
+    const second = event("second", {playback_branch_id: "branch:1", branch_decision: "assumed", branch_taken: true});
+    const marker = event("marker", {playback_branch_id: "branch:0"}, "branch_region");
+    delete (marker.meta as any).branch_decision;
+    const runtime = load([first, second, marker], [graph()], {status: "running"});
+    assert.equal(runtime.meta(marker).branch_taken, false);
+    assert.deepEqual(runtime.render(marker).actions.slice(0, 2).map((action: any) => action.options.disabled), [true, true]);
+  });
+
+  it("does not offer a conditional choice for an unconditional playback jump", () => {
+    const jump = event("jump", {op: "jmp", playback_branch_id: "branch:0", branch_taken: true});
+    const marker = event("marker", {playback_branch_id: "branch:0"}, "branch_region");
+    delete (marker.meta as any).op;
+    const runtime = load([jump, marker], [graph()], {status: "paused"});
+    assert.equal(runtime.eligible(jump), false);
+    assert.equal(runtime.eligible(marker), false);
   });
 
   it("opens a branch chip without notifying the host to jump to source", () => {

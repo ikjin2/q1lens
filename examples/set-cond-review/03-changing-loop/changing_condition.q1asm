@@ -1,0 +1,16 @@
+# Compact analysis interprets only the first iteration.
+                move            0,R0    # Conditional enable: 0, then 1.
+                move            1,R2    # Trigger address 1 mask.
+                move            0,R3    # OR operator.
+                move            2,R1    # Loop count.
+
+body:           set_cond        R0,R2,R3,20
+                wait            8
+                add             R0,1,R0
+                nop
+                set_cond        0,0,0,4
+                loop            R1,@body
+
+# Disabling cannot recover time already made uncertain by the hidden iteration.
+                wait            4
+                stop

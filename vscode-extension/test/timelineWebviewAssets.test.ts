@@ -120,7 +120,7 @@ function loadQ1TimelineFoldRuntime(script: string, timelineIr: any, options: any
   assert.ok(expandedState, "Missing persisted gap initialization");
   const sources = [
     "readPersistedWebviewState", "writePersistedWebviewState", "timelineExtentMatches",
-    "snapTimelineNs", "formatWindowValue", "formatFoldDuration", "timelineTimeScale",
+    "snapTimelineNs", "formatWindowValue", "formatFoldDuration", "timelineTimeScale", "timelineWaitTimeScale",
     "displayTimelineTime", "realTimelineTime", "timelineDisplayWindow", "toggleTimelineGap",
     "toggleTimelineFolds", "renderWaitFolds", "clamp", "sharedTimelinePointerAnchorRatio",
     "timelinePointerAnchorRatio", "timelineTimeFromPointer", "renderHardwareCursor", "isTimelineSelectionTarget",
@@ -163,11 +163,15 @@ function loadQ1TimelineFoldRuntime(script: string, timelineIr: any, options: any
     let timelineLayout = "time";
     let instructionView = { cellWidth: 112, leftOrdinal: 0 };
     let timelineWaitsCollapsed = savedState.timelineWaitsCollapsed !== false;
+    const currentFoldState = true;
     ${expandedState}
     const timelineTimeScales = new Map();
+    const expandedPlaybackLoops = new Set();
+    const visiblePlaybackEvent = event => event;
     let timelineWindow = options.current || { min: 0, max: 10000 };
     let timelineSelectionRange = { start: 4900, end: 5100 };
     let selectedTimelineEventId = "selected";
+    let selectedSourceEventIds = new Set();
     const hardwareView = { getState: () => ({ time: 5050 }) };
     const tracks = [element("div", "ruler"), element("div", "lane-track"), element("div", "lane-track")];
     const toolbar = element("button");
@@ -183,6 +187,7 @@ function loadQ1TimelineFoldRuntime(script: string, timelineIr: any, options: any
           : tracks,
     };
     let renders = 0;
+    const sourceSelectionsAtRender = [];
     const scrolledEventIds = [];
     function timelineSvg() {}
     function timelineContainer() { return tracks[1]; }
@@ -203,16 +208,18 @@ function loadQ1TimelineFoldRuntime(script: string, timelineIr: any, options: any
     function setIconOnlyToolbarButton(node, icon, title) { node.title = title; }
     function applyTimelineScale() {
       renders += 1;
+      sourceSelectionsAtRender.push(Array.from(selectedSourceEventIds));
       tracks.forEach(track => { track.children = []; });
       renderWaitFolds();
       renderHardwareCursor();
     }
     ${sources.join("\n")}
     return {
-      tracks, toolbar, timelineTimeScale, displayTimelineTime, realTimelineTime, formatFoldDuration,
+      tracks, toolbar, timelineTimeScale: timelineWaitTimeScale, displayTimelineTime, realTimelineTime, formatFoldDuration,
       timelineTimeFromPointer, renderWaitFolds, renderHardwareCursor, toggleTimelineGap, toggleTimelineFolds, isTimelineSelectionTarget,
       sourceRangeTimelineBounds, zoomTimelineToEventRange,
       setTimelineLayout, installTimelineMouseInteractions, zoomTimelineToHighlightedEvent, scrolledEventIds,
+      selectedSources: () => Array.from(selectedSourceEventIds), sourceSelectionsAtRender,
       layout: () => timelineLayout,
       activeElement: () => document.activeElement,
       state: () => savedState,
@@ -262,6 +269,7 @@ function loadQ1TimelineZoomRuntime(script: string, events: any[], options: any =
     function timelineSvg() {}
     function timelineGeometry() { return full; }
     function timelineTimeScale() { return scale; }
+    const visiblePlaybackEvent = event => event;
     function applyTimelineScale() {}
     function syncTimelineZoomActionState() {}
     const scrolledEventIds = [];
@@ -517,6 +525,61 @@ describe("timeline webview assets", () => {
     ]);
   });
 
+  it("aliases packet state mirrors to RT commands without hiding independent state events", () => {
+    const adapter = require(join(__dirname, "..", "src", "q1timeline", "media", "timelineAdapter.js"));
+    const event = (id: string, kind: string, start: number, end: number, meta: any = {}, sequencer = "seq0") => ({
+      id, kind, sequencer_id: sequencer, lane: `rt.${kind}`, t0: { value: start }, t1: { value: end },
+      confidence: "exact", source: { file: "seq0.q1asm", line: 1 }, meta: { rt_packet_id: "p0", ...meta },
+    });
+    const ir = { events: [
+      event("update", "upd_param", 0, 4),
+      event("marker", "marker_state", 0, 4),
+      event("applied", "latched_state_applied", 0, 4),
+      event("other-packet", "marker_state", 0, 4, { rt_packet_id: "p1" }),
+      event("other-time", "marker_state", 4, 8),
+      event("other-sequencer", "marker_state", 0, 4, {}, "seq1"),
+      event("other-branch", "marker_state", 0, 4, { branch_comparison_path: "taken" }),
+      event("other-preview", "marker_state", 0, 4, { loop_preview: "L0", loop_iteration_index: 1 }),
+    ] };
+    const before = JSON.stringify(ir);
+    for (const mode of ["normal", "debug"]) {
+      for (const layout of ["time", "instruction"]) {
+        const model = adapter.buildQ1TimelineSharedModel(ir, { mode, layout });
+        const blocks = model.lanes.flatMap((lane: any) => lane.blocks);
+        const command = blocks.find((block: any) => block.id === "update");
+        assert.deepEqual(command.eventIds, ["update", "marker", "applied"]);
+        assert.deepEqual(command.domain.eventIds, command.eventIds);
+        assert.equal(blocks.some((block: any) => ["marker", "applied"].includes(block.id)), false);
+        for (const id of ["other-packet", "other-time", "other-sequencer", "other-branch", "other-preview"]) {
+          assert.ok(blocks.some((block: any) => block.id === id), `${mode}/${layout}: ${id}`);
+        }
+      }
+    }
+    assert.equal(JSON.stringify(ir), before);
+  });
+
+  it("keeps merged play state aliases within their packet preview occurrence", () => {
+    const adapter = require(join(__dirname, "..", "src", "q1timeline", "media", "timelineAdapter.js"));
+    const event = (id: string, kind: string, iteration: number, path?: number) => ({
+      id, kind, sequencer_id: "seq0", lane: path === undefined ? "rt.marker" : `rt.path${path}`,
+      t0: { value: iteration * 100 }, t1: { value: iteration * 100 + 4 }, confidence: "exact",
+      source: { file: "seq0.q1asm", line: 1 }, meta: { rt_packet_id: "p0", path,
+        loop_preview: "L0", loop_iteration_index: iteration },
+    });
+    const ir = { events: [0, 1].flatMap((iteration) => [
+      event(`play${iteration}-0`, "play", iteration, 0), event(`play${iteration}-1`, "play", iteration, 1),
+      event(`marker${iteration}`, "marker_state", iteration),
+    ]) };
+    for (const layout of ["time", "instruction"]) {
+      const model = adapter.buildQ1TimelineSharedModel(ir, { mode: "debug", layout });
+      const blocks = model.lanes.flatMap((lane: any) => lane.blocks);
+      assert.equal(blocks.length, 2);
+      for (const iteration of [0, 1]) {
+        assert.deepEqual(blocks[iteration].eventIds, [`play${iteration}-0`, `play${iteration}-1`, `marker${iteration}`]);
+      }
+    }
+  });
+
   it("keeps symbolic runtime events on additive lower-bound times instead of stacking at zero", () => {
     const adapter = require(join(__dirname, "..", "src", "q1timeline", "media", "timelineAdapter.js"));
     const model = adapter.buildQ1TimelineSharedModel({
@@ -589,6 +652,43 @@ describe("timeline webview assets", () => {
       ["seq0:second-wait", 67563, 65535],
     ]);
     assert.equal(model.viewport.end, 133098);
+  });
+
+  it("keeps conditional timing boundaries visible without placing unknown RT commands at zero", () => {
+    const adapter = require(join(__dirname, "..", "src", "q1timeline", "media", "timelineAdapter.js"));
+    const unknown = { kind: "unknown", display: "unknown(conditional_execution)" };
+    const make = (id: string, kind: string, t0: any, t1: any, meta: any = {}) => ({
+      id, kind, sequencer_id: "q0", lane: kind === "q1_issue" ? "debug.q1_issue" : `rt.${kind}`,
+      confidence: kind === "unknown_region" ? "unknown" : "exact", t0, t1, meta,
+      source: { file: "q0.q1asm", line: 1, raw: meta.op || kind },
+    });
+    const ir = { events: [
+      make("prefix", "wait", 0, 1000),
+      make("conditional", "unknown_region", 1000, null, {
+        reason: "conditional_execution_unknown", conditional_time_unknown: true, op: "play", rt_packet_id: "p1",
+      }),
+      make("disabled-q1", "q1_issue", 12, 16, { op: "set_cond", conditional_enabled: false }),
+      make("wait-q1", "q1_issue", 16, 20, { op: "wait", rt_packet_id: "p2" }),
+      { ...make("unknown-wait", "wait", unknown, unknown, { conditional_time_unknown: true, rt_packet_id: "p2" }),
+        duration: { kind: "concrete", value: 65_535 } },
+      make("play-q1", "q1_issue", 20, 24, { op: "play", rt_packet_id: "p3" }),
+      { ...make("unknown-play", "play", unknown, unknown, { conditional_time_unknown: true, rt_packet_id: "p3", path: 0 }), lane: "rt.path0" },
+    ] };
+    const before = JSON.stringify(ir);
+    const time = adapter.buildQ1TimelineSharedModel(ir, { layout: "time" });
+    const blocks = time.lanes.flatMap((lane: any) => lane.blocks);
+    assert.deepEqual(blocks.filter((block: any) => block.kind !== "q1_issue").map((block: any) => block.id), ["prefix", "conditional"]);
+    assert.equal(blocks.find((block: any) => block.id === "conditional").start, 1000);
+    assert.match(blocks.find((block: any) => block.id === "conditional").title, /-> unknown$/);
+    assert.ok(blocks.some((block: any) => block.id === "disabled-q1"));
+    assert.equal(time.viewport.end, 1001);
+    const instruction = adapter.buildQ1TimelineSharedModel(ir, { layout: "instruction" });
+    const ids = instruction.lanes.flatMap((lane: any) => lane.blocks.flatMap((block: any) => block.eventIds));
+    assert.ok(ids.includes("unknown-wait"));
+    assert.ok(ids.includes("unknown-play"));
+    assert.deepEqual(instruction.lanes.find((lane: any) => lane.kind === "runtime").blocks.map((block: any) => block.id),
+      ["prefix", "conditional", "unknown-wait"]);
+    assert.equal(JSON.stringify(ir), before);
   });
 
   it("shows branch controls on q1 issue commands and ghost effects on runtime lanes", () => {
@@ -921,7 +1021,7 @@ describe("timeline webview assets", () => {
   it("keeps shared q1timeline loop ranges from covering blocks", () => {
     const adapter = require(join(__dirname, "..", "src", "q1timeline", "media", "timelineAdapter.js"));
     const sharedCss = readFileSync(join(__dirname, "..", "src", "shared", "timeline", "renderer.css"), "utf-8");
-    const model = adapter.buildQ1TimelineSharedModel({
+    const ir = {
       events: [
         {
           id: "seq0:loop",
@@ -947,6 +1047,16 @@ describe("timeline webview assets", () => {
           confidence: "exact",
         },
         {
+          id: "seq0:loop-overlay", sequencer_id: "seq0", lane: "control.flow", kind: "control_flow_loop",
+          t0: { value: 20 }, t1: { value: 220 }, label: "loop L0 forever",
+          meta: { control_flow_source_event_id: "seq0:loop" },
+        },
+        {
+          id: "seq0:branch-overlay", sequencer_id: "seq0", lane: "control.flow", kind: "control_flow_branch",
+          t0: { value: 20 }, t1: { value: 220 }, label: "branch overlay",
+          meta: { control_flow_source_event_id: "seq0:play" },
+        },
+        {
           id: "seq0:play",
           sequencer_id: "seq0",
           lane: "rt.play",
@@ -958,16 +1068,47 @@ describe("timeline webview assets", () => {
           confidence: "exact",
         },
       ],
-    }, { mode: "normal" });
+    };
+    for (const mode of ["normal", "debug"]) {
+      for (const layout of ["time", "instruction"]) {
+        const model = adapter.buildQ1TimelineSharedModel(ir, { mode, layout });
+        const blocks = model.lanes.flatMap((lane: any) => lane.blocks);
 
-    const blocks = model.lanes.flatMap((lane: any) => lane.blocks);
-
-    assert.equal(model.annotations.filter((annotation: any) => annotation.type === "loop-range").length, 1);
-    assert.equal(blocks.some((block: any) => block.kind === "loop_block"), false);
-    assert.equal(blocks.some((block: any) => block.kind === "loop_iteration_preview"), false);
-    assert.equal(blocks.some((block: any) => block.kind === "play"), true);
+        assert.equal(model.annotations.filter((annotation: any) => annotation.type === "loop-range").length, 1);
+        assert.equal(blocks.some((block: any) => block.kind === "loop_block"), false);
+        assert.equal(blocks.some((block: any) => block.kind === "loop_iteration_preview"), false);
+        assert.deepEqual(blocks.map((block: any) => block.kind), ["play"]);
+      }
+    }
     assert.match(sharedCss, /\.loop-range-label\s*{[^}]*opacity:\s*0/s);
     assert.match(sharedCss, /\.timeline-loop-range:hover \.loop-range-label,[\s\S]*\.timeline-loop-range\.is-selected \.loop-range-label\s*{[^}]*opacity:\s*1/s);
+  });
+
+  it("ignores standalone HTML control overlays when folding waits and executed loops", () => {
+    const adapter = require(join(__dirname, "..", "src", "q1timeline", "media", "timelineAdapter.js"));
+    const event = (id: string, kind: string, start: number, end: number, meta: any = {}) => ({
+      id, kind, sequencer_id: "seq0", lane: `rt.${kind}`, t0: { kind: "concrete", value: start }, t1: { kind: "concrete", value: end },
+      confidence: "exact", meta,
+    });
+    const overlays = ["control_flow_loop", "control_flow_branch"].map((kind) => ({
+      ...event(kind, kind, 0, 196605), lane: "control.flow", meta: { control_flow_source_event_id: "loop" },
+    }));
+    const ir = { events: [event("wait", "wait", 0, 65535),
+      event("loop", "loop_block", 0, 65535, { count: 3, period: { value: 65535 }, wait_only: true }),
+      event("stop", "stop", 196605, 196605)] };
+    const waitScale = adapter.buildWaitTimeScale(ir);
+    assert.ok(waitScale.gaps.length);
+    assert.deepEqual(adapter.buildWaitTimeScale({ events: [...ir.events, ...overlays] }).gaps, waitScale.gaps);
+
+    const playback = { playback: { status: "completed" }, events: [
+      event("wait0", "wait", 0, 65535), event("wait1", "wait", 65535, 196605),
+      event("loop", "loop_block", 0, 196605, { playback: true, loop_preview_key: "L0", count: 3,
+        first_iteration_end: 65535, hidden_event_ids: ["wait1"] }),
+      event("stop", "stop", 196605, 196605),
+    ] };
+    const loopScale = adapter.buildTimelineTimeScale(playback);
+    assert.ok(loopScale.gaps.length);
+    assert.deepEqual(adapter.buildTimelineTimeScale({ ...playback, events: [...playback.events, ...overlays] }).gaps, loopScale.gaps);
   });
 
   it("renders q1timeline through the shared renderer when assets are available", () => {
@@ -1257,7 +1398,7 @@ describe("timeline webview assets", () => {
 
     assert.match(script, /function selectEventNode\(eventNode, options = \{\}\)/);
     assert.match(script, /options\.notify !== false/);
-    assert.match(script, /selectEventNode\(target, \{ notify: false \}\)/);
+    assert.match(script, /selectEventNode\(target, \{ notify: false, syncHardware: visibleEvent === highlightedEvent \}\)/);
   });
 
   it("marks hardware source jumps to preserve the readable-time cursor", () => {
@@ -1356,7 +1497,7 @@ describe("timeline webview assets", () => {
 
     assert.match(script, /function findVisibleEventNodeByIds\(eventIds\)/);
     assert.match(script, /candidateNodes\.find\(isTimelineEventVisible\)/);
-    assert.match(script, /const target = findVisibleEventNodeByIds\(highlightEventIds\)/);
+    assert.match(script, /findVisibleEventNodeByIds\(visibleEvent \? \[visibleEvent.id, \.\.\.highlightEventIds\] : highlightEventIds\)/);
   });
 
   it("expands q1 issue lanes and zooms tiny source highlights", () => {
@@ -1377,7 +1518,7 @@ describe("timeline webview assets", () => {
     assert.match(script, /const highlightEventIds = prioritizedHighlightEventIds\(event\.data\.highlightEventIds \|\| \[\]\)/);
     assert.match(script, /expandQ1IssueLanesForHighlight\(highlightEventIds\)/);
     assert.match(script, /const highlightedEvent = highlightedEventForIds\(highlightEventIds\)/);
-    assert.match(script, /zoomTimelineToHighlightedEvent\(highlightedEvent\)/);
+    assert.match(script, /zoomTimelineToHighlightedEvent\(visibleEvent\)/);
   });
 
   it("repositions q1timeline diagnostic badges when the timeline window changes", () => {
@@ -1727,12 +1868,12 @@ describe("timeline webview assets", () => {
     assert.match(script, /function ensureTimelineControlOverlay\(\)/);
     assert.match(script, /function openTimelineControlPopover\(chip, event, actionKind\)/);
     assert.match(script, /function positionTimelineControlPopover\(popover, chip\)/);
-    assert.match(script, /className = "q1timeline-control-chip q1timeline-control-chip-branch"/);
+    assert.match(script, /className = `q1timeline-control-chip q1timeline-control-chip-\$\{actionKind\}`/);
     assert.match(script, /function branchAssumptionIconName\(meta\)/);
     assert.match(script, /function branchSourceJumpLabel\(event\)/);
     assert.match(script, /Line \$\{line\}: \$\{raw\}/);
     assert.match(script, /function branchPathDescriptor\(event, path\)/);
-    assert.match(script, /chip\.setAttribute\("aria-label", branchSourceJumpLabel\(event\)\)/);
+    assert.match(script, /chip\.setAttribute\("aria-label", isFeedback \?.* : branchSourceJumpLabel\(event\)\)/);
     assert.match(script, /chip\.innerHTML = timelineControlSvgIcon\(branchAssumptionIconName\(meta\)\)/);
     assert.doesNotMatch(script, /chip\.innerHTML = timelineControlSvgIcon\("branch"\)/);
     assert.doesNotMatch(script, /Branch path: condition/);
@@ -1748,7 +1889,7 @@ describe("timeline webview assets", () => {
     assert.match(script, /chip\.getBoundingClientRect\(\)/);
     assert.match(script, /Math\.max\(8, Math\.min\(left,/);
     assert.match(script, /function renderBranchControls\(popover, event\)/);
-    assert.match(script, /vscode\.postMessage\(\{ type: "setBranchAssumption", branchId, path, eventId: String\(event.id\) \}\)/);
+    assert.match(script, /vscode\.postMessage\(\{ type: playback \? "setExecutionBranch" : "setBranchAssumption", branchId, path, eventId: String\(event.id\) \}\)/);
     assert.doesNotMatch(script, /postSourceJump/);
     assert.match(script, /vscode\.postMessage\(\{ type: "setLoopPreview", loopKey, visibleIterations \}\)/);
     assert.match(css, /\.q1timeline-control-overlay\s*{/);
@@ -2335,6 +2476,8 @@ describe("timeline webview assets", () => {
       let selectedTimelineEventId = "previous";
       let selectedSourceEventIds = new Set();
       function renderSharedEventInspector() {}
+      const visiblePlaybackEvent = event => event;
+      const timelineEventsById = {get: id => ({id})};
       function syncTimelineRelatedSelection() {}
       function ensureRelatedBlockSummaryNode() { return summary; }
       function zoomTimelineToEventRange() { throw new Error("Instruction highlight changed the real-time window"); }
@@ -2363,11 +2506,11 @@ describe("timeline webview assets", () => {
     const adapter = require(join(__dirname, "..", "src", "q1timeline", "media", "timelineAdapter.js"));
     let rendered: any;
     const stage = { scrollLeft: 88, dataset: {}, style: { setProperty() {} }, querySelectorAll: () => [] };
-    const root = { querySelector: () => stage };
+    const root = { querySelector: (selector: string) => selector === ".shared-timeline-stage" ? stage : undefined };
     const noopNames = [
       "renderTimelineLayoutToggle", "renderTimelineWindowStatus", "renderTimeBasisToggle", "installSharedQ1IssueControls",
       "syncSharedSequencerFoldControls", "installTimelineControlChips", "installTimelineMouseInteractions", "applySharedSelection",
-      "renderWaitFolds", "renderHardwareCursor",
+      "renderWaitFolds", "renderPlaybackFolds", "renderHardwareCursor",
       "setInstructionView",
     ];
     const runtime = Function("window", "document", `
@@ -2376,6 +2519,7 @@ describe("timeline webview assets", () => {
       let selectedTimelineEventId;
       const selectedSourceEventIds = new Set(["play-path1"]);
       const expandedQ1IssueSequencers = new Set();
+      const expandedPlaybackLoops = new Set();
       const timelineIr = { events: [
         { id: "q1", kind: "q1_issue", sequencer_id: "q0", t0: 8, t1: 12, source: { raw: "play 0,1,4" } },
         { id: "play", kind: "play", sequencer_id: "q0", t0: 400016, t1: 400020,
@@ -2409,7 +2553,7 @@ describe("timeline webview assets", () => {
     assert.deepEqual(runtime.q1Preference(), []);
   });
 
-  it("uses RT source-range bounds instead of Q1 issue times or enclosing loop summaries", () => {
+  it("fits selected Q1 and RT source-range bounds without enclosing loop or control-flow summaries", () => {
     const script = readFileSync(join(__dirname, "..", "src", "q1timeline", "media", "timeline.js"), "utf-8");
     const event = (id: string, kind: string, start: number, end: number, extra = {}) => ({
       id, kind, sequencer_id: "Control", lane: `rt.${kind}`, confidence: "exact", t0: start, t1: end, ...extra,
@@ -2420,18 +2564,41 @@ describe("timeline webview assets", () => {
       event("wait", "wait", 400_020, 400_060), event("repeat", "play", 800_016, 800_020),
       event("loop", "loop_block", 12, 40_160_000), event("preview", "loop_iteration_preview", 12, 401_548),
       event("branch", "branch_region", 0, 40_160_000), event("debug", "slack", 0, 40_160_000, { lane: "debug.slack" }),
+      event("controlLoop", "control_flow_loop", 0, 40_160_000), event("controlBranch", "control_flow_branch", 0, 40_160_000),
       event("removed", "play", 0, 4, { meta: { diff_status: "removed" } }),
     ] });
     assert.deepEqual(runtime.sourceRangeTimelineBounds([
-      "issue", "loop", "preview", "branch", "debug", "gain", "playI", "playI", "playQ", "wait", "removed", "missing",
-    ]), { start: 400_016, end: 400_060, eventIds: ["gain", "playI", "playQ", "wait"], clock: "RT" });
+      "issue", "loop", "preview", "branch", "debug", "controlLoop", "controlBranch", "gain", "playI", "playI", "playQ", "wait", "removed", "missing",
+    ]), { start: 200, end: 400_060, eventIds: ["issue", "gain", "playI", "playQ", "wait"], clock: "Q1 core + RT" });
     assert.deepEqual(runtime.sourceRangeTimelineBounds(["playI", "repeat"]), {
       start: 400_016, end: 800_020, eventIds: ["playI", "repeat"], clock: "RT",
     });
     assert.deepEqual(runtime.sourceRangeTimelineBounds(["issue", "loop", "preview", "debug"]), {
       start: 200, end: 204, eventIds: ["issue"], clock: "Q1 core",
     });
-    assert.equal(runtime.sourceRangeTimelineBounds(["loop", "preview", "branch", "debug", "removed"]), undefined);
+    assert.equal(runtime.sourceRangeTimelineBounds(["loop", "preview", "branch", "debug", "controlLoop", "controlBranch", "removed"]), undefined);
+  });
+
+  it("includes every selected Q1 instruction and only the selected RT packet before a long wait", () => {
+    const script = readFileSync(join(__dirname, "..", "src", "q1timeline", "media", "timeline.js"), "utf-8");
+    const issue = (index: number) => ({ id: `q${index}`, kind: "q1_issue", sequencer_id: "disabled", lane: "debug.q1_issue",
+      t0: { kind: "concrete", value: index * 4 }, t1: { kind: "concrete", value: (index + 1) * 4 } });
+    const ir = { events: [
+      ...Array.from({ length: 6 }, (_unused, index) => issue(index)),
+      { id: "update", kind: "upd_param", sequencer_id: "disabled", lane: "rt.update", t0: 0, t1: 4 },
+      { id: "wait", kind: "wait", sequencer_id: "disabled", lane: "rt.wait", t0: 4, t1: 65_539 },
+      { id: "loop", kind: "loop_block", sequencer_id: "disabled", lane: "control.loop", t0: 4, t1: 196_609 },
+    ] };
+    const runtime = loadQ1TimelineFoldRuntime(script, ir, { full: { min: 0, max: 196_613 } });
+    const ids = ["q0", "q1", "q2", "q3", "q4", "q5", "update"];
+    assert.deepEqual(runtime.zoomTimelineToEventRange(ids), {
+      start: 0, end: 24, eventIds: ids, clock: "Q1 core + RT",
+    });
+    assert.deepEqual(runtime.selectedSources(), ids);
+    assert.deepEqual(runtime.sourceSelectionsAtRender, [ids]);
+    assert.deepEqual(runtime.preserved().selection, { start: 0, end: 24 });
+    assert.deepEqual(runtime.preserved().window, { min: 0, max: 26 });
+    assert.equal(runtime.state().timelineExpandedGaps, undefined);
   });
 
   it("rejects unknown source-range endpoints and never mixes aligned and local clocks", () => {
@@ -2439,9 +2606,10 @@ describe("timeline webview assets", () => {
     const play = { id: "play", kind: "play", sequencer_id: "q0", lane: "rt.play", confidence: "exact", t0: 400_016, t1: 400_020 };
     const issue = { ...play, id: "issue", kind: "q1_issue", t0: 200, t1: 204 };
     const valid = { ...play, meta: { aligned_t0: 401_016, aligned_t1: 401_020 } };
-    const aligned = loadQ1TimelineFoldRuntime(script, { events: [valid, issue] }, { basis: "aligned" });
+    const alignedIssue = { ...issue, meta: { aligned_t0: 1200, aligned_t1: 1204 } };
+    const aligned = loadQ1TimelineFoldRuntime(script, { events: [valid, alignedIssue] }, { basis: "aligned" });
     assert.deepEqual(aligned.sourceRangeTimelineBounds(["issue", "play"]), {
-      start: 401_016, end: 401_020, eventIds: ["play"], clock: "RT",
+      start: 1200, end: 401_020, eventIds: ["issue", "play"], clock: "Q1 core + RT",
     });
     const cases = [
       { basis: "local", event: { ...play, t1: { kind: "symbolic", expr: "T" } } },
@@ -2461,9 +2629,21 @@ describe("timeline webview assets", () => {
       assert.deepEqual(runtime.preserved(), before);
       assert.equal(runtime.renders(), 0);
     }
+    for (const invalidIssue of [
+      { ...issue, t1: { kind: "unknown", reason: "Q1 timing unresolved" } },
+      { ...issue, t1: 199 },
+    ]) {
+      const runtime = loadQ1TimelineFoldRuntime(script, { events: [play, invalidIssue] });
+      assert.equal(runtime.sourceRangeTimelineBounds(["play", "issue"]), undefined);
+      assert.equal(runtime.zoomTimelineToEventRange(["play", "issue"]), undefined);
+      assert.deepEqual(runtime.selectedSources(), []);
+      assert.equal(runtime.renders(), 0);
+    }
+    const missingAlignedIssue = loadQ1TimelineFoldRuntime(script, { events: [valid, issue] }, { basis: "aligned" });
+    assert.equal(missingAlignedIssue.sourceRangeTimelineBounds(["issue", "play"]), undefined);
   });
 
-  it("zooms a source range linearly including edge padding while preserving folds outside the window", () => {
+  it("zooms a source range in displayed coordinates without expanding any folds", () => {
     const script = readFileSync(join(__dirname, "..", "src", "q1timeline", "media", "timeline.js"), "utf-8");
     const event = (id: string, kind: string, start: number, end: number, sequencer_id = "q0") => ({
       id, kind, sequencer_id, lane: `rt.${kind}`, confidence: "exact", t0: start, t1: end,
@@ -2483,19 +2663,18 @@ describe("timeline webview assets", () => {
       assert.deepEqual(runtime.zoomTimelineToEventRange(["selected"]), {
         start: 5000 + offset, end: 5400 + offset, eventIds: ["selected"], clock: "RT",
       });
-      assert.deepEqual(runtime.preserved(), {
-        window: { min: 4980 + offset, max: 5420 + offset },
-        selection: { start: 5000 + offset, end: 5400 + offset }, selected: undefined, time: 5050,
-      });
-      assert.deepEqual(runtime.timelineTimeScale().gaps.map(({ start, end }: any) => ({ start, end })), [
-        { start: 10_016 + offset, end: 14_984 + offset }, { start: 15_016 + offset, end: 19_984 + offset },
-      ]);
-      assert.equal(runtime.displayTimelineTime(5420 + offset) - runtime.displayTimelineTime(4980 + offset), 440);
-      assert.equal(runtime.timelineTimeFromPointer({ clientX: 600 }), 5200 + offset);
+      const view = runtime.preserved();
+      assert.deepEqual(runtime.sourceSelectionsAtRender, [["selected"]]);
+      assert.deepEqual(view.selection, {start: 5000 + offset, end: 5400 + offset});
+      assert.equal(view.selected, undefined);
+      assert.equal(view.time, 5050);
+      assert.equal(runtime.timelineTimeScale().gaps.length, 4);
+      assert.ok(Math.abs(runtime.displayTimelineTime(view.window.max) - runtime.displayTimelineTime(view.window.min) - 440) < 0.05);
+      assert.ok(Math.abs(runtime.timelineTimeFromPointer({ clientX: 600 }) - (5200 + offset)) < 0.05);
       assert.deepEqual(runtime.state().timelineWindow, {
-        min: 4980 + offset, max: 5420 + offset, fullMin: full.min, fullMax: full.max, basis,
+        min: view.window.min, max: view.window.max, fullMin: full.min, fullMax: full.max, basis,
       });
-      assert.equal(runtime.state().timelineExpandedGaps.length, 2);
+      assert.equal(runtime.state().timelineExpandedGaps, undefined);
     }
     const linear = loadQ1TimelineFoldRuntime(script, ir, { full: { min: 0, max: 20_000 }, state: { timelineWaitsCollapsed: false } });
     linear.zoomTimelineToEventRange(["selected"]);

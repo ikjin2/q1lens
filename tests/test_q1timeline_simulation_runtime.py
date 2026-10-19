@@ -187,6 +187,42 @@ def test_conditional_execution_uses_trigger_counts_at_rt_time(operator: int, exp
     assert state.rt_time_ns == Concrete(216 if expected else 232)
 
 
+@pytest.mark.parametrize("operator", [6, 7])
+@pytest.mark.parametrize("enabled", [0, 1])
+def test_undefined_condition_operator_only_blocks_when_enabled(operator: int, enabled: int) -> None:
+    state, = run(f"set_cond {enabled},0,{operator},8\nupd_param 4\nstop")
+    assert status(state) == ("blocked" if enabled else "completed")
+    assert not events(state, "conditional_skip")
+    if enabled:
+        assert not state.rt_packets
+        assert "Conditional operators 6 and 7" in state.metadata["execution"]["reason"]
+    else:
+        assert state.rt_time_ns == Concrete(204)
+        assert len(events(state, "upd_param")) == 1
+
+
+def test_disabled_condition_does_not_require_unused_register_values() -> None:
+    state, = run("move 0,R0\nnop\nset_cond R0,R1,R2,4\nupd_param 4\nstop")
+    assert status(state) == "completed"
+    assert state.rt_time_ns == Concrete(204)
+    condition, = events(state, "latched_state_pending")
+    assert condition.meta["value"][0] == 0
+    assert condition.meta["value"][1]["kind"] == "unknown"
+    assert condition.meta["value"][2]["kind"] == "unknown"
+    assert not events(state, "conditional_skip")
+
+
+def test_condition_rechecks_each_rt_instruction_without_gating_q1_or_disabled_rt() -> None:
+    state, = run(
+        "set_latch_en 1,4\nset_cond 1,1,0,8\nmove 7,R0\nupd_param 4\nupd_param 4\n"
+        "set_cond 0,0,0,8\nupd_param 4\nstop",
+        inputs={"triggers": [{"target": "seq", "time_ns": 210, "address": 1}]})
+    assert status(state) == "completed"
+    assert state.registers["R0"] == Concrete(7)
+    assert [(event.t0.value, event.t1.value) for event in events(state, "conditional_skip")] == [(204, 212)]
+    assert [(event.t0.value, event.t1.value) for event in events(state, "upd_param")] == [(212, 216), (216, 220)]
+
+
 def test_wait_trigger_ignores_earlier_arrival_and_resumes_on_later_input() -> None:
     state, = run("wait 8\nwait_trigger 1,4\nstop", inputs={"triggers": [
         {"target": "seq", "time_ns": 205, "address": 1},

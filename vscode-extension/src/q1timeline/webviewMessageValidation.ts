@@ -24,6 +24,29 @@ function parseWebviewMessage(message) {
     return { valid: true, type: "requestRefresh" };
   }
 
+  if (message.type === "executionControl" && ["play", "pause"].includes(message.action) &&
+      hasOnlyKeys(message, ["type", "action"])) {
+    return { valid: true, type: message.type, action: message.action };
+  }
+
+  if (message.type === "setExecutionBranch" &&
+      typeof message.eventId === "string" && message.eventId.trim().length > 0 &&
+      typeof message.branchId === "string" && message.branchId.trim().length > 0 &&
+      ["taken", "fallthrough"].includes(message.path) &&
+      hasOnlyKeys(message, ["type", "eventId", "branchId", "path"])) {
+    return { valid: true, type: message.type, eventId: message.eventId, branchId: message.branchId, path: message.path };
+  }
+
+  if (message.type === "setExecutionFeedback" &&
+      typeof message.eventId === "string" && message.eventId.trim().length > 0 &&
+      typeof message.feedbackId === "string" && message.feedbackId.trim().length > 0 &&
+      (message.value === null || Number.isInteger(message.value) && message.value >= -2147483648 && message.value <= 4294967295) &&
+      Number.isSafeInteger(message.delayNs) && message.delayNs >= 0 &&
+      hasOnlyKeys(message, ["type", "eventId", "feedbackId", "value", "delayNs"])) {
+    return { valid: true, type: message.type, eventId: message.eventId, feedbackId: message.feedbackId,
+      value: message.value, delayNs: message.delayNs };
+  }
+
   if (
     message.type === "prepareExecutionReplay" &&
     typeof message.sequencerId === "string" &&

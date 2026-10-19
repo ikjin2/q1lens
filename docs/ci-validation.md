@@ -71,4 +71,4 @@ Validate workflow syntax locally with:
 go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/validation.yml
 ```
 
-Local passes and workflow syntax validation do not prove a hosted GitHub Actions run passed. The first remote run must be inspected after these files are pushed; creating this workflow does not push or dispatch it.
+Local passes and workflow syntax validation do not prove a hosted GitHub Actions run passed. Inspect the hosted run results in GitHub Actions.

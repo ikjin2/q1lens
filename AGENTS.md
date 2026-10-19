@@ -10,11 +10,12 @@ source copies to keep synchronized manually:
 
 | Role | Local path | Branch / recorded revision |
 | --- | --- | --- |
-| Canonical development | `${HOME}/.codex/worktrees/latch-register-integration/q1lens` | `codex/latch-register-integration`; integration baseline `b64f1ab5d2b83c99e8ac308049b8db9f14e6030b` |
+| Canonical development | `${HOME}/.codex/worktrees/latch-register-integration/q1lens` | `codex/latch-register-integration`; integration baseline `ee70e7ffc8b57597814704ee29b61f9dba40be54` |
 | Released 0.2.2 source | `${HOME}/.codex/worktrees/release-0-2-2/q1lens` | Release tag `v0.2.2`; exact verified development commit |
-| Released 0.2.1 source | `${HOME}/.codex/worktrees/timeline-navigation-20261014/q1lens` | `agent/timeline-navigation-20261014`; `6a0492f5ba3a76c9408039e7ab4711b552eeaf0a` |
+| Released 0.2.1 source | `${HOME}/.codex/worktrees/timeline-navigation-20261014/q1lens` | `agent/timeline-navigation-20261014`; `7070d962586230c26a7df3b75a302b61dd392a4d` |
 | Preserved previous workspace | `${HOME}/Documents/GitHub/q1lens` | `agent/cli-diagnostics-workflow`; previous work and local research/equipment material |
 
+Resolve `${HOME}` to the current user's home directory before using these paths.
 These paths describe this Windows machine. The integration baseline is historical;
 development HEAD advances with later commits. Do not reset to that baseline.
 The older `.worktrees/public-release` checkout is not the 0.2.1 release source.
@@ -48,6 +49,11 @@ the published source and is not a second development baseline.
 For a requested public release, prepare the exact verified development commit in
 a separate release worktree and build from that commit. Keep this guide's release
 mapping current when the release checkout or published revision changes.
+
+Use `public/main` as the upstream and comparison base for product development.
+Preserved feature worktrees are independent references; port selected changes
+onto the current development branch rather than merging their full ancestry.
+Publish only the intended branch and tags, never all local refs.
 
 The accepted integration retains the current Hardware UI, removes duplicated
 latched setters from RT rows, and displays Compare both alternatives in separate

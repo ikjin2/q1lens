@@ -2,61 +2,46 @@
 
 ## Source of truth
 
-The user designated the integrated source as the development baseline on 2026-10-15.
-Use it for subsequent product development, tests, builds, and local installation.
+Use `${HOME}/Documents/GitHub/q1lens` on branch `main` for product development,
+tests, builds, and local installation. Resolve `${HOME}` to the current user's
+home directory. This is the single development workspace designated by the user.
 
-These are existing local Git worktrees sharing one repository, not independent
-source copies to keep synchronized manually:
+The `origin` remote is the public repository:
+`https://github.com/ikjin2/q1lens.git`. Track and compare against `origin/main`.
 
-| Role | Local path | Branch / recorded revision |
-| --- | --- | --- |
-| Canonical development | `${HOME}/.codex/worktrees/latch-register-integration/q1lens` | `codex/latch-register-integration`; integration baseline `ee70e7ffc8b57597814704ee29b61f9dba40be54` |
-| Released 0.2.2 source | `${HOME}/.codex/worktrees/release-0-2-2/q1lens` | Release tag `v0.2.2`; exact verified development commit |
-| Released 0.2.1 source | `${HOME}/.codex/worktrees/timeline-navigation-20261014/q1lens` | `agent/timeline-navigation-20261014`; `7070d962586230c26a7df3b75a302b61dd392a4d` |
-| Preserved previous workspace | `${HOME}/Documents/GitHub/q1lens` | `agent/cli-diagnostics-workflow`; previous work and local research/equipment material |
-
-Resolve `${HOME}` to the current user's home directory before using these paths.
-These paths describe this Windows machine. The integration baseline is historical;
-development HEAD advances with later commits. Do not reset to that baseline.
-The older `.worktrees/public-release` checkout is not the 0.2.1 release source.
-Do not infer the newest source from a folder name, package version, or tool cwd.
-
-## Before making changes
-
-- Verify the target checkout with `git rev-parse --show-toplevel`,
-  `git branch --show-current`, and `git status --short`.
-- If a tool starts in the preserved or release checkout, use the canonical
-  development path explicitly for product work, unless the user requests work
-  on a specific checkout. Read that checkout's applicable instructions as well.
-- Preserve the previous workspace's tracked changes, untracked files, research,
-  equipment data, and generated output. Do not reset, clean, mass-stage, or copy
-  its contents wholesale into the integrated source.
-- The previous workspace also holds the shared Git repository in `.git`.
-  Do not move or delete that workspace or its `.git`; the linked worktrees depend
-  on it.
-- Keep this canonical worktree available; it is the active development workspace.
+Before changes, verify `git rev-parse --show-toplevel`, `git branch --show-current`,
+and `git status --short`. Do not choose a different source copy based on its
+folder name, package version, or the tool's starting directory.
 
 ## Development and release flow
 
-Develop and verify in the canonical workspace. Build both the VS Code extension
-and Python package from the same source revision when installing an updated
-integration, and verify that the installed artifacts match that source.
-Installing a local build does not publish a release.
-Release 0.2.2 builds the extension and Python package from the same tagged commit.
-Use the canonical workspace for later development; the release checkout preserves
-the published source and is not a second development baseline.
+Develop in this checkout. Do not merge the full ancestry of archived branches or
+restore an older workspace over it. Port individual changes only when requested
+and review them against the current `main`.
 
-For a requested public release, prepare the exact verified development commit in
-a separate release worktree and build from that commit. Keep this guide's release
-mapping current when the release checkout or published revision changes.
+For a public release, build the exact verified development commit in a temporary
+release worktree. Build the Python package and VS Code extension from that same
+revision and verify the installed artifacts. Installing a local build does not
+publish a release. Release versions are recorded by tags; release worktrees are
+not separate development baselines and can be closed after required artifacts
+and verification reports have been retained.
 
-Use `public/main` as the upstream and comparison base for product development.
-Preserved feature worktrees are independent references; port selected changes
-onto the current development branch rather than merging their full ancestry.
-Publish only the intended branch and tags, never all local refs.
+Publish only the intended branch and tags, never all local refs. Keep `.git` in
+place; do not move or delete repository metadata as a way to change workspaces.
 
-The accepted integration retains the current Hardware UI, removes duplicated
-latched setters from RT rows, and displays Compare both alternatives in separate
-Jump/Continue rows. Critical Path UI and the old separate register-inspector
-badges/flags remain deferred. Local research and equipment material remain
-separate from product changes; do not silently include them in a release.
+## Local material
+
+Research manuscripts, experiment records, and equipment notes are archived
+outside this checkout. They are reference material, not an alternative product
+source. Do not copy them into product changes or include them in a release
+without an explicit request.
+
+Keep generated output, local installation artifacts, and dependency caches
+untracked. Stage specific source files for a change rather than an entire folder.
+
+## Accepted product baseline
+
+Retain the current Hardware UI, show latched settings where RT instructions
+apply them without duplicating setters in RT rows, and display Compare both
+alternatives in separate Jump/Continue rows. Critical Path UI and the old separate
+register-inspector badges/flags remain deferred.

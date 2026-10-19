@@ -19,11 +19,5 @@ desktop-app/dist/
 output/
 .verification/
 examples/cursor-frequency-demo/verification/generated/
-paper/
-experiments/
-docs/drafts/
 .worktrees/
 .scratch/
-docs/bug-tickets/
-downloads/
-examples/qblox_application_examples/

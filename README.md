@@ -344,9 +344,6 @@ timeline using the same Python analysis. For reproducible checks, see
 [continuous validation](docs/ci-validation.md) and the
 [cursor-frequency verification guide](examples/cursor-frequency-demo/verification/README.md).
 
-Reproduction steps, fixes and regression tests for extension bugs are recorded in
-the [VS Code extension bug fix log](docs/vscode-extension-bugfix-log.md).
-
 ### Build and test
 
 Python:

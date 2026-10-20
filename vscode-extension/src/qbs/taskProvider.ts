@@ -1,8 +1,12 @@
 import type * as vscodeTypes from "vscode";
+import { spawn } from "node:child_process";
+import { dirname, resolve } from "node:path";
+import { resolveFilePythonEnvironment } from "../pythonEnvironment";
 
 export interface QbsTimelineTaskProject {
   project: string;
   outputDir: string;
+  resource?: vscodeTypes.Uri;
 }
 
 export interface QbsTimelineTaskDefinition {
@@ -161,17 +165,73 @@ export class QbsTimelineTaskProvider implements vscodeTypes.TaskProvider {
   private createTask(
     vscode: typeof vscodeTypes,
     definition: QbsTimelineTaskDefinition,
-    settings: QbsTimelineTaskExecutionSettings,
+    resource?: vscodeTypes.Uri,
     scope: vscodeTypes.Task["scope"] = vscode.TaskScope.Workspace,
     name = definition.label,
   ): vscodeTypes.Task {
-    const execution = buildTaskExecution(definition, settings);
     const task = new vscode.Task(
       definition,
       scope ?? vscode.TaskScope.Workspace,
       name,
       "qbsTimeline",
-      new vscode.ShellExecution(execution.command, execution.args),
+      new vscode.CustomExecution(async (resolvedDefinition) => {
+        const write = new vscode.EventEmitter<string>();
+        const exit = new vscode.EventEmitter<number>();
+        let child: ReturnType<typeof spawn> | undefined;
+        let closed = false;
+        const print = (text: string) => write.fire(text.replace(/\r?\n/g, "\r\n"));
+        const finish = (code: number) => {
+          if (closed) return;
+          closed = true;
+          exit.fire(code);
+          write.dispose();
+          exit.dispose();
+        };
+        return {
+          onDidWrite: write.event,
+          onDidClose: exit.event,
+          open: () => {
+            void (async () => {
+              try {
+                const resolved = resolveTaskDefinition({ ...definition, ...resolvedDefinition });
+                if (!resolved) throw new Error("Invalid Q1Lens task definition.");
+                const target = resource ?? taskResource(vscode, resolved.project, scope);
+                if (!target) throw new Error("Set this Q1Lens task's workspace folder or use an absolute project path.");
+                const environment = await resolveFilePythonEnvironment(vscode, target, "qbs");
+                if (closed) return;
+                const workspaceDir = vscode.workspace.getWorkspaceFolder(target)?.uri.fsPath ?? dirname(target.fsPath);
+                const execution = buildTaskExecution({
+                  ...resolved,
+                  project: target.fsPath,
+                  irPath: resolve(workspaceDir, resolved.irPath),
+                  htmlPath: resolve(workspaceDir, resolved.htmlPath),
+                }, environment);
+                print(`Python: ${environment.pythonPath}\nSource: ${environment.sourceLabel}\nCommand: ${JSON.stringify([execution.command, ...execution.args])}\n\n`);
+                child = spawn(execution.command, execution.args, {
+                  cwd: dirname(target.fsPath),
+                  shell: false,
+                  windowsHide: true,
+                  stdio: ["ignore", "pipe", "pipe"],
+                });
+                child.stdout?.setEncoding("utf8").on("data", print);
+                child.stderr?.setEncoding("utf8").on("data", print);
+                child.on("error", (error) => { print(`Q1Lens task failed: ${error.message}\n`); finish(1); });
+                child.on("close", (code) => finish(code ?? 1));
+              } catch (error) {
+                if (!closed) print(`Q1Lens task failed: ${error instanceof Error ? error.message : String(error)}\n`);
+                finish(1);
+              }
+            })();
+          },
+          close: () => {
+            if (closed) return;
+            closed = true;
+            child?.kill();
+            write.dispose();
+            exit.dispose();
+          },
+        };
+      }),
     );
     task.problemMatchers = [];
     return task;
@@ -180,24 +240,46 @@ export class QbsTimelineTaskProvider implements vscodeTypes.TaskProvider {
   async provideTasks(): Promise<vscodeTypes.Task[]> {
     const vscode = require("vscode") as typeof vscodeTypes;
     const { readSettings } = require("./settings") as typeof import("./settings");
-    const settings = readSettings();
-    const definitions = buildTaskDefinitions(await this.getProjects(), settings.outputDirOverride);
-    return definitions.map((definition) => this.createTask(vscode, definition, settings));
+    return (await this.getProjects()).flatMap((project) => {
+      const info = taskProject(project);
+      const resource = info.resource ?? taskResource(vscode, info.project);
+      const settings = readSettings(resource);
+      const scope = resource ? vscode.workspace.getWorkspaceFolder(resource) : undefined;
+      return buildTaskDefinitions([info], settings.outputDirOverride)
+        .map((definition) => this.createTask(vscode, definition, resource, scope));
+    });
   }
 
   resolveTask(task: vscodeTypes.Task): vscodeTypes.Task | undefined {
     const vscode = require("vscode") as typeof vscodeTypes;
     const { readSettings } = require("./settings") as typeof import("./settings");
-    const settings = readSettings();
+    const resource = typeof task.definition.project === "string"
+      ? taskResource(vscode, task.definition.project, task.scope)
+      : undefined;
+    const settings = readSettings(resource);
     const definition = resolveTaskDefinition(task.definition as Record<string, unknown>, settings.outputDirOverride);
     if (!definition) {
       return undefined;
     }
-    const resolved = this.createTask(vscode, definition, settings, task.scope, task.name || definition.label);
+    const resolved = this.createTask(vscode, definition, resource, task.scope, task.name || definition.label);
+    resolved.definition = task.definition;
     resolved.detail = task.detail;
     resolved.group = task.group;
     resolved.presentationOptions = task.presentationOptions;
     resolved.runOptions = task.runOptions;
     return resolved;
   }
+}
+
+function taskResource(
+  vscode: typeof vscodeTypes,
+  project: string,
+  scope?: vscodeTypes.Task["scope"],
+): vscodeTypes.Uri | undefined {
+  if (project.includes("${")) return undefined;
+  if (isAbsoluteTaskPath(project)) return vscode.Uri.file(project);
+  const folder = scope && typeof scope === "object"
+    ? scope
+    : vscode.workspace.workspaceFolders?.length === 1 ? vscode.workspace.workspaceFolders[0] : undefined;
+  return folder ? vscode.Uri.joinPath(folder.uri, project) : undefined;
 }

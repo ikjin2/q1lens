@@ -3,7 +3,9 @@ from __future__ import annotations
 import pytest
 
 from q1timeline.analysis.interpreter import interpret_program
+from q1timeline.ir.serialize import timeline_ir_from_states
 from q1timeline.q1asm.parser import parse_q1asm
+from q1timeline.render.html import render_html
 
 
 def analyze(source: str, previews: dict[str, int]):
@@ -90,3 +92,29 @@ def test_loop_members_that_precede_the_branch_keep_their_shared_event_ids() -> N
             for event_id in members:
                 member = by_id[event_id]
                 assert member.meta.get("branch_comparison_path") in (None, loop.meta["branch_comparison_path"])
+
+
+@pytest.mark.parametrize("loop_spans_branch", [False, True])
+def test_compared_loop_diagnostics_reference_existing_events_and_render(loop_spans_branch: bool) -> None:
+    source = (
+        "move 2,R1\nnop\nbody: set_freq 4\njlt R0,1,@target\n"
+        "upd_param 4\ntarget: wait 4\nloop R1,@body\nstop"
+        if loop_spans_branch else
+        "move 2,R1\nnop\njlt R0,1,@body\nwait 4\n"
+        "body: set_freq 4\nupd_param 4\nloop R1,@body\nstop"
+    )
+    state = analyze(source, {})
+    by_id = {event.id: event for event in state.events}
+    shared = {event.id for event in state.events if event.source.line == 3 and "branch_comparison_path" not in event.meta}
+    diagnostics = [diagnostic for diagnostic in state.diagnostics if diagnostic.category == "loop_truncated"]
+    assert len(diagnostics) == 2
+    for diagnostic in diagnostics:
+        path = diagnostic.details["branch_comparison_path"]
+        assert diagnostic.related_events
+        assert any(event_id.endswith(f":branch-{path}") for event_id in diagnostic.related_events)
+        if loop_spans_branch:
+            assert shared <= set(diagnostic.related_events)
+        for event_id in diagnostic.related_events:
+            assert by_id[event_id].meta.get("branch_comparison_path") in (None, path)
+
+    assert "<html" in render_html(timeline_ir_from_states([state]))

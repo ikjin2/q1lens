@@ -26,6 +26,7 @@ const { collectProjectRelatedPaths, isProjectRelatedPath } = require("./projectR
 const { fallbackAnalyzerDiagnostic, normalizeAnalyzerDiagnostics } = require("./diagnosticFallback");
 const { prependPythonArgs } = require("./invocation");
 const { q1timelineConfigValue } = require("./settings");
+const { ensureFilePythonEnvironment } = require("../fileEnvironment");
 const {
   lookupEventIdsForSourceLine,
   lookupEventIdsForSourceRange,
@@ -714,6 +715,7 @@ export class TimelineController {
     this.panelDisposables = [];
     this.projectUri = undefined;
     this.singleFileUri = undefined;
+    this.pythonEnvironment = undefined;
     this.singleFileMode = false;
     this.outputDir = undefined;
     this.timelineIr = undefined;
@@ -761,7 +763,8 @@ export class TimelineController {
           isWholeLine: true,
         })
       : undefined;
-    this.activeSourceDecorationEditor = undefined;
+    this.activeSourceDecorationEditors = new Set();
+    this.sourceDecorationsByPath = new Map();
     this.hardwareSourceReveal = undefined;
     this.output.appendLine("Q1ASM Timeline extension activated.");
     context.subscriptions.push(this.output);
@@ -801,7 +804,15 @@ export class TimelineController {
       context.subscriptions.push(
         vscode.window.onDidChangeActiveTextEditor((editor) => {
           this.rememberSourceViewColumn(editor);
+          this.restoreSourceDecoration(editor);
           this.followSourceEditor(editor);
+        })
+      );
+    }
+    if (typeof vscode.window.onDidChangeVisibleTextEditors === "function") {
+      context.subscriptions.push(
+        vscode.window.onDidChangeVisibleTextEditors((editors) => {
+          for (const editor of editors) this.restoreSourceDecoration(editor);
         })
       );
     }
@@ -817,6 +828,7 @@ export class TimelineController {
       this.comparison = { mode: "none" };
       this.lastPreviewHtml = undefined;
       this.timelineIr = undefined;
+      this.pythonEnvironment = undefined;
       this.clearAnalyzerOverrides();
     }
     this.projectUri = uri;
@@ -1285,13 +1297,14 @@ export class TimelineController {
   }
 
   checkAnalyzerInstallation() {
-    return vscode.commands.executeCommand("q1lens.checkEnvironment", "q1timeline.refreshPreview");
+    return vscode.commands.executeCommand("q1lens.checkEnvironment", "q1timeline.refreshPreview", this.singleFileUri || this.projectUri);
   }
 
   config() {
-    const q1lensConfig = vscode.workspace.getConfiguration("q1lens");
-    const qbloxConfig = vscode.workspace.getConfiguration("qbloxTimeline");
-    const legacyConfig = vscode.workspace.getConfiguration("q1timeline");
+    const resource = this.singleFileUri || this.projectUri || vscode.window.activeTextEditor?.document.uri;
+    const q1lensConfig = vscode.workspace.getConfiguration("q1lens", resource);
+    const qbloxConfig = vscode.workspace.getConfiguration("qbloxTimeline", resource);
+    const legacyConfig = vscode.workspace.getConfiguration("q1timeline", resource);
     return {
       get(key, fallback) {
         return q1timelineConfigValue(qbloxConfig, legacyConfig, key, fallback, q1lensConfig);
@@ -1357,10 +1370,11 @@ export class TimelineController {
 
   createPlaybackClient() {
     const configuration = this.config();
+    if (!this.pythonEnvironment) throw new Error("Select a Python environment before calculating execution.");
     const args = ["-u", "-m", "q1timeline.playback", "--project", this.projectUri.fsPath];
     for (const [name, value] of this.parameterOverrides) args.push("--set-param", `${name}=${value}`);
-    return new PlaybackClient(configuration.get("pythonPath", "python"),
-      prependPythonArgs(configuration.get("pythonArgs", []), args), {
+    return new PlaybackClient(this.pythonEnvironment.pythonPath,
+      prependPythonArgs(this.pythonEnvironment.pythonArgs, args), {
         cwd: this.projectRootCwd(),
         env: { ...process.env, ...this.normaliseAnalyzerEnv(configuration.get("analyzer.env", {})) },
         onStderr: (text) => this.output.appendLine(`Playback: ${text}`),
@@ -1392,6 +1406,7 @@ export class TimelineController {
       return;
     }
     const sourceRevision = this.sourceRevision;
+    const analysisRequestId = this.analysisRequestId;
     let client;
     this.playbackInFlight = true;
     this.playbackRunning = true;
@@ -1399,6 +1414,18 @@ export class TimelineController {
     this.pendingBranchSelection = undefined;
     this.setExecutionState({ ...this.executionState, status: "running", reason: "Calculating for up to 5 seconds." });
     try {
+      if (!this.pythonEnvironment) {
+        const environment = await ensureFilePythonEnvironment(vscode, this.singleFileUri || this.projectUri, "q1asm", this.output, {
+          cwd: this.projectRootCwd(),
+          env: this.normaliseAnalyzerEnv(this.config().get("analyzer.env", {})),
+        });
+        if (!this.panel || this.sourceRevision !== sourceRevision || !this.isCurrentAnalysis(analysisRequestId)) return;
+        if (!environment) {
+          this.setExecutionState({ status: "blocked", can_resume: true, reason: "Select a Python environment and complete setup before calculating execution." });
+          return;
+        }
+        this.pythonEnvironment = environment;
+      }
       client = this.playbackClient || (this.playbackClient = this.createPlaybackClient());
       if (update) await client.request(update);
       const deadline = Date.now() + 5000;
@@ -1430,6 +1457,8 @@ export class TimelineController {
   }
 
   async publishPlaybackSnapshot(ir, client) {
+    if (!this.pythonEnvironment) return;
+    const { pythonPath, pythonArgs } = this.pythonEnvironment;
     const requestId = ++this.analysisRequestId;
     const sourceRevision = this.sourceRevision;
     const configuration = this.config();
@@ -1441,7 +1470,7 @@ export class TimelineController {
       if (!isCurrent()) return;
       await fsPromises.writeFile(irPath, JSON.stringify(ir));
       if (!isCurrent()) return;
-      await this.runRender(configuration.get("pythonPath", "python"), configuration.get("pythonArgs", []),
+      await this.runRender(pythonPath, pythonArgs,
         irPath, htmlPath, configuration.get("analyzer.timeoutMs", 30000), this.projectRootCwd(),
         this.normaliseAnalyzerEnv(configuration.get("analyzer.env", {})), this.viewMode(), requestId);
       if (!isCurrent()) return;
@@ -1696,7 +1725,7 @@ export class TimelineController {
       this.setAnalysisStatus("stale", "A newer analysis request is queued.");
       return;
     }
-    if (this.analysisStatus.status === "error") {
+    if (this.analysisStatus.status === "error" || !this.pythonEnvironment) {
       await this.runAnalysis();
       return;
     }
@@ -1712,8 +1741,7 @@ export class TimelineController {
       throw error;
     }
     const configuration = this.config();
-    const pythonPath = configuration.get("pythonPath", "python");
-    const pythonArgs = configuration.get("pythonArgs", []);
+    const { pythonPath, pythonArgs } = this.pythonEnvironment;
     const timeoutMs = configuration.get("analyzer.timeoutMs", 30000);
     const extraEnv = this.normaliseAnalyzerEnv(configuration.get("analyzer.env", {}));
     const cwd = this.projectRootCwd();
@@ -2143,6 +2171,7 @@ export class TimelineController {
     this.cancelSourceRangeZoom();
     const sourceRevision = this.sourceRevision;
     const analysisProjectFile = this.projectUri.fsPath;
+    const environmentResource = this.singleFileUri || this.projectUri;
     const analysisRequestId = ++this.analysisRequestId;
     if (this.pendingBranchSelection) {
       this.pendingBranchSelection.analysisRequestId = analysisRequestId;
@@ -2150,8 +2179,9 @@ export class TimelineController {
     }
     this.setAnalysisStatus("analyzing", "Analyzing q1timeline project.");
     const configuration = this.config();
-    const pythonPath = configuration.get("pythonPath", "python");
-    const pythonArgs = configuration.get("pythonArgs", []);
+    this.pythonEnvironment = undefined;
+    let pythonPath;
+    let pythonArgs;
     const timeoutMs = configuration.get("analyzer.timeoutMs", 30000);
     const extraArgs = configuration.get("analyzer.extraArgs", []);
     const extraEnv = this.normaliseAnalyzerEnv(configuration.get("analyzer.env", {}));
@@ -2159,13 +2189,13 @@ export class TimelineController {
     const timelineIrPath = path.join(this.outputDir, "timeline_ir.json");
     const diagnosticsPath = path.join(this.outputDir, "diagnostics.json");
     const htmlPath = path.join(this.outputDir, "timeline.html");
-    const args = prependPythonArgs(pythonArgs, [
+    const analyzerArgs = [
       "-m",
       "q1lens",
       "q1timeline",
       "analyze",
       "--project",
-      this.projectUri.fsPath,
+      analysisProjectFile,
       "--out",
       timelineIrPath,
       "--diagnostics",
@@ -2180,17 +2210,27 @@ export class TimelineController {
       ...this.executionArgs(),
       ...hardwareReadinessAnalyzerArgs(configuration.get("hardwareReadiness", false)),
       ...this.analyzerOverrideArgs(extraArgs),
-    ]);
+    ];
     const parameterSummary = this.parameterOverrideSummary();
     if (parameterSummary) {
       this.output.appendLine(`Active analysis parameter overrides: ${parameterSummary}`);
     }
-    this.output.appendLine(`Analyzer command: ${[pythonPath, ...args].join(" ")}`);
     this.logAnalyzerEnv(extraEnv);
     const cwd = this.projectRootCwd();
     this.output.appendLine(`Analyzer working directory: ${cwd}`);
     return Promise.resolve()
       .then(async () => {
+        const environment = await ensureFilePythonEnvironment(vscode, environmentResource, "q1asm", this.output, { cwd, env: extraEnv });
+        if (!this.isCurrentAnalysis(analysisRequestId) || this.projectUri?.fsPath !== analysisProjectFile ||
+          (this.singleFileUri || this.projectUri)?.fsPath !== environmentResource.fsPath) return;
+        if (!environment) {
+          this.setAnalysisStatus("error", "Python environment setup is required.");
+          return;
+        }
+        this.pythonEnvironment = environment;
+        ({ pythonPath, pythonArgs } = environment);
+        const args = prependPythonArgs(pythonArgs, analyzerArgs);
+        this.output.appendLine(`Analyzer command: ${[pythonPath, ...args].join(" ")}`);
         await fsPromises.mkdir(this.outputDir, { recursive: true });
         await this.clearAnalyzerOutputFiles(timelineIrPath, diagnosticsPath, htmlPath);
         return this.execFile(pythonPath, args, timeoutMs, cwd, extraEnv, "analyzer");
@@ -2207,6 +2247,7 @@ export class TimelineController {
         return { stdout: error.stdout, stderr: error.stderr, elapsedMs: error.elapsedMs, exitCode: error.exitCode };
       })
       .then(async (result) => {
+        if (!result) return;
         if (!this.isCurrentAnalysis(analysisRequestId)) {
           this.output.appendLine(`Dropping stale analyzer result ${analysisRequestId}; current request is ${this.analysisRequestId}.`);
           return;
@@ -2381,7 +2422,7 @@ export class TimelineController {
   }
 
   showAnalyzerMissingMessage(error) {
-    const pythonPath = this.config().get("pythonPath", "python");
+    const pythonPath = this.pythonEnvironment?.pythonPath || "unavailable";
     return vscode.window.showErrorMessage(
       `Q1Lens is unavailable in the selected Python environment (${pythonPath}). ${error.message}`,
       "Check Python Environment"
@@ -2610,6 +2651,10 @@ export class TimelineController {
       this.openSourceForEvent(parsedMessage.eventId);
       return;
     }
+    if (parsedMessage.type === "feedbackFlowClick") {
+      await this.openSourceForFeedbackFlow(parsedMessage.flowId, parsedMessage.role);
+      return;
+    }
     if (parsedMessage.type === "requestRefresh") {
       this.refreshPreview();
       return;
@@ -2761,13 +2806,44 @@ export class TimelineController {
     return this.openSourceLocation(item.source);
   }
 
+  async openSourceForFeedbackFlow(flowId, role) {
+    const flow = this.timelineIr?.feedback_flows?.find((candidate) =>
+      String(candidate.id || `${candidate.from_event_id}->${candidate.to_event_id}`) === flowId);
+    if (!flow) return;
+    const eventIds = role === "source" ? [flow.from_event_id]
+      : role === "target" ? [flow.to_event_id] : [flow.from_event_id, flow.to_event_id];
+    const sourcesByPath = new Map();
+    for (const eventId of eventIds) {
+      const source = lookupSourceForEvent(this.timelineIr, eventId);
+      if (!source?.file) continue;
+      const key = normalizedFsPath(this.resolveSourcePath(source.file));
+      if (!sourcesByPath.has(key)) sourcesByPath.set(key, { source, lines: new Set() });
+      sourcesByPath.get(key).lines.add(Math.max(0, Number(source.line || 1) - 1));
+    }
+    const sourceReveal = { targets: [], opening: true };
+    let appendSourceDecoration = false;
+    try {
+      for (const { source, lines } of sourcesByPath.values()) {
+        await this.openSourceLocation(source, {
+          preserveHardwareCursor: true, sourceReveal,
+          sourceLines: [...lines], appendSourceDecoration,
+        });
+        appendSourceDecoration = true;
+      }
+    } finally {
+      sourceReveal.opening = false;
+    }
+  }
+
   async openSourceLocation(source, options = {}) {
     this.pendingBranchSelection = undefined;
     this.cancelSourceRangeZoom();
     const sourcePath = this.resolveSourcePath(source.file);
     const line = Math.max(0, Number(source.line || 1) - 1);
     const position = new vscode.Position(line, Math.max(0, Number(source.column || 1) - 1));
-    const reveal = options.preserveHardwareCursor ? { path: normalizedFsPath(sourcePath), position, opening: true } : undefined;
+    const target = { path: normalizedFsPath(sourcePath), position };
+    const reveal = options.preserveHardwareCursor ? options.sourceReveal || { ...target, opening: true } : undefined;
+    if (reveal?.targets) reveal.targets.push(target);
     this.hardwareSourceReveal = reveal;
     try {
       const existingDocument = workspaceTextDocumentForPath(sourcePath, vscode.workspace.textDocuments);
@@ -2790,11 +2866,14 @@ export class TimelineController {
         range = new vscode.Range(new vscode.Position(startLine, 0), end);
       }
       editor.selection = new vscode.Selection(range ? range.start : position, range ? range.end : position);
-      this.applySourceDecoration(editor, range || line);
+      this.applySourceDecoration(editor, options.sourceLines || range || line, options.appendSourceDecoration);
       editor.revealRange(range || new vscode.Range(position, position), vscode.TextEditorRevealType.InCenter);
       if (reveal) {
-        reveal.position = editor.selection.active;
-        reveal.opening = false;
+        if (reveal.targets) target.position = editor.selection.active;
+        else {
+          reveal.position = editor.selection.active;
+          reveal.opening = false;
+        }
       }
     } catch (error) {
       if (this.hardwareSourceReveal === reveal) this.hardwareSourceReveal = undefined;
@@ -2848,27 +2927,33 @@ export class TimelineController {
     }
   }
 
-  applySourceDecoration(editor, sourceRange) {
-    this.clearSourceDecoration();
+  applySourceDecoration(editor, sourceRange, append = false) {
+    if (!append) this.clearSourceDecoration();
     if (!this.sourceSelectionDecoration || !editor || typeof editor.setDecorations !== "function") {
       return;
     }
-    const range = typeof sourceRange === "number"
-      ? new vscode.Range(sourceRange, 0, sourceRange, Number.MAX_SAFE_INTEGER)
-      : sourceRange;
-    editor.setDecorations(this.sourceSelectionDecoration, [range]);
-    this.activeSourceDecorationEditor = editor;
+    const ranges = (Array.isArray(sourceRange) ? sourceRange : [sourceRange]).map((range) =>
+      typeof range === "number" ? new vscode.Range(range, 0, range, Number.MAX_SAFE_INTEGER) : range);
+    editor.setDecorations(this.sourceSelectionDecoration, ranges);
+    this.activeSourceDecorationEditors.add(editor);
+    this.sourceDecorationsByPath.set(normalizedFsPath(editor.document.uri.fsPath), ranges);
+  }
+
+  restoreSourceDecoration(editor) {
+    const ranges = this.sourceDecorationsByPath.get(normalizedFsPath(editor?.document?.uri?.fsPath));
+    if (!ranges || !this.sourceSelectionDecoration || typeof editor?.setDecorations !== "function") return;
+    editor.setDecorations(this.sourceSelectionDecoration, ranges);
+    this.activeSourceDecorationEditors.add(editor);
   }
 
   clearSourceDecoration() {
-    if (
-      this.sourceSelectionDecoration &&
-      this.activeSourceDecorationEditor &&
-      typeof this.activeSourceDecorationEditor.setDecorations === "function"
-    ) {
-      this.activeSourceDecorationEditor.setDecorations(this.sourceSelectionDecoration, []);
+    for (const editor of this.activeSourceDecorationEditors) {
+      if (this.sourceSelectionDecoration && typeof editor.setDecorations === "function") {
+        editor.setDecorations(this.sourceSelectionDecoration, []);
+      }
     }
-    this.activeSourceDecorationEditor = undefined;
+    this.activeSourceDecorationEditors.clear();
+    this.sourceDecorationsByPath.clear();
   }
 
   followSourceEditor(editor, kind) {
@@ -2878,7 +2963,8 @@ export class TimelineController {
     if (reveal) {
       const manual = kind !== undefined && (kind === vscode.TextEditorSelectionChangeKind?.Keyboard || kind === vscode.TextEditorSelectionChangeKind?.Mouse);
       const position = editor.selection?.active;
-      const sameTarget = normalizedFsPath(editor.document?.uri?.fsPath) === reveal.path && position?.line === reveal.position.line && position?.character === reveal.position.character;
+      const sameTarget = (reveal.targets || [reveal]).some((target) =>
+        normalizedFsPath(editor.document?.uri?.fsPath) === target.path && position?.line === target.position.line && position?.character === target.position.character);
       // showTextDocument and assigning selection can echo after the await returns.
       // Keep the timeline event or hardware value's readable time until the user navigates the source.
       if (!manual && (reveal.opening || sameTarget)) return;

@@ -136,6 +136,36 @@ describe("q1timeline settings bridge", () => {
     assert.equal(q1timelineConfigValue(config({}, pythonDefaults), legacy, "pythonPath", "python", primary), "py-legacy");
     assert.deepEqual(q1timelineConfigValue(config({}, pythonDefaults), legacy, "pythonArgs", [], primary), ["-3.11"]);
   });
+
+  it("honors legacy refresh mode despite registered primary defaults", () => {
+    assert.equal(q1timelineConfigValue(
+      config({}),
+      config({ updateMode: "manual" }, { updateMode: "onSave" }),
+      "updateMode",
+      "onSave",
+      config({}, { "q1timeline.updateMode": "onSave" }),
+    ), "manual");
+  });
+
+  it("honors a qblox project filename despite registered primary defaults", () => {
+    assert.equal(q1timelineConfigValue(
+      config({ "q1timeline.projectFile": "experiment.yml" }, { "q1timeline.projectFile": "q1timeline.yml" }),
+      config({ projectFile: "legacy.yml" }, { projectFile: "q1timeline.yml" }),
+      "projectFile",
+      "q1timeline.yml",
+      config({}, { "q1timeline.projectFile": "q1timeline.yml" }),
+    ), "experiment.yml");
+  });
+
+  it("prefers an explicit primary refresh mode even when it equals the default", () => {
+    assert.equal(q1timelineConfigValue(
+      config({ "q1timeline.updateMode": "onType" }),
+      config({ updateMode: "manual" }),
+      "updateMode",
+      "onSave",
+      config({ "q1timeline.updateMode": "onSave" }, { "q1timeline.updateMode": "onSave" }),
+    ), "onSave");
+  });
 });
 
 describe("shared Python settings", () => {

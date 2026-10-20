@@ -18,11 +18,14 @@ export function q1timelineConfigValue<T>(
       ?? explicitConfigValue<T>(qbloxConfig, key)
       ?? primaryConfig.get(key, qbloxConfig.get(key, fallback));
   }
-  return primaryConfig.get(
-    `q1timeline.${key}`,
-    qbloxConfig.get(
+  return explicitConfigValue<T>(primaryConfig, `q1timeline.${key}`)
+    ?? explicitConfigValue<T>(qbloxConfig, `q1timeline.${key}`)
+    ?? explicitConfigValue<T>(legacyConfig, key)
+    ?? primaryConfig.get(
       `q1timeline.${key}`,
-      legacyConfig.get(key, fallback),
-    ),
-  );
+      qbloxConfig.get(
+        `q1timeline.${key}`,
+        legacyConfig.get(key, fallback),
+      ),
+    );
 }

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 import re
+
+import pytest
 
 from q1timeline.q1asm.instruction_table import INSTRUCTION_TABLE
 from q1timeline.render.html import render_html
@@ -149,19 +152,37 @@ def test_parameters_panel_is_collapsed_between_timeline_and_analysis_details() -
     ]}})
 
     assert '<details id="q1timeline-parameters" class="analysis-parameters">' in html
-    assert '<summary>Parameters · 2 · 1 overridden</summary>' in html
+    assert '<span class="parameters-title">Parameters · 2 · 1 overridden</span>' in html
     assert html.index('id="timeline-root"') < html.index('id="q1timeline-parameters"')
     assert html.index('id="q1timeline-parameters"') < html.index('id="q1timeline-analysis-details"')
     assert '<code>DRIVE_DURATION</code>' in html
-    assert '<tr data-parameter-index="0"><th scope="row"><code>DRIVE_DURATION</code>' in html
-    assert '<tr data-parameter-index="1"><th scope="row"><code>GAIN_I</code>' in html
+    assert '<dl class="parameters-list">' in html
+    assert '<div class="parameter-row" data-parameter-index="0"><dt><code>DRIVE_DURATION</code></dt>' in html
+    assert '<div class="parameter-row" data-parameter-index="1"><dt><code>GAIN_I</code></dt>' in html
+    assert '<dd class="parameter-value"><code>128</code>' in html
     assert '<code>128</code>' in html
     assert '← base 64' in html
     assert '<code>GAIN_I</code>' in html
     assert '<code>10000</code>' in html
     assert html.count('<span class="parameter-override">') == 1
     assert 'not live hardware or register values' in html
-    assert '.parameters-table-scroll { max-height: 240px; overflow: auto; }' in html
+    assert '.parameters-list-scroll { max-height: 240px; overflow: auto; }' in html
+
+
+def test_parameters_panel_has_accessible_search_controls() -> None:
+    html = render_html({"version": "0.1.0", "events": [], "analysis": {"parameters": [
+        {"name": "GAIN_I", "value_json": "10000", "overridden": False},
+    ]}})
+
+    assert re.search(
+        r'<summary>.*<button class="parameters-search-toggle" type="button" aria-label="Search parameters" '
+        r'aria-controls="q1timeline-parameter-search" aria-expanded="false" hidden>.*</button></summary>', html,
+    )
+    assert '<div id="q1timeline-parameter-search" class="parameters-search" hidden>' in html
+    assert re.search(r'<input class="parameters-search-input" type="search"[^>]+aria-label="Search parameters by name">', html)
+    assert '<button class="parameters-search-clear" type="button" aria-label="Clear parameter search">Clear</button>' in html
+    assert '<span class="parameters-search-count" role="status" aria-live="polite"></span>' in html
+    assert '<p class="parameters-empty" hidden>No matching parameters.</p>' in html
 
 
 def test_parameters_panel_preserves_exact_values_and_escapes_html() -> None:
@@ -176,7 +197,7 @@ def test_parameters_panel_preserves_exact_values_and_escapes_html() -> None:
     assert '&quot;&lt;/code&gt;&lt;script&gt;alert(1)&lt;/script&gt;&quot;' in html
     assert '← base &quot;&lt;base&gt;&quot;' in html
     assert '<script>alert(1)</script>' not in html
-    assert '<tr data-parameter-index="0">' in html
+    assert '<div class="parameter-row" data-parameter-index="0">' in html
     assert '<code>9007199254740993</code>' in html
     assert '<code>{&quot;values&quot;: [1, null]}</code>' in html
 
@@ -187,7 +208,7 @@ def test_parameters_panel_marks_added_and_equal_value_overrides() -> None:
         {"name": "SAME", "value_json": "64", "overridden": True, "base_value_json": "64"},
     ]}})
 
-    assert '<summary>Parameters · 2 · 2 overridden</summary>' in html
+    assert '<span class="parameters-title">Parameters · 2 · 2 overridden</span>' in html
     assert 'added for this analysis' in html
     assert '<code>null</code>' in html
     assert '← base 64' in html
@@ -195,7 +216,7 @@ def test_parameters_panel_marks_added_and_equal_value_overrides() -> None:
 
 def test_parameters_panel_distinguishes_empty_snapshot_from_older_ir() -> None:
     html = render_html({"version": "0.1.0", "events": [], "analysis": {"parameters": []}})
-    assert '<summary>Parameters · 0</summary>' in html
+    assert '<span class="parameters-title">Parameters · 0</span>' in html
     assert 'No parameters configured for this analysis.' in html
     assert 'id="q1timeline-parameters"' not in render_html({"version": "0.1.0", "events": []})
 
@@ -266,112 +287,106 @@ def test_branch_region_renders_marker_without_block_in_debug_mode() -> None:
     assert "Show fallthrough path" not in html
 
 
-def test_control_flow_graph_panel_renders_nodes_and_edges() -> None:
-    html = render_html(
-        {
-            "version": "0.1.0",
-            "events": [
-                {
-                    "id": "seq0:e0",
-                    "sequencer_id": "seq0",
-                    "lane": "debug.q1_issue",
-                    "kind": "q1_issue",
-                    "t0": _ns(0),
-                    "t1": _ns(24),
-                    "duration": _ns(24),
-                    "label": "jl",
-                    "confidence": "exact",
-                    "source": {"file": "seq0.q1asm", "line": 2, "column": 1},
-                    "meta": {
-                        "op": "jl",
-                        "branch_id": "seq0:branch:0",
-                        "condition": "jl status flags",
-                        "assumed_branch_path": "taken",
-                    },
+@pytest.mark.parametrize("mode", ["normal", "debug"])
+def test_control_flow_graph_is_retained_without_rendering_a_panel(mode: str) -> None:
+    ir = {
+        "version": "0.1.0",
+        "events": [
+            {
+                "id": "seq0:e0",
+                "sequencer_id": "seq0",
+                "lane": "debug.q1_issue",
+                "kind": "q1_issue",
+                "t0": _ns(0),
+                "t1": _ns(24),
+                "duration": _ns(24),
+                "label": "jl",
+                "confidence": "exact",
+                "source": {"file": "seq0.q1asm", "line": 2, "column": 1},
+                "meta": {
+                    "op": "jl",
+                    "branch_id": "seq0:branch:0",
+                    "condition": "jl status flags",
+                    "assumed_branch_path": "taken",
                 },
-            ],
-            "diagnostics": [],
-            "control_flow_graph": {
-                "sequencers": [
-                    {
-                        "sequencer_id": "seq0",
-                        "nodes": [
-                            {
-                                "id": "seq0:cfg:n0",
-                                "label": "start",
-                                "start_pc": 0,
-                                "end_pc": 1,
-                                "event_ids": ["seq0:e0"],
-                                "source": {"file": "seq0.q1asm", "line": 1, "column": 1},
-                            },
-                            {
-                                "id": "seq0:cfg:n1",
-                                "label": "done",
-                                "start_pc": 2,
-                                "end_pc": 2,
-                                "event_ids": [],
-                                "source": {"file": "seq0.q1asm", "line": 3, "column": 1},
-                            },
-                            {
-                                "id": "seq0:cfg:n2",
-                                "label": "done",
-                                "start_pc": 3,
-                                "end_pc": 3,
-                                "event_ids": [],
-                                "source": {"file": "seq0.q1asm", "line": 4, "column": 1},
-                            },
-                        ],
-                        "edges": [
-                            {
-                                "id": "seq0:cfg:e0",
-                                "from_node_id": "seq0:cfg:n0",
-                                "to_node_id": "seq0:cfg:n2",
-                                "kind": "branch_taken",
-                                "op": "jl",
-                                "label": "jl @done",
-                                "event_ids": ["seq0:e0"],
-                                "source": {"file": "seq0.q1asm", "line": 2, "column": 1},
-                            },
-                            {
-                                "id": "seq0:cfg:e1",
-                                "from_node_id": "seq0:cfg:n0",
-                                "to_node_id": "seq0:cfg:n1",
-                                "kind": "branch_fallthrough",
-                                "op": "jl",
-                                "label": "else",
-                                "event_ids": ["seq0:e0"],
-                                "source": {"file": "seq0.q1asm", "line": 2, "column": 1},
-                            },
-                        ],
-                    }
-                ]
             },
+        ],
+        "diagnostics": [],
+        "control_flow_graph": {
+            "sequencers": [
+                {
+                    "sequencer_id": "seq0",
+                    "nodes": [
+                        {
+                            "id": "seq0:cfg:n0",
+                            "label": "start",
+                            "start_pc": 0,
+                            "end_pc": 1,
+                            "event_ids": ["seq0:e0"],
+                            "source": {"file": "seq0.q1asm", "line": 1, "column": 1},
+                        },
+                        {
+                            "id": "seq0:cfg:n1",
+                            "label": "done",
+                            "start_pc": 2,
+                            "end_pc": 2,
+                            "event_ids": [],
+                            "source": {"file": "seq0.q1asm", "line": 3, "column": 1},
+                        },
+                        {
+                            "id": "seq0:cfg:n2",
+                            "label": "done",
+                            "start_pc": 3,
+                            "end_pc": 3,
+                            "event_ids": [],
+                            "source": {"file": "seq0.q1asm", "line": 4, "column": 1},
+                        },
+                    ],
+                    "edges": [
+                        {
+                            "id": "seq0:cfg:e0",
+                            "from_node_id": "seq0:cfg:n0",
+                            "to_node_id": "seq0:cfg:n2",
+                            "kind": "branch_taken",
+                            "op": "jl",
+                            "label": "jl @done",
+                            "event_ids": ["seq0:e0"],
+                            "source": {"file": "seq0.q1asm", "line": 2, "column": 1},
+                        },
+                        {
+                            "id": "seq0:cfg:e1",
+                            "from_node_id": "seq0:cfg:n0",
+                            "to_node_id": "seq0:cfg:n1",
+                            "kind": "branch_fallthrough",
+                            "op": "jl",
+                            "label": "else",
+                            "event_ids": ["seq0:e0"],
+                            "source": {"file": "seq0.q1asm", "line": 2, "column": 1},
+                        },
+                    ],
+                }
+            ]
         },
-        default_mode="debug",
-    )
+    }
+    html = render_html(ir, default_mode=mode)
 
-    assert 'class="control-flow-graph"' in html
-    assert "Control-flow graph" in html
-    assert '<svg class="cfg-graph"' in html
-    assert '<g class="cfg-graph-node" data-cfg-node-id="seq0:cfg:n0"' in html
-    assert '<path class="cfg-graph-edge cfg-edge-branch_taken" data-cfg-edge-id="seq0:cfg:e0"' in html
-    assert 'marker-end="url(#cfg-arrow)"' in html
-    assert 'data-cfg-event-ids="seq0:e0"' in html
-    assert 'data-cfg-node-id="seq0:cfg:n0"' in html
-    assert 'data-cfg-edge-id="seq0:cfg:e0"' in html
-    assert 'class="cfg-branch-map"' in html
-    assert 'data-cfg-edge-id="seq0:cfg:e1"' in html
-    assert "Branch map" in html
-    assert "Condition true" in html
-    assert "Condition false" in html
-    assert "shown path" in html
-    assert "jl status flags" in html
-    assert "function selectCfgElement" in html
-    assert "highlightRelatedCfgElementsForEvent" in html
-    assert "start" in html
-    assert "done" in html
-    assert "branch taken" in html
-    assert "jl @done" in html
+    for removed_ui in (
+        'class="control-flow-graph"',
+        "Control-flow graph",
+        "Branch map",
+        "<h3>Blocks</h3>",
+        "<h3>Edges</h3>",
+        'class="cfg-graph"',
+        "data-cfg-",
+    ):
+        assert removed_ui not in html
+
+    embedded_json = re.search(r'<script id="timeline-ir" type="application/json">(.*?)</script>', html, re.DOTALL)
+    assert embedded_json is not None
+    embedded_ir = json.loads(embedded_json[1])
+    assert embedded_ir["control_flow_graph"] == ir["control_flow_graph"]
+    assert embedded_ir["events"][0] == ir["events"][0]
+    assert "function renderBranchActions" in html
 
 
 def test_normal_mode_collapses_feedback_instruction_blocks_behind_flow_overlay() -> None:

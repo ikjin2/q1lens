@@ -127,12 +127,21 @@ function createContext(storedProjectFile?: string) {
   };
 }
 
+function resolvedPython(resource, pythonPath = "python", pythonArgs = []) {
+  return { pythonPath, pythonArgs, source: "vscode", sourceLabel: "VS Code selection", resource };
+}
+
 async function withMockedVscode(vscode: any, callback: (controllerModule: any) => Promise<void>) {
   const originalLoad = Module._load;
   Module._load = function patchedLoad(request: string, parent: any, isMain: boolean) {
     if (request === "vscode") {
       return vscode;
     }
+    if (request === "../fileEnvironment") {
+      return { ensureFilePythonEnvironment: vscode.resolveFileEnvironment ||
+        (async (_api, resource) => resolvedPython(resource)) };
+    }
+    if (request === "./playbackClient" && vscode.PlaybackClient) return { PlaybackClient: vscode.PlaybackClient };
     return originalLoad.call(this, request, parent, isMain);
   };
   const modulePath = require.resolve("../../src/q1timeline/controller");
@@ -206,8 +215,8 @@ function loopSourceNavigation(vscode: any, TimelineController: any, lines: strin
   return {
     controller, editor, document, sourcePath, posted, decorated, revealed,
     source: (line: number, extra: any = {}) => ({ file: sourcePath, line, column: 1, ...extra }),
-    selectionEvent: (kind?: number) => selectionHandler({ textEditor: editor, kind }),
-    activeEvent: () => activeHandler(editor),
+    selectionEvent: (kind?: number, target = editor) => selectionHandler({ textEditor: target, kind }),
+    activeEvent: (target = editor) => activeHandler(target),
   };
 }
 
@@ -242,6 +251,168 @@ async function withFakeTimers(callback: (clock: any) => Promise<void>) {
 }
 
 describe("q1timeline controller", () => {
+  function fileEnvironmentController(TimelineController, vscode) {
+    const controller = new TimelineController(createContext());
+    const outputDir = mkdtempSync(join(tmpdir(), "q1-python-selection-"));
+    const calls = [];
+    controller.projectUri = vscode.Uri.file(join(outputDir, "q1timeline.yml"));
+    controller.outputDir = outputDir;
+    controller.panel = vscode.window.createWebviewPanel();
+    controller.panel.webview.postMessage = () => {};
+    controller.refreshWebview = async () => true;
+    controller.execFile = async (pythonPath, args, _timeout, cwd, env, stage) => {
+      calls.push({ pythonPath, args, stage, cwd, env });
+      writeFileSync(args[args.indexOf("--out") + 1], stage === "analyzer"
+        ? JSON.stringify({ events: [] }) : "<html><body></body></html>");
+      return { stdout: JSON.stringify({ schema_version: "0.2.0", status: "ok" }), stderr: "", exitCode: 0, elapsedMs: 1 };
+    };
+    return { controller, calls };
+  }
+
+  it("uses the original file's selected Python for analysis and rendering, scoped to its workspace", async () => {
+    const vscode = createMockVscode();
+    const resolutions = [];
+    const scopes = [];
+    const selectedPython = join(tmpdir(), "project with spaces", ".venv", "bin", "python");
+    vscode.resolveFileEnvironment = async (_api, resource, kind) => {
+      resolutions.push({ resource, kind });
+      return resolvedPython(resource, selectedPython);
+    };
+    vscode.workspace.getConfiguration = (_name, resource) => {
+      scopes.push(resource);
+      return { get: (key, fallback) => key === "pythonPath" ? "wrong-system-python" : fallback };
+    };
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const { controller, calls } = fileEnvironmentController(TimelineController, vscode);
+      controller.singleFileUri = vscode.Uri.file(join(tmpdir(), "original-project", "seq0.q1asm"));
+      vscode.window.activeTextEditor = { document: { uri: vscode.Uri.file(join(tmpdir(), "other-project", "main.py")) } };
+      await controller.runAnalysis();
+      assert.deepEqual(resolutions, [{ resource: controller.singleFileUri, kind: "q1asm" }]);
+      assert.ok(scopes.every((resource) => resource === controller.singleFileUri));
+      assert.deepEqual(calls.map(({ pythonPath, stage }) => ({ pythonPath, stage })), [
+        { pythonPath: selectedPython, stage: "analyzer" }, { pythonPath: selectedPython, stage: "renderer" },
+      ]);
+      controller.dispose();
+    });
+  });
+
+  it("keeps view changes and playback on the analyzed Python, then re-resolves the original project on Refresh", async () => {
+    const vscode = createMockVscode();
+    const resolutions = [];
+    const playbackStarts = [];
+    let selectedPython = join(tmpdir(), "first", ".venv", "bin", "python");
+    const firstPython = selectedPython;
+    vscode.resolveFileEnvironment = async (_api, resource) => {
+      resolutions.push(resource);
+      return resolvedPython(resource, selectedPython, ["-X", "utf8"]);
+    };
+    vscode.PlaybackClient = class {
+      constructor(command, args) { playbackStarts.push({ command, args }); }
+      async request(message) {
+        const playback = { status: "completed", can_resume: false, steps: 1 };
+        return message.command === "snapshot" ? { ir: { events: [], playback } } : { playback };
+      }
+      dispose() {}
+    };
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const { controller, calls } = fileEnvironmentController(TimelineController, vscode);
+      const originalProject = controller.projectUri;
+      await controller.runAnalysis();
+      selectedPython = join(tmpdir(), "second", ".venv", "bin", "python");
+      vscode.window.activeTextEditor = { document: { uri: vscode.Uri.file(join(tmpdir(), "unrelated", "main.py")) } };
+      await controller.setViewMode("normal");
+      await controller.runPlayback();
+      assert.deepEqual(resolutions, [originalProject]);
+      assert.ok(calls.every((call) => call.pythonPath === firstPython));
+      assert.ok(calls.every((call) => call.args[0] === "-X" && call.args[1] === "utf8"));
+      assert.equal(playbackStarts[0].command, firstPython);
+      assert.deepEqual(playbackStarts[0].args.slice(0, 2), ["-X", "utf8"]);
+      assert.equal(calls.filter((call) => call.stage === "renderer").length, 3);
+      await controller.refreshPreview();
+      assert.deepEqual(resolutions, [originalProject, originalProject]);
+      assert.deepEqual(calls.slice(-2).map((call) => call.pythonPath), [selectedPython, selectedPython]);
+      controller.dispose();
+    });
+  });
+
+  it("does not fall back to configured or cached Python when environment setup is cancelled", async () => {
+    const vscode = createMockVscode();
+    let available = true;
+    vscode.resolveFileEnvironment = async (_api, resource) => available ? resolvedPython(resource, "previous-python") : undefined;
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const { controller, calls } = fileEnvironmentController(TimelineController, vscode);
+      await controller.runAnalysis();
+      available = false;
+      calls.length = 0;
+      await controller.refreshPreview();
+      assert.equal(controller.analysisInFlight, false);
+      assert.equal(controller.analysisStatus.status, "error");
+      assert.equal(controller.pythonEnvironment, undefined);
+      assert.deepEqual(calls, []);
+      controller.createPlaybackClient = () => assert.fail("No playback process may start without a resolved environment");
+      await controller.runPlayback();
+      assert.equal(controller.executionState.status, "blocked");
+      await controller.setViewMode("normal");
+      assert.deepEqual(calls, []);
+      controller.dispose();
+    });
+  });
+
+  it("checks relative manual launchers with the same working directory and environment as analysis and playback", async () => {
+    const vscode = createMockVscode();
+    const checks = [];
+    const playbackStarts = [];
+    vscode.resolveFileEnvironment = async (_api, resource, _kind, _output, options) => {
+      checks.push(options);
+      return resolvedPython(resource, "./.venv/bin/python");
+    };
+    vscode.PlaybackClient = class {
+      constructor(_command, _args, options) { playbackStarts.push(options); }
+      async request(message) {
+        const playback = { status: "completed", can_resume: false, steps: 1 };
+        return message.command === "snapshot" ? { ir: { events: [], playback } } : { playback };
+      }
+      dispose() {}
+    };
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const { controller, calls } = fileEnvironmentController(TimelineController, vscode);
+      const env = { PYTHONPATH: "project-modules" };
+      controller.config = () => ({ get: (key, fallback) => key === "analyzer.env" ? env : fallback });
+      const cwd = controller.projectRootCwd();
+      await controller.runPlayback();
+      assert.deepEqual(checks, [{ cwd, env }]);
+      assert.equal(playbackStarts[0].cwd, cwd);
+      assert.equal(playbackStarts[0].env.PYTHONPATH, env.PYTHONPATH);
+      await controller.runAnalysis();
+      assert.deepEqual(checks, [{ cwd, env }, { cwd, env }]);
+      assert.ok(calls.every((call) => call.cwd === cwd && call.env.PYTHONPATH === env.PYTHONPATH));
+      controller.dispose();
+    });
+  });
+
+  it("drops a Python selection that completes after the analysis project has changed", async () => {
+    const vscode = createMockVscode();
+    let release;
+    let started;
+    const resolving = new Promise((resolve) => { started = resolve; });
+    vscode.resolveFileEnvironment = (_api, resource) => new Promise((resolve) => {
+      release = () => resolve(resolvedPython(resource, "old-project-python"));
+      started();
+    });
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const { controller, calls } = fileEnvironmentController(TimelineController, vscode);
+      const analysis = controller.runAnalysis();
+      await resolving;
+      controller.setProjectUri(vscode.Uri.file(join(tmpdir(), "new-project", "q1timeline.yml")));
+      release();
+      await analysis;
+      assert.deepEqual(calls, []);
+      assert.equal(controller.pythonEnvironment, undefined);
+      assert.equal(controller.analysisInFlight, false);
+      controller.dispose();
+    });
+  });
+
   function playbackController(TimelineController, vscode, request) {
     const controller = new TimelineController(createContext());
     const posted = [];
@@ -251,6 +422,7 @@ describe("q1timeline controller", () => {
     const client = { request: async (message) => { calls.push(message); return request(message); }, dispose: () => disposed++ };
     controller.projectUri = vscode.Uri.file("C:\\repo\\q1timeline.yml");
     controller.outputDir = "C:\\repo\\.q1timeline";
+    controller.pythonEnvironment = resolvedPython(controller.projectUri);
     controller.panel = { webview: { postMessage: (message) => posted.push(message) }, dispose() {} };
     controller.createPlaybackClient = () => client;
     controller.publishPlaybackSnapshot = async (ir) => { controller.timelineIr = ir; published.push(ir); };
@@ -436,6 +608,7 @@ describe("q1timeline controller", () => {
       const outputDir = mkdtempSync(join(tmpdir(), "q1lens-playback-render-"));
       controller.projectUri = vscode.Uri.file(join(outputDir, "q1timeline.yml"));
       controller.outputDir = outputDir;
+      controller.pythonEnvironment = resolvedPython(controller.projectUri);
       controller.panel = { webview: { postMessage() {} }, dispose() {} };
       const client = { dispose() {} };
       controller.playbackClient = client;
@@ -3123,6 +3296,166 @@ describe("q1timeline controller", () => {
     }));
   });
 
+  it("opens each feedback marker's endpoint and ignores unknown or malformed flows", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const setup = loopSourceNavigation(vscode, TimelineController, ["wait 4", "fb_com_data 1", "wait 4", "fb_pop_data R0"]);
+      const { controller, source, editor, decorated, posted } = setup;
+      controller.timelineIr = {
+        events: [{ id: "send", source: source(2, { column: 3 }) }, { id: "receive", source: source(4, { column: 5 }) }],
+        feedback_flows: [{ id: "flow", from_event_id: "send", to_event_id: "receive" }],
+      };
+      for (const [role, line, column] of [["source", 1, 2], ["target", 3, 4]]) {
+        await controller.handleWebviewMessage({ type: "feedbackFlowClick", flowId: "flow", role });
+        assert.deepEqual([editor.selection.active.line, editor.selection.active.character], [line, column]);
+        assert.deepEqual(decorated.at(-1).map((range) => range.start.line), [line]);
+      }
+      const decorationCount = decorated.length;
+      await controller.handleWebviewMessage({ type: "feedbackFlowClick", flowId: "missing" });
+      await controller.handleWebviewMessage({ type: "feedbackFlowClick", flowId: "flow", role: "both" });
+      assert.equal(decorated.length, decorationCount);
+      assert.deepEqual(posted, []);
+      controller.dispose();
+    });
+  });
+
+  it("highlights both discrete feedback lines in one file and clears them on an ordinary block jump", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const setup = loopSourceNavigation(vscode, TimelineController, ["wait 4", "fb_com_data 1", "wait 4", "fb_pop_data R0"]);
+      const { controller, source, sourcePath, editor, decorated, posted } = setup;
+      let shown = 0;
+      const showTextDocument = vscode.window.showTextDocument;
+      vscode.window.showTextDocument = async (...args) => { shown += 1; return showTextDocument(...args); };
+      controller.timelineIr = {
+        source_map: { by_event_id: { send: source(2) }, by_source: { [`${sourcePath}:2`]: ["send"], [`${sourcePath}:4`]: ["receive"] } },
+        events: [{ id: "send", source: source(1) }, { id: "receive", source: source(4) }],
+        feedback_flows: [{ from_event_id: "send", to_event_id: "receive" }],
+      };
+      await controller.handleWebviewMessage({ type: "feedbackFlowClick", flowId: "send->receive" });
+      assert.equal(shown, 1, "one file should be opened only once");
+      assert.deepEqual(decorated.at(-1).map((range) => [range.start.line, range.end.line]), [[1, 1], [3, 3]]);
+      assert.equal(editor.selection.isEmpty, true, "feedback navigation should not select the intervening source range");
+      setup.activeEvent();
+      setup.selectionEvent(vscode.TextEditorSelectionChangeKind.Command);
+      setup.selectionEvent();
+      assert.deepEqual(posted, [], "source reveal echoes must retain the feedback selection and hardware cursor");
+      setup.selectionEvent(vscode.TextEditorSelectionChangeKind.Mouse);
+      assert.deepEqual(posted.pop(), { type: "highlightEventIds", highlightEventIds: ["send"] });
+
+      await controller.openSourceForEvent("receive");
+      assert.deepEqual(decorated.at(-2), []);
+      assert.deepEqual(decorated.at(-1).map((range) => range.start.line), [3]);
+      controller.timelineIr.source_map.by_event_id.receive = source(2, { column: 5 });
+      await controller.handleWebviewMessage({ type: "feedbackFlowClick", flowId: "send->receive" });
+      assert.deepEqual(decorated.at(-1).map((range) => range.start.line), [1], "same-line endpoints should share one highlight");
+      controller.dispose();
+    });
+  });
+
+  it("keeps feedback highlights in both visible source editors and suppresses delayed echoes from either file", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const setup = loopSourceNavigation(vscode, TimelineController, ["wait 4", "fb_com_data 1"]);
+      const { controller, source, sourcePath, editor, decorated, posted } = setup;
+      const receiverPath = "C:\\repo\\q1asm\\seq1.q1asm";
+      const receiverDocument = { uri: vscode.Uri.file(receiverPath) };
+      const receiverDecorations: any[] = [];
+      let receiverSelection = sourceSelection(0, 0);
+      const receiver = {
+        document: receiverDocument, viewColumn: 3, revealRange() {},
+        setDecorations(_type, ranges) { receiverDecorations.push(ranges); },
+        get selection() { return receiverSelection; },
+        set selection(value) { receiverSelection = value; setup.selectionEvent(3, receiver); },
+      };
+      const shown: any[] = [];
+      vscode.workspace.textDocuments.push(receiverDocument);
+      vscode.window.visibleTextEditors.push(receiver);
+      vscode.window.showTextDocument = async (document, options) => {
+        const target = document === receiverDocument ? receiver : editor;
+        shown.push([document.uri.fsPath, options.viewColumn]);
+        setup.activeEvent(target);
+        return target;
+      };
+      controller.projectRelatedPaths.add(receiverPath);
+      controller.timelineIr = {
+        source_map: {},
+        events: [{ id: "send", source: source(2) }, { id: "receive", source: { file: receiverPath, line: 4, column: 3 } }],
+        feedback_flows: [{ id: "flow", from_event_id: "send", to_event_id: "receive" }],
+      };
+      await controller.handleWebviewMessage({ type: "feedbackFlowClick", flowId: "flow" });
+      assert.deepEqual(shown, [[sourcePath, 1], [receiverPath, 3]]);
+      assert.deepEqual(decorated.at(-1).map((range) => range.start.line), [1]);
+      assert.deepEqual(receiverDecorations.at(-1).map((range) => range.start.line), [3]);
+      for (const target of [editor, receiver]) {
+        setup.activeEvent(target);
+        setup.selectionEvent(vscode.TextEditorSelectionChangeKind.Command, target);
+        setup.selectionEvent(undefined, target);
+      }
+      assert.deepEqual(posted, [], "neither file's reveal may move the hardware cursor or timeline selection");
+      setup.selectionEvent(vscode.TextEditorSelectionChangeKind.Mouse, receiver);
+      assert.deepEqual(posted.pop(), { type: "highlightEventIds", highlightEventIds: ["receive"] });
+      await controller.openSourceForEvent("send");
+      assert.deepEqual(receiverDecorations.at(-1), [], "ordinary block navigation must clear the other file too");
+      assert.deepEqual(decorated.at(-1).map((range) => range.start.line), [1]);
+      await controller.handleWebviewMessage({ type: "feedbackFlowClick", flowId: "flow" });
+      controller.dispose();
+      assert.deepEqual(decorated.at(-1), []);
+      assert.deepEqual(receiverDecorations.at(-1), []);
+    });
+  });
+
+  it("restores feedback highlights when same-group tabs create new editor instances", async () => {
+    const vscode = createMockVscode();
+    let visibleHandler: any;
+    vscode.window.onDidChangeVisibleTextEditors = (handler) => { visibleHandler = handler; return { dispose() {} }; };
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const setup = loopSourceNavigation(vscode, TimelineController, ["wait 4", "fb_com_data 1"]);
+      const { controller, source, sourcePath, editor, posted } = setup;
+      const receiverPath = "C:\\repo\\q1asm\\seq1.q1asm";
+      const receiverDocument = { uri: vscode.Uri.file(receiverPath) };
+      let selection = sourceSelection(0, 0);
+      const receiver = {
+        document: receiverDocument, viewColumn: 1, setDecorations() {}, revealRange() {},
+        get selection() { return selection; },
+        set selection(value) { selection = value; setup.selectionEvent(3, receiver); },
+      };
+      vscode.workspace.textDocuments.push(receiverDocument);
+      vscode.window.tabGroups.all = [{ viewColumn: 1, tabs: [sourcePath, receiverPath].map((file) => ({ input: { uri: vscode.Uri.file(file) } })) }];
+      vscode.window.showTextDocument = async (document, options) => {
+        assert.equal(options.viewColumn, 1, "both tabs must keep their existing editor group");
+        const target = document === receiverDocument ? receiver : editor;
+        vscode.window.visibleTextEditors = [target];
+        visibleHandler([target]);
+        setup.activeEvent(target);
+        return target;
+      };
+      controller.timelineIr = {
+        source_map: {},
+        events: [{ id: "send", source: source(2) }, { id: "receive", source: { file: receiverPath, line: 4 } }],
+        feedback_flows: [{ id: "flow", from_event_id: "send", to_event_id: "receive" }],
+      };
+      await controller.handleWebviewMessage({ type: "feedbackFlowClick", flowId: "flow" });
+      const restored: any[] = [];
+      const reopened = {
+        document: setup.document, viewColumn: 1, selection: editor.selection,
+        setDecorations(_type, ranges) { restored.push(ranges); },
+      };
+      vscode.window.visibleTextEditors = [reopened];
+      visibleHandler([reopened]);
+      setup.activeEvent(reopened);
+      assert.deepEqual(restored.at(-1).map((range) => range.start.line), [1], "a new TextEditor must recover the hidden sender's highlight");
+      assert.deepEqual(posted, [], "reopening a highlighted tab must preserve feedback selection");
+      await controller.openSourceForEvent("receive");
+      assert.deepEqual(restored.at(-1), []);
+      const restoredCount = restored.length;
+      visibleHandler([reopened]);
+      setup.activeEvent(reopened);
+      assert.equal(restored.length, restoredCount, "an ordinary block jump must also clear saved hidden-tab highlights");
+      controller.dispose();
+    });
+  });
+
   it("preserves an RT click through source reveal echoes and resumes manual source-follow", async () => {
     const vscode = createMockVscode();
     vscode.TextEditorSelectionChangeKind = { Keyboard: 1, Mouse: 2, Command: 3 };
@@ -3252,7 +3585,7 @@ describe("q1timeline controller", () => {
       controller.dispose();
     });
   });
-  it("offers a Python environment check with a retry when the analyzer is missing", async () => {
+  it("offers a source-scoped Python environment check with a retry when the analyzer is missing", async () => {
     const vscode = createMockVscode();
     const calls: any[] = [];
     vscode.commands.executeCommand = async (...args: any[]) => calls.push(args);
@@ -3263,8 +3596,11 @@ describe("q1timeline controller", () => {
     };
     await withMockedVscode(vscode, async ({ TimelineController }) => {
       const controller = new TimelineController(createContext());
+      const sourceUri = vscode.Uri.file("C:\\repo\\seq0.q1asm");
+      controller.singleFileUri = sourceUri;
+      controller.projectUri = vscode.Uri.file("C:\\repo\\q1timeline.yml");
       await controller.showAnalyzerMissingMessage(new Error("No module named q1lens"));
-      assert.deepEqual(calls, [["q1lens.checkEnvironment", "q1timeline.refreshPreview"]]);
+      assert.deepEqual(calls, [["q1lens.checkEnvironment", "q1timeline.refreshPreview", sourceUri]]);
       controller.dispose();
     });
   });

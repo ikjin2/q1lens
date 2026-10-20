@@ -5,8 +5,10 @@ import { parseProjectConfigLite } from "./qbs/projectDiscovery";
 import { registerSidebar } from "./qbs/sidebar";
 import { registerQ1Timeline } from "./q1timeline/register";
 import { registerEnvironmentCommands } from "./environment";
+import { registerPythonEnvironmentStatus } from "./pythonEnvironmentStatus";
 
 export function activate(context: vscode.ExtensionContext): void {
+  registerPythonEnvironmentStatus(context);
   registerEnvironmentCommands(context);
   const q1timeline = registerQ1Timeline(context);
   registerCommands(context, { openQ1TimelineTarget: q1timeline.openTarget });
@@ -18,12 +20,12 @@ export function activate(context: vscode.ExtensionContext): void {
         const uris = await vscode.workspace.findFiles("**/qbstimeline.y{ml,aml}", "**/.qbs_timeline/**");
         return Promise.all(
           uris.map(async (uri) => {
-            const project = vscode.workspace.asRelativePath(uri);
+            const project = vscode.workspace.asRelativePath(uri, false);
             try {
               const bytes = await vscode.workspace.fs.readFile(uri);
-              return { project, outputDir: parseProjectConfigLite(Buffer.from(bytes).toString("utf8")).outputDir };
+              return { project, resource: uri, outputDir: parseProjectConfigLite(Buffer.from(bytes).toString("utf8")).outputDir };
             } catch {
-              return { project, outputDir: ".qbs_timeline" };
+              return { project, resource: uri, outputDir: ".qbs_timeline" };
             }
           }),
         );

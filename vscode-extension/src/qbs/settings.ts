@@ -11,11 +11,11 @@ export interface QbsTimelineSettings {
   q1timelineCommand: string | null;
 }
 
-export function readSettings(): QbsTimelineSettings {
+export function readSettings(resource?: vscodeTypes.Uri): QbsTimelineSettings {
   const vscode = require("vscode") as typeof vscodeTypes;
-  const q1lensConfig = vscode.workspace.getConfiguration("q1lens");
-  const qbloxConfig = vscode.workspace.getConfiguration("qbloxTimeline");
-  const qbsConfig = vscode.workspace.getConfiguration("qbsTimeline");
+  const q1lensConfig = vscode.workspace.getConfiguration("q1lens", resource);
+  const qbloxConfig = vscode.workspace.getConfiguration("qbloxTimeline", resource);
+  const qbsConfig = vscode.workspace.getConfiguration("qbsTimeline", resource);
   const settings = {
     q1lens: {
       revealOutputChannel: q1lensConfig.get<boolean | undefined>("revealOutputChannel"),

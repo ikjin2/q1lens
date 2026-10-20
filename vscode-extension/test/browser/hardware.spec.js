@@ -3,6 +3,39 @@ const { createHash } = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 
+test("removed comparison events do not create hardware state or move its cursor", async ({ page }) => {
+  const source = { file: "seq.q1asm", line: 1, raw: "upd_param 4" };
+  const event = (id, kind, t0, t1, meta) => ({
+    id, kind, t0, t1, sequencer_id: "seq", source, meta,
+    lane: kind === "q1_issue" ? "q1.issue" : "rt.control",
+  });
+  await page.route("**/ir/01-digital.json", (route) => route.fulfill({ json: {
+    sequencers: [{ id: "seq", module: "QCM0" }], register_history: [],
+    execution: { seq: { mode: "concrete", status: "completed" } },
+    events: [
+      event("current-issue", "q1_issue", 0, 4, { execution_index: 0 }),
+      event("current-rt", "upd_param", 0, 4, { rt_packet_id: "current", applied_state: { frequency: 120 } }),
+      event("current-stop", "stop", 8, 8, {}),
+      event("removed-issue", "q1_issue", 200, 204, { execution_index: 0, diff_status: "removed" }),
+      event("removed-acquire", "acquire", 200, 204, {
+        diff_status: "removed", rt_packet_id: "old", acquisition_index: 0, bin_index: 0,
+        applied_state: { frequency: 700 },
+      }),
+      { ...event("removed-sequencer", "q1_issue", 300, 304, { diff_status: "removed" }), sequencer_id: "deleted" },
+    ],
+  } }));
+  await page.goto("/?case=01-digital");
+  await expect(page.locator("[data-module-card]")).toHaveCount(1);
+  await page.getByRole("button", { name: "Open QCM0: 1 sequencer", exact: true }).click();
+  await page.getByRole("button", { name: "Inspect sequencer seq", exact: true }).click();
+  await at(page, 4);
+  await page.evaluate(() => window.hardwarePreview.selectEvent("removed-acquire"));
+  await expect(page.getByRole("spinbutton")).toHaveValue("4");
+  await page.getByRole("button", { name: "Execution replay", exact: true }).click();
+  await expect(page.locator('[data-action="replay-run"]')).toBeVisible();
+  await expect(value(page, "replay-progress")).toHaveText("1 / 1 instructions");
+});
+
 test("missing signal samples leave chart gaps and real zero samples remain visible", async ({ page }) => {
   await page.route("**/ir/01-digital.json", (route) => route.fulfill({ json: {
     sequencers: [{ id: "seq", module: "QCM0" }],

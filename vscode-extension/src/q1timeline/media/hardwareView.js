@@ -76,7 +76,7 @@
         ? { min: Math.min(...steps.map((times) => times[0])), max: Math.max(...steps.map((times) => times[times.length - 1])) }
         : { min: 0, max: 0 };
     }
-    const events = new Map((ir.events || []).map((event) => [String(event.id), event]));
+    const events = index.eventsById;
     const initial = options.initialState || {};
     const state = {
       sequencerId: sequencers.some((seq) => seq.id === initial.sequencerId) ? initial.sequencerId : sequencers[0] && sequencers[0].id,

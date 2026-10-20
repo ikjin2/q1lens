@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.3
+
+- Select and check Python environments for Q1ASM files, schedules, and notebook kernels, with guided setup and version-matched installation commands.
+- Keep analysis, refresh, and playback attached to the selected file or notebook environment.
+- Preserve source highlights across editor changes and navigate feedback endpoints and compared branch diagnostics to the correct event.
+- Improve analysis parameter layout and search, and label applied settings with their RT instructions.
+- Unify source and timeline instruction colors, link Q1 packet issuance to RT execution, and improve folded-loop source navigation.
+- Exclude removed comparison events from the Hardware view and retain synchronization instructions in the Q1 lane.
+- Remove Branch map, Blocks, Edges, and the CFG diagram from the UI while retaining internal graph data and branch controls.
+- Simplify documentation and expand environment, browser, and extension regression coverage.
+- Pair with Python package 0.2.3.
+
 ## 0.2.2
 
 - Add bounded Run playback with automatic branch choices and editable feedback value and arrival-time assumptions.

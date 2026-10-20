@@ -275,7 +275,7 @@
   }
 
   function createIndex(ir) {
-    const events = Array.isArray(ir.events) ? ir.events : [];
+    const events = (Array.isArray(ir.events) ? ir.events : []).filter((event) => (event.meta || {}).diff_status !== "removed");
     const history = Array.isArray(ir.register_history) ? ir.register_history : [];
     const sequencers = new Map((ir.sequencers || []).map((item) => [String(item.id), { ...item, id: String(item.id) }]));
     const eventsBySequencer = new Map();

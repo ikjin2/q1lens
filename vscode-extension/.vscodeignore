@@ -14,3 +14,9 @@ scripts/**
 tsconfig.json
 playwright.config.js
 out/src/environment.js
+out/src/notebookEnvironment.js
+out/src/notebookInstallCommand.js
+out/src/notebookSetupHtml.js
+out/src/pythonEnvironment.js
+out/src/pythonEnvironmentStatus.js
+out/src/fileEnvironment.js

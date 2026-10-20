@@ -2,7 +2,7 @@
   "name": "q1lens",
   "displayName": "Q1Lens",
   "description": "Inspect Qblox schedules, symbolic pulses, Q1ASM timelines, and lowering provenance inside VS Code.",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "publisher": "q1lens",
   "author": {
     "name": "Ik Kyeong Jin",
@@ -27,6 +27,7 @@
     "Other"
   ],
   "activationEvents": [
+    "onCommand:q1lens.showPythonEnvironment",
     "onCommand:q1lens.checkEnvironment",
     "onCommand:q1lens.selectPythonEnvironment",
     "onCommand:q1timeline.setAnalysisParameter",
@@ -56,6 +57,11 @@
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
+      {
+        "command": "q1lens.showPythonEnvironment",
+        "title": "Show Python Environment",
+        "category": "Q1Lens"
+      },
       {
         "command": "q1lens.checkEnvironment",
         "title": "Check Python Environment",
@@ -270,10 +276,21 @@
     "configuration": {
       "title": "Q1Lens",
       "properties": {
+        "q1lens.pythonEnvironment": {
+          "type": "string",
+          "enum": ["auto", "vscode"],
+          "default": "auto",
+          "enumDescriptions": [
+            "Preserve explicitly configured Q1Lens launchers; otherwise follow VS Code's selected Python.",
+            "Follow VS Code's selected Python for files, keeping saved Q1Lens launcher settings for later use."
+          ],
+          "scope": "resource",
+          "description": "How file analysis selects Python. Notebook analysis always follows its kernel."
+        },
         "q1lens.pythonPath": {
           "type": "string",
           "default": "python",
-          "description": "Python executable used by Q1Lens, including integrated Q1ASM timeline workflows."
+          "description": "Optional manual Python executable for file analysis. When not explicitly set, Q1Lens uses the VS Code Python selection for the analysis target. Notebook analysis follows its kernel."
         },
         "q1lens.pythonArgs": {
           "type": "array",
@@ -281,7 +298,7 @@
           "items": {
             "type": "string"
           },
-          "description": "Additional Python launcher arguments inserted before Q1Lens module names."
+          "description": "Manual Python launcher arguments inserted before Q1Lens module names (for example run, python with a uv executable). Nonempty arguments preserve the manual launcher instead of using automatic interpreter selection."
         },
         "q1lens.qbs.autoRefresh": {
           "type": "boolean",
@@ -317,7 +334,7 @@
         "q1lens.q1timeline.pythonPath": {
           "type": "string",
           "default": "python",
-          "description": "Optional Python executable override for standalone Q1ASM timeline analysis."
+          "description": "Manual Python executable override for standalone Q1ASM analysis. Otherwise uses a shared manual Python setting, or the target project's VS Code Python selection."
         },
         "q1lens.q1timeline.pythonArgs": {
           "type": "array",
@@ -570,7 +587,7 @@
     "test:extension": "npm run compile && npm run bundle && node ./out/test/runTest.js",
     "package": "vsce package",
     "verify:installed": "node ./scripts/verify-installed-assets.js",
-    "reinstall:local": "npm run package && code --install-extension q1lens-0.2.2.vsix --force && npm run verify:installed",
+    "reinstall:local": "npm run package && code --install-extension q1lens-0.2.3.vsix --force && npm run verify:installed",
     "test:browser": "playwright test"
   },
   "dependencies": {

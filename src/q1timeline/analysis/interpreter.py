@@ -3003,6 +3003,7 @@ def _explore_conditional_branch_both_paths(
                 path_state.diagnostics[snapshot_diagnostic_count:],
                 branch_id=branch_id,
                 path=path,
+                path_event_ids=path_event_ids,
             )
         )
     state.rt_packets.extend(comparison_packets)
@@ -3106,6 +3107,7 @@ def _branch_comparison_diagnostics(
     *,
     branch_id: str,
     path: str,
+    path_event_ids: set[str],
 ) -> list[Diagnostic]:
     transformed: list[Diagnostic] = []
     for diagnostic in diagnostics:
@@ -3118,7 +3120,10 @@ def _branch_comparison_diagnostics(
                 category=diagnostic.category,
                 message=f"{path}: {diagnostic.message}",
                 source=diagnostic.source,
-                related_events=list(diagnostic.related_events),
+                related_events=[
+                    f"{event_id}:branch-{path}" if event_id in path_event_ids else event_id
+                    for event_id in diagnostic.related_events
+                ],
                 details=details,
             )
         )

@@ -185,9 +185,11 @@
   }
 
   function selectEventNode(eventNode, options = {}) {
-    if (!isTimelineEventVisible(eventNode)) {
+    if (eventNode && !isTimelineEventVisible(eventNode)) {
       return;
     }
+    const eventId = options.eventId || eventNode?.dataset.eventId;
+    if (!eventId) return;
     if (selectedSourceEventIds.size) {
       timelineSelectionRange = undefined;
       document.querySelectorAll(".shared-timeline-stage .time-selection").forEach((node) => node.remove());
@@ -196,13 +198,14 @@
       node.classList.remove("is-selected");
       node.setAttribute("aria-selected", "false");
     });
-    eventNode.classList.add("is-selected");
-    eventNode.setAttribute("aria-selected", "true");
-    const eventId = eventNode.dataset.eventId;
+    if (eventNode) {
+      eventNode.classList.add("is-selected");
+      eventNode.setAttribute("aria-selected", "true");
+    }
     selectedTimelineEventId = eventId;
     selectedSourceEventIds.clear();
     const relatedEventIds = syncTimelineRelatedSelection(eventId);
-    const hadFocus = document.activeElement === eventNode;
+    const hadFocus = eventNode && document.activeElement === eventNode;
     if (expandQ1IssueLanesForHighlight(relatedEventIds) && hadFocus) {
       const replacement = findVisibleEventNodeByIds([eventId]);
       if (replacement) replacement.focus({ preventScroll: true });
@@ -1293,9 +1296,18 @@
         }
         selectEventNode(node);
       },
-      onAnnotationClick: (annotation, _node, event) => {
+      onAnnotationClick: (annotation, node, event) => {
         if (event && typeof event.stopPropagation === "function") {
           event.stopPropagation();
+        }
+        const flow = annotation.domain?.kind === "feedback" ? annotation.domain.flow : undefined;
+        if (flow) {
+          const role = event?.target?.closest?.("[data-feedback-role]")?.dataset.feedbackRole || node.dataset.feedbackRole;
+          const eventId = String(role === "source" ? flow.from_event_id : flow.to_event_id);
+          selectEventNode(findVisibleEventNodeByIds([eventId]), { eventId, notify: false });
+          vscode.postMessage({ type: "feedbackFlowClick", flowId: String(annotation.flowId || annotation.id),
+            ...(["source", "target"].includes(role) ? { role } : {}) });
+          return;
         }
         const eventIds = Array.isArray(annotation.eventIds) ? annotation.eventIds : [annotation.eventId];
         const target = findVisibleEventNodeByIds(eventIds);
@@ -1814,6 +1826,12 @@
         editor.apply.disabled = Boolean(pendingEditor);
         editor.cancel.disabled = Boolean(pendingEditor);
       }
+      const searchInput = details.querySelector(".parameters-search-input");
+      for (const selector of [".parameters-search-toggle", ".parameters-search-input", ".parameters-search-clear"]) {
+        const control = details.querySelector(selector);
+        if (control) control.disabled = Boolean(activeEditor || pendingEditor) ||
+          selector === ".parameters-search-clear" && !searchInput.value;
+      }
     }
 
     function request(editor, type) {
@@ -1833,7 +1851,7 @@
 
     for (const row of details.querySelectorAll("[data-parameter-index]")) {
       const parameter = parameters[Number(row.dataset.parameterIndex)];
-      const cell = row.querySelector("td");
+      const cell = row.querySelector(".parameter-value");
       if (!parameter || typeof parameter.name !== "string" || typeof parameter.value_json !== "string" || !cell) {
         continue;
       }
@@ -1926,6 +1944,82 @@
       syncControls();
     });
     details.dataset.parameterEditors = "true";
+  }
+
+  function installParameterSearch() {
+    const details = document.getElementById("q1timeline-parameters");
+    if (!details || details.dataset.parameterSearch === "true") return;
+    const toggle = details.querySelector(".parameters-search-toggle");
+    const search = details.querySelector(".parameters-search");
+    const input = details.querySelector(".parameters-search-input");
+    const clear = details.querySelector(".parameters-search-clear");
+    const count = details.querySelector(".parameters-search-count");
+    const empty = details.querySelector(".parameters-empty");
+    if (!toggle || !search || !input || !clear || !count || !empty) return;
+    const rows = Array.from(details.querySelectorAll("[data-parameter-index]"));
+    const saved = readPersistedWebviewState();
+    input.value = typeof saved.parametersSearchQuery === "string" ? saved.parametersSearchQuery : "";
+    search.hidden = !saved.parametersSearchOpen && !input.value;
+    toggle.setAttribute("aria-expanded", String(!search.hidden));
+
+    function persist() {
+      writePersistedWebviewState({ parametersSearchQuery: input.value, parametersSearchOpen: !search.hidden });
+    }
+
+    function filter() {
+      const query = input.value.trim().toLowerCase();
+      let matched = 0;
+      for (const row of rows) {
+        row.hidden = !row.querySelector("dt").textContent.toLowerCase().includes(query);
+        if (!row.hidden) matched += 1;
+      }
+      count.textContent = `${matched} / ${rows.length}`;
+      empty.hidden = matched > 0 || rows.length === 0;
+      clear.disabled = !input.value;
+    }
+
+    function close() {
+      input.value = "";
+      filter();
+      search.hidden = true;
+      toggle.setAttribute("aria-expanded", "false");
+      persist();
+      toggle.focus();
+    }
+
+    toggle.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (details.open && !search.hidden) {
+        close();
+        return;
+      }
+      details.open = true;
+      search.hidden = false;
+      toggle.setAttribute("aria-expanded", "true");
+      persist();
+      input.focus();
+    });
+    input.addEventListener("input", () => {
+      filter();
+      persist();
+    });
+    clear.addEventListener("click", () => {
+      input.value = "";
+      filter();
+      persist();
+      input.focus();
+    });
+    search.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        close();
+      }
+    });
+    filter();
+    toggle.hidden = false;
+    details.dataset.parameterSearch = "true";
   }
 
   function toolbarSvgIcon(name) {
@@ -3885,7 +3979,7 @@
 
   function isTimelineSelectionTarget(target) {
     const node = target && target.closest ? target : undefined;
-    if (!node || node.closest("button, .q1timeline-control-popover, .q1timeline-control-chip")) {
+    if (!node || node.closest("button, .q1timeline-control-popover, .q1timeline-control-chip, [data-flow-id]")) {
       return false;
     }
     return Boolean(node.closest(".shared-timeline-stage .ruler, .shared-timeline-stage .lane-track, svg, .timeline"));
@@ -3960,6 +4054,7 @@
     if (event.button !== undefined && event.button !== 0) {
       return;
     }
+    if (event.target?.closest?.("[data-flow-id]")) return;
     if (event.shiftKey) {
       beginTimelineSelectionDrag(event);
       return;
@@ -4193,6 +4288,7 @@
   installParametersPersistence();
   installAnalysisDetailsPersistence();
   installParameterEditors();
+  installParameterSearch();
   const sharedTimelineRendered = renderSharedTimelineIfAvailable(initialViewMode);
   if (!sharedTimelineRendered) {
     restoreTimelineZoom();

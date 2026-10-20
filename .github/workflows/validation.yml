@@ -111,6 +111,35 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  notebook-onboarding-linux:
+    name: Python environment onboarding / Node 24 / Ubuntu
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: vscode-extension
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Install Python dependencies for environment probe tests
+        run: python -m pip install .
+        working-directory: .
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: vscode-extension/package-lock.json
+      - run: npm ci
+      - run: npm run compile
+      - name: Test Python environment selection, setup, and native POSIX commands
+        run: npx mocha out/test/pythonEnvironment.test.js out/test/fileEnvironment.test.js out/test/taskProvider.test.js out/test/notebookEnvironment.test.js out/test/notebookInstallCommand.test.js out/test/environment.test.js
+      - name: Test original notebook and file environments through analysis and refresh
+        run: npx mocha out/test/commands.test.js --grep "uses the original notebook's current kernel|Python for file schedules and refreshes the original file"
+
   extension-host:
     name: VS Code ${{ matrix.vscode }} / Windows
     runs-on: windows-latest

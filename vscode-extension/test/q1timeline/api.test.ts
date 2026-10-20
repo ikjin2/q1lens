@@ -79,6 +79,37 @@ describe("q1timeline internal API", () => {
     );
   });
 
+  it("keeps root-level and nested source files with the same basename separate", () => {
+    const root = join(tmpdir(), "q1lens-source-map");
+    const sources = {
+      root: { file: "seq0.q1asm", line: 3 },
+      nested: { file: "nested/seq0.q1asm", line: 3 },
+    };
+    for (const mapping of [
+      { source_map: { by_source: { "seq0.q1asm:3": ["root"], "nested/seq0.q1asm:3": ["nested"] } } },
+      { source_map: { by_event_id: sources } },
+      { events: Object.entries(sources).map(([id, source]) => ({ id, source })) },
+    ]) {
+      const timelineIr = { project: { root }, ...mapping };
+      assert.deepEqual(lookupEventIdsForSourceLine(timelineIr, join(root, "nested", "seq0.q1asm"), 3), ["nested"]);
+      assert.deepEqual(lookupEventIdsForSourceLine(timelineIr, join(root, "seq0.q1asm"), 3), ["root"]);
+      assert.deepEqual(lookupEventIdsForSourceLine(timelineIr, join(root, "other", "nested", "seq0.q1asm"), 3), []);
+      assert.deepEqual(lookupEventIdsForSourceLine(timelineIr, "nested/seq0.q1asm", 3), ["nested"]);
+    }
+  });
+
+  it("matches relative source paths by suffix when no project root is available", () => {
+    const timelineIr = {
+      source_map: {
+        by_event_id: {
+          root: { file: "seq0.q1asm", line: 3 },
+          nested: { file: "nested/seq0.q1asm", line: 3 },
+        },
+      },
+    };
+    assert.deepEqual(lookupEventIdsForSourceLine(timelineIr, join(tmpdir(), "nested", "seq0.q1asm"), 3), ["root", "nested"]);
+  });
+
   it("matches source-map paths case-insensitively on Windows", () => {
     const timelineIr: any = {
       source_map: {

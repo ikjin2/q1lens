@@ -196,13 +196,17 @@
       node.classList.add("is-selected");
     }
     node.title = annotation.label || annotation.title || "";
-    node.appendChild(element("span", "feedback-dot feedback-dot-source"));
+    const sourceDot = element("span", "feedback-dot feedback-dot-source");
+    sourceDot.dataset.feedbackRole = "source";
+    node.appendChild(sourceDot);
     node.appendChild(element("span", "feedback-mini-track feedback-mini-track-before"));
     node.appendChild(element("span", "feedback-label", annotation.labelShort || "fb"));
     const afterTrack = element("span", "feedback-mini-track feedback-mini-track-after");
     afterTrack.appendChild(element("span", "feedback-mini-arrow"));
     node.appendChild(afterTrack);
-    node.appendChild(element("span", "feedback-dot feedback-dot-target"));
+    const targetDot = element("span", "feedback-dot feedback-dot-target");
+    targetDot.dataset.feedbackRole = "target";
+    node.appendChild(targetDot);
     installAnnotationInteractions(node, annotation, handlers);
     return node;
   }
@@ -522,7 +526,7 @@
     return rowHeight - 4;
   }
 
-  function renderFeedbackConnectorPath(annotation, model, laneGeometryById) {
+  function renderFeedbackConnectorPath(annotation, model, laneGeometryById, handlers) {
     const fromLane = laneGeometryById.get(annotation.fromLaneId);
     const toLane = laneGeometryById.get(annotation.toLaneId);
     const fromPoint = timePointStyle(annotation.fromTime, model.viewport);
@@ -541,10 +545,10 @@
     const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
     path.setAttribute("class", `feedback-connector${annotation.selected ? " is-selected" : ""}`);
     path.setAttribute("d", `M ${x1} ${y1} C ${x1} ${controlY1} ${x2} ${controlY2} ${x2} ${y2}`);
-    path.setAttribute("data-flow-id", String(annotation.flowId || annotation.id || ""));
-    path.setAttribute("data-event-ids", annotationEventIds(annotation).join(" "));
+    path.setAttribute("aria-label", annotation.label || annotation.title || "Feedback flow");
     path.setAttribute("marker-end", "url(#feedback-bridge-arrow)");
     path.setAttribute("vector-effect", "non-scaling-stroke");
+    installAnnotationInteractions(path, annotation, handlers);
     return path;
   }
 
@@ -592,7 +596,7 @@
     svg.setAttribute("preserveAspectRatio", "none");
     renderFeedbackConnectorDefs(svg);
     for (const annotation of crossAnnotations) {
-      const path = renderFeedbackConnectorPath(annotation, model, laneGeometryById);
+      const path = renderFeedbackConnectorPath(annotation, model, laneGeometryById, handlers);
       if (path) {
         layer.appendChild(svg);
         svg.appendChild(path);

@@ -250,7 +250,6 @@ def render_html(
         panel
         for panel in (
             _confidence_legend(_visible_confidences(events, default_mode=default_mode)),
-            _control_flow_graph_panel(ir.get("control_flow_graph", {}), source_events),
             _feedback_balance_panel(ir.get("feedback_balance", {})),
             _diagnostics_panel(diagnostics, event_dom_ids),
             _semantic_panel(ir.get("semantic", {}), event_dom_ids),
@@ -1092,21 +1091,30 @@ def _parameters_panel(analysis: dict[str, Any]) -> str:
                 f'<span class="parameter-base">{escape(origin)}</span>'
             )
         rows.append(
-            f'<tr data-parameter-index="{index}"><th scope="row"><code>{escape(parameter["name"])}</code></th>'
-            f'<td><code>{escape(parameter["value_json"])}</code>{annotation}</td></tr>'
+            f'<div class="parameter-row" data-parameter-index="{index}"><dt><code>{escape(parameter["name"])}</code></dt>'
+            f'<dd class="parameter-value"><code>{escape(parameter["value_json"])}</code>{annotation}</dd></div>'
         )
     content = (
-        '<div class="parameters-table-scroll" tabindex="0" role="region" aria-label="Analysis parameter values">'
-        '<table><thead><tr><th scope="col">Parameter</th><th scope="col">Current value</th></tr></thead>'
-        f'<tbody>{"".join(rows)}</tbody></table></div>'
+        '<div class="parameters-list-scroll" tabindex="0" role="region" aria-label="Analysis parameter values">'
+        f'<dl class="parameters-list">{"".join(rows)}</dl></div>'
         if rows else '<p>No parameters configured for this analysis.</p>'
     )
     return (
         '<details id="q1timeline-parameters" class="analysis-parameters">'
-        f'<summary>{summary}</summary>'
+        f'<summary><span class="parameters-title">{summary}</span>'
+        '<button class="parameters-search-toggle" type="button" aria-label="Search parameters" '
+        'aria-controls="q1timeline-parameter-search" aria-expanded="false" hidden>'
+        '<svg aria-hidden="true" width="12" height="12" viewBox="0 0 16 16" fill="none" '
+        'stroke="currentColor" stroke-width="1.5"><circle cx="6.5" cy="6.5" r="4.5"/>'
+        '<path d="m10 10 4 4"/></svg> Search</button></summary>'
         '<p class="parameters-help">Values used for this timeline analysis, not live hardware or register values. '
         'Overrides do not change the parameter file.</p>'
-        f'{content}</details>'
+        '<div id="q1timeline-parameter-search" class="parameters-search" hidden>'
+        '<input class="parameters-search-input" type="search" placeholder="Search parameters" '
+        'aria-label="Search parameters by name">'
+        '<button class="parameters-search-clear" type="button" aria-label="Clear parameter search">Clear</button>'
+        '<span class="parameters-search-count" role="status" aria-live="polite"></span></div>'
+        f'{content}<p class="parameters-empty" hidden>No matching parameters.</p></details>'
     )
 
 
@@ -1271,421 +1279,6 @@ def _event_confidence_visible(event: dict[str, Any], *, default_mode: str) -> bo
     if kind == "branch_region":
         return True
     return True
-
-
-def _control_flow_graph_panel(graph: dict[str, Any], events: list[Any]) -> str:
-    sequencers = graph.get("sequencers", []) if isinstance(graph, dict) else []
-    if not isinstance(sequencers, list):
-        return ""
-    branch_decisions = _branch_decisions_by_source(events)
-    rendered = "".join(_control_flow_graph_sequencer_panel(sequencer, branch_decisions) for sequencer in sequencers)
-    if not rendered:
-        return ""
-    node_count = sum(len(sequencer.get("nodes", [])) for sequencer in sequencers if isinstance(sequencer, dict))
-    edge_count = sum(len(sequencer.get("edges", [])) for sequencer in sequencers if isinstance(sequencer, dict))
-    summary = f"{node_count} nodes - {edge_count} edges"
-    return (
-        '<details class="control-flow-graph" open data-default-open="true" aria-label="Control-flow graph">'
-        f'<summary><span class="panel-title">Control-flow graph</span> <span class="panel-summary">{escape(summary)}</span></summary>'
-        f"{rendered}"
-        "</details>"
-    )
-
-
-def _control_flow_graph_sequencer_panel(
-    sequencer: Any,
-    branch_decisions: dict[tuple[str, int], dict[str, Any]],
-) -> str:
-    if not isinstance(sequencer, dict):
-        return ""
-    nodes = sequencer.get("nodes", [])
-    edges = sequencer.get("edges", [])
-    if not isinstance(nodes, list) or not isinstance(edges, list) or not nodes:
-        return ""
-    node_by_id = {
-        str(node.get("id", "")): node
-        for node in nodes
-        if isinstance(node, dict) and node.get("id")
-    }
-    node_items = "".join(_control_flow_node_item(node) for node in nodes if isinstance(node, dict))
-    edge_items = "".join(
-        _control_flow_edge_item(edge, node_by_id)
-        for edge in edges
-        if isinstance(edge, dict)
-    )
-    graph_svg = _control_flow_graph_svg(nodes, edges, node_by_id)
-    branch_map = _control_flow_branch_map(edges, node_by_id, branch_decisions)
-    sequencer_id = escape(str(sequencer.get("sequencer_id", "sequencer")))
-    return (
-        '<section class="cfg-sequencer">'
-        f"<h2>{sequencer_id}</h2>"
-        f"{branch_map}"
-        f"{graph_svg}"
-        '<div class="cfg-grid">'
-        f'<div><h3>Blocks</h3><ol class="cfg-nodes">{node_items}</ol></div>'
-        f'<div><h3>Edges</h3><ol class="cfg-edges">{edge_items}</ol></div>'
-        "</div>"
-        "</section>"
-    )
-
-
-def _control_flow_branch_map(
-    edges: list[Any],
-    node_by_id: dict[str, dict[str, Any]],
-    branch_decisions: dict[tuple[str, int], dict[str, Any]],
-) -> str:
-    branches = _control_flow_branch_groups(edges)
-    if not branches:
-        return ""
-    items = "".join(_control_flow_branch_item(branch, node_by_id, branch_decisions) for branch in branches)
-    return f'<div class="cfg-branch-map"><h3>Branch map</h3><ol class="cfg-branch-list">{items}</ol></div>'
-
-
-def _control_flow_branch_groups(edges: list[Any]) -> list[dict[str, dict[str, Any]]]:
-    groups: dict[tuple[str, str, int | None, str], dict[str, dict[str, Any]]] = {}
-    for edge in edges:
-        if not isinstance(edge, dict):
-            continue
-        kind = str(edge.get("kind", ""))
-        if kind not in {"branch_taken", "branch_fallthrough"}:
-            continue
-        source = edge.get("source")
-        key = (
-            str(edge.get("from_node_id", "")),
-            str(source.get("file", "")) if isinstance(source, dict) else "",
-            source.get("line") if isinstance(source, dict) and type(source.get("line")) is int else None,
-            str(edge.get("op", "")),
-        )
-        groups.setdefault(key, {})[kind] = edge
-    return [group for group in groups.values() if "branch_taken" in group and "branch_fallthrough" in group]
-
-
-def _control_flow_branch_item(
-    branch: dict[str, dict[str, Any]],
-    node_by_id: dict[str, dict[str, Any]],
-    branch_decisions: dict[tuple[str, int], dict[str, Any]],
-) -> str:
-    taken = branch["branch_taken"]
-    fallthrough = branch["branch_fallthrough"]
-    source = taken.get("source") if isinstance(taken.get("source"), dict) else fallthrough.get("source")
-    decision = branch_decisions.get(_source_key(source), {})
-    condition = str(decision.get("condition") or _branch_condition_fallback(taken, source))
-    raw = str(source.get("raw", taken.get("label", "branch")) if isinstance(source, dict) else taken.get("label", "branch"))
-    status = _control_flow_branch_status(decision, taken, fallthrough)
-    source_label = _source_range_label(source, None)
-    assumed_path = str(decision.get("assumed_branch_path", ""))
-    return (
-        '<li class="cfg-branch-card">'
-        '<div class="cfg-branch-header">'
-        f'<div><code>{escape(raw)}</code><span class="cfg-source">{escape(source_label)}</span></div>'
-        f'<span class="cfg-branch-status">{escape(status)}</span>'
-        "</div>"
-        f'<div class="cfg-branch-condition">{escape(condition)}</div>'
-        '<div class="cfg-branch-paths">'
-        f'{_control_flow_branch_path_item(taken, node_by_id, "taken", assumed_path)}'
-        f'{_control_flow_branch_path_item(fallthrough, node_by_id, "fallthrough", assumed_path)}'
-        "</div>"
-        "</li>"
-    )
-
-
-def _control_flow_branch_path_item(
-    edge: dict[str, Any],
-    node_by_id: dict[str, dict[str, Any]],
-    path: str,
-    assumed_path: str,
-) -> str:
-    kind = str(edge.get("kind", "edge"))
-    edge_id = escape(str(edge.get("id", "")), quote=True)
-    class_name = escape(_class_token(kind), quote=True)
-    selected_class = " is-assumed" if assumed_path in {path, "both"} else ""
-    event_ids_attr = _cfg_event_ids_attribute(edge)
-    target = _control_flow_edge_node_label(edge.get("to_node_id"), node_by_id)
-    if not target:
-        target = str(edge.get("target_label") or edge.get("target") or edge.get("target_pc") or "?")
-    label = "Condition true" if path == "taken" else "Condition false"
-    action = "jump to" if path == "taken" else "continue to"
-    return (
-        f'<div class="cfg-branch-path cfg-edge-{class_name}{selected_class}" '
-        f'data-cfg-edge-id="{edge_id}"{event_ids_attr} tabindex="0">'
-        f'<span class="cfg-branch-path-label">{escape(label)}</span>'
-        f'<span class="cfg-branch-path-target">{escape(action)} <code>{escape(target)}</code></span>'
-        f'<span class="cfg-edge-label">{escape(str(edge.get("label", "")))}</span>'
-        "</div>"
-    )
-
-
-def _control_flow_branch_status(
-    decision: dict[str, Any],
-    taken: dict[str, Any],
-    fallthrough: dict[str, Any],
-) -> str:
-    assumed_path = decision.get("assumed_branch_path")
-    if assumed_path == "taken":
-        return "shown path: condition true"
-    if assumed_path == "fallthrough":
-        return "shown path: condition false"
-    if assumed_path == "both":
-        return "shown paths: both"
-    if assumed_path == "collapsed":
-        return "shown path: collapsed"
-    if taken.get("event_ids") or fallthrough.get("event_ids"):
-        return "reached in current timeline"
-    return "not reached in current timeline"
-
-
-def _control_flow_graph_svg(
-    nodes: list[Any],
-    edges: list[Any],
-    node_by_id: dict[str, dict[str, Any]],
-) -> str:
-    graph_nodes = [node for node in nodes if isinstance(node, dict) and node.get("id")]
-    if not graph_nodes:
-        return ""
-    layout = _control_flow_graph_layout(graph_nodes)
-    width = 620
-    height = max(92, 36 + len(graph_nodes) * 64)
-    edge_parts = [
-        _control_flow_graph_edge_svg(edge, layout, node_by_id)
-        for edge in edges
-        if isinstance(edge, dict)
-    ]
-    node_parts = [_control_flow_graph_node_svg(node, layout[str(node.get("id"))]) for node in graph_nodes]
-    return (
-        f'<svg class="cfg-graph" viewBox="0 0 {width} {height}" role="img" aria-label="Control-flow graph diagram">'
-        '<defs><marker id="cfg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" /></marker></defs>'
-        f"{''.join(edge_parts)}"
-        f"{''.join(node_parts)}"
-        "</svg>"
-    )
-
-
-def _control_flow_graph_layout(nodes: list[dict[str, Any]]) -> dict[str, dict[str, float]]:
-    layout: dict[str, dict[str, float]] = {}
-    for index, node in enumerate(nodes):
-        layout[str(node.get("id"))] = {
-            "x": 24.0,
-            "y": 24.0 + index * 64.0,
-            "width": 188.0,
-            "height": 38.0,
-        }
-    return layout
-
-
-def _control_flow_graph_node_svg(node: dict[str, Any], box: dict[str, float]) -> str:
-    node_id = escape(str(node.get("id", "")), quote=True)
-    label = escape(str(node.get("label", "block")))
-    pc_range = escape(f"pc {node.get('start_pc', '?')}-{node.get('end_pc', '?')}")
-    title = escape(f"{node.get('label', 'block')} {pc_range}")
-    event_ids_attr = _cfg_event_ids_attribute(node)
-    x = box["x"]
-    y = box["y"]
-    width = box["width"]
-    height = box["height"]
-    return (
-        f'<g class="cfg-graph-node" data-cfg-node-id="{node_id}"{event_ids_attr} tabindex="0">'
-        f"<title>{title}</title>"
-        f'<rect x="{x:.2f}" y="{y:.2f}" width="{width:.2f}" height="{height:.2f}" rx="4" />'
-        f'<text class="cfg-graph-node-label" x="{x + 10:.2f}" y="{y + 17:.2f}">{label}</text>'
-        f'<text class="cfg-graph-node-meta" x="{x + 10:.2f}" y="{y + 31:.2f}">{pc_range}</text>'
-        "</g>"
-    )
-
-
-def _control_flow_graph_edge_svg(
-    edge: dict[str, Any],
-    layout: dict[str, dict[str, float]],
-    node_by_id: dict[str, dict[str, Any]],
-) -> str:
-    from_id = str(edge.get("from_node_id", ""))
-    to_id = str(edge.get("to_node_id", ""))
-    from_box = layout.get(from_id)
-    to_box = layout.get(to_id)
-    if from_box is None:
-        return ""
-    edge_id = escape(str(edge.get("id", "")), quote=True)
-    kind = str(edge.get("kind", "edge"))
-    class_name = escape(_class_token(kind), quote=True)
-    label = escape(str(edge.get("label", "")))
-    event_ids_attr = _cfg_event_ids_attribute(edge)
-    title = escape(
-        f"{_control_flow_edge_kind_label(kind)}: "
-        f"{_control_flow_edge_node_label(from_id, node_by_id)} -> "
-        f"{_control_flow_edge_node_label(to_id, node_by_id) or edge.get('target', '?')}"
-    )
-    path = _control_flow_graph_edge_path(from_box, to_box)
-    text = _control_flow_graph_edge_label(edge, from_box, to_box)
-    return (
-        f'<g class="cfg-graph-edge-group cfg-edge-{class_name}" data-cfg-edge-id="{edge_id}"{event_ids_attr} tabindex="0">'
-        f"<title>{title}</title>"
-        f'<path class="cfg-graph-edge cfg-edge-{class_name}" data-cfg-edge-id="{edge_id}"{event_ids_attr} d="{path}" marker-end="url(#cfg-arrow)" />'
-        f"{text if label else ''}"
-        "</g>"
-    )
-
-
-def _control_flow_graph_edge_path(
-    from_box: dict[str, float],
-    to_box: dict[str, float] | None,
-) -> str:
-    x1 = from_box["x"] + from_box["width"]
-    y1 = from_box["y"] + from_box["height"] / 2
-    if to_box is None:
-        x2 = x1 + 180
-        y2 = y1
-        return f"M {x1:.2f} {y1:.2f} C {x1 + 70:.2f} {y1:.2f}, {x2 - 50:.2f} {y2:.2f}, {x2:.2f} {y2:.2f}"
-    x2 = to_box["x"] + to_box["width"]
-    y2 = to_box["y"] + to_box["height"] / 2
-    if abs(y1 - y2) < 1:
-        loop_x = x1 + 118
-        return (
-            f"M {x1:.2f} {y1:.2f} "
-            f"C {loop_x:.2f} {y1 - 42:.2f}, {loop_x:.2f} {y1 + 42:.2f}, {x2:.2f} {y2:.2f}"
-        )
-    bend_x = x1 + 118
-    return f"M {x1:.2f} {y1:.2f} C {bend_x:.2f} {y1:.2f}, {bend_x:.2f} {y2:.2f}, {x2:.2f} {y2:.2f}"
-
-
-def _control_flow_graph_edge_label(
-    edge: dict[str, Any],
-    from_box: dict[str, float],
-    to_box: dict[str, float] | None,
-) -> str:
-    label = escape(str(edge.get("label", "")))
-    x = from_box["x"] + from_box["width"] + 128
-    y = from_box["y"] + from_box["height"] / 2 - 5
-    if to_box is not None:
-        y = (from_box["y"] + to_box["y"]) / 2 + 8
-    return f'<text class="cfg-graph-edge-label" x="{x:.2f}" y="{y:.2f}">{label}</text>'
-
-
-def _control_flow_node_item(node: dict[str, Any]) -> str:
-    node_id = escape(str(node.get("id", "")), quote=True)
-    label = escape(str(node.get("label", "block")))
-    start_pc = escape(str(node.get("start_pc", "?")))
-    end_pc = escape(str(node.get("end_pc", "?")))
-    source = _source_range_label(node.get("source"), node.get("source_end"))
-    event_ids_attr = _cfg_event_ids_attribute(node)
-    return (
-        f'<li class="cfg-node" data-cfg-node-id="{node_id}"{event_ids_attr}>'
-        f"<code>{label}</code> "
-        f'<span class="cfg-meta">pc {start_pc}-{end_pc}</span> '
-        f'<span class="cfg-source">{escape(source)}</span>'
-        "</li>"
-    )
-
-
-def _control_flow_edge_item(edge: dict[str, Any], node_by_id: dict[str, dict[str, Any]]) -> str:
-    edge_id = escape(str(edge.get("id", "")), quote=True)
-    kind = str(edge.get("kind", "edge"))
-    kind_label = escape(_control_flow_edge_kind_label(kind))
-    label = escape(str(edge.get("label", "")))
-    event_ids_attr = _cfg_event_ids_attribute(edge)
-    from_label = _control_flow_edge_node_label(edge.get("from_node_id"), node_by_id)
-    to_label = _control_flow_edge_node_label(edge.get("to_node_id"), node_by_id)
-    if not to_label:
-        to_label = str(edge.get("target", "") or "?")
-    route = escape(f"{from_label} -> {to_label}")
-    source = _source_range_label(edge.get("source"), None)
-    return (
-        f'<li class="cfg-edge cfg-edge-{escape(_class_token(kind), quote=True)}" data-cfg-edge-id="{edge_id}"{event_ids_attr}>'
-        f'<span class="cfg-edge-kind">{kind_label}</span> '
-        f"<code>{route}</code> "
-        f'<span class="cfg-edge-label">{label}</span> '
-        f'<span class="cfg-source">{escape(source)}</span>'
-        "</li>"
-    )
-
-
-def _cfg_event_ids_attribute(item: dict[str, Any]) -> str:
-    event_ids = item.get("event_ids", [])
-    if not isinstance(event_ids, list):
-        return ""
-    ids = [str(event_id) for event_id in event_ids if isinstance(event_id, str) and event_id]
-    if not ids:
-        return ""
-    return f' data-cfg-event-ids="{escape(" ".join(ids), quote=True)}"'
-
-
-def _branch_decisions_by_source(events: list[Any]) -> dict[tuple[str, int], dict[str, Any]]:
-    decisions: dict[tuple[str, int], dict[str, Any]] = {}
-    for event in events:
-        if not isinstance(event, dict):
-            continue
-        meta = event.get("meta", {})
-        if not isinstance(meta, dict) or not meta.get("branch_id"):
-            continue
-        key = _source_key(event.get("source"))
-        if not key:
-            continue
-        decision = decisions.setdefault(key, {})
-        for name in (
-            "condition",
-            "branch_decision",
-            "branch_policy",
-            "assumed_branch_path",
-            "assumed_branch_taken",
-            "target_label",
-        ):
-            value = meta.get(name)
-            if value is not None and value != "":
-                decision[name] = value
-    return decisions
-
-
-def _source_key(source: Any) -> tuple[str, int] | None:
-    if not isinstance(source, dict):
-        return None
-    file = source.get("file")
-    line = source.get("line")
-    if not file or type(line) is not int:
-        return None
-    return (str(file), line)
-
-
-def _branch_source_comment(source: Any) -> str:
-    if not isinstance(source, dict):
-        return ""
-    raw = str(source.get("raw", ""))
-    if "#" not in raw:
-        return ""
-    return raw.split("#", 1)[1].strip()
-
-
-def _branch_condition_fallback(edge: dict[str, Any], source: Any) -> str:
-    comment = _branch_source_comment(source)
-    if comment:
-        return comment
-    op = str(edge.get("op", "branch"))
-    if op in {"jge", "jlt", *STATUS_BRANCH_OPS}:
-        return f"{op} status flags"
-    return f"{op} condition"
-
-
-def _control_flow_edge_node_label(node_id: Any, node_by_id: dict[str, dict[str, Any]]) -> str:
-    if not node_id:
-        return ""
-    node = node_by_id.get(str(node_id))
-    if not isinstance(node, dict):
-        return str(node_id)
-    return str(node.get("label") or node_id)
-
-
-def _control_flow_edge_kind_label(kind: str) -> str:
-    return kind.replace("_", " ")
-
-
-def _source_range_label(start: Any, end: Any) -> str:
-    if not isinstance(start, dict):
-        return ""
-    file = str(start.get("file", ""))
-    line = start.get("line")
-    end_line = end.get("line") if isinstance(end, dict) else None
-    if line is None:
-        return file
-    if end_line is not None and end_line != line:
-        return f"{file}:{line}-{end_line}"
-    return f"{file}:{line}"
 
 
 def _semantic_panel(semantic: dict[str, Any], event_dom_ids: dict[str, str]) -> str:
@@ -2428,23 +2021,34 @@ body.vscode-dark button { background: var(--vscode-button-secondaryBackground, #
 button[aria-pressed="true"] { background: #17202a; color: #fff; }
 .analysis-details { margin: 0 16px 16px; }
 .analysis-details > summary { cursor: pointer; padding: 8px 0; font-weight: 700; }
-.analysis-parameters { margin: 0 16px 8px; font-size: 12px; }
+.analysis-parameters { margin: 0 16px 8px; font-size: 12px; container-type: inline-size; }
 .analysis-parameters > summary { cursor: pointer; padding: 8px 0; font-size: 14px; font-weight: 700; }
+.analysis-parameters .parameters-search-toggle { float: right; display: inline-flex; align-items: center; gap: 4px; font-size: 12px; font-weight: normal; }
 .parameters-help { margin: 0 0 8px; color: var(--vscode-descriptionForeground, #4b5563); }
-.parameters-table-scroll { max-height: 240px; overflow: auto; }
-.analysis-parameters table { width: 100%; border-collapse: collapse; text-align: left; }
-.analysis-parameters th, .analysis-parameters td { padding: 6px 10px; border-bottom: 1px solid var(--vscode-panel-border, #d8dee6); vertical-align: top; overflow-wrap: anywhere; }
-.analysis-parameters th[scope="row"] { font-weight: normal; }
+.parameters-list-scroll { max-height: 240px; overflow: auto; }
+.parameters-list { display: grid; grid-template-columns: minmax(0, 1fr); column-gap: 24px; margin: 0; }
+.parameter-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-content: start; padding: 4px 0; border-bottom: 1px solid var(--vscode-panel-border, #d8dee6); overflow-wrap: anywhere; }
+.parameter-row[hidden], .parameters-search[hidden], .parameters-search-toggle[hidden] { display: none; }
+.parameter-row dt { min-width: 0; padding-right: 12px; }
+.parameter-value { min-width: 0; margin: 0; }
+@container (min-width: 720px) { .parameters-list { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.parameters-search { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 8px; }
+.parameters-search-count { margin-left: auto; color: var(--vscode-descriptionForeground, #4b5563); white-space: nowrap; }
+.parameters-empty { color: var(--vscode-descriptionForeground, #4b5563); }
 .analysis-parameters code { font-family: var(--vscode-editor-font-family, monospace); white-space: pre-wrap; }
 .parameter-override { display: inline-block; margin-left: 8px; padding: 0 4px; border: 1px solid var(--vscode-panel-border, #d8dee6); border-radius: 3px; font-size: 11px; }
 .parameter-base { display: block; margin-top: 2px; color: var(--vscode-descriptionForeground, #4b5563); white-space: pre-wrap; }
 .parameter-actions { display: inline-flex; gap: 6px; margin-left: 8px; }
 .analysis-parameters button { padding: 2px 6px; font: inherit; color: var(--vscode-button-secondaryForeground, #17202a); background: var(--vscode-button-secondaryBackground, #f3f4f6); border-color: var(--vscode-panel-border, #9aa7b4); }
 .analysis-parameters button:disabled { opacity: 0.5; cursor: default; }
+@media (hover: hover) and (pointer: fine) {
+  .analysis-parameters button.parameter-edit { opacity: 0; }
+  .parameter-row:hover .parameter-edit, .parameter-row:focus-within .parameter-edit { opacity: 1; }
+}
 .parameter-editor { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 6px; }
 .parameter-editor[hidden] { display: none; }
-.parameter-input { flex: 1; width: 20ch; min-width: 0; max-width: 28rem; padding: 4px 6px; font-family: var(--vscode-editor-font-family, monospace); color: var(--vscode-input-foreground, #17202a); background: var(--vscode-input-background, #fff); border: 1px solid var(--vscode-input-border, #9aa7b4); border-radius: 3px; }
-.parameter-input:focus-visible, .analysis-parameters button:focus-visible { outline: 1px solid var(--vscode-focusBorder, #007acc); outline-offset: 2px; }
+.parameter-input, .parameters-search-input { flex: 1; width: 20ch; min-width: 0; max-width: 28rem; padding: 4px 6px; font-family: var(--vscode-editor-font-family, monospace); color: var(--vscode-input-foreground, #17202a); background: var(--vscode-input-background, #fff); border: 1px solid var(--vscode-input-border, #9aa7b4); border-radius: 3px; }
+.parameter-input:focus-visible, .parameters-search-input:focus-visible, .analysis-parameters button:focus-visible { outline: 1px solid var(--vscode-focusBorder, #007acc); outline-offset: 2px; }
 .parameter-error { flex-basis: 100%; color: var(--vscode-errorForeground, #c72c2c); }
 .parameter-status { display: block; color: var(--vscode-descriptionForeground, #4b5563); }
 .diagnostics { margin: 16px 16px 0; padding: 10px 12px; border: 1px solid var(--vscode-panel-border, #d8dee6); }
@@ -2452,7 +2056,6 @@ button[aria-pressed="true"] { background: #17202a; color: #fff; }
 .diagnostics-secondary { margin-top: 8px; }
 .diagnostics-secondary > summary,
 .confidence-legend > summary,
-.control-flow-graph > summary,
 .feedback-balance > summary { cursor: pointer; font-size: 12px; }
 .panel-title { font-weight: 700; font-size: 14px; }
 .panel-summary { margin-left: 6px; color: var(--vscode-descriptionForeground, #4b5563); font-size: 12px; }
@@ -2472,43 +2075,6 @@ button[aria-pressed="true"] { background: #17202a; color: #fff; }
 .legend-swatch.confidence-assumed { border-style: dashed; }
 .legend-swatch.confidence-unknown { background: #e5e7eb; }
 .legend-swatch.confidence-runtime_dependent { background: #fde68a; border-color: #b45309; }
-.control-flow-graph { margin: 16px 16px 0; padding: 10px 12px; border: 1px solid var(--vscode-panel-border, #d8dee6); }
-.cfg-sequencer { margin-top: 10px; }
-.cfg-sequencer h2 { margin-top: 0; }
-.cfg-sequencer h3 { margin: 0 0 6px; font-size: 12px; color: var(--vscode-descriptionForeground, #4b5563); }
-.cfg-branch-map { margin: 8px 0 12px; }
-.cfg-branch-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
-.cfg-branch-card { border: 1px solid var(--vscode-panel-border, #d8dee6); border-radius: 4px; padding: 8px; background: var(--vscode-editorWidget-background, #f8fafc); }
-.cfg-branch-header { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: start; font-size: 12px; }
-.cfg-branch-header code { overflow-wrap: anywhere; }
-.cfg-branch-status { color: #1d4ed8; font-weight: 700; white-space: nowrap; }
-.cfg-branch-condition { margin-top: 4px; color: var(--vscode-descriptionForeground, #4b5563); font-size: 12px; }
-.cfg-branch-paths { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 8px; margin-top: 8px; }
-.cfg-branch-path { cursor: pointer; border: 1px solid #94a3b8; border-left-width: 4px; border-radius: 4px; padding: 7px 8px; display: grid; gap: 3px; background: var(--vscode-editor-background, #ffffff); font-size: 12px; }
-.cfg-branch-path.cfg-edge-branch_taken { border-left-color: #7c3aed; }
-.cfg-branch-path.cfg-edge-branch_fallthrough { border-left-color: #64748b; }
-.cfg-branch-path.is-assumed { border-color: #2563eb; box-shadow: inset 0 0 0 1px #2563eb; }
-.cfg-branch-path-label { font-weight: 700; }
-.cfg-branch-path-target { color: var(--vscode-foreground, #17202a); }
-.cfg-graph { width: 100%; min-height: 220px; max-height: 720px; margin: 8px 0 12px; border: 1px solid var(--vscode-panel-border, #d8dee6); background: var(--vscode-editor-background, #ffffff); }
-.cfg-graph-node rect { fill: var(--vscode-editorWidget-background, #f8fafc); stroke: #64748b; stroke-width: 1.2; }
-.cfg-graph-node text { fill: var(--vscode-foreground, #17202a); font-size: 11px; pointer-events: none; }
-.cfg-graph-node, .cfg-graph-edge-group, .cfg-node, .cfg-edge, .cfg-branch-path { cursor: pointer; }
-.cfg-graph-node-label { font-weight: 700; }
-.cfg-graph-node-meta { fill: var(--vscode-descriptionForeground, #4b5563); }
-.cfg-graph-edge { fill: none; stroke: #64748b; stroke-width: 1.4; opacity: 0.9; }
-.cfg-edge-branch_taken .cfg-graph-edge { stroke: #7c3aed; }
-.cfg-edge-branch_fallthrough .cfg-graph-edge { stroke: #64748b; stroke-dasharray: 4 4; }
-.cfg-edge-jump .cfg-graph-edge { stroke: #0369a1; }
-.cfg-graph-edge-label { fill: var(--vscode-descriptionForeground, #4b5563); font-size: 10px; }
-.cfg-graph-node.is-selected rect, .cfg-graph-node.is-related rect { stroke: #2563eb; stroke-width: 2.5; }
-.cfg-graph-edge-group.is-selected .cfg-graph-edge, .cfg-graph-edge-group.is-related .cfg-graph-edge { stroke: #2563eb; stroke-width: 3; opacity: 1; }
-.cfg-node.is-selected, .cfg-node.is-related, .cfg-edge.is-selected, .cfg-edge.is-related, .cfg-branch-path.is-selected, .cfg-branch-path.is-related { outline: 1px solid #2563eb; outline-offset: 2px; }
-.cfg-grid { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(260px, 2fr); gap: 14px; }
-.cfg-nodes, .cfg-edges { margin: 0; padding-left: 20px; font-size: 12px; }
-.cfg-node, .cfg-edge { margin: 4px 0; overflow-wrap: anywhere; }
-.cfg-edge-kind { display: inline-block; min-width: 96px; color: var(--vscode-descriptionForeground, #4b5563); }
-.cfg-meta, .cfg-source, .cfg-edge-label { color: var(--vscode-descriptionForeground, #4b5563); }
 .feedback-balance { margin: 16px 16px 0; padding: 10px 12px; border: 1px solid var(--vscode-panel-border, #d8dee6); }
 .feedback-balance ol { margin: 8px 0 0; padding-left: 20px; }
 .feedback-balance-channel { margin: 4px 0; font-size: 12px; }
@@ -2521,7 +2087,6 @@ button[aria-pressed="true"] { background: #17202a; color: #fff; }
 body.vscode-high-contrast .timeline-svg,
 body.vscode-high-contrast .diagnostics,
 body.vscode-high-contrast .confidence-legend,
-body.vscode-high-contrast .control-flow-graph,
 body.vscode-high-contrast .feedback-balance,
 body.vscode-high-contrast .semantic-annotations,
 body.vscode-high-contrast .event-inspector { border-color: var(--vscode-contrastBorder, #ffffff); }
@@ -2680,9 +2245,6 @@ const eventsById = new Map((timelineIr.events || []).map((event) => [String(even
 const timelineEventSelector = '.event, .loop-bracket, .branch-marker';
 const selectedTimelineEventSelector = '.event.is-selected, .loop-bracket.is-selected, .branch-marker.is-selected';
 const relatedTimelineEventSelector = '.event.is-related, .loop-bracket.is-related, .branch-marker.is-related';
-const cfgElementSelector = '.cfg-graph-node, .cfg-graph-edge-group, .cfg-node, .cfg-edge, .cfg-branch-path';
-const selectedCfgElementSelector = '.cfg-graph-node.is-selected, .cfg-graph-edge-group.is-selected, .cfg-node.is-selected, .cfg-edge.is-selected, .cfg-branch-path.is-selected';
-const relatedCfgElementSelector = '.cfg-graph-node.is-related, .cfg-graph-edge-group.is-related, .cfg-node.is-related, .cfg-edge.is-related, .cfg-branch-path.is-related';
 const eventInspector = document.getElementById('event-inspector');
 const inspectorFields = document.getElementById('event-inspector-fields');
 function querySelectorAllWithFallback(selector) {
@@ -2704,9 +2266,6 @@ function querySelectorAllWithFallback(selector) {
 }
 function timelineEventNodes() {
   return querySelectorAllWithFallback(timelineEventSelector);
-}
-function cfgElementNodes() {
-  return querySelectorAllWithFallback(cfgElementSelector);
 }
 function escapeHtml(value) {
   return String(value)
@@ -2983,65 +2542,6 @@ function branchDecisionStatus(meta) {
 function clearRelatedControlFlow() {
   querySelectorAllWithFallback(relatedTimelineEventSelector).forEach((node) => node.classList.remove('is-related'));
   document.querySelectorAll('.control-flow-connector.is-related').forEach((node) => node.classList.remove('is-related'));
-  querySelectorAllWithFallback(relatedCfgElementSelector).forEach((node) => node.classList.remove('is-related'));
-}
-function clearSelectedCfgElements() {
-  querySelectorAllWithFallback(selectedCfgElementSelector).forEach((node) => node.classList.remove('is-selected'));
-}
-function cfgEventIds(node) {
-  const raw = node && node.dataset ? node.dataset.cfgEventIds || '' : '';
-  return raw.split(/\\s+/).map((value) => value.trim()).filter(Boolean);
-}
-function cfgElementMatchesEventId(node, eventId) {
-  return cfgEventIds(node).includes(String(eventId));
-}
-function selectFirstVisibleTimelineEvent(eventIds) {
-  for (const eventId of eventIds) {
-    const eventNode = findEventNodeById(eventId);
-    if (eventNode && isTimelineEventVisible(eventNode)) {
-      selectEventNode(eventNode, { clearCfgSelection: false });
-      eventNode.scrollIntoView({ block: 'center', inline: 'center' });
-      return true;
-    }
-  }
-  return false;
-}
-function selectCfgElement(cfgNode) {
-  if (!cfgNode) {
-    clearSelectedCfgElements();
-    return;
-  }
-  clearSelectedCfgElements();
-  cfgNode.classList.add('is-selected');
-  const cfgNodeId = cfgNode.dataset.cfgNodeId;
-  const cfgEdgeId = cfgNode.dataset.cfgEdgeId;
-  for (const peer of cfgElementNodes()) {
-    if (
-      (cfgNodeId && peer.dataset.cfgNodeId === cfgNodeId) ||
-      (cfgEdgeId && peer.dataset.cfgEdgeId === cfgEdgeId)
-    ) {
-      peer.classList.add('is-selected');
-    }
-  }
-  const eventIds = cfgEventIds(cfgNode);
-  clearRelatedControlFlow();
-  for (const eventId of eventIds) {
-    const eventNode = findEventNodeById(eventId);
-    if (eventNode) {
-      eventNode.classList.add('is-related');
-    }
-  }
-  selectFirstVisibleTimelineEvent(eventIds);
-}
-function highlightRelatedCfgElementsForEvent(eventId) {
-  if (!eventId) {
-    return;
-  }
-  for (const cfgNode of cfgElementNodes()) {
-    if (cfgElementMatchesEventId(cfgNode, eventId)) {
-      cfgNode.classList.add('is-related');
-    }
-  }
 }
 function highlightRelatedControlFlowConnectors(eventNode) {
   if (!eventNode) {
@@ -3081,15 +2581,10 @@ function highlightRelatedControlFlow(eventNode) {
     }
   }
   highlightRelatedControlFlowConnectors(eventNode);
-  highlightRelatedCfgElementsForEvent(eventId);
 }
-function selectEventNode(eventNode, options = {}) {
-  const clearCfgSelection = options.clearCfgSelection !== false;
+function selectEventNode(eventNode) {
   if (!eventNode) {
     querySelectorAllWithFallback(selectedTimelineEventSelector).forEach((node) => node.classList.remove('is-selected'));
-    if (clearCfgSelection) {
-      clearSelectedCfgElements();
-    }
     clearRelatedControlFlow();
     renderInspector(null);
     return;
@@ -3098,9 +2593,6 @@ function selectEventNode(eventNode, options = {}) {
     return;
   }
   querySelectorAllWithFallback(selectedTimelineEventSelector).forEach((node) => node.classList.remove('is-selected'));
-  if (clearCfgSelection) {
-    clearSelectedCfgElements();
-  }
   eventNode.classList.add('is-selected');
   highlightRelatedControlFlow(eventNode);
   const eventId = eventNode.dataset.eventId;
@@ -3186,17 +2678,6 @@ for (const eventNode of timelineEventNodes()) {
   });
   eventNode.addEventListener('click', () => {
     selectEventNode(eventNode);
-  });
-}
-for (const cfgNode of cfgElementNodes()) {
-  cfgNode.addEventListener('click', () => {
-    selectCfgElement(cfgNode);
-  });
-  cfgNode.addEventListener('keydown', (event) => {
-    if (event.key === 'Enter' || event.key === ' ') {
-      event.preventDefault();
-      selectCfgElement(cfgNode);
-    }
   });
 }
 for (const link of document.querySelectorAll('[data-related-event-id]')) {

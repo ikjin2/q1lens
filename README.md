@@ -32,6 +32,23 @@ package in the same environment as the schedule project.
 
 ## Install
 
+### From a VS Code notebook
+
+Install the Q1Lens VS Code extension, select your notebook's Python kernel, and
+run a cell. **Q1Lens: Open Q1Lens from This Cell** uses that kernel's environment
+automatically; no Python path setting is needed. If the environment needs
+attention, choose **Show Setup** to see the diagnosis and select **pip** or
+**uv pip**. Copy the command or insert it into a terminal, review and run it
+yourself, then choose **Check Again** to continue. The extension does not install
+packages or bootstrap pip. Windows uses PowerShell commands; Linux and macOS
+use POSIX shell commands, always targeting the notebook's Python explicitly.
+**Refresh** follows the original notebook's current kernel. Keep the notebook
+open with its kernel running.
+
+This works when the kernel and VS Code extension run on the same host. Separate
+remote Jupyter servers are not supported. Analysis reruns the selected cells in
+a separate process; existing notebook variables are not shared.
+
 ### With uv
 
 Add Q1Lens as a development dependency:
@@ -43,7 +60,8 @@ uv run q1lens --help
 
 Install
 [Q1Lens from the VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=q1lens.q1lens),
-then add this to your VS Code settings:
+then choose the project's environment with **Python: Select Interpreter**.
+To keep using uv as an explicit launcher, you can instead add:
 
 ```json
 {
@@ -63,8 +81,10 @@ python -m pip install q1lens
 python -m q1lens --help
 ```
 
-Install the VS Code extension from the Marketplace. If `python` does not refer
-to the correct environment, set `q1lens.pythonPath` to its interpreter:
+Install the VS Code extension from the Marketplace and choose that environment
+with **Python: Select Interpreter**. General file analysis and Refresh follow
+the VS Code selection for the original analysis target. Existing explicit
+Q1Lens Python settings remain manual overrides, for example:
 
 ```json
 {
@@ -74,7 +94,15 @@ to the correct environment, set `q1lens.pythonPath` to its interpreter:
 
 On Windows, use `.venv\\Scripts\\python.exe`.
 
-Run **Q1Lens: Check Python Environment** to inspect the configured Python,
+Click the **Q1Lens Python** status item or run **Q1Lens: Show Python Environment**
+to see the interpreter, its selection source and analysis target. Windows and
+Linux use the same selection rules. Missing or unusable selections are explained
+instead of silently falling back to a different Python.
+**Follow VS Code Selection** switches this project to automatic selection while
+keeping old Q1Lens launcher settings saved; `q1lens.pythonEnvironment: "auto"`
+restores the normal manual-override precedence.
+
+Run **Q1Lens: Check Python Environment** to inspect the selected Python,
 package locations, and Q1ASM bridge. **Q1Lens: Select Python Environment**
 selects a workspace virtual environment or interpreter for both timeline views.
 Explicit Q1ASM Python settings take precedence over shared settings.
@@ -220,7 +248,7 @@ artifacts:
 
 ### Review and execution workflows
 
-The following workflows are available in the Q1Lens 0.2.2 Python package and
+The following workflows are available in the Q1Lens 0.2.3 Python package and
 VS Code extension. The Desktop workbench is a development app run from the
 source checkout; this release does not include a Desktop installer.
 
@@ -337,9 +365,6 @@ npm test
 npm run test:extension
 npm run package
 ```
-
-See [Migrating to Q1Lens](docs/migration-from-qbs-and-q1timeline.md) when
-replacing the older separate QBS Timeline and q1timeline extensions.
 
 ## Project status and authorship
 

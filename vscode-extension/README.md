@@ -21,6 +21,63 @@ Created by [Ik Kyeong Jin](https://github.com/ikjin2).
 Q1Lens imports and runs schedule code during analysis, so a separate
 Q1Lens-only environment will not see your project dependencies.
 
+## Start from a Jupyter notebook
+
+1. Select your Python kernel in VS Code and run a cell to start it.
+2. Run **Q1Lens: Open Q1Lens from This Cell** from the notebook.
+3. If the environment needs attention, choose **Show Setup** to see the Python
+   path and diagnosis: a missing Q1Lens package or an import failure.
+4. Select **pip** or **uv pip**, then **Copy Command** or **Insert into Terminal**.
+   The suggested command explicitly targets the notebook's Python and uses the
+   extension's package version. Review or edit it and press Enter yourself.
+5. Choose **Check Again** after installing. Q1Lens checks the original notebook's
+   current kernel and continues the analysis when it is ready.
+
+Q1Lens never runs the installer or bootstraps pip. If pip is missing, setup
+explains this and offers uv pip; uv must already be available on your PATH.
+You can also manage Q1Lens through your project's existing dependency workflow
+and then check again. The suggested commands do not modify project dependency
+or lock files.
+
+Windows commands use PowerShell; Linux and macOS commands use POSIX sh syntax.
+**Insert into Terminal** opens a new terminal using that shell and fills in the
+command without executing it. If you copy a command, use the shell indicated
+in the setup screen. A changed notebook kernel updates the setup before a
+command can be copied or inserted.
+
+Notebook analysis uses the selected kernel's Python automatically; no
+`q1lens.pythonPath` setting is needed. **Refresh** checks the original notebook's
+current kernel again, even if another editor is active. Keep that notebook open
+with its kernel running.
+
+This supports kernels on the same host as the VS Code extension, including a
+shared Remote SSH/WSL host. A separate remote Jupyter server is not supported.
+Analysis reruns the selected setup and schedule cells in a separate process;
+it uses the kernel's installed packages, not its live variables.
+
+## Python for standalone files
+
+For Python schedule projects and standalone Q1ASM files, Q1Lens uses the
+Microsoft Python extension's selected interpreter for the analysis target's
+project. Select it with **Python: Select Interpreter**. This works on Windows,
+Linux and macOS, including an extension running in a Remote SSH or WSL workspace.
+
+Explicit Q1Lens Python paths and launcher arguments remain manual overrides,
+including legacy settings and Q1ASM-specific settings. Notebook workflows
+continue to use their selected kernel. **Follow VS Code Selection** in the
+environment screen switches this project to VS Code without deleting saved
+launchers. Set `q1lens.pythonEnvironment` back to `auto` to use those settings again.
+
+The **Q1Lens Python** status item shows the environment and whether it came from
+VS Code, a manual setting, or a notebook kernel. Click it, or run **Q1Lens: Show
+Python Environment**, to see the executable, selection source and analysis target.
+**Refresh** resolves that same target again; another active editor does not
+redirect the environment. View changes and playback use the analyzed environment.
+
+If no usable interpreter is selected, Q1Lens explains how to choose one. It
+does not silently fall back to Python on PATH. Missing packages and import errors
+use the same user-managed **Show Setup** / **Check Again** flow as notebooks.
+
 ## Install the Python package
 
 With uv:
@@ -30,7 +87,8 @@ uv add --dev q1lens
 uv run q1lens --help
 ```
 
-Configure the extension to use uv:
+Select the project's virtual environment with **Python: Select Interpreter**.
+Alternatively, explicitly configure the extension to launch through uv:
 
 ```json
 {
@@ -46,12 +104,13 @@ python -m pip install q1lens
 python -m q1lens --help
 ```
 
-If `python` does not point to that environment, set `q1lens.pythonPath` to the
-interpreter, for example `.venv/bin/python` on macOS or Linux, or
-`.venv\\Scripts\\python.exe` on Windows.
+Select that environment with **Python: Select Interpreter**. A manual
+`q1lens.pythonPath` is optional, for example an absolute path to `.venv/bin/python`
+on macOS or Linux, or `.venv\\Scripts\\python.exe` on Windows.
 
 Run **Q1Lens: Check Python Environment**, also available in the sidebar, to
-inspect Python versions, package locations, and Q1ASM bridge availability.
+inspect the selected paths and their sources, Python versions, package locations,
+and Q1ASM bridge availability.
 **Q1Lens: Select Python Environment** lets you select a workspace `.venv`/`venv`,
 browse for an interpreter, or enter its path. Use the environment that runs
 your schedule. Selecting an existing configured command preserves its launcher

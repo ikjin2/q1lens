@@ -5,6 +5,8 @@ import { buildAnalyzeInvocation, buildQ1TimelineAnalyzeInvocation, buildRenderIn
 import { OutputPaths, ProjectConfigLite, chooseProjectFile, deriveOutputPaths, parseProjectConfigLite } from "./projectDiscovery";
 import { parseQbsIrText, Q1TimelineDiagnostic, QbsIr } from "./qbsIr";
 import { QbsTimelineSettings, readSettings } from "./settings";
+import { ensureNotebookEnvironment } from "../notebookEnvironment";
+import { ensureFilePythonEnvironment } from "../fileEnvironment";
 import type * as vscodeTypes from "vscode";
 import { openFileAtLine, openFileBelowAtLine, openNotebookAtCell, resolveGeneratedFile } from "./navigation";
 import { Q1TimelineOpenTarget } from "../q1timeline/api";
@@ -134,7 +136,7 @@ export interface AnalyzeAndOpenDeps {
   listExistingQ1asmFiles: (paths: OutputPaths) => Promise<Set<string>>;
   publishDiagnostics: (paths: OutputPaths, ir: QbsIr, existingFiles: Set<string>) => void;
   showPanel: (ir: QbsIr, paths: OutputPaths) => void;
-  readSettings: () => QbsTimelineSettings;
+  readSettings: (projectFile: string, config: ProjectConfigLite) => QbsTimelineSettings | undefined | Promise<QbsTimelineSettings | undefined>;
   showOutput: () => void;
 }
 
@@ -259,12 +261,15 @@ export function createAnalyzeAndOpenHandler(deps: AnalyzeAndOpenDeps): () => Pro
       return;
     }
 
-    const settings = deps.readSettings();
+    const config = await deps.readProjectConfig(projectFile);
+    const settings = await deps.readSettings(projectFile, config);
+    if (!settings) {
+      return;
+    }
     if (settings.revealOutputChannel) {
       deps.showOutput();
     }
 
-    const config = await deps.readProjectConfig(projectFile);
     const paths = deps.derivePaths({
       projectFile,
       scheduleFile: config.scheduleFile,
@@ -596,7 +601,11 @@ export function registerCommands(context: vscodeTypes.ExtensionContext, deps: Re
     },
   });
 
-  const createHandler = (resolveProject: () => Promise<string | undefined>) => createAnalyzeAndOpenHandler({
+  const createHandler = (
+    resolveProject: () => Promise<string | undefined>,
+    notebookEnvironment?: { pythonPath: string; pythonArgs: string[] },
+    onEnvironmentResource?: (resource: vscodeTypes.Uri) => void,
+  ) => createAnalyzeAndOpenHandler({
       resolveProject,
       readProjectConfig: readProjectConfigFromDisk,
       derivePaths: (input) => {
@@ -634,32 +643,75 @@ export function registerCommands(context: vscodeTypes.ExtensionContext, deps: Re
         lastPaths = paths;
         lastIr = ir;
       },
-      readSettings,
+      readSettings: async (projectFile, config) => {
+        if (!config.scheduleNotebook) {
+          const resource = vscode.Uri.file(config.scheduleFile
+            ? resolve(dirname(projectFile), config.scheduleFile)
+            : projectFile);
+          onEnvironmentResource?.(resource);
+          const settings = readSettings(resource);
+          const environment = await ensureFilePythonEnvironment(vscode, resource, "qbs", output, { cwd: dirname(projectFile) });
+          return environment ? {
+            ...settings,
+            ...environment,
+            q1timelineCommand: environment.source === "vscode" ? null : settings.q1timelineCommand,
+          } : undefined;
+        }
+        const notebookPath = config.sourceNotebook ?? config.scheduleNotebook;
+        const resource = vscode.Uri.file(resolve(dirname(projectFile), notebookPath));
+        onEnvironmentResource?.(resource);
+        const settings = readSettings(resource);
+        const environment = notebookEnvironment ?? await ensureNotebookEnvironment(
+          vscode, resource, output,
+        );
+        return environment ? { ...settings, ...environment, q1timelineCommand: null } : undefined;
+      },
       showOutput: () => output.show(true),
     });
-  const runAnalyzeAndOpenForProject = async (projectFile?: string) => {
-    const runner = createHandler(projectFile ? async () => projectFile : resolveProjectWithVscode);
+  const runAnalyzeAndOpenForProject = async (
+    projectFile?: string,
+    notebookEnvironment?: { pythonPath: string; pythonArgs: string[] },
+  ) => {
+    let resource: vscodeTypes.Uri | undefined;
+    const runner = createHandler(
+      projectFile ? async () => projectFile : resolveProjectWithVscode,
+      notebookEnvironment,
+      (resolvedResource) => { resource = resolvedResource; },
+    );
     try {
       await runner();
     } catch (error) {
       const processError = error as NodeJS.ErrnoException;
       const missingPython = processError.code === "ENOENT" && processError.syscall?.startsWith("spawn");
-      if (!missingPython && !/No module named ['"]?(q1lens|qbstimeline|q1timeline)\b/.test(String(error))) throw error;
       output.appendLine(String(error));
+      if (!missingPython && !/No module named ['"]?(q1lens|qbstimeline|q1timeline)\b/.test(String(error))) {
+        void vscode.window.showErrorMessage(`Q1Lens analysis failed: ${error instanceof Error ? error.message : String(error)}`);
+        return;
+      }
       const action = await vscode.window.showErrorMessage(
-        `Q1Lens is unavailable in the selected Python environment (${readSettings().pythonPath}).`,
+        "Q1Lens is unavailable in the selected Python environment.",
         "Check Python Environment",
       );
-      if (action === "Check Python Environment") await vscode.commands.executeCommand("q1lens.checkEnvironment", "qbsTimeline.analyzeAndOpen");
+      if (action === "Check Python Environment") await vscode.commands.executeCommand("q1lens.checkEnvironment", "qbsTimeline.analyzeAndOpen", resource);
     }
   };
   analyzeHandler = () => runAnalyzeAndOpenForProject();
   refreshHandler = () => runAnalyzeAndOpenForProject(lastPaths?.projectFile);
 
   const openNotebookTimelineFromCell = async (cellArg?: unknown) => {
-    const notebookContext = resolveNotebookCellContext(vscode, cellArg);
+    let notebookContext = resolveNotebookCellContext(vscode, cellArg);
     if (!notebookContext) {
       await vscode.window.showWarningMessage("Open a saved notebook code cell before opening Q1Lens.");
+      return;
+    }
+    const selectedCell = notebookContext.notebook.cellAt(notebookContext.selectedCellIndex);
+    const environment = await ensureNotebookEnvironment(vscode, notebookContext.notebook.uri, output);
+    if (!environment) return;
+    notebookContext = notebookContext.notebook.isClosed || !notebookContext.notebook.getCells().includes(selectedCell)
+      ? undefined
+      : resolveNotebookCellContext(vscode, selectedCell);
+    if (!notebookContext) {
+      await vscode.window.showWarningMessage("The original notebook cell is no longer available. Open Q1Lens again from a saved notebook code cell.");
       return;
     }
     const defaults = inferNotebookTimelineVariables(notebookContext.cells, notebookContext.selectedCellIndex);
@@ -691,7 +743,7 @@ export function registerCommands(context: vscodeTypes.ExtensionContext, deps: Re
     await vscode.workspace.fs.createDirectory(vscode.Uri.file(project.projectDir));
     await vscode.workspace.fs.writeFile(vscode.Uri.file(project.snapshotFile), Buffer.from(project.snapshotJson, "utf8"));
     await vscode.workspace.fs.writeFile(vscode.Uri.file(project.projectFile), Buffer.from(project.projectYaml, "utf8"));
-    await runAnalyzeAndOpenForProject(project.projectFile);
+    await runAnalyzeAndOpenForProject(project.projectFile, environment);
   };
 
   const markNotebookCell = async (tag: string, cellArg?: unknown) => {

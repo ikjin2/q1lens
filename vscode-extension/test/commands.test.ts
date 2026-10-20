@@ -794,7 +794,7 @@ describe("commands", () => {
     );
   });
 
-  it("opens Q1Lens from a notebook cell through a managed project", async () => {
+  it("uses the original notebook's current kernel for opening and refreshing a managed project", async () => {
     const root = mkdtempSync(join(tmpdir(), "qbs-notebook-cell-"));
     const notebookPath = join(root, "experiment.ipynb");
     writeFileSync(notebookPath, "{}", "utf8");
@@ -802,6 +802,16 @@ describe("commands", () => {
     const commands: Record<string, (...args: any[]) => Promise<void>> = {};
     let analyzedProjectFile = "";
     let shownProjectFile = "";
+    let panelHandlers: any;
+    let panelShows = 0;
+    let configurationWrites = 0;
+    let variablePrompts = 0;
+    let activeNotebookEditor: any;
+    let notebookEnvironment: { pythonPath: string; pythonArgs: string[] } | undefined;
+    let environmentWait = Promise.resolve();
+    let scheduleText = "two_tone_sched = Schedule('demo')\n";
+    const environmentNotebooks: string[] = [];
+    const invocations: Array<{ stage: string; pythonPath: string; pythonArgs: string[]; q1timelineCommand?: string | null }> = [];
     const originalLoad = (Module as any)._load;
     const vscode = {
       Uri: {
@@ -813,12 +823,27 @@ describe("commands", () => {
         createOutputChannel: () => ({ appendLine: () => {}, show: () => {}, dispose: () => {} }),
         showWarningMessage: async () => undefined,
         showQuickPick: async (items: any[]) => items[0],
-        showInputBox: async (options: any) => options.value,
+        showInputBox: async (options: any) => {
+          variablePrompts += 1;
+          return options.value;
+        },
         activeTextEditor: undefined,
-        activeNotebookEditor: undefined,
+        get activeNotebookEditor() {
+          return activeNotebookEditor;
+        },
       },
       workspace: {
-        getConfiguration: () => ({ get: (_key: string, fallback: any) => fallback }),
+        getConfiguration: (section: string) => ({
+          get: (key: string, fallback: any) => {
+            if (section === "q1lens") {
+              if (key === "pythonPath") return "configured-python";
+              if (key === "pythonArgs") return ["--configured-argument"];
+              if (key === "q1timelineCommand") return "configured-q1timeline";
+            }
+            return fallback;
+          },
+          update: async () => { configurationWrites += 1; },
+        }),
         findFiles: async () => [],
         fs: {
           createDirectory: async (uri: any) => mkdirSync(uri.fsPath, { recursive: true }),
@@ -854,7 +879,7 @@ describe("commands", () => {
         index: 1,
         kind: vscode.NotebookCellKind.Code,
         metadata: {},
-        document: { getText: () => "two_tone_sched = Schedule('demo')\n" },
+        document: { getText: () => scheduleText },
       },
     ];
     const notebook = {
@@ -871,11 +896,24 @@ describe("commands", () => {
       if (request === "vscode") {
         return vscode;
       }
+      if (request === "../notebookEnvironment") {
+        return {
+          ensureNotebookEnvironment: async (_vscode: any, uri: any) => {
+            environmentNotebooks.push(uri.fsPath);
+            await environmentWait;
+            return notebookEnvironment;
+          },
+        };
+      }
       if (request === "./webview/panel") {
         return {
           TimelinePanel: class {
+            constructor(_extensionUri: any, handlers: any) {
+              panelHandlers = handlers;
+            }
             show(_ir: any, paths: any) {
               shownProjectFile = paths.projectFile;
+              panelShows += 1;
             }
           },
         };
@@ -886,17 +924,26 @@ describe("commands", () => {
       if (request === "./qbsCli") {
         let irPath = "";
         let htmlPath = "";
+        let timelineIrPath = "";
+        let diagnosticsPath = "";
         return {
           buildAnalyzeInvocation: (input: any) => {
+            invocations.push({ stage: "analyze", ...input });
             analyzedProjectFile = input.projectFile;
             irPath = input.irPath;
             return { command: "mock", args: ["analyze"] };
           },
           buildRenderInvocation: (input: any) => {
+            invocations.push({ stage: "render", ...input });
             htmlPath = input.htmlPath;
             return { command: "mock", args: ["render"] };
           },
-          buildQ1TimelineAnalyzeInvocation: () => ({ command: "mock", args: ["q1timeline"] }),
+          buildQ1TimelineAnalyzeInvocation: (input: any) => {
+            invocations.push({ stage: "q1timeline", ...input });
+            timelineIrPath = input.timelineIrPath;
+            diagnosticsPath = input.diagnosticsPath;
+            return { command: "mock", args: ["q1timeline"] };
+          },
           runProcessWithSpawn: (_command: string, args: string[]) => {
             if (args[0] === "analyze") {
               mkdirSync(join(root, ".qbs_timeline"), { recursive: true });
@@ -907,14 +954,19 @@ describe("commands", () => {
                   operations: [],
                   symbolic_values: [],
                   symbolic_pulses: [],
-                  q1asm_programs: [],
+                  q1asm_programs: [{ sequencer: "seq0", file: "q1asm/seq0.q1asm" }],
                   q1asm_provenance: [],
                 }),
                 "utf8",
               );
+              writeFileSync(join(root, ".qbs_timeline", "q1timeline.yml"), "sequencers: []\n", "utf8");
             }
             if (args[0] === "render") {
               writeFileSync(htmlPath, "<html></html>", "utf8");
+            }
+            if (args[0] === "q1timeline") {
+              writeFileSync(timelineIrPath, JSON.stringify({ events: [] }), "utf8");
+              writeFileSync(diagnosticsPath, "[]", "utf8");
             }
             return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
           },
@@ -934,18 +986,277 @@ describe("commands", () => {
 
       await commands["qbsTimeline.openNotebookTimelineFromCell"](cells[1]);
 
+      assert.equal(variablePrompts, 0);
+      assert.equal(analyzedProjectFile, "");
+      assert.equal(existsSync(join(root, ".qbs_timeline", "notebook", "qbstimeline.yml")), false);
+
+      notebookEnvironment = { pythonPath: join(root, "kernel-a", "python.exe"), pythonArgs: [] };
+      let resumeEnvironment!: () => void;
+      environmentWait = new Promise<void>((resolveDone) => { resumeEnvironment = resolveDone; });
+      activeNotebookEditor = { notebook, selection: { start: 1 } };
+      const opening = commands["qbsTimeline.openNotebookTimelineFromCell"]();
+      scheduleText = "updated_sched = Schedule('edited during setup')\n";
+      activeNotebookEditor = { notebook: { uri: vscode.Uri.file(join(root, "other.ipynb")) }, selection: { start: 0 } };
+      resumeEnvironment();
+      await opening;
+
       assert.equal(analyzedProjectFile.endsWith(join(".qbs_timeline", "notebook", "qbstimeline.yml")), true);
       assert.equal(shownProjectFile, analyzedProjectFile);
       const projectText = readFileSync(analyzedProjectFile, "utf8");
-      assert.match(projectText, /schedule_variable: two_tone_sched/);
+      assert.match(projectText, /schedule_variable: updated_sched/);
       assert.match(projectText, /compiler_variable: hw_agent/);
       const snapshotText = readFileSync(join(root, ".qbs_timeline", "notebook", "selected.ipynb"), "utf8");
       assert.equal(JSON.parse(snapshotText).cells[1].metadata.tags.includes("qbstimeline-schedule"), true);
+      assert.equal(JSON.parse(snapshotText).cells[1].source.join(""), scheduleText);
+      assert.deepEqual(invocations.map(({ stage, pythonPath, pythonArgs }) => ({ stage, pythonPath, pythonArgs })), [
+        { stage: "analyze", ...notebookEnvironment },
+        { stage: "render", ...notebookEnvironment },
+        { stage: "q1timeline", ...notebookEnvironment },
+      ]);
+      assert.equal(invocations[2].q1timelineCommand, null);
+
+      activeNotebookEditor = { notebook: { uri: vscode.Uri.file(join(root, "other.ipynb")) } };
+      notebookEnvironment = { pythonPath: join(root, "kernel-b", "python.exe"), pythonArgs: [] };
+      const originalProjectFile = analyzedProjectFile;
+      await commands["qbsTimeline.refresh"]();
+
+      assert.equal(analyzedProjectFile, originalProjectFile);
+      assert.deepEqual(invocations.slice(3).map(({ stage, pythonPath, pythonArgs }) => ({ stage, pythonPath, pythonArgs })), [
+        { stage: "analyze", ...notebookEnvironment },
+        { stage: "render", ...notebookEnvironment },
+        { stage: "q1timeline", ...notebookEnvironment },
+      ]);
+      assert.equal(invocations[5].q1timelineCommand, null);
+
+      notebookEnvironment = undefined;
+      await panelHandlers.onRefresh();
+
+      assert.deepEqual(environmentNotebooks, [notebookPath, notebookPath, notebookPath, notebookPath]);
+      assert.equal(invocations.length, 6);
+      assert.equal(panelShows, 2);
+      assert.equal(configurationWrites, 0);
     } finally {
       delete require.cache[modulePath];
       (Module as any)._load = originalLoad;
     }
   });
+
+  for (const unavailable of ["closed", "deleted"] as const) {
+    it(`stops opening a notebook when its original cell is ${unavailable} during environment setup`, async () => {
+      const commands: Record<string, (...args: any[]) => Promise<void>> = {};
+      const warnings: string[] = [];
+      const cells: any[] = [];
+      const notebook = {
+        uri: { fsPath: join(tmpdir(), "q1lens-unavailable-notebook.ipynb") },
+        isClosed: false,
+        getCells: () => cells,
+        cellAt: (index: number) => cells[index],
+      };
+      cells.push({ notebook, index: 0, kind: 2, document: { getText: () => "schedule = Schedule('demo')\n" } });
+      const originalLoad = (Module as any)._load;
+      (Module as any)._load = function patchedLoad(request: string, parent: any, isMain: boolean) {
+        if (request === "vscode") return {
+          NotebookCellKind: { Markup: 1, Code: 2 },
+          window: {
+            createOutputChannel: () => ({ appendLine: () => {}, show: () => {}, dispose: () => {} }),
+            showWarningMessage: async (message: string) => { warnings.push(message); },
+            showInputBox: async () => { assert.fail("Variable prompts must not open for an unavailable cell"); },
+          },
+          workspace: {
+            getConfiguration: () => ({ get: (_key: string, fallback: any) => fallback }),
+            fs: {
+              createDirectory: async () => { assert.fail("No project artifacts should be created"); },
+            },
+          },
+          languages: {
+            createDiagnosticCollection: () => ({ clear: () => {}, set: () => {}, dispose: () => {} }),
+          },
+          commands: {
+            registerCommand: (name: string, callback: (...args: any[]) => Promise<void>) => {
+              commands[name] = callback;
+              return { dispose: () => {} };
+            },
+          },
+        };
+        if (request === "../notebookEnvironment") return {
+          ensureNotebookEnvironment: async () => {
+            if (unavailable === "closed") notebook.isClosed = true;
+            else cells.splice(0, 1);
+            return { pythonPath: "notebook-python", pythonArgs: [] };
+          },
+        };
+        if (request === "./webview/panel") return { TimelinePanel: class {} };
+        if (request === "./diagnostics") return { publishDiagnostics: () => {} };
+        return originalLoad.call(this, request, parent, isMain);
+      };
+      const modulePath = require.resolve("../src/qbs/commands");
+      delete require.cache[modulePath];
+      try {
+        require("../src/qbs/commands").registerCommands(
+          { extensionUri: { fsPath: "C:\\extension" }, subscriptions: [] },
+          { openQ1TimelineTarget: async () => undefined },
+        );
+        await commands["qbsTimeline.openNotebookTimelineFromCell"](cells[0]);
+
+        assert.equal(warnings.length, 1);
+        assert.match(warnings[0], /original notebook cell is no longer available/);
+      } finally {
+        delete require.cache[modulePath];
+        (Module as any)._load = originalLoad;
+      }
+    });
+  }
+
+  for (const source of ["vscode", "manual"] as const) {
+    it(`uses ${source} Python for file schedules and refreshes the original file's environment`, async () => {
+      const root = mkdtempSync(join(tmpdir(), "qbs-file-environment-"));
+      const projectFile = join(root, "qbstimeline.yml");
+      const scheduleFile = join(root, "schedule.py");
+      const outputDir = join(root, ".qbs_timeline");
+      mkdirSync(outputDir);
+      // Source metadata must not turn a file schedule into a notebook runtime.
+      writeFileSync(projectFile, "schedule:\n  file: schedule.py\nsource:\n  notebook: source.ipynb\n", "utf8");
+      writeFileSync(join(outputDir, "qbs_ir.json"), JSON.stringify({
+        operations: [], symbolic_values: [], symbolic_pulses: [],
+        q1asm_programs: [{ sequencer: "seq0", file: "q1asm/seq0.q1asm" }], q1asm_provenance: [],
+      }), "utf8");
+      writeFileSync(join(outputDir, "q1timeline.yml"), "sequencers: []\n", "utf8");
+      const commands: Record<string, () => Promise<void>> = {};
+      const invocations: Array<{ stage: string; pythonPath: string; pythonArgs: string[]; q1timelineCommand?: string | null }> = [];
+      const environmentResources: string[] = [];
+      const configurationResources: string[] = [];
+      const recoveryCommands: any[][] = [];
+      let failAnalysis = false;
+      const q1timelineCommand = "custom-q1timeline";
+      const expectedQ1timelineCommand = source === "manual" ? q1timelineCommand : null;
+      let activeFile = scheduleFile;
+      let selectedEnvironment: { pythonPath: string; pythonArgs: string[] } | undefined = {
+        pythonPath: source === "manual" ? "custom-launcher" : join(root, ".venv", "bin", "python"),
+        pythonArgs: source === "manual" ? ["-3.12"] : [],
+      };
+      let kernelLookups = 0;
+      let panelShows = 0;
+      let panelHandlers: any;
+      const originalLoad = (Module as any)._load;
+      (Module as any)._load = function patchedLoad(request: string, parent: any, isMain: boolean) {
+        if (request === "vscode") {
+          return {
+            Uri: { file: (fsPath: string) => ({ fsPath }) },
+            window: {
+              createOutputChannel: () => ({ appendLine: () => {}, show: () => {}, dispose: () => {} }),
+              showErrorMessage: async () => "Check Python Environment",
+              get activeTextEditor() { return { document: { uri: { fsPath: activeFile } } }; },
+            },
+            workspace: {
+              getConfiguration: (section: string, resource: any) => {
+                if (resource) configurationResources.push(resource.fsPath);
+                return {
+                  get: (key: string, fallback: any) => {
+                    if (section === "q1lens" && key === "pythonPath") return "wrong-default-python";
+                    if (section === "q1lens" && key === "pythonArgs") return ["--wrong-argument"];
+                    if (section === "q1lens" && key === "q1timelineCommand") return q1timelineCommand;
+                    return fallback;
+                  },
+                };
+              },
+              findFiles: async () => [{ fsPath: projectFile }],
+            },
+            languages: {
+              createDiagnosticCollection: () => ({ clear: () => {}, set: () => {}, dispose: () => {} }),
+            },
+            commands: {
+              executeCommand: async (...args: any[]) => { recoveryCommands.push(args); },
+              registerCommand: (name: string, callback: () => Promise<void>) => {
+                commands[name] = callback;
+                return { dispose: () => {} };
+              },
+            },
+          };
+        }
+        if (request === "../notebookEnvironment") {
+          return { ensureNotebookEnvironment: async () => { kernelLookups += 1; return undefined; } };
+        }
+        if (request === "../fileEnvironment") {
+          return {
+            ensureFilePythonEnvironment: async (_vscode: any, resource: any, kind: string, _output: any, options: any) => {
+              assert.equal(kind, "qbs");
+              assert.equal(options.cwd, root);
+              environmentResources.push(resource.fsPath);
+              return selectedEnvironment ? { ...selectedEnvironment, source, sourceLabel: source, resource } : undefined;
+            },
+          };
+        }
+        if (request === "./webview/panel") {
+          return { TimelinePanel: class {
+            constructor(_extensionUri: any, handlers: any) { panelHandlers = handlers; }
+            show() { panelShows += 1; }
+          } };
+        }
+        if (request === "./diagnostics") {
+          return { publishDiagnostics: () => {} };
+        }
+        if (request === "./qbsCli") {
+          const invocation = (stage: string) => (input: any) => {
+            invocations.push({ stage, ...input });
+            return { command: "mock", args: [] };
+          };
+          return {
+            buildAnalyzeInvocation: invocation("analyze"),
+            buildRenderInvocation: invocation("render"),
+            buildQ1TimelineAnalyzeInvocation: invocation("q1timeline"),
+            runProcessWithSpawn: async () => {
+              if (failAnalysis) throw new Error("No module named 'q1lens'");
+              return { exitCode: 0, stdout: "", stderr: "" };
+            },
+          };
+        }
+        return originalLoad.call(this, request, parent, isMain);
+      };
+      const modulePath = require.resolve("../src/qbs/commands");
+      delete require.cache[modulePath];
+      try {
+        require("../src/qbs/commands").registerCommands(
+          { extensionUri: { fsPath: "C:\\extension" }, subscriptions: [] },
+          { openQ1TimelineTarget: async () => undefined },
+        );
+        await commands["qbsTimeline.analyzeAndOpen"]();
+        assert.deepEqual(invocations.map(({ stage, pythonPath, pythonArgs }) => ({ stage, pythonPath, pythonArgs })), [
+          { stage: "analyze", ...selectedEnvironment },
+          { stage: "render", ...selectedEnvironment },
+          { stage: "q1timeline", ...selectedEnvironment },
+        ]);
+        assert.equal(invocations[2].q1timelineCommand, expectedQ1timelineCommand);
+
+        activeFile = join(root, "other-project", "qbstimeline.yml");
+        selectedEnvironment = { pythonPath: join(root, ".changed-venv", "bin", "python"), pythonArgs: [] };
+        await commands["qbsTimeline.refresh"]();
+        assert.deepEqual(invocations.slice(3).map(({ stage, pythonPath, pythonArgs }) => ({ stage, pythonPath, pythonArgs })), [
+          { stage: "analyze", ...selectedEnvironment },
+          { stage: "render", ...selectedEnvironment },
+          { stage: "q1timeline", ...selectedEnvironment },
+        ]);
+        assert.equal(invocations[5].q1timelineCommand, expectedQ1timelineCommand);
+
+        selectedEnvironment = undefined;
+        await panelHandlers.onRefresh();
+        assert.equal(invocations.length, 6, "An unavailable environment must not fall back to configured Python");
+        assert.equal(kernelLookups, 0);
+        assert.deepEqual(environmentResources, Array(3).fill(scheduleFile));
+        assert.equal(configurationResources.length, 9);
+        assert.equal(configurationResources.every((resource) => resource === scheduleFile), true);
+        assert.equal(panelShows, 2);
+
+        selectedEnvironment = { pythonPath: "selected-python", pythonArgs: [] };
+        failAnalysis = true;
+        await commands["qbsTimeline.refresh"]();
+        assert.equal(recoveryCommands[0][0], "q1lens.checkEnvironment");
+        assert.equal(recoveryCommands[0][2].fsPath, scheduleFile);
+      } finally {
+        delete require.cache[modulePath];
+        (Module as any)._load = originalLoad;
+      }
+    });
+  }
 
   it("opens current folder Q1ASM files through the all-files q1timeline opener", async () => {
     const root = mkdtempSync(join(tmpdir(), "qbs-current-folder-q1asm-"));
@@ -1097,6 +1408,13 @@ describe("commands", () => {
       (Module as any)._load = function patchedLoad(request: string, parent: any, isMain: boolean) {
         if (request === "vscode") {
           return vscode;
+        }
+        if (request === "../fileEnvironment") {
+          return {
+            ensureFilePythonEnvironment: async (_vscode: any, resource: any) => ({
+              pythonPath: "selected-python", pythonArgs: [], source: "vscode", sourceLabel: "VS Code selection", resource,
+            }),
+          };
         }
         if (request === "./webview/panel") {
           return {

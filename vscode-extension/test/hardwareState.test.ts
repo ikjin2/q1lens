@@ -234,6 +234,36 @@ describe("project execution replay trace", () => {
 });
 
 describe("hardware state cursor model", () => {
+  it("excludes removed comparison events from current state, cursor steps and replay", () => {
+    const current = replayFixture();
+    current.events.push(event("current-rt", "upd_param", 20, 24, 7, {
+      rt_packet_id: "current", applied_state: { frequency: 120 },
+    }));
+    const ir = structuredClone(current);
+    const removed = { diff_status: "removed" };
+    ir.events.push(
+      event("removed-issue", "q1_issue", 100, 104, 8, { ...removed, execution_index: 1 }),
+      event("removed-acquire", "acquire", 200, 204, 9, {
+        ...removed, rt_packet_id: "old", acquisition_index: 0, bin_index: 0, applied_state: { frequency: 700 },
+      }),
+      event("removed-play", "play", 204, 208, 10, { ...removed, rt_packet_id: "old-play" }),
+      event("removed-region", "unknown_region", 208, null, 11, removed),
+      { ...event("removed-sequencer", "q1_issue", 500, 504, 12, removed), sequencer_id: "deleted" },
+    );
+    const before = JSON.stringify(ir);
+    const expected = hardware.createIndex(current);
+    const index = hardware.createIndex(ir);
+    assert.deepEqual(index.sequencers, expected.sequencers);
+    assert.equal(index.eventsById.has("removed-acquire"), false);
+    for (const basis of ["local", "aligned"]) {
+      assert.deepEqual(hardware.stepTimes(index, "seq0", basis), hardware.stepTimes(expected, "seq0", basis));
+      assert.deepEqual(hardware.snapshot(index, "seq0", 600, basis), hardware.snapshot(expected, "seq0", 600, basis));
+      assert.deepEqual(hardware.executionTrace(index, "seq0", basis), hardware.executionTrace(expected, "seq0", basis));
+    }
+    assert.deepEqual(hardware.projectExecutionTrace(index), hardware.projectExecutionTrace(expected));
+    assert.equal(JSON.stringify(ir), before);
+  });
+
   it("tracks simulated queue occupancy and stalls without treating telemetry as RT commands", () => {
     const ir = fixture();
     ir.simulation = { seq0: { queue_capacity: 2, startup_delay_ns: 100, end_time_ns: 120 } };

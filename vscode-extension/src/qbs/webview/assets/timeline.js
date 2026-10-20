@@ -664,6 +664,9 @@ function render(ir, explicitSelectedId, sourceContext) {
   if (!currentIr) {
     return;
   }
+  const title = currentIr.schedule?.name || "Q1Lens";
+  document.querySelector(".topbar h1").textContent = title;
+  document.title = title;
   if (explicitSelectedId) {
     selectedId = explicitSelectedId;
   }

@@ -1711,9 +1711,10 @@ describe("timeline webview assets", () => {
       const initialSnapshot = JSON.stringify(snapshot);
       const details = new Node("details");
       for (const [index, parameter] of parameters.entries()) {
-        const row = new Node("tr");
+        const row = new Node("div");
         row.dataset.parameterIndex = String(index);
-        const cell = new Node("td");
+        const cell = new Node("dd");
+        cell.className = "parameter-value";
         const value = new Node("code");
         value.textContent = parameter.value_json;
         const annotation = new Node("span");

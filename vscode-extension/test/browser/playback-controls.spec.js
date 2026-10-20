@@ -936,3 +936,126 @@ test("an older queued parameter applies while a newer setter remains independent
   await expect(marker("rt2")).not.toHaveClass(/is-applied/);
   expect(await page.evaluate(() => JSON.parse(document.getElementById("timeline-ir").textContent))).toEqual(ir);
 });
+
+function feedbackNavigationFixture() {
+  const feedback = (id, kind, time, sequencer, line) => ({...event(id, kind, time, time),
+    sequencer_id: sequencer, source: {file: `${sequencer}.q1asm`, line}, lane: "rt.feedback"});
+  return {sequencers: [{id: "sender"}, {id: "middle"}, {id: "receiver"}], events: [
+    feedback("send", "feedback_com", 80, "sender", 3),
+    feedback("inline-send", "feedback_com", 200, "sender", 6),
+    feedback("local", "feedback_pop", 240, "sender", 7),
+    {...event("crossed-block", "wait", 0, 300), sequencer_id: "middle"},
+    feedback("receive", "feedback_pop", 180, "receiver", 5),
+    {...event("end", "stop", 300, 300), sequencer_id: "receiver"},
+  ], feedback_flows: [
+    {id: "cross-flow", from_event_id: "send", to_event_id: "receive", channel: "cross"},
+    {id: "inline-flow", from_event_id: "inline-send", to_event_id: "local", channel: "local"},
+  ]};
+}
+
+async function feedbackPathPoint(path, target) {
+  return path.evaluate((node, target) => {
+    const length = node.getTotalLength();
+    for (let step = 5; step < 96; step++) {
+      const point = node.getPointAtLength(length * step / 100).matrixTransform(node.getScreenCTM());
+      const hit = document.elementFromPoint(point.x, point.y);
+      if (target === "path" ? hit === node : hit?.closest(".timeline-block")?.dataset.eventId === target) {
+        return {x: point.x, y: point.y};
+      }
+    }
+    throw new Error(`No feedback path point hits ${target}`);
+  }, target);
+}
+
+test("feedback markers and connector navigate in normal view with hidden instruction blocks", async ({page}) => {
+  const ir = feedbackNavigationFixture();
+  await mount(page, "completed", ir, {timelineWaitsCollapsed: false});
+  await page.getByRole("button", {name: "Normal view", exact: true}).click();
+  await expect(page.locator('.timeline-block[data-event-id="send"]')).toBeHidden();
+  await expect(page.locator('.timeline-block[data-event-id="receive"]')).toBeHidden();
+  const source = page.locator('.feedback-endpoint[data-flow-id="cross-flow"][data-feedback-role="source"]');
+  const target = page.locator('.feedback-endpoint[data-flow-id="cross-flow"][data-feedback-role="target"]');
+  const connector = page.locator('.feedback-connector[data-flow-id="cross-flow"]');
+  const inline = page.locator('.feedback-inline-capsule[data-flow-id="inline-flow"]');
+  const messages = () => page.evaluate(() => window.messages.filter((message) => ["eventClick", "feedbackFlowClick"].includes(message.type)));
+  for (const [marker, role] of [[source, "source"], [target, "target"],
+    [inline.locator('.feedback-dot-source'), "source"], [inline.locator('.feedback-dot-target'), "target"]]) {
+    const flowId = marker === source || marker === target ? "cross-flow" : "inline-flow";
+    await page.evaluate(() => {window.messages = [];});
+    await marker.click();
+    expect(await messages()).toEqual([{type: "feedbackFlowClick", flowId, role}]);
+  }
+  for (const node of [connector, inline]) {
+    const flowId = node === connector ? "cross-flow" : "inline-flow";
+    await page.evaluate(() => {window.messages = [];});
+    if (node === connector) {
+      const point = await feedbackPathPoint(connector, "path");
+      await page.mouse.click(point.x, point.y);
+    } else await inline.locator('.feedback-mini-track-before').click();
+    expect(await messages()).toEqual([{type: "feedbackFlowClick", flowId}]);
+    for (const key of ["Enter", "Space"]) {
+      await page.evaluate(() => {window.messages = [];});
+      await node.focus();
+      await node.press(key);
+      expect(await messages()).toEqual([{type: "feedbackFlowClick", flowId}]);
+    }
+  }
+  await page.screenshot({path: test.info().outputPath("feedback-source-navigation.png"), fullPage: true});
+  expect(await page.evaluate(() => JSON.parse(document.getElementById("timeline-ir").textContent))).toEqual(ir);
+});
+
+test("feedback connector crossings preserve block clicks and empty overlay space preserves panning", async ({page}) => {
+  await mount(page, "completed", feedbackNavigationFixture(), {timelineWaitsCollapsed: false});
+  await page.getByRole("button", {name: "Normal view", exact: true}).click();
+  const connector = page.locator('.feedback-connector[data-flow-id="cross-flow"]');
+  const crossing = await feedbackPathPoint(connector, "crossed-block");
+  await page.evaluate(() => {window.messages = [];});
+  await page.mouse.click(crossing.x, crossing.y);
+  expect(await page.evaluate(() => window.messages.filter((message) => ["eventClick", "feedbackFlowClick"].includes(message.type))))
+    .toEqual([{type: "eventClick", eventId: "crossed-block"}]);
+  const track = page.locator('.timeline-row[data-lane="sequencer:sender"] .lane-track');
+  const bounds = await track.boundingBox();
+  const empty = {x: bounds.x + bounds.width * .7, y: bounds.y + 2};
+  expect(await page.evaluate(({x, y}) => document.elementFromPoint(x, y).classList.contains("lane-track"), empty)).toBe(true);
+  await page.mouse.move(empty.x, empty.y);
+  await page.mouse.wheel(0, -400);
+  const before = await page.evaluate(() => window.getSavedTimelineState().timelineWindow);
+  expect(before.max - before.min).toBeLessThan(300);
+  await page.evaluate(() => {window.messages = [];});
+  await page.mouse.move(empty.x, empty.y);
+  await page.mouse.down();
+  await page.mouse.move(empty.x + 60, empty.y, {steps: 4});
+  await page.mouse.up();
+  const after = await page.evaluate(() => window.getSavedTimelineState().timelineWindow);
+  expect(after.max - after.min).toBeCloseTo(before.max - before.min, 6);
+  expect(after.min).toBeLessThan(before.min);
+  expect(await page.evaluate(() => window.messages.filter((message) => ["eventClick", "feedbackFlowClick"].includes(message.type)))).toEqual([]);
+});
+
+test("blocks take precedence over feedback marker overlap while exposed marker edges remain clickable", async ({page}) => {
+  const ir = feedbackNavigationFixture();
+  ir.events.push(...[["source-block", 70, 90, "sender"], ["target-block", 170, 190, "receiver"],
+    ["inline-block", 195, 245, "sender"]].map(([id, start, end, sequencer_id]) => ({...event(id, "wait", start, end), sequencer_id})));
+  await mount(page, "completed", ir, {timelineWaitsCollapsed: false});
+  await page.getByRole("button", {name: "Normal view", exact: true}).click();
+  for (const [selector, eventId, role] of [
+    ['.feedback-endpoint[data-feedback-role="source"]', "source-block", "source"],
+    ['.feedback-endpoint[data-feedback-role="target"]', "target-block", "target"],
+    ['.feedback-inline-capsule', "inline-block", undefined],
+  ]) {
+    const marker = page.locator(selector);
+    const bounds = await marker.boundingBox();
+    const point = {x: bounds.x + bounds.width / 2, y: bounds.y + 2};
+    expect(await page.evaluate(({x, y}) => document.elementFromPoint(x, y)?.closest('.timeline-block')?.dataset.eventId, point)).toBe(eventId);
+    await page.evaluate(() => {window.messages = [];});
+    await page.mouse.click(point.x, point.y);
+    expect(await page.evaluate(() => window.messages.filter((message) => ["eventClick", "feedbackFlowClick"].includes(message.type))))
+      .toEqual([{type: "eventClick", eventId}]);
+    const flowId = await marker.getAttribute("data-flow-id");
+    const edge = await marker.boundingBox();
+    await page.evaluate(() => {window.messages = [];});
+    await page.mouse.click(edge.x + edge.width / 2, edge.y + edge.height - 2);
+    expect(await page.evaluate(() => window.messages.filter((message) => ["eventClick", "feedbackFlowClick"].includes(message.type))))
+      .toEqual([{type: "feedbackFlowClick", flowId, ...(role ? {role} : {})}]);
+  }
+});

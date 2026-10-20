@@ -20,6 +20,14 @@ function parseWebviewMessage(message) {
     return { valid: true, type: "eventClick", eventId: message.eventId };
   }
 
+  if (message.type === "feedbackFlowClick" &&
+      typeof message.flowId === "string" && message.flowId.trim().length > 0 &&
+      (message.role === undefined || message.role === "source" || message.role === "target") &&
+      hasOnlyKeys(message, ["type", "flowId", "role"])) {
+    return { valid: true, type: "feedbackFlowClick", flowId: message.flowId,
+      ...(message.role === undefined ? {} : { role: message.role }) };
+  }
+
   if (message.type === "requestRefresh" && hasOnlyKeys(message, ["type"])) {
     return { valid: true, type: "requestRefresh" };
   }

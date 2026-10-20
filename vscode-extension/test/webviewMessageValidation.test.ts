@@ -2,6 +2,16 @@ import assert from "node:assert/strict";
 import { parseWebviewMessage } from "../src/q1timeline/webviewMessageValidation";
 
 describe("q1timeline webview message validation", () => {
+  it("accepts feedback flow source jumps with an optional endpoint role", () => {
+    for (const role of [undefined, "source", "target"]) {
+      const message = { type: "feedbackFlowClick", flowId: "flow", ...(role === undefined ? {} : { role }) };
+      assert.deepEqual(parseWebviewMessage(message), { valid: true, ...message });
+    }
+    for (const change of [
+      { flowId: "" }, { flowId: " " }, { flowId: 4 }, { role: null }, { role: "both" }, { role: 1 }, { extra: true },
+    ]) assert.equal(parseWebviewMessage({ type: "feedbackFlowClick", flowId: "flow", ...change }).valid, false);
+  });
+
   it("accepts unknown or 32-bit feedback values and nonnegative integral receive delays", () => {
     for (const value of [null, 0, -2147483648, 4294967295]) {
       const message = { type: "setExecutionFeedback", eventId: "seq:e4", feedbackId: "seq:feedback:3", value, delayNs: 1000 };

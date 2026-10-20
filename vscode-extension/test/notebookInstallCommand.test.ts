@@ -93,5 +93,5 @@ describe("notebook installation commands", () => {
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
-  });
+  }).timeout(25000);
 });

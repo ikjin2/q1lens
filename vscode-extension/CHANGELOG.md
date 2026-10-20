@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.4
+
+- Allow native shell installation-command checks enough time for both PowerShell launches on Windows CI.
+- Include the Python environment and timeline improvements from 0.2.3, paired with Python package 0.2.4.
+
 ## 0.2.3
 
 - Select and check Python environments for Q1ASM files, schedules, and notebook kernels, with guided setup and version-matched installation commands.

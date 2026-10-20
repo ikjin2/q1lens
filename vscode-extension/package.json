@@ -2,7 +2,7 @@
   "name": "q1lens",
   "displayName": "Q1Lens",
   "description": "Inspect Qblox schedules, symbolic pulses, Q1ASM timelines, and lowering provenance inside VS Code.",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "publisher": "q1lens",
   "author": {
     "name": "Ik Kyeong Jin",
@@ -587,7 +587,7 @@
     "test:extension": "npm run compile && npm run bundle && node ./out/test/runTest.js",
     "package": "vsce package",
     "verify:installed": "node ./scripts/verify-installed-assets.js",
-    "reinstall:local": "npm run package && code --install-extension q1lens-0.2.3.vsix --force && npm run verify:installed",
+    "reinstall:local": "npm run package && code --install-extension q1lens-0.2.4.vsix --force && npm run verify:installed",
     "test:browser": "playwright test"
   },
   "dependencies": {

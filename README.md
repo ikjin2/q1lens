@@ -248,7 +248,7 @@ artifacts:
 
 ### Review and execution workflows
 
-The following workflows are available in the Q1Lens 0.2.3 Python package and
+The following workflows are available in the Q1Lens 0.2.4 Python package and
 VS Code extension. The Desktop workbench is a development app run from the
 source checkout; this release does not include a Desktop installer.
 
@@ -343,6 +343,9 @@ The [desktop workbench](desktop-app/README.md) provides a local Electron/Pixi
 timeline using the same Python analysis. For reproducible checks, see
 [continuous validation](docs/ci-validation.md) and the
 [cursor-frequency verification guide](examples/cursor-frequency-demo/verification/README.md).
+
+Reproduction steps, fixes and regression tests for extension bugs are recorded in
+the [VS Code extension bug fix log](docs/vscode-extension-bugfix-log.md).
 
 ### Build and test
 

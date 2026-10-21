@@ -88,7 +88,7 @@
       showAllRegisters: initial.showAllRegisters === true,
       replaySpeed: [100, 450, 900].includes(initial.replaySpeed) ? initial.replaySpeed : 450,
       replayScope: sequencers.length > 1 && initial.replayScope !== "sequencer" ? "project" : "sequencer",
-      binOffset: 0,
+      binOffset: Number.isInteger(initial.binOffset) && initial.binOffset >= 0 ? initial.binOffset : 0,
       level: ["modules", "sequencers", "detail"].includes(initial.level) ? initial.level : "modules",
       moduleId: modules.includes(initial.moduleId) ? initial.moduleId : undefined,
     };
@@ -96,8 +96,8 @@
     if (state.moduleId === undefined || state.level === "detail") state.moduleId = initialSequencer ? moduleId(initialSequencer) : "";
     if (!initialSequencer) state.level = "modules";
     let snapshot;
-    let selectedRegister = "R0";
-    let selectedBin;
+    let selectedRegister = /^R([0-9]|[1-5][0-9]|6[0-3])$/.test(initial.selectedRegister) ? initial.selectedRegister : "R0";
+    let selectedBin = typeof initial.selectedBin === "string" ? initial.selectedBin : undefined;
     let frame;
     let destroyed = false;
     let sourceTarget;
@@ -240,7 +240,7 @@
     }
 
     function notify() {
-      if (options.onStateChange) options.onStateChange({ ...state, replayOpen });
+      if (options.onStateChange) options.onStateChange({ ...state, selectedRegister, selectedBin, replayOpen });
     }
 
     function setSequencerOptions() {
@@ -545,6 +545,7 @@
     function navigate(level, module, sequencer) {
       pauseReplay();
       if (level !== "detail" || sequencer !== undefined && sequencer !== state.sequencerId) replayOpen = false;
+      if (sequencer !== undefined && sequencer !== state.sequencerId) state.binOffset = 0;
       if (module !== undefined) state.moduleId = module;
       if (sequencer !== undefined) state.sequencerId = sequencer;
       state.level = level;
@@ -832,7 +833,7 @@
       const event = selectedEvent();
       sourceTarget = state.selectedBlock === "registers" && register ? { source: register.source, eventId: register.eventId } : event ? { source: event.source, eventId: event.id } : undefined;
       const bin = snapshot.bins.records.find((entry) => `${entry.acquisitionIndex}:${entry.binIndex}` === selectedBin);
-      if (state.selectedBlock === "bins" && bin) sourceTarget = { source: bin.source, eventId: bin.eventId };
+      if (state.selectedBlock === "bins" && selectedBin !== undefined) sourceTarget = bin ? { source: bin.source, eventId: bin.eventId } : undefined;
       const source = sourceTarget && sourceTarget.source;
       text(values["selection-detail"], source && source.file ? `${source.file}:${source.line || 1}` : "Select a register or active block to inspect its source instruction.");
       find('[data-action="source"]').disabled = !(source && source.file && options.onSourceClick);
@@ -844,7 +845,6 @@
       pauseReplay();
       state.time = Math.round(time);
       syncReplayPosition();
-      state.binOffset = 0;
       render(notifyChange);
     }
 
@@ -856,7 +856,7 @@
       const sequencer = sequencers.find((seq) => seq.id === seqId);
       if (!sequencer) return;
       pauseReplay();
-      if (state.sequencerId !== seqId) replayOpen = false;
+      if (state.sequencerId !== seqId) { replayOpen = false; state.binOffset = 0; }
       state.sequencerId = seqId;
       state.moduleId = moduleId(sequencer);
       state.level = "detail";
@@ -873,7 +873,7 @@
       const sequencer = sequencers.find((seq) => seq.id === String(event.sequencer_id));
       if (!writer || !sequencer) return;
       pauseReplay();
-      if (state.sequencerId !== sequencer.id) replayOpen = false;
+      if (state.sequencerId !== sequencer.id) { replayOpen = false; state.binOffset = 0; }
       selectedRegister = register;
       state.selectedBlock = "registers";
       state.sequencerId = sequencer.id;
@@ -968,7 +968,7 @@
       if (control === "module") {
         navigate("sequencers", controls.module.value);
       }
-      if (control === "sequencer") { state.binOffset = 0; navigate("detail", state.moduleId, controls.sequencer.value); }
+      if (control === "sequencer") navigate("detail", state.moduleId, controls.sequencer.value);
       if (control === "register-format") { state.registerFormat = controls[control].value; render(); }
       if (control === "all-registers") { state.showAllRegisters = controls[control].checked; render(); }
       if (control === "signal-stage") { state.signalStage = controls[control].value; render(); }
@@ -1017,6 +1017,11 @@
     render(false);
     return {
       selectEvent(eventId) { chooseEvent(eventId, false); },
+      finishReplayPreparation() {
+        if (!preparingReplay) return;
+        preparingReplay = false;
+        render();
+      },
       setTime,
       setTimeBasis(basis) {
         const nextBasis = basis === "aligned" ? "aligned" : "local";
@@ -1031,7 +1036,7 @@
         updateReplayTrace();
         render();
       },
-      getState() { return { ...state, replayOpen }; },
+      getState() { return { ...state, selectedRegister, selectedBin, replayOpen }; },
       destroy() {
         destroyed = true;
         pauseReplay();

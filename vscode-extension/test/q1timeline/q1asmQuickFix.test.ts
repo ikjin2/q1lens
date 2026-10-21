@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { join } from "node:path";
+import { execFileSync } from "node:child_process";
+import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import {
   DIAGNOSTIC_SUGGESTED_EDIT_PROPERTY,
@@ -103,6 +104,57 @@ function documentFor(file: string, text = "wait 4"): any {
 }
 
 describe("Q1ASM diagnostic quick fixes", () => {
+  it("withdraws attached and transported suggestions after another source line changes", () => {
+    const vscode = mockVscode();
+    const file = join(tmpdir(), "q1lens-quick-fix", "seq0.q1asm");
+    const before = "set_freq 100\nwait 4\nstop\n";
+    const after = "set_freq 100\nupd_param 4\nstop\n";
+    const repoRoot = resolve(__dirname, "../../../..");
+    const analyze = (source: string) => JSON.parse(execFileSync("python", ["-c",
+      "import json,sys; from q1timeline.analysis.api import analyze_text; print(json.dumps(analyze_text(sys.argv[1],file=sys.argv[2],hardware_readiness=True)))",
+      source, file,
+    ], { cwd: repoRoot, env: { ...process.env, PYTHONPATH: join(repoRoot, "src") }, encoding: "utf8", windowsHide: true }));
+    const original = analyze(before);
+    const corrected = analyze(after);
+    const pending = original.diagnostics.find((item: any) => item.category === "pending_hardware_state");
+    assert.ok(pending);
+    assert.ok(!corrected.diagnostics.some((item: any) => item.category === "pending_hardware_state"));
+    const published: Diagnostic[][] = [];
+    const manager = new DiagnosticsManager(vscode,
+      { clear() {}, set: (_target: any, items: Diagnostic[]) => published.push(items) },
+      (sourceFile: string) => sourceFile);
+    manager.apply([pending]);
+    const diagnostic = published[0][0];
+    const transported = new Diagnostic(diagnostic.range, diagnostic.message, diagnostic.severity);
+    transported.source = diagnostic.source;
+    transported.code = diagnostic.code;
+    const provider = new Q1asmQuickFixProvider(vscode);
+    const range = new Range(2, 0, 2, 4) as any;
+    assert.equal(provider.provideCodeActions(documentFor(file, before), range, { diagnostics: [transported] } as any).length, 1);
+    const Module = require("node:module");
+    const originalLoad = Module._load;
+    const controllerPath = require.resolve("../../src/q1timeline/controller");
+    const cached = require.cache[controllerPath];
+    Module._load = function (request: string, parent: unknown, isMain: boolean) {
+      return request === "vscode" ? vscode : originalLoad.call(this, request, parent, isMain);
+    };
+    delete require.cache[controllerPath];
+    try {
+      const { TimelineController } = require("../../src/q1timeline/controller");
+      TimelineController.prototype.invalidateSourceAnalysis.call({
+        resetPlayback() {}, sourceRevision: 0, cancelSourceRangeZoom() {}, diagnosticsManager: manager,
+      });
+      for (const stale of [diagnostic, transported]) {
+        assert.deepEqual(provider.provideCodeActions({ ...documentFor(file, after), isDirty: false }, range,
+          { diagnostics: [stale] } as any), [], "A saved fix on another line must invalidate the old insertion");
+      }
+    } finally {
+      Module._load = originalLoad;
+      if (cached) require.cache[controllerPath] = cached;
+      else delete require.cache[controllerPath];
+    }
+  });
+
   it("rejects stale suggestions after the diagnosed line changes or the document is dirty", () => {
     const vscode = mockVscode();
     const file = join(tmpdir(), "q1lens-quick-fix", "seq0.q1asm");

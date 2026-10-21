@@ -18,6 +18,7 @@ function harness() {
     action: undefined as string | undefined,
     error: undefined as Error | undefined,
     setup: undefined as (() => void) | undefined,
+    probe: undefined as (() => Promise<void>) | undefined,
     trusted: true,
   };
   const resolutions: unknown[] = [], probes: any[] = [], displays: any[] = [], setupCalls: any[] = [], messages: string[] = [];
@@ -43,9 +44,12 @@ function harness() {
       },
     };
     if (request === "./environment") return { probePythonEnvironment: async (pythonPath: string, args: string[], options: unknown) => {
-      probes.push({ pythonPath, args, options }); return { ...state.report };
+      probes.push({ pythonPath, args, options });
+      const report = { ...state.report };
+      await state.probe?.();
+      return report;
     } };
-    if (request === "./pythonEnvironmentStatus") return { publishPythonEnvironment: (display: unknown) => displays.push(display) };
+    if (request === "./pythonEnvironmentStatus") return { beginPythonEnvironmentCheck: () => ({}), publishPythonEnvironment: (display: unknown) => displays.push(display) };
     if (request === "./notebookEnvironment") return { showNotebookSetup: async (...args: any[]) => {
       setupCalls.push(args); state.setup?.();
       const checked = await args[4]();
@@ -58,7 +62,7 @@ function harness() {
   const { ensureFilePythonEnvironment } = require("../src/fileEnvironment") as typeof import("../src/fileEnvironment");
   const output = { appendLine: () => undefined, show: () => undefined } as unknown as vscode.OutputChannel;
   return { resource, state, resolutions, probes, displays, setupCalls, messages,
-    run: (kind: "qbs" | "q1asm" = "q1asm") => ensureFilePythonEnvironment(fakeVscode, resource, kind, output),
+    run: (kind: "qbs" | "q1asm" = "q1asm", options: { signal?: AbortSignal } = {}) => ensureFilePythonEnvironment(fakeVscode, resource, kind, output, options),
     restore: () => { Module._load = originalLoad; delete require.cache[modulePath]; },
   };
 }
@@ -83,6 +87,61 @@ describe("File Python environment setup", () => {
     assert.deepEqual(await test.run("qbs"), test.state.selected);
     assert.deepEqual(test.probes[0].args, ["run", "python"]);
     assert.deepEqual(test.probes[0].options.env, {});
+  });
+
+  for (const kind of ["qbs", "q1asm"] as const) {
+    for (const failed of [false, true]) {
+      it(`stops ${kind} analysis when selection changes during a ${failed ? "failed" : "successful"} subprocess probe`, async () => {
+        let current = true;
+        test.state.selected.assertCurrentSelection = () => {
+          if (!current) throw new Error("The VS Code Python selection changed. Please try again.");
+        };
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => { release = resolve; });
+        test.state.probe = async () => { await gate; if (failed) throw new Error("Obsolete A probe failed"); };
+        const checking = test.run(kind);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.equal(test.probes.length, 1);
+        current = false;
+        release();
+        assert.equal(await checking, undefined);
+        assert.ok(test.displays.every((display) => !display.report));
+        assert.match(test.displays.at(-1).error, /Python selection changed/i);
+        assert.equal(test.setupCalls.length, 0);
+
+        current = true;
+        test.state.probe = undefined;
+        test.state.selected.pythonPath = "/env/b/python";
+        test.state.report.executable = "/env/b/python";
+        assert.equal((await test.run(kind))?.pythonPath, "/env/b/python");
+        assert.equal(test.displays.at(-1).report.executable, "/env/b/python");
+      });
+    }
+  }
+
+  it("keeps the original probe failure when its interpreter selection is still current", async () => {
+    test.state.selected.assertCurrentSelection = () => {};
+    test.state.probe = async () => { throw new Error("Current interpreter probe failed"); };
+    assert.equal(await test.run(), undefined);
+    assert.match(test.displays.at(-1).error, /Current interpreter probe failed/);
+  });
+
+  it("keeps cancellation silent while an obsolete interpreter probe finishes late", async () => {
+    let checks = 0;
+    test.state.selected.assertCurrentSelection = () => { checks++; throw new Error("Obsolete interpreter"); };
+    let release!: () => void;
+    test.state.probe = () => new Promise<void>((resolve) => { release = resolve; });
+    const cancellation = new AbortController();
+    const checking = test.run("q1asm", { signal: cancellation.signal });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(test.probes.length, 1);
+    cancellation.abort();
+    assert.equal(await checking, undefined);
+    release();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(checks, 0);
+    assert.ok(test.displays.every((display) => !display.report));
+    assert.deepEqual(test.messages, []);
   });
 
   it("rechecks the original file selection after user-managed setup and returns the new environment", async () => {

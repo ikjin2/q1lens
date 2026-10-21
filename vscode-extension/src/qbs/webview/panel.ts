@@ -18,8 +18,10 @@ export interface TimelinePanelHandlers {
 }
 
 export class TimelinePanel {
+  private disposed = false;
   private panel: vscode.WebviewPanel | undefined;
   private ready = false;
+  private renderId = 0;
   private pendingIr: QbsIr | undefined;
   private pendingSourceContext: TimelineSourceContext | undefined;
 
@@ -28,7 +30,19 @@ export class TimelinePanel {
     private readonly handlers: TimelinePanelHandlers,
   ) {}
 
-  show(ir: QbsIr, paths?: OutputPaths): void {
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.panel?.dispose();
+    this.panel = undefined;
+    this.ready = false;
+    this.pendingIr = undefined;
+    this.pendingSourceContext = undefined;
+  }
+
+  show(ir: QbsIr, paths?: OutputPaths, reveal = false): void {
+    if (this.disposed) return;
+    this.renderId += 1;
     const isFirstShow = !this.panel;
     if (!this.panel) {
       this.panel = vscode.window.createWebviewPanel(
@@ -37,6 +51,7 @@ export class TimelinePanel {
         vscode.ViewColumn.Beside,
         {
           enableScripts: true,
+          retainContextWhenHidden: true,
           localResourceRoots: [
             vscode.Uri.joinPath(this.extensionUri, "out", "src", "shared", "timeline"),
             vscode.Uri.joinPath(this.extensionUri, "out", "src", "qbs", "webview", "assets"),
@@ -53,7 +68,10 @@ export class TimelinePanel {
         }
       });
       this.panel.webview.onDidReceiveMessage((message: WebviewToExtensionMessage) => {
-        void this.receiveMessage(message);
+        void this.receiveMessage(message).catch((error: unknown) => {
+          if (this.disposed || this.panel !== createdPanel) return;
+          void vscode.window.showErrorMessage(`Q1Lens action failed: ${error instanceof Error ? error.message : String(error)}`);
+        });
       });
       const sharedCssUri = this.panel.webview.asWebviewUri(
         vscode.Uri.joinPath(this.extensionUri, "out", "src", "shared", "timeline", "renderer.css"),
@@ -90,14 +108,19 @@ export class TimelinePanel {
     this.panel.title = `Q1Lens: ${getScheduleTitle(ir)}`;
     this.pendingIr = ir;
     this.pendingSourceContext = paths ? buildSourceContext(paths, ir) : undefined;
-    if (isFirstShow) {
-      this.panel.reveal(vscode.ViewColumn.Beside);
-    } else if (this.ready) {
-      void this.postPendingRender();
+    if (!isFirstShow) {
+      if (reveal) {
+        this.panel.reveal(this.panel.viewColumn);
+      }
+      if (this.ready) {
+        void this.postPendingRender();
+      }
     }
   }
 
   private async receiveMessage(message: WebviewToExtensionMessage): Promise<void> {
+    if (this.disposed) return;
+    if (message.type.startsWith("open") && message.renderId !== this.renderId) return;
     if (message.type === "ready") {
       this.ready = true;
       await this.postPendingRender();
@@ -124,6 +147,7 @@ export class TimelinePanel {
     if (this.pendingIr && this.panel) {
       await this.panel.webview.postMessage({
         type: "render",
+        renderId: this.renderId,
         ir: this.pendingIr,
         sourceContext: this.pendingSourceContext,
       });

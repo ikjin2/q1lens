@@ -917,6 +917,26 @@ describe("timelineModel", () => {
     assert.equal(model.inspector.q1asmDrilldown.targetLine, 3);
   });
 
+  it("inspects the selected occurrence when several schedulables share an operation id", () => {
+    const { buildTimelineModel } = loadModel();
+    const payload: any = ir();
+    payload.operations = [
+      { id: "first", operation_id: "shared", label: "First occurrence", abs_time: 0, duration: 10e-9 },
+      { id: "second", operation_id: "shared", label: "Second occurrence", abs_time: 20e-9, duration: 10e-9 },
+    ];
+    payload.symbolic_pulses = [];
+    payload.q1asm_provenance = [
+      { operation_id: "shared", schedulable_id: "first", sequencer: "seq0", line: 3 },
+      { operation_id: "shared", schedulable_id: "second", sequencer: "seq0", line: 8 },
+    ];
+    const model = buildTimelineModel(payload, "second");
+    assert.equal(model.inspector.title, "Second occurrence");
+    assert.equal(model.inspector.rows.find((row: any) => row.label === "Start").value, "20 ns");
+    assert.equal(model.inspector.rows.find((row: any) => row.label === "Q1ASM").value, "seq0:L8");
+    assert.equal(model.inspector.actions[0].message.blockId, "second");
+    assert.equal(model.inspector.q1asmDrilldown.targetLine, 8);
+  });
+
   it("uses operation schedule id in operation-only q1timeline open messages", () => {
     const { buildTimelineModel } = loadModel();
     const payload: any = {
@@ -1548,6 +1568,30 @@ describe("timelineModel", () => {
     assert.equal(q1Blocks[1].widthPercent, 54.546);
   });
 
+  it("clips timed inline Q1 events against the viewport instead of a clipped QBS pulse", () => {
+    const { buildTimelineModel } = loadModel();
+    const payload: any = ir();
+    payload.q1asm_provenance[0] = { ...payload.q1asm_provenance[0], source_id: "pulse:cz" };
+    payload.q1timeline_ir = { events: [{
+      id: "timed-play", sequencer_id: "cluster0_module4_seq0", kind: "play", lane: "rt.path0",
+      source: { line: 3, raw: "play 0,0,20" }, t0: { value: 60 }, t1: { value: 80 }, duration: { value: 20 },
+    }] };
+    const modelFor = (start: number, end: number) => buildTimelineModel(payload, "pulse:cz", undefined, {
+      viewport: { start, end }, expandedGroups: ["target:q0_q1"], expandedInlineQ1Lanes: ["inline-q1:q0_q1:flux / cz"],
+    });
+    const partial = modelFor(70e-9, 90e-9);
+    const clipped = partial.lanes.find((lane: any) => lane.kind === "q1").blocks[0];
+    assert.equal(clipped.leftPercent, 0);
+    assert.equal(clipped.widthPercent, 50);
+    assert.equal(clipped.startLabel, "60 ns");
+    assert.equal(clipped.durationLabel, "20 ns");
+    assert.deepEqual(clipped.q1asmSourceMessage, { type: "openQ1AsmSource", sequencer: "cluster0_module4_seq0", line: 3 });
+    const outside = modelFor(80e-9, 100e-9);
+    assert.equal(outside.inspector.selectedId, "pulse:cz");
+    assert.ok(outside.lanes.flatMap((lane: any) => lane.blocks).some((block: any) => block.id === "pulse:cz"));
+    assert.ok(outside.lanes.every((lane: any) => lane.kind !== "q1"), "An offscreen recorded event must not become a generic fallback preview");
+  });
+
   it("scales a single q1timeline inline event against the selected QBS block duration", () => {
     const { buildTimelineModel } = loadModel();
     const payload: any = ir();
@@ -2042,6 +2086,66 @@ describe("timelineModel", () => {
     const draggedLeftPastEnd = panViewport(200e-9, { start: 50e-9, end: 150e-9 }, -1);
     assert.ok(Math.abs(draggedLeftPastEnd.start - 100e-9) < 1e-18);
     assert.ok(Math.abs(draggedLeftPastEnd.end - 200e-9) < 1e-18);
+  });
+
+  for (const kind of ["operation", "pulse", "control-flow"]) {
+    it(`keeps the selected ${kind} in the inspector when it is outside the viewport`, () => {
+      const { buildTimelineModel } = loadModel();
+      const payload: any = kind === "control-flow" ? loopIr() : ir();
+      const selectedId = kind === "control-flow" ? "control-flow:loop"
+        : kind === "pulse" ? "pulse:cz" : "reset_q0";
+      if (kind === "control-flow") {
+        payload.operations.push({ id: "late", operation_id: "late", label: "Late(q0)", abs_time: 180e-9, duration: 40e-9 });
+      }
+      const initial = buildTimelineModel(payload, selectedId);
+      const viewport = kind === "control-flow" ? { start: 180e-9, end: 220e-9 }
+        : kind === "pulse" ? { start: 0, end: 40e-9 } : { start: 44e-9, end: 132e-9 };
+
+      const zoomed = buildTimelineModel(payload, selectedId, undefined, { viewport });
+
+      assert.equal(zoomed.inspector.selectedId, initial.inspector.selectedId);
+      assert.equal(zoomed.inspector.title, initial.inspector.title);
+      assert.deepEqual(zoomed.inspector.actions, initial.inspector.actions);
+      assert.deepEqual(zoomed.inspector.q1asmDrilldown, initial.inspector.q1asmDrilldown);
+      assert.ok(zoomed.lanes.flatMap((lane: any) => lane.blocks).every((block: any) => !block.selected));
+      assert.equal(buildTimelineModel(payload, selectedId).inspector.selectedId, selectedId);
+    });
+  }
+
+  it("does not silently select another block when the selected occurrence disappears", () => {
+    const { buildTimelineModel } = loadModel();
+    const payload = ir();
+    const initial = buildTimelineModel(payload, "reset_q0");
+    assert.equal(initial.inspector.selectedId, "reset_q0");
+    payload.operations.shift();
+
+    const refreshed = buildTimelineModel(payload, "reset_q0");
+
+    assert.equal(refreshed.inspector.title, "No selection");
+    assert.equal(refreshed.inspector.selectedId, undefined);
+    assert.ok(refreshed.inspector.actions.every((action: any) => action.message.type !== "openQ1Timeline"));
+    assert.ok(refreshed.lanes.flatMap((lane: any) => lane.blocks).every((block: any) => !block.selected));
+    assert.ok(buildTimelineModel(payload).inspector.selectedId, "the initial default selection still works");
+  });
+
+  it("prefers the exact occurrence over a visible shared operation alias", () => {
+    const { buildTimelineModel } = loadModel();
+    const operations = [
+      { id: "shared", operation_id: "shared", label: "Pulse(q0)", abs_time: 0, duration: 40e-9 },
+      { id: "second", operation_id: "shared", label: "Pulse(q0)", abs_time: 50e-9, duration: 40e-9 },
+    ];
+    for (const order of [operations, [...operations].reverse()]) {
+      const payload = { schedule: { name: "Repeated alias schedule" }, operations: order };
+      for (const viewport of [undefined, { start: 50e-9, end: 90e-9 }]) {
+        const model = buildTimelineModel(payload, "shared", undefined, { viewport });
+        assert.equal(model.inspector.selectedId, "shared");
+        assert.equal(model.inspector.actions[0].message.blockId, "shared");
+        assert.equal(model.inspector.actions[0].message.operationId, "shared");
+        assert.equal(model.inspector.rows.find((row: any) => row.label === "Start").value, "0 ns");
+      }
+    }
+    const alias = buildTimelineModel({ operations: [operations[1]] }, "shared");
+    assert.equal(alias.inspector.selectedId, "second", "semantic-only selections still resolve");
   });
 
   it("normalizes selected time ranges for rendering", () => {

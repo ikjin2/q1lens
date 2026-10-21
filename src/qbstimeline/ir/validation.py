@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -395,7 +396,9 @@ def _validate_q1asm_ranges(
             instruction = _text(mapping.get("instruction"))
             if instruction and lines is not None and 1 <= mapping_line <= len(lines):
                 actual_line = lines[mapping_line - 1].strip()
-                if not actual_line.startswith(instruction):
+                instruction_line = re.sub(r"^[A-Za-z_][A-Za-z0-9_]*\s*:\s*", "", actual_line, count=1)
+                boundary = r"(?=$|[\s,#_])" if instruction == "acquire" else r"(?=$|[\s,#])"
+                if not re.match(re.escape(instruction) + boundary, instruction_line):
                     diagnostics.append(
                         IrDiagnostic(
                             code="q1asm_instruction_mismatch",

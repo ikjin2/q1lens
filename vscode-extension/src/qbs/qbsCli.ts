@@ -16,10 +16,12 @@ export function buildAnalyzeInvocation(input: {
   pythonArgs: string[];
   projectFile: string;
   irPath: string;
+  outputDir?: string;
 }): ProcessInvocation {
   return {
     command: input.pythonPath,
-    args: [...input.pythonArgs, "-m", "q1lens", "analyze", "--project", input.projectFile, "--out", input.irPath],
+    args: [...input.pythonArgs, "-m", "q1lens", "analyze", "--project", input.projectFile,
+      ...(input.outputDir ? ["--out-dir", input.outputDir] : []), "--out", input.irPath],
   };
 }
 
@@ -124,14 +126,15 @@ export function runProcessWithSpawn(
       callback();
     };
 
-    child.stdout.on("data", (chunk: Buffer) => {
-      const text = chunk.toString("utf8");
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+
+    child.stdout.on("data", (text: string) => {
       stdout += text;
       options.onOutput?.(text);
     });
 
-    child.stderr.on("data", (chunk: Buffer) => {
-      const text = chunk.toString("utf8");
+    child.stderr.on("data", (text: string) => {
       stderr += text;
       options.onOutput?.(text);
     });

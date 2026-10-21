@@ -95,13 +95,14 @@ def select_tagged_notebook_cells(
     schedule_tag: str,
 ) -> SelectedNotebookCells:
     setup_tag_set = set(setup_tags)
-    setup_cells = tuple(cell for cell in cells if setup_tag_set.intersection(cell.tags))
     schedule_cells = tuple(cell for cell in cells if schedule_tag in cell.tags)
     if len(schedule_cells) != 1:
         raise ValueError(
             f"Expected exactly one notebook schedule cell tagged '{schedule_tag}', found {len(schedule_cells)}"
         )
-    return SelectedNotebookCells(setup_cells=setup_cells, schedule_cell=schedule_cells[0])
+    schedule_cell = schedule_cells[0]
+    setup_cells = tuple(cell for cell in cells if cell is not schedule_cell and setup_tag_set.intersection(cell.tags))
+    return SelectedNotebookCells(setup_cells=setup_cells, schedule_cell=schedule_cell)
 
 
 def execute_selected_notebook_cells(

@@ -37,6 +37,7 @@ describe("QBS refresh errors", () => {
       },
       workspace: {
         findFiles: async () => [{ fsPath: projectFile }],
+        getWorkspaceFolder: () => ({ uri: { fsPath: root } }),
         getConfiguration: (section: string) => ({
           get: (key: string, fallback: any) => section === "q1lens" && key === "qbs.autoRefresh" ? true : fallback,
         }),
@@ -64,6 +65,7 @@ describe("QBS refresh errors", () => {
       if (request === "./webview/panel") return { TimelinePanel: class {
         constructor(_extensionUri: any, handlers: any) { panelHandlers = handlers; }
         show() { panelShows += 1; panelRendered(); }
+        dispose() {}
       } };
       if (request === "./diagnostics") return { publishDiagnostics() {} };
       if (request === "./qbsCli") return {

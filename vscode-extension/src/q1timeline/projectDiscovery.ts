@@ -141,7 +141,7 @@ function isPathInside(root: string, candidate: string): boolean {
   const normalizedRoot = normalizeFsPath(root);
   const normalizedCandidate = normalizeFsPath(candidate);
   const relativePath = path.relative(normalizedRoot, normalizedCandidate);
-  return relativePath === "" || (!!relativePath && !relativePath.startsWith("..") && !path.isAbsolute(relativePath));
+  return relativePath !== ".." && !relativePath.startsWith(`..${path.sep}`) && !path.isAbsolute(relativePath);
 }
 
 function normalizeFsPath(filePath: string): string {

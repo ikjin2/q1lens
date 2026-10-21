@@ -181,6 +181,7 @@ type DiagnosticWithSuggestedEdit = vscodeTypes.Diagnostic & {
 };
 
 const suggestedEdits = new Map<string, SuggestedTextEdit>();
+const diagnosticsWithEdits = new Set<DiagnosticWithSuggestedEdit>();
 
 function diagnosticKey(file: string, diagnostic: vscodeTypes.Diagnostic): string {
   const range = diagnosticRange(diagnostic);
@@ -195,6 +196,8 @@ function diagnosticKey(file: string, diagnostic: vscodeTypes.Diagnostic): string
 }
 
 export function clearSuggestedEdits(): void {
+  for (const diagnostic of diagnosticsWithEdits) delete diagnostic[DIAGNOSTIC_SUGGESTED_EDIT_PROPERTY];
+  diagnosticsWithEdits.clear();
   suggestedEdits.clear();
 }
 
@@ -204,6 +207,7 @@ export function preserveSuggestedEdit(
   edit: SuggestedTextEdit,
 ): void {
   (diagnostic as DiagnosticWithSuggestedEdit)[DIAGNOSTIC_SUGGESTED_EDIT_PROPERTY] = edit;
+  diagnosticsWithEdits.add(diagnostic);
   suggestedEdits.set(diagnosticKey(file, diagnostic), edit);
 }
 

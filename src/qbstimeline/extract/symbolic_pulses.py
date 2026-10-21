@@ -375,7 +375,13 @@ def _uses_source_order_timing(schedulables: Mapping[Any, Any]) -> bool:
 
 
 def _operation_duration(operation: Any) -> float:
-    duration = _number_or_none(get_value(operation, "duration", None))
+    # Computed durations may live on the operation rather than in its data mapping.
+    try:
+        duration = _number_or_none(getattr(operation, "duration", None))
+    except Exception:
+        duration = None
+    if duration is None:
+        duration = _number_or_none(get_value(operation, "duration", None))
     if duration is not None:
         return duration
     extents = [

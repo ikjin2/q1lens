@@ -25,14 +25,19 @@ export function registerQ1asmColors(
       rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed,
     }),
   }));
+  const decoratedEditors = new WeakSet<vscodeTypes.TextEditor>();
 
-  function update(editor: vscodeTypes.TextEditor): void {
-    if (editor.document.languageId !== "q1asm") {
+  function update(editor: vscodeTypes.TextEditor, document = editor.document): void {
+    if (document.languageId !== "q1asm") {
+      if (decoratedEditors.has(editor)) {
+        for (const { type } of decorations) editor.setDecorations(type, []);
+        decoratedEditors.delete(editor);
+      }
       return;
     }
     const ranges = new Map(decorations.map(({ family }) => [family, [] as vscodeTypes.Range[]]));
-    for (let line = 0; line < editor.document.lineCount; line += 1) {
-      const text = editor.document.lineAt(line).text;
+    for (let line = 0; line < document.lineCount; line += 1) {
+      const text = document.lineAt(line).text;
       for (const token of instructionColors.sourceTokens(text)) {
         const familyRanges = ranges.get(token.kind === "command" ? token.family || "unknown" : token.kind);
         if (familyRanges) {
@@ -43,11 +48,17 @@ export function registerQ1asmColors(
     for (const { family, type } of decorations) {
       editor.setDecorations(type, ranges.get(family)!);
     }
+    decoratedEditors.add(editor);
   }
 
   context.subscriptions.push(
     ...decorations.map(({ type }) => type),
-    vscode.window.onDidChangeVisibleTextEditors((editors) => editors.forEach(update)),
+    vscode.window.onDidChangeVisibleTextEditors((editors) => editors.forEach((editor) => update(editor))),
+    vscode.workspace.onDidOpenTextDocument((document) => {
+      for (const editor of vscode.window.visibleTextEditors) {
+        if (editor.document.uri.toString() === document.uri.toString()) update(editor, document);
+      }
+    }),
     vscode.workspace.onDidChangeTextDocument(({ document }) => {
       for (const editor of vscode.window.visibleTextEditors) {
         if (editor.document === document) {
@@ -56,5 +67,5 @@ export function registerQ1asmColors(
       }
     }),
   );
-  vscode.window.visibleTextEditors.forEach(update);
+  vscode.window.visibleTextEditors.forEach((editor) => update(editor));
 }

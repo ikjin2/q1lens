@@ -18,11 +18,13 @@ describe("notebook project UX", () => {
       compilerVariable: "hw_agent",
       cells: [
         {
+          id: "setup-cell",
           kind: "code",
           text: "hw_agent = build_compiler()\n",
           metadata: { tags: ["qbstimeline-setup"] },
         },
         {
+          id: "schedule-cell",
           kind: "code",
           text: "two_tone_sched = Schedule('demo')\n",
           metadata: { tags: ["old-tag"] },
@@ -50,6 +52,8 @@ describe("notebook project UX", () => {
     assert.match(project.projectYaml, /outputs:\n  dir: \.\./);
 
     const snapshot = JSON.parse(project.snapshotJson);
+    assert.equal(snapshot.cells[0].id, "setup-cell");
+    assert.equal(snapshot.cells[1].id, "schedule-cell");
     assert.deepEqual(snapshot.cells[0].metadata.tags, ["qbstimeline-setup"]);
     assert.deepEqual(snapshot.cells[1].metadata.tags, ["old-tag", "qbstimeline-schedule"]);
     assert.deepEqual(snapshot.cells[2].metadata.tags, []);

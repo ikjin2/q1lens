@@ -53,6 +53,25 @@ GENERATED_QBLOX_VARIABLE_RE = re.compile(r"^Var[0-9a-fA-F]{32}$")
 
 
 def analyze_project(config: ProjectConfig) -> AnalysisResult:
+    source_file = config.notebook_schedule.notebook if config.notebook_schedule is not None else config.schedule_file
+    if source_file is None:
+        return _analyze_project(config)
+    # Factories, compilation, and artifact methods can import sibling helpers lazily.
+    source_root = str(source_file.parent.resolve())
+    inserted = source_root not in sys.path
+    if inserted:
+        sys.path.insert(0, source_root)
+    try:
+        return _analyze_project(config)
+    finally:
+        if inserted:
+            try:
+                sys.path.remove(source_root)
+            except ValueError:
+                pass
+
+
+def _analyze_project(config: ProjectConfig) -> AnalysisResult:
     source_trace = SourceTrace()
     if config.notebook_schedule is not None:
         notebook_config = config.notebook_schedule
@@ -180,10 +199,7 @@ def _extract_schedule_source_map(schedule_file: Path | None, project_root: Path)
         return {"schedulables": {}}
 
     schedulables: dict[str, dict[str, Any]] = {}
-    try:
-        file_name = schedule_file.relative_to(project_root).as_posix()
-    except ValueError:
-        file_name = schedule_file.name
+    file_name = _relative_or_absolute(schedule_file, project_root)
 
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -334,7 +350,8 @@ def _direct_notebook_source_location(
     if match is None:
         return None
     notebook_path = Path(match.group("file")).resolve()
-    if notebook_path != config.source_notebook:
+    executed_notebook = config.notebook_schedule.notebook if config.notebook_schedule is not None else None
+    if notebook_path != config.source_notebook and notebook_path != executed_notebook:
         return None
     cell_index = int(match.group("cell"))
     notebook_location: dict[str, Any] = {
@@ -345,7 +362,7 @@ def _direct_notebook_source_location(
     try:
         cell = next(
             cell
-            for cell in load_notebook_code_cells(config.source_notebook)
+            for cell in load_notebook_code_cells(notebook_path)
             if cell.cell_index == cell_index
         )
     except (OSError, StopIteration, ValueError):
@@ -528,18 +545,7 @@ def _load_python_module(path: Path) -> ModuleType:
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Could not load schedule module: {path}")
     module = importlib.util.module_from_spec(spec)
-    source_root = str(path.parent.resolve())
-    inserted = source_root not in sys.path
-    if inserted:
-        sys.path.insert(0, source_root)
-    try:
-        spec.loader.exec_module(module)
-    finally:
-        if inserted:
-            try:
-                sys.path.remove(source_root)
-            except ValueError:
-                pass
+    spec.loader.exec_module(module)
     return module
 
 

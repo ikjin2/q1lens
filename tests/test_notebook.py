@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from qbstimeline.notebook import (
     GeneratedLineMapper,
     execute_selected_notebook_cells,
@@ -39,9 +41,14 @@ def _write_notebook(path: Path) -> None:
     )
 
 
-def test_select_tagged_notebook_cells(tmp_path: Path) -> None:
+@pytest.mark.parametrize("schedule_is_setup", [False, True])
+def test_select_tagged_notebook_cells(tmp_path: Path, schedule_is_setup: bool) -> None:
     notebook = tmp_path / "experiment.ipynb"
     _write_notebook(notebook)
+    if schedule_is_setup:
+        raw = json.loads(notebook.read_text(encoding="utf-8"))
+        raw["cells"][2]["metadata"]["tags"].append("qbstimeline-setup")
+        notebook.write_text(json.dumps(raw), encoding="utf-8")
 
     cells = load_notebook_code_cells(notebook)
     selected = select_tagged_notebook_cells(
@@ -122,6 +129,60 @@ def test_execute_selected_notebook_cells_runs_only_tagged_cells(tmp_path: Path) 
 
     assert namespace["two_tone_sched"] == 42
     assert "hw_agent" in namespace
+
+
+def test_execute_selected_notebook_cells_runs_dual_tagged_schedule_once_after_other_setup(tmp_path: Path) -> None:
+    notebook = tmp_path / "experiment.ipynb"
+    counter = tmp_path / "execution-count.txt"
+    selected_source = "\n".join(
+        [
+            "from pathlib import Path",
+            f"counter = Path({str(counter)!r})",
+            "counter.write_text(str(int(counter.read_text()) + 1 if counter.exists() else 1))",
+            "execution_order.append('schedule')",
+        ]
+    )
+    notebook.write_text(
+        json.dumps(
+            {
+                "cells": [
+                    {
+                        "cell_type": "code",
+                        "source": "execution_order = ['setup-before']",
+                        "metadata": {"tags": ["qbstimeline-setup"]},
+                    },
+                    {
+                        "cell_type": "code",
+                        "source": selected_source,
+                        "metadata": {"tags": ["qbstimeline-setup", "qbstimeline-schedule"]},
+                    },
+                    {
+                        "cell_type": "code",
+                        "source": "execution_order.append('setup-after')",
+                        "metadata": {"tags": ["qbstimeline-setup"]},
+                    },
+                    {
+                        "cell_type": "code",
+                        "source": "raise RuntimeError('untagged cell must not run')",
+                        "metadata": {},
+                    },
+                ],
+                "metadata": {},
+                "nbformat": 4,
+                "nbformat_minor": 5,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    namespace = execute_selected_notebook_cells(
+        notebook,
+        setup_tags=("qbstimeline-setup",),
+        schedule_tag="qbstimeline-schedule",
+    )
+
+    assert counter.read_text(encoding="utf-8") == "1"
+    assert namespace["execution_order"] == ["setup-before", "setup-after", "schedule"]
 
 
 def test_execute_selected_notebook_cells_can_import_sibling_helpers(tmp_path: Path) -> None:

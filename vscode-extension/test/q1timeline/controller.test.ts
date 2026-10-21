@@ -23,6 +23,7 @@ function createMockVscode() {
       joinPath: (base: any, ...parts: string[]) => createUri([base.fsPath, ...parts].join("\\")),
     },
     ViewColumn: { Active: -1, Beside: 2 },
+    RelativePattern: class { constructor(public baseUri, public pattern) {} },
     DiagnosticSeverity: { Error: 0, Warning: 1, Information: 2, Hint: 3 },
     window: {
       activeTextEditor: undefined,
@@ -127,6 +128,48 @@ function createContext(storedProjectFile?: string) {
   };
 }
 
+function fileWatchSubscriptions(vscode) {
+  const path = require("node:path"), { minimatch } = require("minimatch");
+  const watchers = [];
+  const relativePath = (root, file) => {
+    const relative = path.relative(root, file);
+    return relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)
+      ? undefined : relative.replace(/\\/g, "/");
+  };
+  vscode.RelativePattern = class { constructor(public baseUri, public pattern) {} };
+  vscode.workspace.getWorkspaceFolder = (uri) => vscode.workspace.workspaceFolders.find((folder) => relativePath(folder.uri.fsPath, uri.fsPath) !== undefined);
+  vscode.workspace.createFileSystemWatcher = (pattern) => {
+    const watcher = { pattern, disposed: false, handlers: {},
+      baseExistedAtRegistration: typeof pattern === "string" || existsSync(pattern.baseUri.fsPath),
+      onDidChange(listener) { this.handlers.change = listener; return { dispose() {} }; },
+      onDidCreate(listener) { this.handlers.create = listener; return { dispose() {} }; },
+      onDidDelete(listener) { this.handlers.delete = listener; return { dispose() {} }; },
+      dispose() { this.disposed = true; },
+    };
+    watchers.push(watcher);
+    return watcher;
+  };
+  return { watchers, async dispatch(file, change = "change") {
+    const pending = [];
+    for (const watcher of [...watchers]) {
+      if (watcher.disposed) continue;
+      if (change === "delete" && typeof watcher.pattern !== "string" && !existsSync(watcher.pattern.baseUri.fsPath)) watcher.baseWasDeleted = true;
+      // Both native host probes miss the first create when this RelativePattern base does not exist.
+      if (change === "create" && (!watcher.baseExistedAtRegistration || watcher.baseWasDeleted)) continue;
+      const roots = typeof watcher.pattern === "string" ? vscode.workspace.workspaceFolders.map((folder) => folder.uri.fsPath)
+        : [watcher.pattern.baseUri.fsPath];
+      const pattern = typeof watcher.pattern === "string" ? watcher.pattern : watcher.pattern.pattern;
+      if (roots.some((root) => {
+        const relative = relativePath(root, file);
+        // Native VS Code also reports deletion of a RelativePattern's base directory itself.
+        if (typeof watcher.pattern !== "string" && relative === "" && change === "delete") return true;
+        return relative !== undefined && minimatch(relative, pattern, { nocase: process.platform !== "linux", dot: true });
+      })) pending.push(watcher.handlers[change]?.(vscode.Uri.file(file)));
+    }
+    await Promise.all(pending);
+  } };
+}
+
 function resolvedPython(resource, pythonPath = "python", pythonArgs = []) {
   return { pythonPath, pythonArgs, source: "vscode", sourceLabel: "VS Code selection", resource };
 }
@@ -152,6 +195,24 @@ async function withMockedVscode(vscode: any, callback: (controllerModule: any) =
     delete require.cache[modulePath];
     Module._load = originalLoad;
   }
+}
+
+async function withControllerFileEnvironment(vscode, probe, callback) {
+  const file = require.resolve("../../src/fileEnvironment");
+  const originalLoad = Module._load;
+  Module._load = function (request, parent, isMain) {
+    if (parent?.filename === file && request === "./environment") return { probePythonEnvironment: probe };
+    if (parent?.filename === file && request === "./pythonEnvironment") return {
+      resolveFilePythonEnvironment: async (_api, resource) => resolvedPython(resource, resource.fsPath),
+      selectVSCodeInterpreter: vscode.selectFileInterpreter || (async () => vscode.commands.executeCommand("python.setInterpreter")),
+    };
+    return originalLoad.call(this, request, parent, isMain);
+  };
+  delete require.cache[file];
+  try {
+    vscode.resolveFileEnvironment = require(file).ensureFilePythonEnvironment;
+    await withMockedVscode(vscode, callback);
+  } finally { Module._load = originalLoad; delete require.cache[file]; }
 }
 
 function automaticSourceFollow(vscode: any, TimelineController: any) {
@@ -269,6 +330,228 @@ describe("q1timeline controller", () => {
     return { controller, calls };
   }
 
+  it("hides Windows subprocess windows for Q1ASM analysis and rendering", async () => {
+    const vscode = createMockVscode();
+    const childProcess = require("node:child_process");
+    const originalExecFile = childProcess.execFile;
+    const launches: any[] = [];
+    childProcess.execFile = (command, args, options, callback) => {
+      const stage = args[args.indexOf("q1timeline") + 1];
+      launches.push({ command, stage, options });
+      writeFileSync(args[args.indexOf("--out") + 1], stage === "analyze"
+        ? JSON.stringify({ events: [] }) : "<html><head></head><body>Timeline</body></html>");
+      queueMicrotask(() => callback(null, stage === "analyze"
+        ? JSON.stringify({ schema_version: "0.2.0", status: "ok" }) : "", ""));
+    };
+    try {
+      await withMockedVscode(vscode, async ({ TimelineController }) => {
+        const { controller } = fileEnvironmentController(TimelineController, vscode);
+        controller.execFile = TimelineController.prototype.execFile.bind(controller);
+        try {
+          await controller.runAnalysis();
+          assert.equal(controller.analysisStatus.status, "idle");
+          assert.deepEqual(launches.map((launch) => launch.stage), ["analyze", "render"]);
+          assert.deepEqual(launches.map((launch) => launch.options.windowsHide), [true, true],
+            "Q1ASM analyzer and renderer must request hidden console windows on Windows");
+        } finally {
+          controller.dispose();
+        }
+      });
+    } finally {
+      childProcess.execFile = originalExecFile;
+    }
+  });
+
+  for (const scenario of [
+    ...["missing package", "unsupported Python", "open Setup", "pending notification", "pending error", "Setup recheck", "pending interpreter focus"].map((failure) => ({ failure })),
+    { failure: "open Setup", sameProject: true },
+  ]) {
+    const failure = scenario.failure;
+    it(scenario.sameProject ? "releases an obsolete Setup when Refresh is queued for the same project"
+      : `cancels an obsolete file environment's ${failure} recovery when another project opens`, async () => {
+      const vscode = createMockVscode();
+      const messages: string[] = [];
+      let release!: (action?: string) => void;
+      let started!: () => void;
+      let setupStarted!: () => void;
+      const waiting = new Promise<void>((resolve) => { started = resolve; });
+      const setupWaiting = new Promise<void>((resolve) => { setupStarted = resolve; });
+      const notification = async (message) => {
+        messages.push(message);
+        if (failure === "pending notification" || failure === "pending error") {
+          return new Promise<string | undefined>((resolve) => { release = resolve; started(); });
+        }
+        if (failure === "pending interpreter focus") return "Select Python Environment";
+        return failure === "open Setup" || failure === "Setup recheck" ? "Show Setup" : undefined;
+      };
+      vscode.window.showInformationMessage = vscode.window.showErrorMessage = notification;
+      vscode.extensions = { getExtension: () => ({ packageJSON: { version: "0.2.2" } }) };
+      let selections = 0;
+      vscode.commands.executeCommand = async () => { selections += 1; };
+      if (failure === "pending interpreter focus") {
+        vscode.selectFileInterpreter = require("../../src/pythonEnvironment").selectVSCodeInterpreter;
+        vscode.window.showTextDocument = async () => new Promise<void>((resolve) => { release = resolve; started(); });
+      }
+      const createPanel = vscode.window.createWebviewPanel;
+      let setupPanel: any;
+      let setupReceive!: (message: any) => Promise<void>;
+      let setupDisposed = false;
+      const setupPosts: any[] = [];
+      vscode.window.createWebviewPanel = (type, ...args) => {
+        if (type !== "q1lens.notebookSetup") return createPanel(type, ...args);
+        let disposed;
+        setupPanel = {
+          webview: { html: "", onDidReceiveMessage: (listener) => { setupReceive = listener; return { dispose() {} }; },
+            postMessage: async (message) => { setupPosts.push(message); return true; } },
+          onDidDispose: (listener) => { disposed = listener; return { dispose() {} }; },
+          dispose: () => { if (!setupDisposed) { setupDisposed = true; disposed?.(); } },
+        };
+        setupStarted();
+        if (failure === "open Setup") started();
+        return setupPanel;
+      };
+      let checks = 0;
+      await withControllerFileEnvironment(vscode, async (executable) => {
+        const count = ++checks;
+        if (count === 1 && ["missing package", "unsupported Python"].includes(failure)) {
+          await new Promise<void>((resolve) => { release = resolve; started(); });
+        }
+        if (count === 2 && failure === "Setup recheck") {
+          await new Promise<void>((resolve) => { release = resolve; started(); });
+          throw new Error("Obsolete Setup recheck failed");
+        }
+        const unsupported = count === 1 && ["unsupported Python", "pending error"].includes(failure);
+        return { executable, version: unsupported ? "3.9.0" : "3.12.0", supported: !unsupported, q1lensInstalled: count !== 1,
+          ...(count === 1 && !unsupported ? { qbsError: "missing q1lens" } : {}) };
+      }, async ({ TimelineController }) => {
+        const setup = sourceFileController(TimelineController, vscode);
+        const { controller, calls } = setup;
+        const projectA = controller.projectUri.fsPath;
+        const rootB = mkdtempSync(join(tmpdir(), "q1-old-environment-"));
+        const projectB = join(rootB, "q1timeline.yml");
+        for (const projectFile of [projectA, projectB]) writeFileSync(projectFile, "sequencers:\n  - id: seq0\n    file: seq0.q1asm\n");
+        writeFileSync(join(rootB, "seq0.q1asm"), "stop\n");
+        let opening: Promise<void> | undefined;
+        let rechecking: Promise<void> | undefined;
+        try {
+          opening = controller.openTarget({ projectFile: projectA });
+          if (failure === "Setup recheck") {
+            await setupWaiting;
+            rechecking = setupReceive({ type: "checkAgain" });
+          }
+          await waiting;
+          const oldMessages = messages.length;
+          if (scenario.sameProject) await controller.refreshPreview();
+          else await controller.openTarget({ projectFile: projectB });
+          if (!scenario.sameProject && failure !== "missing package" && failure !== "unsupported Python") {
+            assert.equal(calls.filter((call) => call.stage === "analyzer").length, 1,
+              "B must finish without waiting for A's visible recovery UI");
+          }
+          if (setupPanel) assert.equal(setupDisposed, true, "Only the obsolete analysis's Setup should be closed");
+          release?.("Select Python Environment");
+          await opening;
+          await rechecking;
+          await setup.settle();
+          const analyzers = calls.filter((call) => call.stage === "analyzer");
+          assert.equal(analyzers.length, 1);
+          assert.equal(analyzers[0].args[analyzers[0].args.indexOf("--project") + 1], scenario.sameProject ? projectA : projectB);
+          assert.equal(messages.length, oldMessages, "Obsolete checks must not open another recovery notification");
+          assert.equal(selections, 0, "A late response to the old notification must not select another interpreter");
+          assert.deepEqual(setupPosts, [], "An aborted Setup recheck must not publish a late error or idle response");
+          assert.equal(controller.analysisQueued, false);
+          assert.equal(controller.analysisInFlight, false);
+        } finally {
+          release?.();
+          setupPanel?.dispose();
+          await opening;
+          await rechecking;
+          await setup.settle();
+          controller.dispose();
+        }
+      });
+    });
+  }
+
+  for (const failure of ["missing package", "unsupported Python", "open Setup", "pending notification"]) {
+    it(`cancels playback's obsolete ${failure} recovery when another project opens`, async () => {
+      const vscode = createMockVscode();
+      let phase = "initial";
+      let projectA: string;
+      const messages: string[] = [];
+      let release!: (action?: string) => void;
+      let started!: () => void;
+      const waiting = new Promise<void>((resolve) => { started = resolve; });
+      const notification = async (message) => {
+        if (phase === "initial") return undefined;
+        messages.push(message);
+        if (failure === "pending notification" && messages.length === 1) return new Promise<string | undefined>((resolve) => { release = resolve; started(); });
+        return failure === "open Setup" ? "Show Setup" : undefined;
+      };
+      vscode.window.showInformationMessage = vscode.window.showErrorMessage = notification;
+      vscode.extensions = { getExtension: () => ({ packageJSON: { version: "0.2.2" } }) };
+      let selections = 0;
+      vscode.commands.executeCommand = async () => { selections += 1; };
+      const createPanel = vscode.window.createWebviewPanel;
+      let setupPanel: any;
+      let setupDisposed = false;
+      vscode.window.createWebviewPanel = (type, ...args) => {
+        if (type !== "q1lens.notebookSetup") return createPanel(type, ...args);
+        let disposed;
+        setupPanel = {
+          webview: { html: "", onDidReceiveMessage: () => ({ dispose() {} }), postMessage: async () => true },
+          onDidDispose: (listener) => { disposed = listener; return { dispose() {} }; },
+          dispose: () => { if (!setupDisposed) { setupDisposed = true; disposed?.(); } },
+        };
+        started();
+        return setupPanel;
+      };
+      await withControllerFileEnvironment(vscode, async (executable) => {
+        const oldPlayback = executable === projectA && phase === "playback";
+        if (oldPlayback && ["missing package", "unsupported Python"].includes(failure)) {
+          await new Promise<void>((resolve) => { release = resolve; started(); });
+        }
+        const missing = executable === projectA;
+        const unsupported = oldPlayback && failure === "unsupported Python";
+        return { executable, version: unsupported ? "3.9.0" : "3.12.0", supported: !unsupported,
+          q1lensInstalled: !missing, ...(missing && !unsupported ? { qbsError: "missing q1lens" } : {}) };
+      }, async ({ TimelineController }) => {
+        const setup = sourceFileController(TimelineController, vscode);
+        const { controller, calls } = setup;
+        projectA = controller.projectUri.fsPath;
+        const rootB = mkdtempSync(join(tmpdir(), "q1-old-playback-environment-"));
+        const projectB = join(rootB, "q1timeline.yml");
+        for (const projectFile of [projectA, projectB]) writeFileSync(projectFile, "sequencers:\n  - id: seq0\n    file: seq0.q1asm\n");
+        writeFileSync(join(rootB, "seq0.q1asm"), "stop\n");
+        let running: Promise<void> | undefined;
+        try {
+          await controller.openTarget({ projectFile: projectA });
+          assert.equal(controller.pythonEnvironment, undefined, "Dismissed setup leaves Run able to check this file's environment again");
+          phase = "playback";
+          running = controller.handleWebviewMessage({ type: "executionControl", action: "play" });
+          await waiting;
+          const oldMessages = messages.length;
+          await controller.openTarget({ projectFile: projectB });
+          await setup.settle();
+          assert.equal(calls.filter((call) => call.stage === "analyzer").length, 1, "B must analyze without waiting for A's playback recovery");
+          if (setupPanel) assert.equal(setupDisposed, true, "Resetting playback must close only its obsolete Setup");
+          release?.("Select Python Environment");
+          await running;
+          assert.equal(messages.length, oldMessages, "A late playback check must not open recovery UI over B");
+          assert.equal(selections, 0, "An obsolete playback notification must not open another interpreter picker");
+          assert.equal(controller.pythonEnvironment.resource.fsPath, projectB);
+          assert.equal(controller.playbackInFlight, false);
+          assert.equal(controller.executionState.status, "idle");
+        } finally {
+          release?.();
+          setupPanel?.dispose();
+          await running;
+          await setup.settle();
+          controller.dispose();
+        }
+      });
+    });
+  }
+
   it("uses the original file's selected Python for analysis and rendering, scoped to its workspace", async () => {
     const vscode = createMockVscode();
     const resolutions = [];
@@ -358,6 +641,150 @@ describe("q1timeline controller", () => {
     });
   });
 
+  for (const missingIr of [false, true]) {
+    it(`drops a view mode change after switching projects during ${missingIr ? "missing" : "existing"} IR inspection`, async () => {
+      const vscode = createMockVscode();
+      await withMockedVscode(vscode, async ({ TimelineController }) => {
+        const { controller, calls } = fileEnvironmentController(TimelineController, vscode);
+        controller.pythonEnvironment = resolvedPython(controller.projectUri);
+        const timelineIrPath = join(controller.outputDir, "timeline_ir.json");
+        writeFileSync(timelineIrPath, JSON.stringify({ events: [] }));
+        const fsPromises = require("node:fs").promises;
+        const originalAccess = fsPromises.access;
+        let release!: () => void;
+        let started!: () => void;
+        const waiting = new Promise<void>((resolve) => { started = resolve; });
+        fsPromises.access = async (file, ...args) => {
+          if (file === timelineIrPath) {
+            await new Promise<void>((resolve) => { release = resolve; started(); });
+            if (missingIr) throw Object.assign(new Error("No timeline IR"), { code: "ENOENT" });
+          }
+          return originalAccess(file, ...args);
+        };
+        let analyses = 0;
+        controller.runAnalysis = async () => { analyses += 1; };
+        try {
+          const changing = controller.setViewMode("normal");
+          await waiting;
+          const outputB = mkdtempSync(join(tmpdir(), "q1-view-project-b-"));
+          controller.setProjectUri(vscode.Uri.file(join(outputB, "q1timeline.yml")));
+          controller.outputDir = outputB;
+          controller.analysisStatus = { status: "idle", message: "Project B" };
+          const requestB = controller.analysisRequestId;
+          release();
+          await changing;
+          assert.deepEqual(calls, [], "A view change for A must not launch a renderer after switching to B");
+          assert.equal(analyses, 0, "Missing A output must not start an unsolicited analysis of B");
+          assert.equal(controller.analysisRequestId, requestB);
+          assert.deepEqual(controller.analysisStatus, { status: "idle", message: "Project B" });
+        } finally {
+          fsPromises.access = originalAccess;
+          controller.dispose();
+        }
+      });
+    });
+  }
+
+  it("keeps the latest view mode when IR inspection finishes out of order", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const { controller } = fileEnvironmentController(TimelineController, vscode);
+      controller.pythonEnvironment = resolvedPython(controller.projectUri);
+      const timelineIrPath = join(controller.outputDir, "timeline_ir.json");
+      writeFileSync(timelineIrPath, JSON.stringify({ events: [] }));
+      const fsPromises = require("node:fs").promises;
+      const originalAccess = fsPromises.access;
+      const releases: Array<() => void> = [];
+      fsPromises.access = async (file, ...args) => {
+        if (file === timelineIrPath) await new Promise<void>((resolve) => { releases.push(resolve); });
+        return originalAccess(file, ...args);
+      };
+      const renderedModes: string[] = [];
+      controller.runRender = async (...args) => { renderedModes.push(args[7]); };
+      try {
+        const older = controller.setViewMode("debug");
+        const newer = controller.setViewMode("normal");
+        assert.equal(releases.length, 2);
+        releases[1]();
+        await newer;
+        releases[0]();
+        await older;
+        assert.deepEqual(renderedModes, ["normal"]);
+        assert.equal(controller.currentViewMode, "normal");
+      } finally {
+        fsPromises.access = originalAccess;
+        controller.dispose();
+      }
+    });
+  });
+
+  for (const trigger of ["Refresh", "view mode change"]) {
+    for (const renderFails of [false, true]) {
+      it(`serializes ${trigger} behind an active view renderer${renderFails ? " that fails" : ""}`, async () => {
+        const vscode = createMockVscode();
+        await withMockedVscode(vscode, async ({ TimelineController }) => {
+          const { controller } = fileEnvironmentController(TimelineController, vscode);
+          controller.refreshWebview = TimelineController.prototype.refreshWebview.bind(controller);
+          controller.pythonEnvironment = resolvedPython(controller.projectUri);
+          const irPath = join(controller.outputDir, "timeline_ir.json");
+          const htmlPath = join(controller.outputDir, "timeline.html");
+          const ir = (id) => ({ events: [{ id, kind: "wait", lane: "seq0", t0: 0, t1: 4 }], diagnostics: [] });
+          writeFileSync(irPath, JSON.stringify(ir("before-edit")));
+          const launches: Array<{ stage: string; mode: string }> = [];
+          let releaseRender!: () => void;
+          let renderStarted!: () => void;
+          const rendering = new Promise<void>((resolve) => { renderStarted = resolve; });
+          let firstRender = true;
+          controller.execFile = async (_python, args, _timeout, _cwd, _env, stage) => {
+            launches.push({ stage, mode: args[args.indexOf("--mode") + 1] });
+            if (stage === "analyzer") {
+              writeFileSync(irPath, JSON.stringify(ir("after-edit")));
+            } else {
+              const capturedIr = JSON.parse(readFileSync(irPath, "utf8"));
+              if (firstRender) {
+                firstRender = false;
+                await new Promise<void>((resolve) => { releaseRender = resolve; renderStarted(); });
+                if (renderFails) throw new Error("View renderer failed");
+              }
+              writeFileSync(htmlPath, '<html><head></head><body><section id="timeline-root"></section>' +
+                '<script id="timeline-ir" type="application/json">' + JSON.stringify(capturedIr) + '</script></body></html>');
+            }
+            return { stdout: JSON.stringify({ schema_version: "0.2.0", status: "ok" }), stderr: "", exitCode: 0, elapsedMs: 1 };
+          };
+          const changing = controller.setViewMode("debug");
+          try {
+            await rendering;
+            if (trigger === "Refresh") {
+              controller.sourceRevision += 1;
+              await controller.runAnalysis();
+            } else {
+              await controller.setViewMode("normal");
+            }
+            assert.deepEqual(launches.map((call) => call.stage), ["renderer"], "The queued request must wait for the view renderer to finish writing");
+            releaseRender();
+            await changing;
+            while (controller.analysisInFlight) await new Promise((resolve) => setImmediate(resolve));
+
+            assert.deepEqual(launches.map((call) => call.stage), ["renderer", "analyzer", "renderer"]);
+            assert.equal(launches[2].mode, trigger === "Refresh" ? "debug" : "normal");
+            const embeddedIr = JSON.parse(controller.panel.webview.html.match(/<script id="timeline-ir" type="application\/json">([\s\S]*?)<\/script>/)[1]);
+            assert.equal(controller.timelineIr.events[0].id, "after-edit");
+            assert.equal(embeddedIr.events[0].id, "after-edit");
+            assert.equal(controller.analyzedSourceRevision, controller.sourceRevision);
+            assert.equal(controller.analysisQueued, false);
+            assert.equal(controller.analysisStatus.status, "idle");
+          } finally {
+            releaseRender?.();
+            await changing;
+            while (controller.analysisInFlight) await new Promise((resolve) => setImmediate(resolve));
+            controller.dispose();
+            require("node:fs").rmSync(controller.outputDir, { recursive: true, force: true });
+          }
+        });
+      });
+    }
+  }
+
   it("checks relative manual launchers with the same working directory and environment as analysis and playback", async () => {
     const vscode = createMockVscode();
     const checks = [];
@@ -380,11 +807,15 @@ describe("q1timeline controller", () => {
       controller.config = () => ({ get: (key, fallback) => key === "analyzer.env" ? env : fallback });
       const cwd = controller.projectRootCwd();
       await controller.runPlayback();
-      assert.deepEqual(checks, [{ cwd, env }]);
+      assert.deepEqual(checks.map(({ cwd, env }) => ({ cwd, env })), [{ cwd, env }]);
+      assert.ok(checks[0].signal instanceof AbortSignal);
+      assert.equal(checks[0].signal.aborted, false);
       assert.equal(playbackStarts[0].cwd, cwd);
       assert.equal(playbackStarts[0].env.PYTHONPATH, env.PYTHONPATH);
       await controller.runAnalysis();
-      assert.deepEqual(checks, [{ cwd, env }, { cwd, env }]);
+      assert.deepEqual(checks.map(({ cwd, env }) => ({ cwd, env })), [{ cwd, env }, { cwd, env }]);
+      assert.ok(checks[1].signal instanceof AbortSignal);
+      assert.equal(checks[1].signal.aborted, false);
       assert.ok(calls.every((call) => call.cwd === cwd && call.env.PYTHONPATH === env.PYTHONPATH));
       controller.dispose();
     });
@@ -413,6 +844,1464 @@ describe("q1timeline controller", () => {
     });
   });
 
+  it("drops analyzer results when the project changes before its replacement analysis starts", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const { controller, calls } = fileEnvironmentController(TimelineController, vscode);
+      let releaseAnalyzer!: () => void;
+      let analyzerStarted!: () => void;
+      const analyzing = new Promise<void>((resolve) => { analyzerStarted = resolve; });
+      const execFile = controller.execFile;
+      let first = true;
+      controller.execFile = async (...args) => {
+        if (first) {
+          first = false;
+          await new Promise<void>((resolve) => { releaseAnalyzer = resolve; analyzerStarted(); });
+        }
+        return execFile(...args);
+      };
+      const analysisA = controller.runAnalysis();
+      await analyzing;
+      const projectB = join(mkdtempSync(join(tmpdir(), "q1-switch-before-analysis-")), "q1timeline.yml");
+      controller.setProjectUri(vscode.Uri.file(projectB));
+      let finishProjectLoading!: () => void;
+      const loading = new Promise<void>((resolve) => { finishProjectLoading = resolve; });
+      controller.refreshProjectRelatedPaths = async () => loading;
+      const openingB = controller.openPreview({ preserveProject: true });
+      releaseAnalyzer();
+      try {
+        await analysisA;
+        assert.equal(controller.lastAnalyzerTimelineIr, undefined, "Project A's result must not become B's comparison history");
+        assert.deepEqual(controller.comparison, { mode: "none" });
+        assert.equal(calls.filter((call) => call.stage === "renderer").length, 0, "Project A must not render after B was selected");
+      } finally {
+        finishProjectLoading();
+        await openingB;
+        controller.dispose();
+      }
+    });
+  });
+
+  it("does not launch analysis after disposal while Python setup is pending", async () => {
+    const vscode = createMockVscode();
+    let release!: () => void;
+    let started!: () => void;
+    const resolving = new Promise<void>((resolve) => { started = resolve; });
+    vscode.resolveFileEnvironment = (_api, resource) => new Promise((resolve) => {
+      release = () => resolve(resolvedPython(resource));
+      started();
+    });
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const { controller, calls } = fileEnvironmentController(TimelineController, vscode);
+      const analysis = controller.runAnalysis();
+      await resolving;
+      controller.dispose();
+      release();
+      await analysis;
+      assert.deepEqual(calls, [], "A disposed controller must not start analyzer or renderer processes");
+      assert.equal(controller.pythonEnvironment, undefined);
+    });
+  });
+
+  it("does not launch analysis after disposal during output preparation", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const { controller, calls } = fileEnvironmentController(TimelineController, vscode);
+      let release!: () => void;
+      let started!: () => void;
+      const preparing = new Promise<void>((resolve) => { started = resolve; });
+      controller.clearAnalyzerOutputFiles = async () => new Promise<void>((resolve) => {
+        release = resolve;
+        started();
+      });
+      const analysis = controller.runAnalysis();
+      await preparing;
+      controller.dispose();
+      release();
+      await analysis;
+      assert.deepEqual(calls, [], "Disposal during awaited output cleanup must not start the analyzer");
+    });
+  });
+
+  it("drops a queued refresh when its preview closes during analysis", async () => {
+    const vscode = createMockVscode();
+    const createPanel = vscode.window.createWebviewPanel;
+    let closePanel!: () => void;
+    vscode.window.createWebviewPanel = () => ({ ...createPanel(), onDidDispose: (listener) => {
+      closePanel = listener;
+      return { dispose() {} };
+    } });
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const { controller, calls } = fileEnvironmentController(TimelineController, vscode);
+      await controller.createPreviewPanel();
+      controller.panel.webview.postMessage = () => {};
+      let release!: () => void;
+      let started!: () => void;
+      const running = new Promise<void>((resolve) => { started = resolve; });
+      const execFile = controller.execFile;
+      controller.execFile = async (...args) => {
+        if (!release) await new Promise<void>((resolve) => { release = resolve; started(); });
+        return execFile(...args);
+      };
+      const analysis = controller.runAnalysis();
+      await running;
+      await controller.runAnalysis();
+      closePanel();
+      release();
+      await analysis;
+      while (controller.analysisInFlight) await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(controller.panel, undefined);
+      assert.equal(controller.analysisQueued, false);
+      assert.equal(calls.filter((call) => call.stage === "analyzer").length, 1, "Closing must discard queued subprocess work");
+      controller.dispose();
+    });
+  });
+
+  it("cancels an open when its preview closes during project loading and allows an explicit reopen", async () => {
+    const vscode = createMockVscode();
+    const createPanel = vscode.window.createWebviewPanel;
+    let closePanel!: () => void;
+    let panels = 0;
+    vscode.window.createWebviewPanel = (...args) => {
+      panels += 1;
+      return { ...createPanel(...args), onDidDispose(listener) {
+        closePanel = listener;
+        return { dispose() {} };
+      } };
+    };
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const projectDir = mkdtempSync(join(tmpdir(), "q1-close-pending-open-"));
+      const projectFile = join(projectDir, "q1timeline.yml");
+      writeFileSync(projectFile, "sequencers: []\n");
+      const controller = new TimelineController(createContext());
+      let analyses = 0;
+      controller.runAnalysis = async () => { analyses += 1; };
+      await controller.openTarget({ projectFile });
+      const fsPromises = require("node:fs").promises;
+      const originalRead = fsPromises.readFile;
+      let started!: () => void;
+      let release!: () => void;
+      const reading = new Promise<void>((resolve) => { started = resolve; });
+      let first = true;
+      fsPromises.readFile = async (...args) => {
+        if (args[0] === projectFile && first) {
+          first = false;
+          await new Promise<void>((resolve) => { release = resolve; started(); });
+        }
+        return originalRead(...args);
+      };
+      try {
+        const opening = controller.openPreview({ preserveProject: true });
+        await reading;
+        closePanel();
+        release();
+        await opening;
+        assert.equal(controller.panel, undefined, "The pending open must not recreate the preview the user closed");
+        assert.equal(panels, 1);
+        assert.equal(analyses, 1);
+        await controller.openPreview({ preserveProject: true });
+        assert.ok(controller.panel, "A later explicit open must continue working");
+        assert.equal(panels, 2);
+        assert.equal(analyses, 2);
+      } finally {
+        fsPromises.readFile = originalRead;
+        controller.dispose();
+      }
+    });
+  });
+
+  for (const nextMode of ["manual", "onSave"]) {
+    it(`drops an on-type refresh when update mode changes to ${nextMode} before its debounce expires`, async () => {
+      const vscode = createMockVscode();
+      let changed: any;
+      vscode.workspace.onDidChangeTextDocument = (handler) => { changed = handler; return { dispose() {} }; };
+      await withFakeTimers(async (clock) => withMockedVscode(vscode, async ({ TimelineController }) => {
+        const controller = new TimelineController(createContext());
+        controller.projectUri = vscode.Uri.file("C:\\repo\\q1timeline.yml");
+        controller.outputDir = "C:\\repo\\.q1timeline";
+        const document = { uri: vscode.Uri.file("C:\\repo\\seq0.q1asm"), isDirty: true };
+        controller.projectRelatedPaths.add(document.uri.fsPath);
+        let mode = "onType";
+        controller.config = () => ({ get: (key, fallback) => key === "updateMode" ? mode : fallback });
+        let analyses = 0;
+        controller.runAnalysis = async () => { analyses += 1; };
+        changed({ document });
+        assert.notEqual(controller.changeTimer, undefined);
+        mode = nextMode;
+        clock.advance(1000);
+        assert.equal(analyses, 0, "Turning off on-type updates must prevent the pending edit from triggering analysis");
+        assert.equal(controller.changeTimer, undefined);
+        mode = "onType";
+        changed({ document });
+        clock.advance(1000);
+        assert.equal(analyses, 1, "Turning on-type updates back on must keep future edits working");
+        controller.dispose();
+      }));
+    });
+  }
+
+  for (const scenario of [
+    { mode: "manual", explicit: undefined, analyses: 0 },
+    { mode: "onSave", explicit: undefined, analyses: 0 },
+    { mode: "onType", explicit: undefined, analyses: 1 },
+    { mode: "manual", explicit: "before", analyses: 1 },
+    { mode: "manual", explicit: "after", analyses: 1 },
+    { mode: "manual", explicit: "after", request: "view-mode change", analyses: 1 },
+    { mode: "manual", explicit: "after", request: "parameter change", analyses: 1 },
+  ]) {
+    const name = scenario.explicit
+      ? `preserves an explicit ${scenario.request || "Refresh"} queued ${scenario.explicit} an on-type refresh when updates become manual`
+      : `rechecks a queued on-type refresh when the current update mode is ${scenario.mode}`;
+    it(name, async () => {
+      const vscode = createMockVscode();
+      const notifications = sourceFileNotifications(vscode);
+      let mode = "onType";
+      let release!: () => void;
+      let started!: () => void;
+      let checks = 0;
+      const waiting = new Promise<void>((resolve) => { started = resolve; });
+      vscode.resolveFileEnvironment = async (_api, resource) => {
+        if (++checks === 1) await new Promise<void>((resolve) => { release = resolve; started(); });
+        return resolvedPython(resource);
+      };
+      await withFakeTimers(async (clock) => withMockedVscode(vscode, async ({ TimelineController }) => {
+        const setup = sourceFileController(TimelineController, vscode);
+        const { controller, calls, document } = setup;
+        controller.config = () => ({ get: (key, fallback) => key === "updateMode" ? mode : fallback });
+        let first: Promise<void> | undefined;
+        try {
+          first = controller.runAnalysis();
+          await waiting;
+          if (scenario.explicit === "before") await controller.refreshPreview();
+          document.isDirty = true;
+          document.text = "wait_sync 4\nwait 32\nstop\n";
+          notifications.edit({ document, contentChanges: [{ text: document.text }] });
+          clock.advance(1000);
+          assert.equal(controller.analysisQueued, true);
+          if (scenario.explicit === "after") {
+            if (scenario.request === "view-mode change") await controller.setViewMode("debug");
+            else if (scenario.request === "parameter change") {
+              const inputs = ["DURATION", "64"];
+              vscode.window.showInputBox = async () => inputs.shift();
+              await controller.setAnalysisParameter();
+            } else await controller.refreshPreview();
+          }
+          mode = scenario.mode;
+          release();
+          await first;
+          await setup.settle();
+          assert.equal(calls.filter((call) => call.stage === "analyzer").length, scenario.analyses);
+          assert.equal(checks, scenario.analyses + 1, "A cancelled automatic refresh must not start another environment check");
+          assert.equal(controller.analysisQueued, false);
+          assert.equal(controller.analysisInFlight, false);
+        } finally {
+          release?.();
+          await first;
+          await setup.settle();
+          controller.dispose();
+        }
+      }));
+    });
+  }
+
+  for (const scenario of [
+    { trigger: "save", mode: "manual", analyses: 0 },
+    { trigger: "watcher", mode: "manual", analyses: 0 },
+    { trigger: "save", mode: "onSave", analyses: 1 },
+    { trigger: "watcher", mode: "onSave", analyses: 1 },
+    { trigger: "save", mode: "onType", analyses: 1 },
+    { trigger: "watcher", mode: "onType", analyses: 1 },
+    { trigger: "save", mode: "manual", explicit: "before", analyses: 1 },
+    { trigger: "save", mode: "manual", explicit: "after", analyses: 1 },
+  ]) {
+    const name = scenario.explicit
+      ? `preserves an explicit Refresh queued ${scenario.explicit} a queued on-save refresh when updates become manual`
+      : `rechecks a queued on-save ${scenario.trigger} refresh when the current update mode is ${scenario.mode}`;
+    it(name, async () => {
+      const vscode = createMockVscode();
+      const notifications = sourceFileNotifications(vscode);
+      let mode = "onSave";
+      let release!: () => void;
+      let started!: () => void;
+      let checks = 0;
+      const waiting = new Promise<void>((resolve) => { started = resolve; });
+      vscode.resolveFileEnvironment = async (_api, resource) => {
+        if (++checks === 1) await new Promise<void>((resolve) => { release = resolve; started(); });
+        return resolvedPython(resource);
+      };
+      await withMockedVscode(vscode, async ({ TimelineController }) => {
+        const setup = sourceFileController(TimelineController, vscode);
+        const { controller, calls, document, sourcePath } = setup;
+        controller.config = () => ({ get: (key, fallback) => key === "updateMode" ? mode : fallback });
+        let first: Promise<void> | undefined;
+        try {
+          first = controller.runAnalysis();
+          await waiting;
+          if (scenario.explicit === "before") await controller.refreshPreview();
+          document.text = "wait_sync 4\nwait 32\nstop\n";
+          writeFileSync(sourcePath, document.text);
+          if (scenario.trigger === "save") await notifications.save(document);
+          else await notifications.change(document.uri);
+          assert.equal(controller.analysisQueued, true);
+          if (scenario.explicit === "after") await controller.refreshPreview();
+          mode = scenario.mode;
+          release();
+          await first;
+          await setup.settle();
+          assert.equal(calls.filter((call) => call.stage === "analyzer").length, scenario.analyses);
+          assert.equal(checks, scenario.analyses + 1);
+          assert.equal(controller.analysisQueued, false);
+          assert.equal(controller.analysisInFlight, false);
+        } finally {
+          release?.();
+          await first;
+          await setup.settle();
+          controller.dispose();
+        }
+      });
+    });
+  }
+
+  for (const scenario of [
+    { mode: "onSave" },
+    { mode: "onSave", edit: "before" },
+    { mode: "onSave", edit: "after" },
+    { mode: "onSave", edit: "queued before" },
+    { mode: "onSave", edit: "queued after" },
+    { mode: "onSave", switchBeforeTimer: true },
+    { mode: "manual" },
+    { mode: "manual", explicit: "before" },
+    { mode: "manual", explicit: "after" },
+  ]) {
+    const detail = scenario.edit ? ` with an edit ${scenario.edit} the saved change`
+      : scenario.explicit ? ` with an explicit Refresh ${scenario.explicit} the saved change`
+      : scenario.switchBeforeTimer ? " before its debounce fires" : " after its debounce fires";
+    it(`preserves a debounced watcher's saved-source policy when updates become ${scenario.mode}${detail}`, async () => {
+      const vscode = createMockVscode();
+      const notifications = sourceFileNotifications(vscode);
+      let mode = "onType";
+      let release!: () => void;
+      let started!: () => void;
+      let checks = 0;
+      const waiting = new Promise<void>((resolve) => { started = resolve; });
+      vscode.resolveFileEnvironment = async (_api, resource) => {
+        if (++checks === 1) await new Promise<void>((resolve) => { release = resolve; started(); });
+        return resolvedPython(resource);
+      };
+      await withFakeTimers(async (clock) => withMockedVscode(vscode, async ({ TimelineController }) => {
+        const setup = sourceFileController(TimelineController, vscode);
+        const { controller, calls, document, sourcePath } = setup;
+        controller.config = () => ({ get: (key, fallback) => key === "updateMode" ? mode : fallback });
+        const edit = () => {
+          document.isDirty = true;
+          document.text = "wait_sync 4\nwait 64\nstop\n";
+          notifications.edit({ document, contentChanges: [{ text: document.text }] });
+        };
+        let first: Promise<void> | undefined;
+        try {
+          first = controller.runAnalysis();
+          await waiting;
+          if (scenario.explicit === "before") await controller.refreshPreview();
+          if (scenario.edit === "before" || scenario.edit === "queued before") edit();
+          if (scenario.edit === "queued before") clock.advance(1000);
+          writeFileSync(sourcePath, "wait_sync 4\nwait 32\nstop\n");
+          await notifications.change(document.uri);
+          assert.notEqual(controller.changeTimer, undefined);
+          if (scenario.edit === "after") edit();
+          if (scenario.switchBeforeTimer) mode = scenario.mode;
+          clock.advance(1000);
+          assert.equal(controller.analysisQueued, true);
+          if (scenario.edit === "queued after") {
+            edit();
+            clock.advance(1000);
+          }
+          if (scenario.explicit === "after") await controller.refreshPreview();
+          mode = scenario.mode;
+          release();
+          await first;
+          await setup.settle();
+          const analyses = scenario.mode === "manual" && !scenario.explicit ? 0 : 1;
+          assert.equal(calls.filter((call) => call.stage === "analyzer").length, analyses);
+          assert.equal(checks, analyses + 1);
+          assert.equal(controller.analysisQueued, false);
+          assert.equal(controller.analysisInFlight, false);
+        } finally {
+          release?.();
+          await first;
+          await setup.settle();
+          controller.dispose();
+        }
+      }));
+    });
+  }
+
+  it("runs a saved-source watcher debounce after changing from on-type to on-save with no active analysis", async () => {
+    const vscode = createMockVscode();
+    const notifications = sourceFileNotifications(vscode);
+    await withFakeTimers(async (clock) => withMockedVscode(vscode, async ({ TimelineController }) => {
+      const setup = sourceFileController(TimelineController, vscode);
+      const { controller, calls, document, sourcePath } = setup;
+      let mode = "onType";
+      controller.config = () => ({ get: (key, fallback) => key === "updateMode" ? mode : fallback });
+      try {
+        writeFileSync(sourcePath, "wait_sync 4\nwait 32\nstop\n");
+        await notifications.change(document.uri);
+        assert.notEqual(controller.changeTimer, undefined);
+        mode = "onSave";
+        clock.advance(1000);
+        await setup.settle();
+        assert.equal(calls.filter((call) => call.stage === "analyzer").length, 1);
+        assert.equal(controller.analysisInFlight, false);
+      } finally {
+        await setup.settle();
+        controller.dispose();
+      }
+    }));
+  });
+
+  it("preserves a queued saved-source refresh after an on-type refresh when updates become on-save", async () => {
+    const vscode = createMockVscode();
+    const notifications = sourceFileNotifications(vscode);
+    let mode = "onType";
+    let release!: () => void;
+    let started!: () => void;
+    let checks = 0;
+    const waiting = new Promise<void>((resolve) => { started = resolve; });
+    vscode.resolveFileEnvironment = async (_api, resource) => {
+      if (++checks === 1) await new Promise<void>((resolve) => { release = resolve; started(); });
+      return resolvedPython(resource);
+    };
+    await withFakeTimers(async (clock) => withMockedVscode(vscode, async ({ TimelineController }) => {
+      const setup = sourceFileController(TimelineController, vscode);
+      const { controller, calls, document, sourcePath } = setup;
+      controller.config = () => ({ get: (key, fallback) => key === "updateMode" ? mode : fallback });
+      let first: Promise<void> | undefined;
+      try {
+        first = controller.runAnalysis();
+        await waiting;
+        document.isDirty = true;
+        document.text = "wait_sync 4\nwait 32\nstop\n";
+        notifications.edit({ document, contentChanges: [{ text: document.text }] });
+        clock.advance(1000);
+        assert.equal(controller.analysisQueued, true);
+        document.isDirty = false;
+        writeFileSync(sourcePath, document.text);
+        await notifications.save(document);
+        mode = "onSave";
+        release();
+        await first;
+        await setup.settle();
+        assert.equal(calls.filter((call) => call.stage === "analyzer").length, 1);
+        assert.equal(checks, 2);
+        assert.equal(controller.analysisQueued, false);
+        assert.equal(controller.analysisInFlight, false);
+      } finally {
+        release?.();
+        await first;
+        await setup.settle();
+        controller.dispose();
+      }
+    }));
+  });
+
+  it("rolls back an inline parameter edit when its queued on-type analysis is cancelled by manual mode", async () => {
+    const vscode = createMockVscode();
+    const notifications = sourceFileNotifications(vscode);
+    let mode = "onType";
+    let release!: () => void;
+    let started!: () => void;
+    let checks = 0;
+    const waiting = new Promise<void>((resolve) => { started = resolve; });
+    vscode.resolveFileEnvironment = async (_api, resource) => {
+      if (++checks === 1) await new Promise<void>((resolve) => { release = resolve; started(); });
+      return resolvedPython(resource);
+    };
+    await withFakeTimers(async (clock) => withMockedVscode(vscode, async ({ TimelineController }) => {
+      const setup = sourceFileController(TimelineController, vscode);
+      const { controller, calls, document } = setup;
+      controller.config = () => ({ get: (key, fallback) => key === "updateMode" ? mode : fallback });
+      const previousIr = { analysis: { parameters: [{ name: "DURATION" }] }, events: [{ id: "previous" }] };
+      controller.timelineIr = controller.lastAnalyzerTimelineIr = previousIr;
+      controller.parameterOverrides.set("DURATION", "128");
+      controller.panel.webview.html = "previous editable preview";
+      const messages: any[] = [];
+      controller.panel.webview.postMessage = (message) => messages.push(message);
+      let editing: Promise<void> | undefined;
+      try {
+        editing = controller.handleWebviewMessage({ type: "setAnalysisParameter", name: "DURATION", valueJson: "256", projectFile: controller.projectUri.fsPath });
+        await waiting;
+        document.isDirty = true;
+        notifications.edit({ document, contentChanges: [{ text: "wait 32" }] });
+        clock.advance(1000);
+        assert.equal(controller.analysisQueued, true);
+        mode = "manual";
+        release();
+        await editing;
+        await setup.settle();
+        assert.equal(calls.filter((call) => call.stage === "analyzer").length, 0);
+        assert.equal(controller.parameterOverrides.get("DURATION"), "128");
+        assert.equal(controller.timelineIr, previousIr);
+        assert.equal(controller.lastAnalyzerTimelineIr, previousIr);
+        assert.equal(controller.panel.webview.html, "previous editable preview");
+        const errors = messages.filter((message) => message.type === "analysisParameterError");
+        assert.equal(errors.length, 1, "The retained parameter editor must receive a failure reply to leave its busy state");
+        assert.match(errors[0].message, /automatic refresh.*cancelled/i);
+      } finally {
+        release?.();
+        await editing;
+        await setup.settle();
+        controller.dispose();
+      }
+    }));
+  });
+
+  for (const trigger of ["save", "Refresh"]) {
+    it(`consumes an on-type debounce when ${trigger} already starts the same analysis`, async () => {
+      const vscode = createMockVscode();
+      let changed: any;
+      let saved: any;
+      vscode.workspace.onDidChangeTextDocument = (handler) => { changed = handler; return { dispose() {} }; };
+      vscode.workspace.onDidSaveTextDocument = (handler) => { saved = handler; return { dispose() {} }; };
+      await withFakeTimers(async (clock) => withMockedVscode(vscode, async ({ TimelineController }) => {
+        const { controller, calls } = fileEnvironmentController(TimelineController, vscode);
+        const document = { uri: vscode.Uri.file(join(controller.outputDir, "seq0.q1asm")), isDirty: true };
+        controller.projectRelatedPaths.add(document.uri.fsPath);
+        controller.config = () => ({ get: (key, fallback) => key === "updateMode" ? "onType" : fallback });
+        const analyses: Promise<void>[] = [];
+        const runAnalysis = controller.runAnalysis.bind(controller);
+        controller.runAnalysis = (...args) => {
+          const analysis = runAnalysis(...args);
+          analyses.push(analysis);
+          return analysis;
+        };
+        changed({ document });
+        assert.notEqual(controller.changeTimer, undefined);
+        document.isDirty = false;
+        if (trigger === "save") await saved(document);
+        else await controller.refreshPreview();
+        await analyses[0];
+        clock.advance(1000);
+        await Promise.all(analyses);
+        assert.equal(calls.filter((call) => call.stage === "analyzer").length, 1, "The old edit timer must not analyze the same saved program again");
+        assert.equal(calls.filter((call) => call.stage === "renderer").length, 1);
+        assert.equal(controller.changeTimer, undefined);
+        controller.dispose();
+      }));
+    });
+  }
+
+  function sourceFileNotifications(vscode) {
+    const handlers = {};
+    vscode.workspace.onDidSaveTextDocument = (handler) => { handlers.save = handler; return { dispose() {} }; };
+    vscode.workspace.onDidChangeTextDocument = (handler) => { handlers.edit = handler; return { dispose() {} }; };
+    vscode.workspace.createFileSystemWatcher = (pattern) => ({
+      onDidChange(handler) { if (typeof pattern === "string") handlers.change = handler; return { dispose() {} }; },
+      onDidCreate(handler) { if (typeof pattern === "string") handlers.create = handler; return { dispose() {} }; },
+      onDidDelete(handler) { if (typeof pattern === "string") handlers.delete = handler; return { dispose() {} }; },
+      dispose() {},
+    });
+    return handlers;
+  }
+
+  function closedDependencyProject(TimelineController, vscode, coverage, mode = "onSave") {
+    const root = mkdtempSync(join(tmpdir(), "q1-closed-dependency-"));
+    const workspace = join(root, "workspace"), external = join(root, "external");
+    mkdirSync(workspace); mkdirSync(external);
+    vscode.workspace.workspaceFolders = [{ uri: vscode.Uri.file(workspace) }];
+    const subscriptions = fileWatchSubscriptions(vscode);
+    const custom = coverage === "workspace custom extensions";
+    const projectDir = coverage === "external project" ? external : workspace;
+    const dependencyDir = join(custom ? workspace : external, "sources");
+    mkdirSync(dependencyDir);
+    const files = {
+      project: join(projectDir, custom ? "timeline.project" : "q1timeline.yml"),
+      file: join(dependencyDir, custom ? "seq.program" : "seq.q1asm"),
+      sequence_json: join(dependencyDir, custom ? "sequence.data" : "sequence.json"),
+      params: join(dependencyDir, custom ? "params.values" : "params.json"),
+      display: join(dependencyDir, custom ? "display.theme" : "display.yml"),
+    };
+    const contents = { file: "wait_sync 4\nwait {WAIT_NS}\nstop\n", sequence_json: "{\"waveforms\": {}}\n",
+      params: "{\"WAIT_NS\": 4}\n", display: "title: initial\n" };
+    for (const [role, text] of Object.entries(contents)) writeFileSync(files[role], text);
+    const writeProject = (paramsFile = files.params) => {
+      const relative = (file) => JSON.stringify(require("node:path").relative(projectDir, file).replace(/\\/g, "/"));
+      writeFileSync(files.project, `sequencers:\n  - id: seq\n    file: ${relative(files.file)}\n    sequence_json: ${relative(files.sequence_json)}\nparams:\n  file: ${relative(paramsFile)}\ndisplay:\n  file: ${relative(files.display)}\n`);
+    };
+    writeProject();
+    const controller = new TimelineController(createContext());
+    controller.config = () => ({ get: (key, fallback) => key === "updateMode" ? mode : fallback });
+    const analyzed: string[] = [];
+    controller.runAnalysis = async () => { analyzed.push(controller.projectUri.fsPath); };
+    return { controller, root, workspace, external, dependencyDir, files, contents, analyzed, subscriptions, writeProject,
+      async open() { await controller.openTarget({ projectFile: files.project }); analyzed.length = 0; } };
+  }
+
+  for (const coverage of ["external project", "external dependencies", "workspace custom extensions"]) {
+    for (const mode of ["manual", "onSave", "onType"]) {
+      it(`observes closed ${coverage} changes under ${mode} updates`, async () => {
+        await withFakeTimers(async (clock) => {
+          const vscode = createMockVscode();
+          await withMockedVscode(vscode, async ({ TimelineController }) => {
+            const setup = closedDependencyProject(TimelineController, vscode, coverage, mode);
+            const { controller, files, subscriptions, analyzed } = setup;
+            try {
+              await setup.open();
+              assert.deepEqual(vscode.workspace.textDocuments, []);
+              for (const role of ["file", "sequence_json", "params", "display", "project"]) {
+                assert.equal(controller.isProjectRelated(vscode.Uri.file(files[role])), true);
+                const revision = controller.sourceRevision, analyses = analyzed.length;
+                const text = readFileSync(files[role], "utf8");
+                writeFileSync(files[role], role === "params" ? "{\"WAIT_NS\": 8}\n" : `${text}\n`);
+                await subscriptions.dispatch(files[role]);
+                clock.advance(1000);
+                assert.equal(controller.sourceRevision, revision + 1, `The closed ${role} dependency must invalidate the source exactly once`);
+                assert.equal(analyzed.length, analyses + (mode === "manual" ? 0 : 1));
+              }
+            } finally { controller.dispose(); }
+          });
+        });
+      });
+    }
+  }
+
+  for (const mode of ["manual", "onSave", "onType"]) {
+    it(`observes a missing external dependency's creation, deletion and recreation under ${mode}`, async () => {
+      await withFakeTimers(async (clock) => {
+        const vscode = createMockVscode();
+        await withMockedVscode(vscode, async ({ TimelineController }) => {
+          const setup = closedDependencyProject(TimelineController, vscode, "external dependencies", mode);
+          const { controller, files, contents, subscriptions, analyzed } = setup;
+          require("node:fs").unlinkSync(files.params);
+          try {
+            await setup.open();
+            for (const change of ["create", "delete", "create"]) {
+              const revision = controller.sourceRevision, analyses = analyzed.length;
+              if (change === "delete") require("node:fs").unlinkSync(files.params);
+              else writeFileSync(files.params, contents.params);
+              await subscriptions.dispatch(files.params, change);
+              clock.advance(1000);
+              assert.equal(controller.sourceRevision, revision + 1);
+              assert.equal(analyzed.length, analyses + (mode === "manual" ? 0 : 1));
+            }
+          } finally { controller.dispose(); }
+        });
+      });
+    });
+  }
+
+  for (const role of ["params", "display"]) {
+    for (const mode of ["manual", "onSave", "onType"]) {
+      it(`observes a new external ${role} file when its parent folder did not exist under ${mode}`, async () => {
+        await withFakeTimers(async (clock) => {
+          const vscode = createMockVscode();
+          await withMockedVscode(vscode, async ({ TimelineController }) => {
+            const setup = closedDependencyProject(TimelineController, vscode, "external dependencies", mode);
+            const { controller, subscriptions, files } = setup;
+            const parent = role === "params" ? join(setup.external, "later", "nested") : join(setup.external, "later");
+            const file = join(parent, `${role}[new].data`);
+            files[role] = file;
+            writeFileSync(files.file, "move 17,R0\nstop\n");
+            setup.writeProject();
+            const repoRoot = require("node:path").resolve(__dirname, "../../../..");
+            const analyses: any[] = [];
+            controller.runAnalysis = async () => {
+              const out = join(setup.root, `optional-${analyses.length}.json`);
+              require("node:child_process").execFileSync("python", ["-m", "q1timeline", "analyze", "--project", files.project,
+                "--out", out, "--format", "vscode-json"],
+              { cwd: repoRoot, env: { ...process.env, PYTHONPATH: join(repoRoot, "src") }, encoding: "utf8", windowsHide: true });
+              analyses.push(JSON.parse(readFileSync(out, "utf8")));
+            };
+            try {
+              assert.equal(existsSync(parent), false);
+              await setup.open();
+              assert.ok(analyses[0].diagnostics.some((item) => item.category === "missing_optional_file" && item.details.kind === role));
+              const revision = controller.sourceRevision;
+              mkdirSync(parent, { recursive: true });
+              writeFileSync(file, role === "params" ? "{\"NEW_VALUE\": 23}\n" : "title: newly configured\n");
+              await subscriptions.dispatch(file, "create");
+              clock.advance(1000);
+              assert.equal(controller.sourceRevision, revision + 1, "Creating the previously missing parent and target file must invalidate the current source");
+              assert.equal(analyses.length, mode === "manual" ? 1 : 2);
+              if (mode === "manual") await controller.refreshPreview();
+              assert.ok(!analyses.at(-1).diagnostics.some((item) => item.category === "missing_optional_file" && item.details.kind === role));
+              if (role === "params") assert.equal(analyses.at(-1).analysis.parameters.find((item) => item.name === "NEW_VALUE").value_json, "23");
+              else assert.equal(analyses.at(-1).project.display.title, "newly configured");
+              assert.ok(subscriptions.watchers.filter((watcher) => !watcher.disposed && typeof watcher.pattern !== "string")
+                .every((watcher) => watcher.pattern.pattern === "*"), "Once the parent exists, supplemental watching must return to direct non-recursive patterns");
+            } finally { controller.dispose(); }
+          });
+        });
+      });
+    }
+  }
+
+  for (const role of ["params", "display"]) {
+    for (const { mode, notification } of ["manual", "onSave", "onType"].flatMap((mode) => ["parent", "file"].map((notification) => ({ mode, notification })))) {
+      it(`invalidates a deleted external ${role} parent and observes recreation under ${mode} with a ${notification} notification`, async () => {
+        await withFakeTimers(async (clock) => {
+          const vscode = createMockVscode();
+          await withMockedVscode(vscode, async ({ TimelineController }) => {
+            const setup = closedDependencyProject(TimelineController, vscode, "external dependencies", mode);
+            const { controller, subscriptions, files } = setup;
+            const parent = join(setup.external, "parent-only"), file = join(parent, `${role}.values`);
+            mkdirSync(parent);
+            files[role] = file;
+            writeFileSync(file, role === "params" ? "{\"VALUE\":17}\n" : "title: initial\n");
+            writeFileSync(files.file, "move 17,R0\nstop\n");
+            setup.writeProject();
+            const repoRoot = require("node:path").resolve(__dirname, "../../../..");
+            const analyses: any[] = [];
+            controller.runAnalysis = async () => {
+              const out = join(setup.root, `lifecycle-${analyses.length}.json`);
+              require("node:child_process").execFileSync("python", ["-m", "q1timeline", "analyze", "--project", files.project,
+                "--out", out, "--format", "vscode-json"],
+              { cwd: repoRoot, env: { ...process.env, PYTHONPATH: join(repoRoot, "src") }, encoding: "utf8", windowsHide: true });
+              analyses.push(JSON.parse(readFileSync(out, "utf8")));
+            };
+            try {
+              await setup.open();
+              const initialWatcher = subscriptions.watchers.find((watcher) => typeof watcher.pattern !== "string" && watcher.pattern.baseUri.fsPath === parent);
+              assert.ok(initialWatcher);
+              const revision = controller.sourceRevision;
+              require("node:fs").unlinkSync(file);
+              require("node:fs").rmdirSync(parent);
+              // Stable emits only the parent URI; minimum can emit only the target file's deletion.
+              await subscriptions.dispatch(notification === "parent" ? parent : file, "delete");
+              clock.advance(1000);
+              assert.equal(controller.sourceRevision, revision + 1, "A directory-only deletion must invalidate its declared dependency");
+              assert.equal(analyses.length, mode === "manual" ? 1 : 2);
+              if (mode === "manual") await controller.refreshPreview();
+              assert.ok(analyses.at(-1).diagnostics.some((item) => item.category === "missing_optional_file" && item.details.kind === role));
+              const afterDelete = controller.sourceRevision;
+              const sibling = `${parent}-sibling`;
+              mkdirSync(sibling); require("node:fs").rmdirSync(sibling);
+              await subscriptions.dispatch(sibling, "delete");
+              assert.equal(controller.sourceRevision, afterDelete, "A sibling with the same filename prefix is not an ancestor");
+              mkdirSync(parent);
+              writeFileSync(file, role === "params" ? "{\"VALUE\":23}\n" : "title: restored\n");
+              await subscriptions.dispatch(file, "create");
+              clock.advance(1000);
+              assert.equal(controller.sourceRevision, afterDelete + 1);
+              assert.equal(analyses.length, mode === "manual" ? 2 : 3);
+              if (mode === "manual") await controller.refreshPreview();
+              assert.ok(!analyses.at(-1).diagnostics.some((item) => item.category === "missing_optional_file" && item.details.kind === role));
+              if (role === "params") assert.equal(analyses.at(-1).analysis.parameters.find((item) => item.name === "VALUE").value_json, "23");
+              else assert.equal(analyses.at(-1).project.display.title, "restored");
+              const restoredRevision = controller.sourceRevision, restoredAnalyses = analyses.length;
+              await initialWatcher.handlers.delete(vscode.Uri.file(parent));
+              assert.equal(controller.sourceRevision, restoredRevision, "A retained callback from the disposed binding must not invalidate the recreated target");
+              assert.equal(analyses.length, restoredAnalyses);
+            } finally { controller.dispose(); }
+          });
+        });
+      });
+    }
+  }
+
+  for (const notification of ["parent", "file", "file across branches"]) {
+    for (const pendingRead of [false, true]) {
+      const separateBranches = notification === "file across branches";
+      if (separateBranches && pendingRead) continue;
+      it(`refreshes a same-byte restored dependency after shared-parent deletion with a ${notification === "parent" ? "parent" : "file"} notification${pendingRead ? " and a pending read" : ""}${separateBranches ? " across separate branches" : ""}`, async () => {
+        const vscode = createMockVscode();
+        await withMockedVscode(vscode, async ({ TimelineController }) => {
+          const setup = closedDependencyProject(TimelineController, vscode, "external dependencies");
+          const { controller, subscriptions, files } = setup;
+          const parent = join(setup.external, "shared-parent");
+          const directories = separateBranches ? [join(parent, "params"), join(parent, "display")] : [parent, parent];
+          for (const directory of new Set(directories)) mkdirSync(directory, { recursive: true });
+          files.params = join(directories[0], "params.values");
+          files.display = join(directories[1], "display.values");
+          writeFileSync(files.params, "{\"VALUE\":17}\n");
+          writeFileSync(files.display, "title: original\n");
+          writeFileSync(files.file, "move 17,R0\nstop\n");
+          setup.writeProject();
+          const repoRoot = require("node:path").resolve(__dirname, "../../../..");
+          const analyses: any[] = [];
+          controller.runAnalysis = async () => {
+            const out = join(setup.root, `shared-${analyses.length}.json`);
+            require("node:child_process").execFileSync("python", ["-m", "q1timeline", "analyze", "--project", files.project,
+              "--out", out, "--format", "vscode-json"],
+            { cwd: repoRoot, env: { ...process.env, PYTHONPATH: join(repoRoot, "src") }, encoding: "utf8", windowsHide: true });
+            analyses.push(JSON.parse(readFileSync(out, "utf8")));
+          };
+          const fs = require("node:fs"), readFile = fs.promises.readFile;
+          let release!: () => void, readStarted!: () => void, reading: Promise<void> | undefined;
+          const waiting = new Promise<void>((resolve) => { readStarted = resolve; });
+          const restoredDisplay = "title: cached\n";
+          try {
+            await setup.open();
+            writeFileSync(files.params, "{\"VALUE\":19}\n");
+            await subscriptions.dispatch(files.params);
+            writeFileSync(files.display, restoredDisplay);
+            await subscriptions.dispatch(files.display);
+            assert.equal(analyses.at(-1).project.display.title, "cached");
+            if (pendingRead) {
+              fs.promises.readFile = async (...args) => {
+                const bytes = await readFile(...args);
+                if (args[0] === files.display) await new Promise<void>((resolve) => { release = resolve; readStarted(); });
+                return bytes;
+              };
+              writeFileSync(files.display, restoredDisplay);
+              reading = subscriptions.dispatch(files.display);
+              await waiting;
+            }
+            fs.unlinkSync(files.params); fs.unlinkSync(files.display);
+            if (separateBranches) for (const directory of directories) fs.rmdirSync(directory);
+            fs.rmdirSync(parent);
+            await subscriptions.dispatch(notification === "parent" ? parent : files.params, "delete");
+            assert.ok(analyses.at(-1).diagnostics.some((item) => item.category === "missing_optional_file" && item.details.kind === "display"));
+            if (pendingRead) { release(); await reading; fs.promises.readFile = readFile; }
+            mkdirSync(require("node:path").dirname(files.display), { recursive: true });
+            writeFileSync(files.display, restoredDisplay);
+            const beforeRestore = analyses.length;
+            await subscriptions.dispatch(files.display, "create");
+            assert.equal(analyses.length, beforeRestore + 1, "Restoring a different declared file with its old bytes must still refresh the missing-file result");
+            assert.ok(!analyses.at(-1).diagnostics.some((item) => item.category === "missing_optional_file" && item.details.kind === "display"));
+            assert.ok(analyses.at(-1).diagnostics.some((item) => item.category === "missing_optional_file" && item.details.kind === "params"));
+            assert.equal(analyses.at(-1).project.display.title, "cached");
+          } finally { release?.(); await reading?.catch(() => {}); fs.promises.readFile = readFile; controller.dispose(); }
+        });
+      });
+    }
+  }
+
+  it("rebinds closed dependency subscriptions after project edits and releases them on switching and disposal", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const setup = closedDependencyProject(TimelineController, vscode, "external dependencies");
+      const { controller, files, subscriptions, analyzed } = setup;
+      const otherFolder = join(setup.external, "other");
+      mkdirSync(otherFolder);
+      const otherParams = join(otherFolder, "new.values");
+      writeFileSync(otherParams, "{\"WAIT_NS\": 12}\n");
+      try {
+        await setup.open();
+        setup.writeProject(otherParams);
+        await subscriptions.dispatch(files.project);
+        analyzed.length = 0;
+        writeFileSync(files.params, "{\"WAIT_NS\": 8}\n");
+        await subscriptions.dispatch(files.params);
+        assert.deepEqual(analyzed, [], "A removed dependency must no longer refresh the preview");
+        writeFileSync(otherParams, "{\"WAIT_NS\": 16}\n");
+        await subscriptions.dispatch(otherParams);
+        assert.deepEqual(analyzed, [files.project]);
+        const nextProject = join(setup.workspace, "next.yml");
+        writeFileSync(nextProject, "sequencers: []\n");
+        await controller.openTarget({ projectFile: nextProject });
+        analyzed.length = 0;
+        assert.ok(subscriptions.watchers.filter((watcher) => typeof watcher.pattern !== "string").every((watcher) => watcher.disposed));
+        writeFileSync(otherParams, "{\"WAIT_NS\": 20}\n");
+        await subscriptions.dispatch(otherParams);
+        assert.deepEqual(analyzed, []);
+        controller.dispose();
+        assert.ok(subscriptions.watchers.every((watcher) => watcher.disposed));
+      } finally { controller.dispose(); }
+    });
+  });
+
+  it("keeps workspace-covered changes singular and ignores nearby unrelated and generated files", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const setup = closedDependencyProject(TimelineController, vscode, "workspace custom extensions");
+      const { controller, subscriptions, analyzed } = setup;
+      const covered = join(setup.workspace, "covered.q1asm");
+      writeFileSync(covered, "stop\n");
+      writeFileSync(setup.files.project, `sequencers: [{id: seq, file: covered.q1asm}]\nparams: {file: sources/params.values}\n`);
+      try {
+        await setup.open();
+        const relatedCalls: string[] = [];
+        const onWatchedFile = controller.onWatchedFile.bind(controller);
+        controller.onWatchedFile = (uri, change) => { relatedCalls.push(uri.fsPath); return onWatchedFile(uri, change); };
+        writeFileSync(covered, "wait 4\nstop\n");
+        await subscriptions.dispatch(covered);
+        assert.deepEqual(relatedCalls, [covered], "A file covered by the workspace watcher must not get a second subscription callback");
+        assert.deepEqual(analyzed, [setup.files.project]);
+        analyzed.length = 0;
+        for (const file of [join(setup.dependencyDir, "unrelated.json"), join(controller.outputDir, "timeline.json")]) {
+          mkdirSync(require("node:path").dirname(file), { recursive: true });
+          writeFileSync(file, "{}\n");
+          await subscriptions.dispatch(file, "create");
+        }
+        assert.deepEqual(analyzed, []);
+      } finally { controller.dispose(); }
+    });
+  });
+
+  it("accepts declared project and dependency paths with custom extensions in the actual Python analyzer", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const setup = closedDependencyProject(TimelineController, vscode, "workspace custom extensions");
+      const repoRoot = require("node:path").resolve(__dirname, "../../../..");
+      try {
+        require("node:child_process").execFileSync("python", ["-m", "q1timeline", "analyze", "--project", setup.files.project,
+          "--out", join(setup.root, "custom-ir.json"), "--format", "vscode-json"],
+        { cwd: repoRoot, env: { ...process.env, PYTHONPATH: join(repoRoot, "src") }, encoding: "utf8", windowsHide: true });
+        const ir = JSON.parse(readFileSync(join(setup.root, "custom-ir.json"), "utf8"));
+        assert.ok(ir.events.length > 0);
+        assert.ok(ir.events.some((event) => event.source?.file === setup.files.file));
+      } finally { setup.controller.dispose(); }
+    });
+  });
+
+  function sourceFileController(TimelineController, vscode) {
+    const setup = fileEnvironmentController(TimelineController, vscode);
+    const { controller } = setup;
+    const sourcePath = join(controller.outputDir, "seq0.q1asm");
+    const document = {
+      uri: vscode.Uri.file(sourcePath), isDirty: false, version: 1, text: "wait_sync 4\nwait 16\nstop\n",
+      getText() { return this.text; },
+    };
+    writeFileSync(sourcePath, document.text);
+    vscode.workspace.textDocuments = [document];
+    controller.projectRelatedPaths.add(sourcePath);
+    controller.startWatchers();
+    const analyses = [];
+    const runAnalysis = controller.runAnalysis.bind(controller);
+    controller.runAnalysis = (...args) => {
+      const analysis = runAnalysis(...args);
+      analyses.push(analysis);
+      return analysis;
+    };
+    return { ...setup, sourcePath, document, analyses, async settle() {
+      for (let index = 0; index < analyses.length; index += 1) await analyses[index];
+    } };
+  }
+
+  for (const scenario of [
+    { trigger: "edit" },
+    { trigger: "save" },
+    { trigger: "watcher" },
+    { trigger: "edit", explicitRefresh: true },
+    { trigger: "edit", finishOpen: true },
+    { trigger: "edit", sameProject: true },
+  ]) {
+    const name = scenario.explicitRefresh ? "preserves a new project's explicit Refresh queued behind the previous project's analysis"
+      : scenario.finishOpen ? "preserves a new project's completed open request queued behind the previous project's analysis"
+      : scenario.sameProject ? "retains an already queued automatic refresh when reopening the same project"
+      : `drops an old project's already queued ${scenario.trigger} refresh while opening a different project`;
+    it(name, async () => {
+      const vscode = createMockVscode();
+      const notifications = sourceFileNotifications(vscode);
+      let releaseEnvironment!: () => void;
+      let environmentStarted!: () => void;
+      const environmentWaiting = new Promise<void>((resolve) => { environmentStarted = resolve; });
+      let checks = 0;
+      vscode.resolveFileEnvironment = async (_api, resource) => {
+        if (++checks === 1) await new Promise<void>((resolve) => { releaseEnvironment = resolve; environmentStarted(); });
+        return resolvedPython(resource);
+      };
+      await withFakeTimers(async (clock) => withMockedVscode(vscode, async ({ TimelineController }) => {
+        const setup = sourceFileController(TimelineController, vscode);
+        const { controller, calls, document, sourcePath } = setup;
+        controller.config = () => ({ get: (key, fallback) => key === "updateMode"
+          ? scenario.trigger === "edit" ? "onType" : "onSave" : fallback });
+        const root = mkdtempSync(join(tmpdir(), "q1-project-analysis-queue-"));
+        const projectFile = scenario.sameProject ? controller.projectUri.fsPath : join(root, "q1timeline.yml");
+        writeFileSync(projectFile, "sequencers:\n  - id: seq0\n    file: seq0.q1asm\n");
+        writeFileSync(join(root, "seq0.q1asm"), "stop\n");
+        const fsPromises = require("node:fs").promises;
+        const originalReadFile = fsPromises.readFile;
+        let releaseRead!: () => void;
+        let readStarted!: () => void;
+        const readWaiting = new Promise<void>((resolve) => { readStarted = resolve; });
+        fsPromises.readFile = async (...args) => {
+          if (args[0] === projectFile) await new Promise<void>((resolve) => { releaseRead = resolve; readStarted(); });
+          return originalReadFile(...args);
+        };
+        let first: Promise<void> | undefined;
+        let opening: Promise<void> | undefined;
+        try {
+          first = controller.runAnalysis();
+          await environmentWaiting;
+          document.text = "wait_sync 4\nwait 32\nstop\n";
+          if (scenario.trigger === "edit") {
+            document.isDirty = true;
+            notifications.edit({ document, contentChanges: [{ text: document.text }] });
+            clock.advance(1000);
+          } else {
+            writeFileSync(sourcePath, document.text);
+            if (scenario.trigger === "save") await notifications.save(document);
+            else await notifications.change(document.uri);
+          }
+          assert.equal(controller.analysisQueued, true);
+          opening = controller.openTarget({ projectFile });
+          await readWaiting;
+          assert.equal(controller.projectUri.fsPath, projectFile);
+          if (scenario.explicitRefresh) await controller.refreshPreview();
+          if (scenario.finishOpen) {
+            releaseRead();
+            await opening;
+            assert.equal(controller.analysisQueued, true);
+          }
+          releaseEnvironment();
+          await first;
+          await setup.settle();
+          const expectedEarly = scenario.explicitRefresh || scenario.finishOpen || scenario.sameProject ? 1 : 0;
+          assert.equal(calls.filter((call) => call.stage === "analyzer").length, expectedEarly,
+            "Only a request belonging to the new project may analyze it before its open operation is ready");
+          assert.equal(checks, expectedEarly + 1);
+          if (!scenario.finishOpen) {
+            releaseRead();
+            await opening;
+            await setup.settle();
+          }
+          const analyzers = calls.filter((call) => call.stage === "analyzer");
+          assert.equal(analyzers.length, scenario.finishOpen ? 1 : expectedEarly + 1);
+          assert.ok(analyzers.every((call) => call.args[call.args.indexOf("--project") + 1] === projectFile));
+          assert.equal(controller.analysisQueued, false);
+          assert.equal(controller.analysisInFlight, false);
+        } finally {
+          releaseRead?.();
+          releaseEnvironment?.();
+          await first;
+          await opening;
+          await setup.settle();
+          fsPromises.readFile = originalReadFile;
+          controller.dispose();
+        }
+      }));
+    });
+  }
+
+  it("drops an old project's on-type refresh while opening a different project", async () => {
+    const vscode = createMockVscode();
+    const notifications = sourceFileNotifications(vscode);
+    await withFakeTimers(async (clock) => withMockedVscode(vscode, async ({ TimelineController }) => {
+      const setup = sourceFileController(TimelineController, vscode);
+      const { controller, calls, document } = setup;
+      controller.config = () => ({ get: (key, fallback) => key === "updateMode" ? "onType" : fallback });
+      const root = mkdtempSync(join(tmpdir(), "q1-project-edit-timer-"));
+      const projectFile = join(root, "q1timeline.yml");
+      writeFileSync(projectFile, "sequencers:\n  - id: seq0\n    file: seq0.q1asm\n");
+      writeFileSync(join(root, "seq0.q1asm"), "stop\n");
+      const fsPromises = require("node:fs").promises;
+      const originalReadFile = fsPromises.readFile;
+      let release!: () => void;
+      let started!: () => void;
+      const waiting = new Promise<void>((resolve) => { started = resolve; });
+      fsPromises.readFile = async (...args) => {
+        if (args[0] === projectFile) await new Promise<void>((resolve) => { release = resolve; started(); });
+        return originalReadFile(...args);
+      };
+      let opening: Promise<void> | undefined;
+      try {
+        await controller.runAnalysis();
+        calls.length = 0;
+        document.text = "wait_sync 4\nwait 32\nstop\n";
+        document.isDirty = true;
+        document.version += 1;
+        notifications.edit({ document, contentChanges: [{ text: document.text }] });
+        const timer = controller.changeTimer;
+        assert.notEqual(timer, undefined);
+        controller.setProjectUri(vscode.Uri.file(controller.projectUri.fsPath));
+        assert.equal(controller.changeTimer, timer, "Reusing the same project must retain its pending edit refresh");
+        opening = controller.openTarget({ projectFile });
+        await waiting;
+        clock.advance(1000);
+        await setup.settle();
+        const analyzesBeforeProjectReadCompletes = calls.filter((call) => call.stage === "analyzer").length;
+        release();
+        await opening;
+        assert.equal(analyzesBeforeProjectReadCompletes, 0, "An old project's edit timer must not analyze the new project while it is opening");
+        assert.deepEqual(calls.filter((call) => call.stage === "analyzer")
+          .map((call) => call.args[call.args.indexOf("--project") + 1]), [projectFile]);
+        assert.equal(controller.changeTimer, undefined);
+      } finally {
+        release?.();
+        await opening;
+        fsPromises.readFile = originalReadFile;
+        controller.dispose();
+      }
+    }));
+  });
+
+  for (const previousState of ["paused", "completed"]) {
+    it(`consumes an on-type refresh when Run replaces a ${previousState} session after an external source change`, async () => {
+      const vscode = createMockVscode();
+      const notifications = sourceFileNotifications(vscode);
+      const clients: any[] = [];
+      let loadedSourcePath: string;
+      let finishInitialRun!: () => void;
+      let finishNewRun!: () => void;
+      vscode.PlaybackClient = class {
+        disposed = false;
+        program: string;
+        index: number;
+        rejectPending: any;
+        constructor() {
+          this.program = readFileSync(loadedSourcePath, "utf8");
+          this.index = clients.length;
+          clients.push(this);
+        }
+        async request(message) {
+          const playback = { status: this.index === 0 ? previousState : "completed",
+            can_resume: this.index === 0 && previousState === "paused", steps: 4 };
+          if (message.command === "run") return new Promise((resolve, reject) => {
+            this.rejectPending = reject;
+            const finish = () => { this.rejectPending = undefined; resolve({ playback }); };
+            if (this.index === 0) finishInitialRun = finish;
+            else finishNewRun = finish;
+          });
+          return { ir: { events: [], playback } };
+        }
+        dispose() {
+          this.disposed = true;
+          this.rejectPending?.(new Error("Playback client disposed."));
+          this.rejectPending = undefined;
+        }
+      };
+      await withFakeTimers(async (clock) => withMockedVscode(vscode, async ({ TimelineController }) => {
+        const setup = sourceFileController(TimelineController, vscode);
+        const { controller, calls, document, sourcePath } = setup;
+        loadedSourcePath = sourcePath;
+        controller.config = () => ({ get: (key, fallback) => key === "updateMode" ? "onType" : fallback });
+        let initial: Promise<void> | undefined;
+        let running: Promise<void> | undefined;
+        try {
+          await controller.runAnalysis();
+          initial = controller.handleWebviewMessage({ type: "executionControl", action: "play" });
+          if (previousState === "paused") await controller.handleWebviewMessage({ type: "executionControl", action: "pause" });
+          finishInitialRun();
+          await initial;
+          assert.equal(controller.playbackClient, clients[0]);
+          assert.equal(controller.executionState.status, previousState);
+          const oldProgram = document.text;
+          calls.length = 0;
+          document.text = "wait_sync 4\nwait 32\nstop\n";
+          document.version += 1;
+          writeFileSync(sourcePath, document.text);
+          await notifications.change(document.uri);
+          assert.equal(clients[0].disposed, true, "The changed file must invalidate the cached execution before Run");
+          assert.equal(controller.playbackClient, undefined);
+          assert.notEqual(controller.changeTimer, undefined);
+          assert.equal(controller.hasUnsavedProjectChanges(), false);
+          running = controller.handleWebviewMessage({ type: "executionControl", action: "play" });
+          assert.equal(clients.length, 2);
+          assert.equal(clients[0].program, oldProgram);
+          assert.equal(clients[1].program, document.text, "The new worker must load the changed on-disk program");
+          clock.advance(1000);
+          await setup.settle();
+          const interrupted = clients[1].disposed;
+          finishNewRun();
+          await running;
+          assert.equal(interrupted, false, "An older automatic refresh must not dispose the execution the user just started");
+          assert.equal(calls.filter((call) => call.stage === "analyzer").length, 0);
+          assert.equal(controller.executionState.status, "completed");
+          assert.equal(controller.changeTimer, undefined);
+        } finally {
+          finishInitialRun?.();
+          finishNewRun?.();
+          await Promise.allSettled([initial, running].filter(Boolean));
+          controller.dispose();
+        }
+      }));
+    });
+  }
+
+  it("preserves a pending on-type refresh when Run is rejected for busy or unsaved source", async () => {
+    const vscode = createMockVscode();
+    await withFakeTimers(async () => withMockedVscode(vscode, async ({ TimelineController }) => {
+      for (const reason of ["busy", "unsaved"]) {
+        const { controller, calls } = playbackController(TimelineController, vscode, () => assert.fail("A rejected Run must not contact the worker"));
+        controller.config = () => ({ get: (key, fallback) => key === "updateMode" ? "onType" : fallback });
+        controller.scheduleAnalysis();
+        const timer = controller.changeTimer;
+        if (reason === "busy") controller.analysisInFlight = true;
+        else controller.hasUnsavedProjectChanges = () => true;
+        await controller.handleWebviewMessage({ type: "executionControl", action: "play" });
+        assert.equal(controller.changeTimer, timer, `${reason} Run rejection must retain the automatic refresh`);
+        assert.deepEqual(calls, []);
+        controller.dispose();
+      }
+    }));
+  });
+
+  for (const firstEvent of ["save", "watcher"]) {
+    it(`analyzes identical save and watcher bytes once with ${firstEvent} first`, async () => {
+      const vscode = createMockVscode();
+      const notifications = sourceFileNotifications(vscode);
+      await withMockedVscode(vscode, async ({ TimelineController }) => {
+        const setup = sourceFileController(TimelineController, vscode);
+        const { controller, calls, document, sourcePath } = setup;
+        const execFile = controller.execFile;
+        let started!: () => void;
+        let release!: () => void;
+        const running = new Promise<void>((resolve) => { started = resolve; });
+        let gate = true;
+        controller.execFile = async (...args) => {
+          if (args[5] === "analyzer" && gate) {
+            gate = false;
+            await new Promise<void>((resolve) => { release = resolve; started(); });
+          }
+          return execFile(...args);
+        };
+        const first = firstEvent === "save" ? notifications.save(document) : notifications.change(document.uri);
+        await running;
+        notifications.edit({ document, contentChanges: [] });
+        if (firstEvent === "save") await notifications.change(document.uri);
+        else await notifications.save(document);
+        assert.equal(readFileSync(sourcePath, "utf8"), document.getText());
+        release();
+        await first;
+        await setup.settle();
+        assert.equal(calls.filter((call) => call.stage === "analyzer").length, 1);
+        assert.equal(calls.filter((call) => call.stage === "renderer").length, 1);
+        assert.equal(controller.sourceRevision, controller.analyzedSourceRevision, "The duplicate event must not leave successfully analyzed source stale");
+        controller.dispose();
+      });
+    });
+  }
+
+  it("deduplicates each file independently when two saved files' watcher events arrive later", async () => {
+    const vscode = createMockVscode();
+    const notifications = sourceFileNotifications(vscode);
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const setup = sourceFileController(TimelineController, vscode);
+      const { controller, calls, document } = setup;
+      const other = { ...document, uri: vscode.Uri.file(join(controller.outputDir, "seq1.q1asm")) };
+      writeFileSync(other.uri.fsPath, other.text);
+      controller.projectRelatedPaths.add(other.uri.fsPath);
+      await notifications.save(document);
+      await notifications.save(other);
+      const revision = controller.sourceRevision;
+      await notifications.change(document.uri);
+      await notifications.change(other.uri);
+      await setup.settle();
+      assert.equal(calls.filter((call) => call.stage === "analyzer").length, 2);
+      assert.equal(controller.sourceRevision, revision);
+      assert.equal(controller.analyzedSourceRevision, revision);
+      controller.dispose();
+    });
+  });
+
+  it("analyzes different external bytes even when the open document has already reloaded them", async () => {
+    const vscode = createMockVscode();
+    const notifications = sourceFileNotifications(vscode);
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const setup = sourceFileController(TimelineController, vscode);
+      const { controller, calls, document, sourcePath } = setup;
+      await notifications.save(document);
+      document.text = "wait_sync 4\nwait 32\nstop\n";
+      document.version += 1;
+      writeFileSync(sourcePath, document.text);
+      notifications.edit({ document, contentChanges: [{ text: document.text }] });
+      assert.equal(document.isDirty, false);
+      await notifications.change(document.uri);
+      await setup.settle();
+      assert.equal(calls.filter((call) => call.stage === "analyzer").length, 2);
+      assert.equal(controller.sourceRevision, controller.analyzedSourceRevision);
+      controller.dispose();
+    });
+  });
+
+  it("keeps an external analysis fresh when the clean document reload arrives after its watcher", async () => {
+    const vscode = createMockVscode();
+    const notifications = sourceFileNotifications(vscode);
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const setup = sourceFileController(TimelineController, vscode);
+      const { controller, calls, document, sourcePath } = setup;
+      await notifications.save(document);
+      const externalText = "wait_sync 4\nwait 48\nstop\n";
+      writeFileSync(sourcePath, externalText);
+      await notifications.change(document.uri);
+      const revision = controller.sourceRevision;
+      document.text = externalText;
+      document.version += 1;
+      await notifications.edit({ document, contentChanges: [{ text: externalText }] });
+      await setup.settle();
+      assert.equal(calls.filter((call) => call.stage === "analyzer").length, 2);
+      assert.equal(controller.sourceRevision, revision, "Reloading the exact bytes already analyzed must not invalidate that result");
+      assert.equal(controller.sourceRevision, controller.analyzedSourceRevision);
+      controller.dispose();
+    });
+  });
+
+  it("invalidates cached source edits before VS Code marks the document dirty", async () => {
+    const vscode = createMockVscode();
+    const notifications = sourceFileNotifications(vscode);
+    await withFakeTimers(async () => withMockedVscode(vscode, async ({ TimelineController }) => {
+      const setup = sourceFileController(TimelineController, vscode);
+      const { controller, document } = setup;
+      controller.config = () => ({ get: (key, fallback) => key === "updateMode" ? "onType" : fallback });
+      await notifications.save(document);
+      const revision = controller.sourceRevision;
+      let disposedPlayback = 0;
+      controller.playbackClient = { dispose() { disposedPlayback += 1; } };
+      controller.executionState = { status: "paused" };
+      document.text = "wait_sync 4\nwait 256\nstop\n";
+      notifications.edit({ document, contentChanges: [{ text: document.text }] });
+      assert.equal(document.isDirty, false, "VS Code can deliver the content event before updating dirty state");
+      assert.equal(controller.sourceRevision, revision + 1);
+      assert.equal(disposedPlayback, 1);
+      assert.notEqual(controller.changeTimer, undefined);
+      document.isDirty = true;
+      notifications.edit({ document, contentChanges: [] });
+      assert.equal(controller.sourceRevision, revision + 1, "The following dirty metadata event must only update the UI");
+      controller.dispose();
+    }));
+  });
+
+  it("processes deletion and identical recreation instead of retaining an old byte snapshot", async () => {
+    const vscode = createMockVscode();
+    const notifications = sourceFileNotifications(vscode);
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const setup = sourceFileController(TimelineController, vscode);
+      const { controller, calls, document, sourcePath } = setup;
+      await notifications.save(document);
+      require("node:fs").rmSync(sourcePath);
+      await notifications.delete(document.uri);
+      writeFileSync(sourcePath, document.text);
+      await notifications.create(document.uri);
+      await notifications.change(document.uri);
+      await setup.settle();
+      assert.equal(calls.filter((call) => call.stage === "analyzer").length, 3);
+      assert.equal(controller.sourceRevision, controller.analyzedSourceRevision);
+      controller.dispose();
+    });
+  });
+
+  it("retains normal change handling when disk bytes cannot be read", async () => {
+    const vscode = createMockVscode();
+    const notifications = sourceFileNotifications(vscode);
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const setup = sourceFileController(TimelineController, vscode);
+      const { controller, calls, document, sourcePath } = setup;
+      await notifications.save(document);
+      const fsPromises = require("node:fs").promises;
+      const originalRead = fsPromises.readFile;
+      try {
+        fsPromises.readFile = async (...args) => {
+          if (args[0] === sourcePath) throw Object.assign(new Error("Cannot read source"), { code: "EACCES" });
+          return originalRead(...args);
+        };
+        await notifications.change(document.uri);
+        await notifications.change(document.uri);
+      } finally { fsPromises.readFile = originalRead; }
+      await notifications.change(document.uri);
+      await notifications.change(document.uri);
+      await setup.settle();
+      assert.equal(calls.filter((call) => call.stage === "analyzer").length, 4, "Unreadable notifications must not be treated as equal to the previous bytes");
+      controller.dispose();
+    });
+  });
+
+  for (const transition of ["project switch", "newer file notification"]) {
+    it(`drops a delayed source byte read after a ${transition}`, async () => {
+      const vscode = createMockVscode();
+      const notifications = sourceFileNotifications(vscode);
+      await withMockedVscode(vscode, async ({ TimelineController }) => {
+        const setup = sourceFileController(TimelineController, vscode);
+        const { controller, calls, document, sourcePath } = setup;
+        const fsPromises = require("node:fs").promises;
+        const originalRead = fsPromises.readFile;
+        let started!: () => void;
+        let release!: () => void;
+        const reading = new Promise<void>((resolve) => { started = resolve; });
+        let first = true;
+        fsPromises.readFile = async (...args) => {
+          const content = await originalRead(...args);
+          if (args[0] === sourcePath && first) {
+            first = false;
+            await new Promise<void>((resolve) => { release = resolve; started(); });
+          }
+          return content;
+        };
+        try {
+          const old = notifications.change(document.uri);
+          await reading;
+          if (transition === "project switch") {
+            controller.setProjectUri(vscode.Uri.file(join(controller.outputDir, "other-project", "q1timeline.yml")));
+          } else {
+            writeFileSync(sourcePath, "wait_sync 4\nwait 64\nstop\n");
+            await notifications.change(document.uri);
+          }
+          const revision = controller.sourceRevision;
+          release();
+          await old;
+          await setup.settle();
+          assert.equal(calls.filter((call) => call.stage === "analyzer").length, transition === "project switch" ? 0 : 1);
+          assert.equal(controller.sourceRevision, revision, "The older read must not invalidate the latest source state");
+          if (transition !== "project switch") {
+            await notifications.change(document.uri);
+            assert.equal(calls.filter((call) => call.stage === "analyzer").length, 1, "The newer bytes must remain the deduplication snapshot");
+          }
+        } finally {
+          fsPromises.readFile = originalRead;
+          controller.dispose();
+        }
+      });
+    });
+  }
+
+  it("preserves manual updates and flushes an on-type watcher refresh on save", async () => {
+    const vscode = createMockVscode();
+    const notifications = sourceFileNotifications(vscode);
+    await withFakeTimers(async (clock) => withMockedVscode(vscode, async ({ TimelineController }) => {
+      const setup = sourceFileController(TimelineController, vscode);
+      const { controller, calls, document, sourcePath } = setup;
+      let mode = "manual";
+      controller.config = () => ({ get: (key, fallback) => key === "updateMode" ? mode : fallback });
+      await notifications.save(document);
+      await notifications.change(document.uri);
+      clock.advance(1000);
+      assert.equal(calls.length, 0);
+      mode = "onSave";
+      await notifications.save(document);
+      assert.equal(calls.filter((call) => call.stage === "analyzer").length, 1);
+      mode = "onType";
+      writeFileSync(sourcePath, "wait_sync 4\nwait 128\nstop\n");
+      await notifications.change(document.uri);
+      assert.notEqual(controller.changeTimer, undefined);
+      await notifications.save(document);
+      await setup.settle();
+      clock.advance(1000);
+      await setup.settle();
+      assert.equal(calls.filter((call) => call.stage === "analyzer").length, 2);
+      assert.equal(controller.changeTimer, undefined);
+      assert.equal(controller.sourceRevision, controller.analyzedSourceRevision);
+      controller.dispose();
+    }));
+  });
+
+  it("keeps reverted saved source fresh and selectable while explicit Refresh still reruns identical bytes", async () => {
+    const vscode = createMockVscode();
+    const notifications = sourceFileNotifications(vscode);
+    await withFakeTimers(async (clock) => withMockedVscode(vscode, async ({ TimelineController }) => {
+      const setup = sourceFileController(TimelineController, vscode);
+      const { controller, calls, document, sourcePath } = setup;
+      const posted: any[] = [];
+      controller.panel.webview.postMessage = (message) => posted.push(message);
+      await notifications.save(document);
+      const originalText = document.text;
+      document.isDirty = true;
+      document.text += "wait 4\n";
+      notifications.edit({ document, contentChanges: [{ text: document.text }] });
+      document.text = originalText;
+      notifications.edit({ document, contentChanges: [{ text: originalText }] });
+      document.isDirty = false;
+      await notifications.save(document);
+      await notifications.change(document.uri);
+      assert.equal(calls.filter((call) => call.stage === "analyzer").length, 2);
+      await controller.refreshPreview();
+      assert.equal(calls.filter((call) => call.stage === "analyzer").length, 3, "Explicit Refresh must always run even when bytes did not change");
+      const revision = controller.sourceRevision;
+      notifications.edit({ document, contentChanges: [] });
+      assert.equal(controller.sourceRevision, revision, "Save/dirty metadata events must not invalidate unchanged source");
+      assert.ok(posted.some((message) => message.type === "setUnsavedChanges" && !message.hasUnsavedChanges));
+      assert.equal(controller.sourceRevision, controller.analyzedSourceRevision);
+      controller.timelineIr = { source_map: { by_source: { [`${sourcePath}:2`]: ["selected"] } }, events: [{ id: "selected" }] };
+      vscode.window.activeTextEditor = { document, selection: sourceSelection(1, 2, 0) };
+      await controller.handleWebviewMessage({ type: "webviewReady" });
+      clock.advance(250);
+      assert.deepEqual(posted.filter((message) => message.type === "highlightEventIds"), [{
+        type: "highlightEventIds", highlightEventIds: ["selected"], zoomToRange: true,
+        sourceRange: { file: sourcePath, startLine: 2, endLine: 2 },
+      }]);
+      controller.dispose();
+    }));
+  });
+
   function playbackController(TimelineController, vscode, request) {
     const controller = new TimelineController(createContext());
     const posted = [];
@@ -427,6 +2316,107 @@ describe("q1timeline controller", () => {
     controller.createPlaybackClient = () => client;
     controller.publishPlaybackSnapshot = async (ir) => { controller.timelineIr = ir; published.push(ir); };
     return { controller, client, calls, posted, published, disposed: () => disposed };
+  }
+
+  for (const stage of ["environment setup", "snapshot rendering"]) {
+    for (const outcome of ["success", "failure"]) {
+      it(`runs a new project during old playback ${stage} and preserves it after a late ${outcome}`, async () => {
+        const vscode = createMockVscode();
+        const clients: any[] = [];
+        let projectA: string;
+        let projectB: string;
+        let aChecks = 0;
+        let started!: () => void;
+        let resolveOlder!: () => void;
+        let rejectOlder!: (error: Error) => void;
+        let finishNewWorker!: () => void;
+        const waiting = new Promise<void>((resolve) => { started = resolve; });
+        const pause = () => new Promise<void>((resolve, reject) => {
+          resolveOlder = resolve;
+          rejectOlder = reject;
+          started();
+        });
+        vscode.resolveFileEnvironment = async (_api, resource) => {
+          if (stage === "environment setup" && resource.fsPath === projectA) {
+            if (++aChecks === 1) return undefined;
+            await pause();
+          }
+          return resolvedPython(resource);
+        };
+        vscode.PlaybackClient = class {
+          project: string;
+          disposed = false;
+          rejectPending: any;
+          constructor(_command, args) {
+            this.project = args[args.indexOf("--project") + 1];
+            clients.push(this);
+          }
+          async request(message) {
+            const playback = { status: "completed", can_resume: false, steps: 1 };
+            if (message.command === "run" && this.project === projectB) {
+              return new Promise((resolve, reject) => {
+                this.rejectPending = reject;
+                finishNewWorker = () => { this.rejectPending = undefined; resolve({ playback }); };
+              });
+            }
+            return message.command === "snapshot" ? { ir: { events: [], playback } } : { playback };
+          }
+          dispose() {
+            this.disposed = true;
+            this.rejectPending?.(new Error("Playback client disposed."));
+            this.rejectPending = undefined;
+          }
+        };
+        await withMockedVscode(vscode, async ({ TimelineController }) => {
+          const { controller } = fileEnvironmentController(TimelineController, vscode);
+          projectA = controller.projectUri.fsPath;
+          const outputA = controller.outputDir;
+          const bRoot = mkdtempSync(join(tmpdir(), "q1-playback-new-project-"));
+          projectB = join(bRoot, "q1timeline.yml");
+          writeFileSync(projectB, "sequencers: []\n");
+          const execute = controller.execFile.bind(controller);
+          controller.execFile = async (...args) => {
+            const htmlPath = args[1][args[1].indexOf("--out") + 1];
+            if (stage === "snapshot rendering" && args[5] === "renderer" &&
+                htmlPath.startsWith(join(outputA, "playback-"))) await pause();
+            return execute(...args);
+          };
+          let older: Promise<void> | undefined;
+          let newer: Promise<void> | undefined;
+          try {
+            await controller.runAnalysis();
+            older = controller.handleWebviewMessage({ type: "executionControl", action: "play" });
+            await waiting;
+            await controller.openTarget({ projectFile: projectB });
+            assert.equal(controller.analysisStatus.status, "idle");
+            newer = controller.handleWebviewMessage({ type: "executionControl", action: "play" });
+            const newClient = clients.find((client) => client.project === projectB);
+            if (outcome === "success") resolveOlder();
+            else rejectOlder(new Error("Old playback failed late."));
+            await older;
+            const stateAfterOldCompletion = {
+              busy: controller.playbackInFlight,
+              running: controller.playbackRunning,
+              status: controller.executionState.status,
+              client: controller.playbackClient,
+              disposed: newClient?.disposed,
+            };
+            finishNewWorker?.();
+            await newer;
+            assert.ok(newClient, "The new project's Run must start before the old request finishes");
+            assert.deepEqual(stateAfterOldCompletion, {
+              busy: true, running: true, status: "running", client: newClient, disposed: false,
+            }, "An obsolete playback completion must not clear or dispose the new execution");
+            assert.equal(controller.executionState.status, "completed");
+          } finally {
+            resolveOlder?.();
+            finishNewWorker?.();
+            await Promise.allSettled([older, newer].filter(Boolean));
+            controller.dispose();
+          }
+        });
+      });
+    }
   }
 
   it("pauses between execution slices and resumes the same session", async () => {
@@ -645,6 +2635,62 @@ describe("q1timeline controller", () => {
     });
   });
 
+  it("does not publish a paused view-mode render after execution resumes", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      let workerStarted!: () => void;
+      let releaseWorker!: () => void;
+      const working = new Promise<void>((resolve) => { workerStarted = resolve; });
+      const completed = { status: "completed", can_resume: false, steps: 20 };
+      const setup = playbackController(TimelineController, vscode, async (message) => {
+        if (message.command === "run") {
+          return new Promise((resolve) => { releaseWorker = () => resolve({ playback: completed }); workerStarted(); });
+        }
+        return { ir: { events: [], playback: completed } };
+      });
+      const { controller, client } = setup;
+      controller.outputDir = mkdtempSync(join(tmpdir(), "q1-playback-view-mode-"));
+      controller.playbackClient = client;
+      controller.timelineIr = { events: [], playback: { status: "paused", can_resume: true, steps: 10 } };
+      controller.executionState = controller.timelineIr.playback;
+      controller.publishPlaybackSnapshot = TimelineController.prototype.publishPlaybackSnapshot.bind(controller);
+      const publishedStates: string[] = [];
+      let html = "<html>Current paused view</html>";
+      Object.assign(controller.panel.webview, { cspSource: "vscode-resource:", asWebviewUri: (uri) => uri });
+      Object.defineProperty(controller.panel.webview, "html", {
+        get() { return html; },
+        set(value) { html = value; publishedStates.push(controller.timelineIr.playback.status); },
+      });
+      let renderStarted!: () => void;
+      let releaseRender!: () => void;
+      const rendering = new Promise<void>((resolve) => { renderStarted = resolve; });
+      let firstRender = true;
+      controller.runRender = async (_python, _args, _ir, htmlPath) => {
+        if (firstRender) {
+          firstRender = false;
+          await new Promise<void>((resolve) => { releaseRender = resolve; renderStarted(); });
+        }
+        writeFileSync(htmlPath, "<html><head></head><body>Rendered execution</body></html>");
+        return { elapsedMs: 1, exitCode: 0 };
+      };
+      const changing = controller.setViewMode("debug");
+      await rendering;
+      const running = controller.runPlayback();
+      await working;
+      releaseRender();
+      await changing;
+      const publishedDuringRun = [...publishedStates];
+      const stateDuringRun = controller.executionState.status;
+      releaseWorker();
+      await running;
+      assert.deepEqual(publishedDuringRun, [], "A previous paused snapshot must not replace the view while the worker is running");
+      assert.equal(stateDuringRun, "running");
+      assert.deepEqual(publishedStates, ["completed"], "The new execution result must still publish normally");
+      assert.equal(controller.executionState.status, "completed");
+      controller.dispose();
+    });
+  });
+
   it("does not warn for supported legacy and current analyzer releases", async () => {
     const vscode = createMockVscode();
     const warnings: string[] = [];
@@ -824,6 +2870,333 @@ describe("q1timeline controller", () => {
     });
   });
 
+  it("discovers an explicitly requested source using its workspace folder's project settings", async () => {
+    const vscode = createMockVscode();
+    const root = mkdtempSync(join(tmpdir(), "q1-folder-project-settings-"));
+    const projectA = join(root, "a");
+    const projectB = join(root, "b");
+    mkdirSync(projectA);
+    mkdirSync(projectB);
+    const fileA = join(projectA, "alpha.q1timeline.yml");
+    const fileB = join(projectB, "beta.q1timeline.yml");
+    writeFileSync(fileA, "sequencers: []\n");
+    writeFileSync(fileB, "sequencers: []\n");
+    vscode.window.activeTextEditor = { document: { uri: vscode.Uri.file(join(projectA, "seq.q1asm")) } };
+    vscode.workspace.getWorkspaceFolder = (uri) => ({ uri: vscode.Uri.file(uri.fsPath.startsWith(projectB) ? projectB : projectA) });
+    vscode.workspace.getConfiguration = (section, resource) => ({ get: (key, fallback) =>
+      section === "q1lens" && key === "q1timeline.projectFile"
+        ? resource?.fsPath.startsWith(projectB) ? "beta.q1timeline.yml" : "alpha.q1timeline.yml"
+        : fallback,
+    });
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      controller.setProjectUri(vscode.Uri.file(fileA));
+      controller.panel = { reveal() {}, dispose() {} };
+      controller.refreshProjectRelatedPaths = async () => undefined;
+      controller.startWatchers = () => undefined;
+      controller.runAnalysis = async () => undefined;
+      let fallbacks = 0;
+      controller.createSingleFileProject = async () => {
+        fallbacks += 1;
+        return vscode.Uri.file(join(projectB, ".q1timeline", "auto-generated.q1timeline.yml"));
+      };
+      await controller.openPreview({ sourceUri: vscode.Uri.file(join(projectB, "seq.q1asm")) });
+      assert.equal(controller.projectUri.fsPath, fileB);
+      assert.equal(fallbacks, 0, "An existing project in the requested source's folder must not be replaced by fallback analysis");
+      controller.dispose();
+    });
+  });
+
+  it("uses the active source folder's settings for manual project selection", async () => {
+    const vscode = createMockVscode();
+    const root = mkdtempSync(join(tmpdir(), "q1-manual-folder-settings-"));
+    const projectA = join(root, "a", "alpha.q1timeline.yml");
+    const projectB = join(root, "b", "beta.q1timeline.yml");
+    const sourceB = vscode.Uri.file(join(root, "b", "seq.q1asm"));
+    vscode.window.activeTextEditor = { document: { uri: sourceB } };
+    vscode.workspace.getConfiguration = (section, resource) => ({ get: (key, fallback) =>
+      section === "q1lens" && key === "q1timeline.projectFile"
+        ? resource?.fsPath === sourceB.fsPath ? "beta.q1timeline.yml" : "alpha.q1timeline.yml"
+        : fallback,
+    });
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      controller.setProjectUri(vscode.Uri.file(projectA));
+      controller.findWorkspaceProjectFiles = async (name) => [vscode.Uri.file(name === "beta.q1timeline.yml" ? projectB : projectA)];
+      controller.pickProjectFile = async (matches) => matches[0];
+      controller.openPreview = async () => undefined;
+      await controller.selectProjectFile();
+      assert.equal(controller.projectUri.fsPath, projectB);
+      controller.dispose();
+    });
+  });
+
+  for (const method of ["selectProjectFile", "selectQ1asmFilesInFolder", "openQ1asmFilesInFolder"]) {
+    for (const replacement of ["a newer target", "a return to the original target", "no newer request"]) {
+      it(`${method} keeps request ownership after a delayed search and ${replacement}`, async () => {
+        const vscode = createMockVscode();
+        const root = mkdtempSync(join(tmpdir(), "q1-selection-request-"));
+        const folder = join(root, "selection");
+        mkdirSync(folder);
+        const source = vscode.Uri.file(join(folder, "seq.q1asm"));
+        writeFileSync(source.fsPath, "wait {WAIT_SELECTED}\nstop\n");
+        const selectedProject = join(folder, "q1timeline.yml");
+        if (method === "selectProjectFile") writeFileSync(selectedProject, "sequencers: []\n");
+        const projects = ["a", "b"].map((name) => {
+          mkdirSync(join(root, name));
+          const file = join(root, name, "q1timeline.yml");
+          writeFileSync(file, "sequencers: []\n");
+          return file;
+        });
+        vscode.window.activeTextEditor = { document: { uri: source } };
+        vscode.workspace.getWorkspaceFolder = (uri) => ({ uri: vscode.Uri.file(require("node:path").dirname(uri.fsPath)) });
+        const picked: string[] = [], stored: any[] = [];
+        vscode.window.showQuickPick = async (items, options) => {
+          picked.push(options.placeHolder);
+          return options.canPickMany ? items : items[0];
+        };
+        let release!: () => void, started!: () => void;
+        const waiting = new Promise<void>((resolve) => { started = resolve; });
+        const pause = () => new Promise<void>((resolve) => { release = resolve; started(); });
+        const fsPromises = require("node:fs").promises, readdir = fsPromises.readdir;
+        if (method === "selectProjectFile") vscode.workspace.findFiles = async () => {
+          await pause();
+          await fsPromises.readFile(selectedProject);
+          return [vscode.Uri.file(selectedProject)];
+        };
+        else fsPromises.readdir = async (path, ...args) => {
+          if (path === folder) await pause();
+          return readdir(path, ...args);
+        };
+        try {
+          await withMockedVscode(vscode, async ({ TimelineController }) => {
+            const context = createContext();
+            context.workspaceState.update = async (key, value) => { stored.push({ key, value }); };
+            const controller = new TimelineController(context);
+            const analyzed: string[] = [];
+            controller.runAnalysis = async () => { analyzed.push(controller.projectUri.fsPath); };
+            await controller.openTarget({ projectFile: projects[0] });
+            analyzed.length = 0;
+            const first = controller[method](source);
+            try {
+              await waiting;
+              if (replacement !== "no newer request") await controller.openTarget({ projectFile: projects[1] });
+              if (replacement === "a return to the original target") await controller.openTarget({ projectFile: projects[0] });
+              release();
+              await first;
+              const generatedProject = join(folder, ".q1timeline", "auto-generated.q1timeline.yml");
+              if (replacement === "no newer request") {
+                const expected = method === "selectProjectFile" ? selectedProject : generatedProject;
+                assert.equal(controller.projectUri.fsPath, expected);
+                assert.deepEqual(analyzed, [expected]);
+                assert.equal(picked.length, method === "openQ1asmFilesInFolder" ? 0 : 1);
+                if (method !== "selectProjectFile") {
+                  assert.match(readFileSync(generatedProject, "utf8"), /\.\.\/seq\.q1asm/);
+                  assert.deepEqual(Object.keys(JSON.parse(readFileSync(join(folder, ".q1timeline", "auto-generated.params.json"), "utf8"))), ["WAIT_SELECTED"]);
+                }
+              } else {
+                const expected = replacement === "a newer target" ? [projects[1]] : [projects[1], projects[0]];
+                assert.equal(controller.projectUri.fsPath, expected.at(-1), "An obsolete search must not replace the newer explicit target");
+                assert.deepEqual(analyzed, expected);
+                assert.deepEqual(picked, [], "A superseded search must not open a late picker");
+                assert.deepEqual(stored, [], "An obsolete search must not change the project restored on activation");
+                assert.equal(existsSync(generatedProject), false, "An obsolete folder request must not create a fallback project");
+              }
+            } finally { release?.(); await first.catch(() => {}); controller.dispose(); }
+          });
+        } finally { fsPromises.readdir = readdir; }
+      });
+    }
+  }
+
+  for (const picker of ["project selection", "folder subset", "existing folder project", "folder params"]) {
+    it(`ignores an obsolete ${picker} picker result after a newer target opens`, async () => {
+      const vscode = createMockVscode();
+      const folder = mkdtempSync(join(tmpdir(), "q1-selection-picker-"));
+      const source = vscode.Uri.file(join(folder, "seq.q1asm"));
+      writeFileSync(source.fsPath, "wait {WAIT_SELECTED}\nstop\n");
+      const project = join(folder, "q1timeline.yml");
+      if (picker === "project selection" || picker === "existing folder project") writeFileSync(project, "sequencers: []\n");
+      if (picker === "existing folder project") writeFileSync(join(folder, "other.q1timeline.yml"), "sequencers: []\n");
+      if (picker === "folder params") {
+        writeFileSync(join(folder, "one.params.json"), "{\"WAIT_SELECTED\": 4}\n");
+        writeFileSync(join(folder, "two.params.json"), "{\"WAIT_SELECTED\": 8}\n");
+      }
+      const nextFolder = mkdtempSync(join(tmpdir(), "q1-selection-picker-new-"));
+      const nextProject = join(nextFolder, "q1timeline.yml");
+      writeFileSync(nextProject, "sequencers: []\n");
+      vscode.window.activeTextEditor = { document: { uri: source } };
+      vscode.workspace.getWorkspaceFolder = (uri) => ({ uri: vscode.Uri.file(require("node:path").dirname(uri.fsPath)) });
+      vscode.workspace.findFiles = async () => [vscode.Uri.file(project)];
+      let release!: () => void, started!: () => void;
+      const waiting = new Promise<void>((resolve) => { started = resolve; });
+      vscode.window.showQuickPick = async (items, options) => {
+        await new Promise<void>((resolve) => { release = resolve; started(); });
+        return options.canPickMany ? items : items[0];
+      };
+      await withMockedVscode(vscode, async ({ TimelineController }) => {
+        const stored: any[] = [], analyzed: string[] = [];
+        const context = createContext();
+        context.workspaceState.update = async (key, value) => { stored.push({ key, value }); };
+        const controller = new TimelineController(context);
+        controller.runAnalysis = async () => { analyzed.push(controller.projectUri.fsPath); };
+        const method = picker === "project selection" ? "selectProjectFile"
+          : picker === "folder subset" ? "selectQ1asmFilesInFolder" : "openQ1asmFilesInFolder";
+        const first = controller[method](source);
+        try {
+          await waiting;
+          await controller.openTarget({ projectFile: nextProject });
+          release();
+          await first;
+          assert.equal(controller.projectUri.fsPath, nextProject, "A prior selection UI must not reclaim a newer open request");
+          assert.deepEqual(analyzed, [nextProject]);
+          assert.deepEqual(stored, [], "An obsolete project picker must not overwrite the restored project choice");
+          assert.equal(existsSync(join(folder, ".q1timeline", "auto-generated.q1timeline.yml")), false);
+        } finally { release?.(); await first.catch(() => {}); controller.dispose(); }
+      });
+    });
+  }
+
+  for (const method of ["selectQ1asmFilesInFolder", "openQ1asmFilesInFolder"]) {
+    for (const superseded of [true, false]) {
+      it(`${method} ${superseded ? "drops an obsolete" : "preserves a current"} folder search failure`, async () => {
+        const vscode = createMockVscode();
+        const folder = mkdtempSync(join(tmpdir(), "q1-selection-deleted-folder-"));
+        const source = vscode.Uri.file(join(folder, "seq.q1asm"));
+        writeFileSync(source.fsPath, "stop\n");
+        const nextFolder = mkdtempSync(join(tmpdir(), "q1-selection-folder-failure-new-"));
+        const nextProject = join(nextFolder, "q1timeline.yml");
+        writeFileSync(nextProject, "sequencers: []\n");
+        vscode.workspace.getWorkspaceFolder = (uri) => ({ uri: vscode.Uri.file(require("node:path").dirname(uri.fsPath)) });
+        const fs = require("node:fs"), readdir = fs.promises.readdir;
+        let release!: () => void, started!: () => void;
+        const waiting = new Promise<void>((resolve) => { started = resolve; });
+        fs.promises.readdir = async (path, ...args) => {
+          if (path === folder) await new Promise<void>((resolve) => { release = resolve; started(); });
+          return readdir(path, ...args);
+        };
+        try {
+          await withMockedVscode(vscode, async ({ TimelineController }) => {
+            const controller = new TimelineController(createContext());
+            const analyzed: string[] = [], warnings: string[] = [];
+            controller.runAnalysis = async () => { analyzed.push(controller.projectUri.fsPath); };
+            vscode.window.showWarningMessage = async (message) => { warnings.push(message); };
+            const first = controller[method](source);
+            try {
+              await waiting;
+              if (superseded) await controller.openTarget({ projectFile: nextProject });
+              fs.unlinkSync(source.fsPath);
+              fs.rmdirSync(folder);
+              release();
+              if (superseded) {
+                await assert.doesNotReject(first, "A deleted old folder must not surface a command error over the newer target");
+                assert.equal(controller.projectUri.fsPath, nextProject);
+                assert.deepEqual(analyzed, [nextProject]);
+              } else await assert.rejects(first, { code: "ENOENT" });
+              assert.deepEqual(warnings, [], "An obsolete failure is not a current empty-folder warning");
+            } finally { release?.(); await first.catch(() => {}); controller.dispose(); }
+          });
+        } finally { fs.promises.readdir = readdir; }
+      });
+    }
+  }
+
+  it("keeps concurrent fallback project generation in its own folder and opens the latest request", async () => {
+    const vscode = createMockVscode();
+    const root = mkdtempSync(join(tmpdir(), "q1-fallback-race-"));
+    const folderA = join(root, "a");
+    const folderB = join(root, "b");
+    mkdirSync(folderA);
+    mkdirSync(folderB);
+    const sourceA = vscode.Uri.file(join(folderA, "a.q1asm"));
+    const sourceB = vscode.Uri.file(join(folderB, "b.q1asm"));
+    writeFileSync(sourceA.fsPath, "wait {WAIT_A}\nstop\n");
+    writeFileSync(sourceB.fsPath, "wait {WAIT_B}\nstop\n");
+    const outputA = join(folderA, ".q1timeline");
+    const outputB = join(folderB, ".q1timeline");
+    const fsPromises = require("node:fs").promises;
+    const original = fsPromises.mkdir;
+    let release!: () => void;
+    let started!: () => void;
+    const waiting = new Promise<void>((resolve) => { started = resolve; });
+    fsPromises.mkdir = async (...args) => {
+      if (args[0] === outputA) await new Promise<void>((resolve) => { release = resolve; started(); });
+      return original(...args);
+    };
+    try {
+      await withMockedVscode(vscode, async ({ TimelineController }) => {
+        const controller = new TimelineController(createContext());
+        const opened: string[] = [];
+        controller.openPreview = async () => { opened.push(controller.projectUri.fsPath); };
+        controller.findProjectFileCandidatesUpward = () => [];
+        controller.paramsFileForAutoGeneratedProject = async () => undefined;
+        const first = controller.openQ1asmFilesInFolder(sourceA);
+        await waiting;
+        await controller.openQ1asmFilesInFolder(sourceB);
+        release();
+        await first;
+        const projectB = join(outputB, "auto-generated.q1timeline.yml");
+        assert.deepEqual(Object.keys(JSON.parse(readFileSync(join(outputB, "auto-generated.params.json"), "utf8"))), ["WAIT_B"]);
+        assert.match(readFileSync(projectB, "utf8"), /\.\.\/b\.q1asm/);
+        assert.equal(controller.projectUri.fsPath, projectB);
+        assert.equal(controller.singleFileUri.fsPath, sourceB.fsPath);
+        assert.deepEqual(opened, [projectB], "The slower old request must not reopen or replace the latest preview");
+        controller.dispose();
+      });
+    } finally { fsPromises.mkdir = original; }
+  });
+
+  for (const stage of ["params", "yaml"]) {
+    it(`keeps newer same-folder fallback files intact after a delayed ${stage} operation`, async () => {
+      const vscode = createMockVscode();
+      const root = mkdtempSync(join(tmpdir(), "q1-same-folder-fallback-"));
+      const sourceA = vscode.Uri.file(join(root, "a.q1asm"));
+      const sourceB = vscode.Uri.file(join(root, "b.q1asm"));
+      writeFileSync(sourceA.fsPath, "wait {WAIT_A}\nstop\n");
+      writeFileSync(sourceB.fsPath, "wait {WAIT_B}\nstop\n");
+      const outputDir = join(root, ".q1timeline");
+      const projectPath = join(outputDir, "auto-generated.q1timeline.yml");
+      const fsPromises = require("node:fs").promises;
+      const originalWrite = fsPromises.writeFile;
+      let release!: () => void;
+      let started!: () => void;
+      const waiting = new Promise<void>((resolve) => { started = resolve; });
+      const pause = () => new Promise<void>((resolve) => { release = resolve; started(); });
+      if (stage === "yaml") fsPromises.writeFile = async (...args) => {
+        if (args[0] === projectPath && String(args[1]).includes("a.q1asm")) await pause();
+        return originalWrite(...args);
+      };
+      try {
+        await withMockedVscode(vscode, async ({ TimelineController }) => {
+          const controller = new TimelineController(createContext());
+          if (stage === "params") {
+            const infer = controller.inferredPlaceholderParams.bind(controller);
+            controller.inferredPlaceholderParams = async (uris) => {
+              if (uris[0].fsPath === sourceA.fsPath) await pause();
+              return infer(uris);
+            };
+          }
+          const first = controller.createSelectedFolderProject(sourceA, [sourceA]);
+          await waiting;
+          const second = controller.createSelectedFolderProject(sourceB, [sourceB]);
+          let timer: NodeJS.Timeout | undefined;
+          try {
+            // Let an independent newer generation finish, or release a serialized one.
+            await Promise.race([second, new Promise<void>((resolve) => { timer = setTimeout(resolve, 100); })]);
+          } finally {
+            clearTimeout(timer);
+            release();
+          }
+          await Promise.all([first, second]);
+          assert.deepEqual(Object.keys(JSON.parse(readFileSync(join(outputDir, "auto-generated.params.json"), "utf8"))), ["WAIT_B"]);
+          assert.match(readFileSync(projectPath, "utf8"), /\.\.\/b\.q1asm/);
+          assert.equal(controller.singleFileUri.fsPath, sourceB.fsPath);
+          controller.dispose();
+        });
+      } finally { fsPromises.writeFile = originalWrite; }
+    });
+  }
+
   it("opens a new q1timeline preview above the current editor group", async () => {
     const vscode = createMockVscode();
     const commands: string[] = [];
@@ -877,6 +3250,7 @@ describe("q1timeline controller", () => {
       const controller = new TimelineController(createContext());
       controller.projectUri = vscode.Uri.file("C:\\repo\\q1timeline.yml");
       controller.panel = {
+        viewColumn: 3,
         reveal: (...args: any[]) => {
           revealArgs.push(args);
         },
@@ -891,9 +3265,369 @@ describe("q1timeline controller", () => {
 
       assert.deepEqual(commands, []);
       assert.equal(createPanelCount, 0);
-      assert.deepEqual(revealArgs, [[]]);
+      assert.deepEqual(revealArgs, [[3]], "Reopening must target the timeline's group when a source editor group is active");
       controller.dispose();
     });
+  });
+
+  describe("preview request ownership", () => {
+    function setup(vscode, TimelineController) {
+      const root = mkdtempSync(join(tmpdir(), "q1-preview-request-"));
+      const projects = ["a", "b"].map((name) => {
+        mkdirSync(join(root, name));
+        const file = join(root, name, "q1timeline.yml");
+        writeFileSync(file, "sequencers: []\n");
+        return file;
+      });
+      const stored: any[] = [];
+      const context = createContext();
+      context.workspaceState.update = async (key, value) => { stored.push({ key, value }); };
+      const controller = new TimelineController(context);
+      controller.refreshProjectRelatedPaths = async () => {};
+      controller.startWatchers = () => {};
+      const analyzed: string[] = [];
+      controller.runAnalysis = async () => { analyzed.push(controller.projectUri.fsPath); };
+      return { root, projects, stored, controller, analyzed };
+    }
+
+    it("keeps a newer explicit target when earlier project discovery finishes later", async () => {
+      const vscode = createMockVscode();
+      await withMockedVscode(vscode, async ({ TimelineController }) => {
+        const { controller, projects, analyzed } = setup(vscode, TimelineController);
+        let started!: () => void;
+        let release!: () => void;
+        const finding = new Promise<void>((resolve) => { started = resolve; });
+        vscode.workspace.findFiles = async () => {
+          await new Promise<void>((resolve) => { release = resolve; started(); });
+          return [vscode.Uri.file(projects[0])];
+        };
+        const older = controller.openPreview();
+        await finding;
+        await controller.openTarget({ projectFile: projects[1] });
+        release();
+        await older;
+        assert.equal(controller.projectUri.fsPath, projects[1]);
+        assert.deepEqual(analyzed, [projects[1]]);
+        controller.dispose();
+      });
+    });
+
+    it("drops an earlier discovery rejection after a newer target opens", async () => {
+      const vscode = createMockVscode();
+      await withMockedVscode(vscode, async ({ TimelineController }) => {
+        const { controller, projects, analyzed } = setup(vscode, TimelineController);
+        let started!: () => void;
+        let rejectDiscovery!: (error: Error) => void;
+        const finding = new Promise<void>((resolve) => { started = resolve; });
+        vscode.workspace.findFiles = () => new Promise((_resolve, reject) => { rejectDiscovery = reject; started(); });
+        const older = controller.openPreview();
+        await finding;
+        await controller.openTarget({ projectFile: projects[1] });
+        rejectDiscovery(new Error("Previous workspace search failed"));
+        await assert.doesNotReject(older, "An obsolete search must not show a command failure over the newer preview");
+        assert.equal(controller.projectUri.fsPath, projects[1]);
+        assert.deepEqual(analyzed, [projects[1]]);
+        controller.dispose();
+      });
+    });
+
+    it("preserves discovery errors for the current open request", async () => {
+      const vscode = createMockVscode();
+      await withMockedVscode(vscode, async ({ TimelineController }) => {
+        const { controller } = setup(vscode, TimelineController);
+        const error = new Error("Current workspace search failed");
+        vscode.workspace.findFiles = async () => { throw error; };
+        await assert.rejects(controller.openPreview(), (actual) => actual === error);
+        controller.dispose();
+      });
+    });
+
+    it("does not store an obsolete discovery picker choice after a newer target opens", async () => {
+      const vscode = createMockVscode();
+      await withMockedVscode(vscode, async ({ TimelineController }) => {
+        const { controller, projects, analyzed, stored } = setup(vscode, TimelineController);
+        vscode.workspace.findFiles = async () => projects.map((file) => vscode.Uri.file(file));
+        let started!: () => void;
+        let release!: () => void;
+        const picking = new Promise<void>((resolve) => { started = resolve; });
+        vscode.window.showQuickPick = async (items) => {
+          await new Promise<void>((resolve) => { release = resolve; started(); });
+          return items[0];
+        };
+        const older = controller.openPreview();
+        await picking;
+        await controller.openTarget({ projectFile: projects[1] });
+        release();
+        await older;
+        assert.deepEqual(stored, [], "An old picker must not change the project restored on the next activation");
+        assert.equal(controller.projectUri.fsPath, projects[1]);
+        assert.deepEqual(analyzed, [projects[1]]);
+        controller.dispose();
+      });
+    });
+
+    it("does not resume an older open after fallback discovery is superseded", async () => {
+      const vscode = createMockVscode();
+      await withMockedVscode(vscode, async ({ TimelineController }) => {
+        const { controller, root, projects, analyzed } = setup(vscode, TimelineController);
+        const source = vscode.Uri.file(join(root, "orphan", "seq.q1asm"));
+        mkdirSync(join(root, "orphan"));
+        writeFileSync(source.fsPath, "stop\n");
+        let started!: () => void;
+        let release!: () => void;
+        const finding = new Promise<void>((resolve) => { started = resolve; });
+        controller.q1asmFilesInFolder = async () => {
+          await new Promise<void>((resolve) => { release = resolve; started(); });
+          return [source];
+        };
+        const older = controller.openPreview({ sourceUri: source });
+        await finding;
+        await controller.openTarget({ projectFile: projects[1] });
+        release();
+        await older;
+        assert.equal(controller.projectUri.fsPath, projects[1]);
+        assert.deepEqual(analyzed, [projects[1]], "The discarded fallback must not reanalyze the newer target");
+        assert.equal(existsSync(join(root, "orphan", ".q1timeline")), false);
+        controller.dispose();
+      });
+    });
+
+    it("keeps an obsolete fallback from changing the source and output of a newer pending discovery", async () => {
+      const vscode = createMockVscode();
+      await withMockedVscode(vscode, async ({ TimelineController }) => {
+        const { controller, root, projects } = setup(vscode, TimelineController);
+        const source = vscode.Uri.file(join(root, "orphan", "seq.q1asm"));
+        mkdirSync(join(root, "orphan"));
+        writeFileSync(source.fsPath, "wait {WAIT_A}\nstop\n");
+        let paramsStarted!: () => void;
+        let releaseParams!: () => void;
+        let discoveryStarted!: () => void;
+        let releaseDiscovery!: () => void;
+        const generating = new Promise<void>((resolve) => { paramsStarted = resolve; });
+        const discovering = new Promise<void>((resolve) => { discoveryStarted = resolve; });
+        const infer = controller.inferredPlaceholderParams.bind(controller);
+        controller.inferredPlaceholderParams = async (...args) => {
+          const params = await infer(...args);
+          await new Promise<void>((resolve) => { releaseParams = resolve; paramsStarted(); });
+          return params;
+        };
+        vscode.workspace.findFiles = async () => {
+          await new Promise<void>((resolve) => { releaseDiscovery = resolve; discoveryStarted(); });
+          return [vscode.Uri.file(projects[1])];
+        };
+        const analyzed: any[] = [];
+        controller.runAnalysis = async () => { analyzed.push({
+          project: controller.projectUri.fsPath, source: controller.singleFileUri?.fsPath, output: controller.outputDir,
+        }); };
+        const warnings: string[] = [];
+        vscode.window.showWarningMessage = async (message) => { warnings.push(message); };
+        const older = controller.openPreview({ sourceUri: source });
+        await generating;
+        const newer = controller.openPreview();
+        await discovering;
+        releaseParams();
+        await older;
+        releaseDiscovery();
+        await newer;
+        assert.deepEqual(analyzed, [{ project: projects[1], source: undefined, output: join(root, "b", ".q1timeline") }]);
+        assert.equal(controller.singleFileMode, false);
+        assert.deepEqual(warnings, [], "The obsolete fallback must not report that the newer project was missing");
+        assert.equal(existsSync(join(root, "orphan", ".q1timeline", "auto-generated.q1timeline.yml")), false);
+        controller.dispose();
+      });
+    });
+
+    for (const stage of ["related-path loading", "shared panel placement"]) {
+      it(`analyzes only the newest open after delayed ${stage}`, async () => {
+        const vscode = createMockVscode();
+        await withMockedVscode(vscode, async ({ TimelineController }) => {
+          const { controller, projects, analyzed } = setup(vscode, TimelineController);
+          let started!: () => void;
+          let release!: () => void;
+          const waiting = new Promise<void>((resolve) => { started = resolve; });
+          const pause = () => new Promise<void>((resolve) => { release = resolve; started(); });
+          let panels = 0;
+          const createPanel = vscode.window.createWebviewPanel;
+          vscode.window.createWebviewPanel = (...args) => { panels += 1; return createPanel(...args); };
+          if (stage === "related-path loading") {
+            controller.refreshProjectRelatedPaths = async () => { if (controller.projectUri.fsPath === projects[0]) await pause(); };
+          } else {
+            vscode.commands.executeCommand = async () => pause();
+          }
+          const older = controller.openTarget({ projectFile: projects[0] });
+          await waiting;
+          const newer = controller.openTarget({ projectFile: projects[1] });
+          if (stage === "related-path loading") await newer;
+          release();
+          await Promise.all([older, newer]);
+          assert.deepEqual(analyzed, [projects[1]]);
+          assert.equal(panels, 1, "Overlapping opens must continue sharing the first panel placement");
+          controller.dispose();
+        });
+      });
+    }
+  });
+
+  it("shares initial panel placement when preview commands overlap", async () => {
+    const vscode = createMockVscode();
+    const commands: string[] = [];
+    let finishPlacement!: () => void;
+    const placement = new Promise<void>((resolve) => { finishPlacement = resolve; });
+    vscode.commands.executeCommand = async (command: string) => {
+      commands.push(command);
+      await placement;
+    };
+    const createPanel = vscode.window.createWebviewPanel;
+    let panelsCreated = 0;
+    vscode.window.createWebviewPanel = (...args: any[]) => {
+      panelsCreated += 1;
+      return createPanel(...args);
+    };
+
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      controller.projectUri = vscode.Uri.file("C:\\repo\\q1timeline.yml");
+      controller.refreshProjectRelatedPaths = async () => undefined;
+      controller.startWatchers = () => undefined;
+      controller.runAnalysis = async () => undefined;
+
+      const first = controller.openPreview({ preserveProject: true });
+      const second = controller.openPreview({ preserveProject: true });
+      await new Promise((resolve) => setImmediate(resolve));
+      const placementRequests = commands.length;
+      finishPlacement();
+      await Promise.all([first, second]);
+
+      assert.equal(placementRequests, 1, "Concurrent opens must request only one editor group");
+      assert.equal(panelsCreated, 1, "Concurrent opens must share one preview panel");
+      controller.dispose();
+    });
+  });
+
+  it("does not create a preview after disposal while editor group placement is pending", async () => {
+    const vscode = createMockVscode();
+    let finishPlacement!: () => void;
+    const placement = new Promise<void>((resolve) => { finishPlacement = resolve; });
+    vscode.commands.executeCommand = async () => placement;
+    let panelsCreated = 0;
+    const createPanel = vscode.window.createWebviewPanel;
+    vscode.window.createWebviewPanel = () => { panelsCreated += 1; return createPanel(); };
+
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      controller.projectUri = vscode.Uri.file("C:\\repo\\q1timeline.yml");
+      controller.refreshProjectRelatedPaths = async () => undefined;
+      controller.startWatchers = () => undefined;
+      let analyses = 0;
+      controller.runAnalysis = async () => { analyses += 1; };
+      const opening = controller.openPreview({ preserveProject: true });
+      await new Promise((resolve) => setImmediate(resolve));
+      controller.dispose();
+      finishPlacement();
+      await opening;
+      assert.equal(panelsCreated, 0, "Disposal must cancel the pending panel creation");
+      assert.equal(analyses, 0);
+      assert.equal(controller.panel, undefined);
+    });
+  });
+
+  it("does not restart watchers or place a panel after disposal during project loading", async () => {
+    const vscode = createMockVscode();
+    let finishLoading!: () => void;
+    const loading = new Promise<void>((resolve) => { finishLoading = resolve; });
+    const placements: string[] = [];
+    vscode.commands.executeCommand = async (command) => { placements.push(command); };
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      controller.projectUri = vscode.Uri.file("C:\\repo\\q1timeline.yml");
+      controller.refreshProjectRelatedPaths = async () => loading;
+      let watchers = 0;
+      let analyses = 0;
+      controller.startWatchers = () => { watchers += 1; };
+      controller.runAnalysis = async () => { analyses += 1; };
+      const opening = controller.openPreview({ preserveProject: true });
+      await new Promise((resolve) => setImmediate(resolve));
+      controller.dispose();
+      finishLoading();
+      await opening;
+      assert.equal(watchers, 0);
+      assert.deepEqual(placements, []);
+      assert.equal(analyses, 0);
+      assert.equal(controller.panel, undefined);
+    });
+  });
+
+  it("keeps the newest watched paths when reads of the same project finish out of order", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const root = mkdtempSync(join(tmpdir(), "q1-watch-same-project-"));
+      const projectPath = join(root, "q1timeline.yml");
+      writeFileSync(projectPath, "sequencers:\n  - file: old.q1asm\n");
+      const controller = new TimelineController(createContext());
+      controller.setProjectUri(vscode.Uri.file(projectPath));
+      const fsPromises = require("node:fs").promises;
+      const originalRead = fsPromises.readFile;
+      let started!: () => void;
+      let release!: () => void;
+      const reading = new Promise<void>((resolve) => { started = resolve; });
+      let first = true;
+      fsPromises.readFile = async (...args) => {
+        const text = await originalRead(...args);
+        if (args[0] === projectPath && first) {
+          first = false;
+          await new Promise<void>((resolve) => { release = resolve; started(); });
+        }
+        return text;
+      };
+      try {
+        const older = controller.refreshProjectRelatedPaths();
+        await reading;
+        writeFileSync(projectPath, "sequencers:\n  - file: newest.q1asm\n");
+        await controller.refreshProjectRelatedPaths();
+        release();
+        await older;
+        assert.equal(controller.isProjectRelated(vscode.Uri.file(join(root, "newest.q1asm"))), true);
+        assert.equal(controller.isProjectRelated(vscode.Uri.file(join(root, "old.q1asm"))), false);
+      } finally {
+        fsPromises.readFile = originalRead;
+        controller.dispose();
+      }
+    });
+  });
+
+  it("does not overwrite the new project's watched sources with a late previous-project read", async () => {
+    const vscode = createMockVscode();
+    const root = mkdtempSync(join(tmpdir(), "q1-watch-project-switch-"));
+    const projectA = join(root, "a", "q1timeline.yml");
+    const projectB = join(root, "b", "q1timeline.yml");
+    mkdirSync(join(root, "a"));
+    mkdirSync(join(root, "b"));
+    writeFileSync(projectA, "sequencers:\n  - file: a.q1asm\n");
+    writeFileSync(projectB, "sequencers:\n  - file: b.q1asm\n");
+    const fsPromises = require("node:fs").promises;
+    const original = fsPromises.readFile;
+    let release!: () => void;
+    let started!: () => void;
+    const waiting = new Promise<void>((resolve) => { started = resolve; });
+    fsPromises.readFile = async (...args) => {
+      if (args[0] === projectA) await new Promise<void>((resolve) => { release = resolve; started(); });
+      return original(...args);
+    };
+    try {
+      await withMockedVscode(vscode, async ({ TimelineController }) => {
+        const controller = new TimelineController(createContext());
+        controller.setProjectUri(vscode.Uri.file(projectA));
+        const loadingA = controller.refreshProjectRelatedPaths();
+        await waiting;
+        controller.setProjectUri(vscode.Uri.file(projectB));
+        await controller.refreshProjectRelatedPaths();
+        release();
+        await loadingA;
+        assert.equal(controller.isProjectRelated(vscode.Uri.file(join(root, "b", "b.q1asm"))), true);
+        assert.equal(controller.isProjectRelated(vscode.Uri.file(join(root, "b", "a.q1asm"))), false);
+        controller.dispose();
+      });
+    } finally { fsPromises.readFile = original; }
   });
 
   it("finds active q1timeline projects for uppercase Q1ASM editor paths", async () => {
@@ -1818,6 +4552,180 @@ describe("q1timeline controller", () => {
     });
   });
 
+  it("offers a fresh quick fix for saved source changed before the analyzer launches", async () => {
+    const vscode = createMockVscode();
+    vscode.CodeAction = class { constructor(public title, public kind) {} };
+    vscode.CodeActionKind = { QuickFix: "quickfix" };
+    vscode.WorkspaceEdit = class { replace() {} };
+    let published: any[] = [];
+    vscode.languages.createDiagnosticCollection = () => ({
+      clear() { published = []; }, set(_uri, diagnostics) { published = diagnostics; }, dispose() {},
+    });
+    const notifications = sourceFileNotifications(vscode);
+    let releaseEnvironment!: () => void;
+    let environmentStarted!: () => void;
+    const waiting = new Promise<void>((resolve) => { environmentStarted = resolve; });
+    await withControllerFileEnvironment(vscode, async (executable) => {
+      await new Promise<void>((resolve) => { releaseEnvironment = resolve; environmentStarted(); });
+      return { executable, version: "3.12.0", supported: true, q1lensInstalled: true };
+    }, async ({ TimelineController }) => {
+      const setup = sourceFileController(TimelineController, vscode);
+      const { controller, document, sourcePath, calls } = setup;
+      controller.config = () => ({ get: (key, fallback) => key === "updateMode" ? "manual" : key === "hardwareReadiness" ? true : fallback });
+      controller.refreshWebview = TimelineController.prototype.refreshWebview.bind(controller);
+      document.languageId = "q1asm";
+      document.uri.scheme = "file";
+      Object.defineProperty(document, "lineCount", { get: () => document.text.split("\n").length });
+      document.lineAt = (line) => ({ text: document.text.split("\n")[line] });
+      const corrected = "set_freq 100\nupd_param 4\nstop\n", pending = "set_freq 100\nwait 4\nstop\n";
+      const repoRoot = require("node:path").resolve(__dirname, "../../../..");
+      const analyze = (source) => JSON.parse(require("node:child_process").execFileSync("python", ["-c",
+        "import json,sys; from q1timeline.analysis.api import analyze_text; print(json.dumps(analyze_text(sys.argv[1],file=sys.argv[2],hardware_readiness=True)))",
+        source, sourcePath,
+      ], { cwd: repoRoot, env: { ...process.env, PYTHONPATH: join(repoRoot, "src") }, encoding: "utf8", windowsHide: true }));
+      assert.ok(!analyze(corrected).diagnostics.some((item) => item.category === "pending_hardware_state"));
+      const execute = controller.execFile.bind(controller);
+      let analyzedText: string | undefined;
+      controller.execFile = async (...args) => {
+        const result = await execute(...args);
+        if (args[5] === "analyzer") {
+          analyzedText = readFileSync(sourcePath, "utf8");
+          const ir = analyze(analyzedText);
+          writeFileSync(args[1][args[1].indexOf("--out") + 1], JSON.stringify(ir));
+          writeFileSync(args[1][args[1].indexOf("--diagnostics") + 1], JSON.stringify(ir.diagnostics));
+        }
+        return result;
+      };
+      let opening: Promise<void> | undefined;
+      try {
+        document.text = corrected;
+        writeFileSync(sourcePath, corrected);
+        writeFileSync(controller.projectUri.fsPath, "sequencers:\n  - id: seq0\n    file: seq0.q1asm\n");
+        opening = controller.openTarget({ projectFile: controller.projectUri.fsPath });
+        await waiting;
+        document.text = pending;
+        document.version += 1;
+        writeFileSync(sourcePath, pending);
+        await notifications.save(document);
+        assert.equal(calls.filter((call) => call.stage === "analyzer").length, 0, "Environment preflight still precedes the analyzer's source read");
+        releaseEnvironment();
+        await opening; await setup.settle();
+        assert.equal(analyzedText, pending);
+        assert.equal(controller.analysisStatus.status, "idle");
+        assert.ok(published.some((item) => item.code === "pending_hardware_state"));
+        const { Q1asmQuickFixProvider } = require("../../src/q1timeline/q1asmQuickFix");
+        const provider = new Q1asmQuickFixProvider(vscode);
+        const range = new vscode.Range(2, 0, 2, 4);
+        assert.equal(provider.provideCodeActions(document, range, { diagnostics: published }).length, 1,
+          "The analyzer consumed the saved source, so its pending-state insertion is fresh");
+        const transported = published.map((diagnostic) => Object.assign(new vscode.Diagnostic(diagnostic.range, diagnostic.message, diagnostic.severity), {
+          source: diagnostic.source, code: diagnostic.code,
+        }));
+        assert.equal(provider.provideCodeActions(document, range, { diagnostics: transported }).length, 1);
+        assert.equal(controller.sourceRevision, controller.analyzedSourceRevision);
+      } finally { releaseEnvironment?.(); await opening; await setup.settle(); controller.dispose(); }
+    });
+  });
+
+  for (const stage of ["late analyzer completion", "late analyzer failure", "stale view rerender"]) {
+    it(`keeps Problems diagnostics without restoring invalidated quick fixes after ${stage}`, async () => {
+      const vscode = createMockVscode();
+      vscode.CodeAction = class { constructor(public title, public kind) {} };
+      vscode.CodeActionKind = { QuickFix: "quickfix" };
+      vscode.WorkspaceEdit = class { replace() {} };
+      let published: any[] = [];
+      vscode.languages.createDiagnosticCollection = () => ({
+        clear() { published = []; }, set(_uri, diagnostics) { published = diagnostics; }, dispose() {},
+      });
+      const { Q1asmQuickFixProvider } = require("../../src/q1timeline/q1asmQuickFix");
+      const provider = new Q1asmQuickFixProvider(vscode);
+      const notifications = sourceFileNotifications(vscode);
+      await withMockedVscode(vscode, async ({ TimelineController }) => {
+        const setup = sourceFileController(TimelineController, vscode);
+        const { controller, document, sourcePath } = setup;
+        controller.config = () => ({ get: (key, fallback) => key === "updateMode" ? "manual" : fallback });
+        controller.refreshWebview = TimelineController.prototype.refreshWebview.bind(controller);
+        document.languageId = "q1asm";
+        document.uri.scheme = "file";
+        Object.defineProperty(document, "lineCount", { get: () => document.text.split("\n").length });
+        document.lineAt = (line) => ({ text: document.text.split("\n")[line] });
+        const before = "set_freq 100\nwait 4\nstop\n", after = "set_freq 100\nupd_param 4\nstop\n";
+        const repoRoot = require("node:path").resolve(__dirname, "../../../..");
+        const analyze = (source) => JSON.parse(require("node:child_process").execFileSync("python", ["-c",
+          "import json,sys; from q1timeline.analysis.api import analyze_text; print(json.dumps(analyze_text(sys.argv[1],file=sys.argv[2],hardware_readiness=True)))",
+          source, sourcePath,
+        ], { cwd: repoRoot, env: { ...process.env, PYTHONPATH: join(repoRoot, "src") }, encoding: "utf8", windowsHide: true }));
+        const beforeIr = analyze(before), afterIr = analyze(after);
+        assert.ok(beforeIr.diagnostics.some((item) => item.category === "pending_hardware_state"));
+        assert.ok(!afterIr.diagnostics.some((item) => item.category === "pending_hardware_state"));
+        const actions = (diagnostics) => provider.provideCodeActions(document, new vscode.Range(2, 0, 2, 4), { diagnostics });
+        const transported = (diagnostic) => Object.assign(new vscode.Diagnostic(diagnostic.range, diagnostic.message, diagnostic.severity), {
+          source: diagnostic.source, code: diagnostic.code,
+        });
+        let gateNextAnalyzer = false;
+        let release!: () => void;
+        let started!: () => void;
+        const waiting = new Promise<void>((resolve) => { started = resolve; });
+        const execute = controller.execFile.bind(controller);
+        controller.execFile = async (...args) => {
+          const gated = args[5] === "analyzer" && gateNextAnalyzer;
+          const ir = document.text === before ? beforeIr : afterIr;
+          if (gated) {
+            gateNextAnalyzer = false;
+            await new Promise<void>((resolve) => { release = resolve; started(); });
+          }
+          const result = await execute(...args);
+          if (args[5] === "analyzer") {
+            writeFileSync(args[1][args[1].indexOf("--out") + 1], JSON.stringify(ir));
+            writeFileSync(args[1][args[1].indexOf("--diagnostics") + 1], JSON.stringify(ir.diagnostics));
+            if (gated && stage === "late analyzer failure") throw Object.assign(new Error("Analyzer stopped"), {
+              stdout: JSON.stringify({ schema_version: "0.2.0", status: "error", diagnostics: ir.diagnostics }), stderr: "", stage: "analyzer",
+            });
+          }
+          return result;
+        };
+        let pending: Promise<void> | undefined;
+        try {
+          document.text = before;
+          writeFileSync(sourcePath, before);
+          writeFileSync(controller.projectUri.fsPath, "sequencers:\n  - id: seq0\n    file: seq0.q1asm\n");
+          await controller.openTarget({ projectFile: controller.projectUri.fsPath });
+          assert.equal(actions(published).length, 1);
+          const initialDiagnostics = [published[0], transported(published[0])];
+          if (stage !== "stale view rerender") {
+            gateNextAnalyzer = true;
+            pending = controller.refreshPreview();
+            await waiting;
+          }
+          document.text = after;
+          document.version += 1;
+          writeFileSync(sourcePath, after);
+          await notifications.save(document);
+          for (const diagnostic of initialDiagnostics) assert.deepEqual(actions([diagnostic]), [], "Source invalidation withdraws retained suggestions immediately");
+          release?.();
+          await pending;
+          await setup.settle();
+          if (stage === "stale view rerender") await controller.setViewMode("debug");
+          assert.ok(published.some((item) => item.code === "pending_hardware_state"), "The stale warning remains visible in Problems until Refresh");
+          assert.ok(controller.analyzerDiagnostics.length > 0);
+          for (const diagnostic of [...initialDiagnostics, ...published, ...published.map(transported)]) {
+            assert.deepEqual(actions([diagnostic]), [], "Neither retained diagnostics nor late output may restore an obsolete insertion");
+          }
+          if (stage === "stale view rerender") assert.ok(controller.sourceRevision > controller.analyzedSourceRevision);
+          document.text = before;
+          document.version += 1;
+          writeFileSync(sourcePath, before);
+          await notifications.save(document);
+          await controller.refreshPreview();
+          assert.equal(controller.sourceRevision, controller.analyzedSourceRevision);
+          assert.equal(actions(published).length, 1, "Fresh analysis can publish a valid suggestion again");
+        } finally {
+          release?.(); await pending; await setup.settle(); controller.dispose();
+        }
+      });
+    });
+  }
+
   it("clears stale preview HTML when analyzer failure handling runs", async () => {
     const vscode = createMockVscode();
 
@@ -1834,6 +4742,140 @@ describe("q1timeline controller", () => {
       assert.equal(controller.lastPreviewHtml, undefined);
       assert.equal(webview.html.includes("old event"), false);
       controller.dispose();
+    });
+  });
+
+  for (const stage of ["timeline_ir.json", "diagnostics.json", "timeline.html"]) {
+    it(`does not publish a previous project's preview after a delayed ${stage} read`, async () => {
+      const vscode = createMockVscode();
+      const published: any[] = [];
+      vscode.languages.createDiagnosticCollection = () => ({
+        clear() { published.push("clear"); },
+        set(uri, diagnostics) { published.push({ uri, diagnostics }); },
+        dispose() {},
+      });
+      await withMockedVscode(vscode, async ({ TimelineController }) => {
+        const { controller } = fileEnvironmentController(TimelineController, vscode);
+        controller.refreshWebview = TimelineController.prototype.refreshWebview.bind(controller);
+        const outputA = controller.outputDir;
+        writeFileSync(join(outputA, "timeline_ir.json"), JSON.stringify({ events: [{ id: "A" }] }));
+        writeFileSync(join(outputA, "diagnostics.json"), JSON.stringify([
+          { severity: "error", message: "Project A error", source: { file: "a.q1asm", line: 1 } },
+        ]));
+        writeFileSync(join(outputA, "timeline.html"), "<html><head></head><body>Project A</body></html>");
+        const fsPromises = require("node:fs").promises;
+        const original = fsPromises.readFile;
+        let release!: () => void;
+        let started!: () => void;
+        const waiting = new Promise<void>((resolve) => { started = resolve; });
+        fsPromises.readFile = async (...args) => {
+          if (args[0] === join(outputA, stage)) await new Promise<void>((resolve) => { release = resolve; started(); });
+          return original(...args);
+        };
+        try {
+          const refreshing = controller.refreshWebview();
+          await waiting;
+          const outputB = mkdtempSync(join(tmpdir(), "q1-publish-project-b-"));
+          controller.setProjectUri(vscode.Uri.file(join(outputB, "q1timeline.yml")));
+          controller.outputDir = outputB;
+          const irB = { events: [{ id: "B" }] };
+          const diagnosticsB = [{ message: "Project B error", severity: "error" }];
+          controller.timelineIr = irB;
+          controller.analyzerDiagnostics = diagnosticsB;
+          controller.lastPreviewHtml = "Project B";
+          controller.panel.webview.html = "Project B";
+          published.length = 0;
+          release();
+          await refreshing;
+          assert.deepEqual(controller.timelineIr, irB);
+          assert.deepEqual(controller.analyzerDiagnostics, diagnosticsB);
+          assert.equal(controller.lastPreviewHtml, "Project B");
+          assert.equal(controller.panel.webview.html, "Project B");
+          assert.deepEqual(published, [], "Stale loads must not clear or replace the new project's Problems entries");
+        } finally {
+          fsPromises.readFile = original;
+          controller.dispose();
+        }
+      });
+    });
+  }
+
+  it("drops a previous project's failure prompt after delayed diagnostic inspection", async () => {
+    const vscode = createMockVscode();
+    const notifications: string[] = [];
+    vscode.window.showErrorMessage = async (message) => { notifications.push(message); };
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const { controller } = fileEnvironmentController(TimelineController, vscode);
+      controller.execFile = async () => { throw new Error("No module named 'q1lens'"); };
+      let release!: () => void;
+      let started!: () => void;
+      const waiting = new Promise<void>((resolve) => { started = resolve; });
+      controller.hasAnalyzerDiagnostics = async () => new Promise<boolean>((resolve) => {
+        release = () => resolve(false);
+        started();
+      });
+      const analysis = controller.runAnalysis();
+      await waiting;
+      controller.setProjectUri(vscode.Uri.file(join(tmpdir(), "replacement-project", "q1timeline.yml")));
+      const diagnosticsB = [{ message: "Project B error", severity: "error" }];
+      controller.analyzerDiagnostics = diagnosticsB;
+      release();
+      await analysis;
+      assert.deepEqual(notifications, [], "An old project's failure must not offer recovery for the newly selected project");
+      assert.deepEqual(controller.analyzerDiagnostics, diagnosticsB);
+      controller.dispose();
+    });
+  });
+
+  it("drops an old analyzer failure while opening a source without a project", async () => {
+    const vscode = createMockVscode();
+    const notifications: string[] = [];
+    vscode.window.showErrorMessage = async (message) => { notifications.push(message); };
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const { controller } = fileEnvironmentController(TimelineController, vscode);
+      let failAnalyzer!: () => void;
+      let analyzerStarted!: () => void;
+      const analyzing = new Promise<void>((resolve) => { analyzerStarted = resolve; });
+      const execFile = controller.execFile;
+      let first = true;
+      controller.execFile = async (...args) => {
+        if (first) {
+          first = false;
+          await new Promise<void>((resolve) => { failAnalyzer = resolve; analyzerStarted(); });
+          throw new Error("No module named q1lens");
+        }
+        return execFile(...args);
+      };
+      const analysisA = controller.runAnalysis();
+      await analyzing;
+      const folderB = mkdtempSync(join(tmpdir(), "q1-fallback-before-failure-"));
+      const sourceB = vscode.Uri.file(join(folderB, "b.q1asm"));
+      writeFileSync(sourceB.fsPath, "stop\n");
+      const fsPromises = require("node:fs").promises;
+      const originalMkdir = fsPromises.mkdir;
+      let releaseFallback!: () => void;
+      let fallbackStarted!: () => void;
+      const preparing = new Promise<void>((resolve) => { fallbackStarted = resolve; });
+      fsPromises.mkdir = async (...args) => {
+        if (args[0] === join(folderB, ".q1timeline")) await new Promise<void>((resolve) => {
+          releaseFallback = resolve;
+          fallbackStarted();
+        });
+        return originalMkdir(...args);
+      };
+      const openingB = controller.openPreview({ sourceUri: sourceB });
+      try {
+        await preparing;
+        assert.equal(controller.projectUri, undefined, "The new source is waiting for its generated project");
+        failAnalyzer();
+        await assert.doesNotReject(analysisA, "The old failure must be discarded before diagnostic publication");
+        assert.deepEqual(notifications, []);
+      } finally {
+        fsPromises.mkdir = originalMkdir;
+        releaseFallback();
+        await openingB;
+        controller.dispose();
+      }
     });
   });
 
@@ -2024,6 +5066,47 @@ describe("q1timeline controller", () => {
     });
   });
 
+  for (const pendingInput of [1, 2]) {
+    it(`drops analysis parameter input after switching projects during the ${pendingInput === 1 ? "name" : "value"} prompt`, async () => {
+      const vscode = createMockVscode();
+      const notifications: string[] = [];
+      vscode.window.showInformationMessage = async (message) => { notifications.push(message); };
+      let release!: () => void;
+      let started!: () => void;
+      const waiting = new Promise<void>((resolve) => { started = resolve; });
+      let inputCount = 0;
+      vscode.window.showInputBox = async () => {
+        const currentInput = ++inputCount;
+        if (currentInput === pendingInput) {
+          await new Promise<void>((resolve) => { release = resolve; started(); });
+        }
+        return currentInput === 1 ? "DURATION_A" : "64";
+      };
+      await withMockedVscode(vscode, async ({ TimelineController }) => {
+        const controller = new TimelineController(createContext());
+        controller.setProjectUri(vscode.Uri.file("C:\\repo\\project-a\\q1timeline.yml"));
+        controller.outputDir = "C:\\repo\\project-a\\.q1timeline";
+        let runCount = 0;
+        controller.runAnalysis = async () => { runCount += 1; };
+        const entering = controller.setAnalysisParameter();
+        await waiting;
+        controller.setProjectUri(vscode.Uri.file("C:\\repo\\project-b\\q1timeline.yml"));
+        controller.outputDir = "C:\\repo\\project-b\\.q1timeline";
+        controller.parameterOverrides.set("DURATION_B", "96");
+        const baselineB = { events: [{ id: "B" }] };
+        controller.lastAnalyzerTimelineIr = baselineB;
+        release();
+        await entering;
+        assert.deepEqual([...controller.parameterOverrides], [["DURATION_B", "96"]]);
+        assert.equal(controller.lastAnalyzerTimelineIr, baselineB);
+        assert.equal(runCount, 0);
+        assert.equal(inputCount, pendingInput, "Switching projects must stop the remaining old-project prompts");
+        assert.deepEqual(notifications, []);
+        controller.dispose();
+      });
+    });
+  }
+
   it("applies exact inline JSON parameter values and exposes session ownership to the webview", async () => {
     const vscode = createMockVscode();
     vscode.window.showInputBox = async () => assert.fail("Inline edits must not open an input box");
@@ -2210,6 +5293,50 @@ describe("q1timeline controller", () => {
     });
   });
 
+  for (const action of ["setAnalysisParameter", "resetAnalysisParameter"]) {
+    it(`rolls back ${action} when Python environment setup is cancelled and permits retry`, async () => {
+      const vscode = createMockVscode();
+      let available = false;
+      vscode.resolveFileEnvironment = async (_api, resource) => available ? resolvedPython(resource) : undefined;
+      await withMockedVscode(vscode, async ({ TimelineController }) => {
+        const { controller, calls } = fileEnvironmentController(TimelineController, vscode);
+        const projectFile = controller.projectUri.fsPath;
+        const previousIr = { analysis: { parameters: [{ name: "DURATION" }] }, events: [{ id: "previous" }] };
+        controller.timelineIr = previousIr;
+        controller.lastAnalyzerTimelineIr = previousIr;
+        controller.lastPreviewHtml = controller.panel.webview.html = "previous editable preview";
+        controller.parameterOverrides.set("DURATION", "128");
+        const messages: any[] = [];
+        controller.panel.webview.postMessage = (message) => messages.push(message);
+        const request = { type: action, name: "DURATION", projectFile,
+          ...(action === "setAnalysisParameter" ? { valueJson: "256" } : {}) };
+
+        await controller.handleWebviewMessage(request);
+
+        assert.equal(controller.parameterOverrides.get("DURATION"), "128");
+        assert.equal(controller.lastAnalyzerTimelineIr, previousIr);
+        assert.equal(controller.timelineIr, previousIr);
+        assert.equal(controller.panel.webview.html, "previous editable preview");
+        assert.equal(controller.analysisInFlight, false);
+        assert.equal(controller.analysisStatus.status, "error");
+        assert.deepEqual(calls, [], "Cancelled environment setup must not start Python");
+        const errors = messages.filter((message) => message.type === "analysisParameterError");
+        assert.equal(errors.length, 1, "The existing webview needs an error reply to restore its editing controls");
+        assert.equal(errors[0].name, "DURATION");
+        assert.match(errors[0].message, /Python environment setup is required/);
+
+        available = true;
+        await controller.handleWebviewMessage(request);
+
+        assert.equal(controller.parameterOverrides.get("DURATION"), action === "setAnalysisParameter" ? "256" : undefined);
+        assert.deepEqual(calls.map((call) => call.stage), ["analyzer", "renderer"]);
+        assert.equal(controller.analysisStatus.status, "idle");
+        assert.equal(messages.filter((message) => message.type === "analysisParameterError").length, 1);
+        controller.dispose();
+      });
+    });
+  }
+
   it("rolls back analyzer-rejected inline values while preserving a usable preview for retry", async () => {
     const vscode = createMockVscode();
     const outputDir = mkdtempSync(join(tmpdir(), "q1-inline-failure-"));
@@ -2319,6 +5446,65 @@ describe("q1timeline controller", () => {
       assert.equal(controller.lastAnalyzerTimelineIr, previousIr);
       assert.equal(webview.html, "previous timeline");
       controller.dispose();
+    });
+  });
+
+  it("does not carry an old inline rollback into a new analysis after switching projects away and back", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const setup = sourceFileController(TimelineController, vscode);
+      const { controller } = setup;
+      const projectA = controller.projectUri.fsPath;
+      const rootB = mkdtempSync(join(tmpdir(), "q1-inline-return-project-"));
+      const projectB = join(rootB, "q1timeline.yml");
+      for (const projectFile of [projectA, projectB]) {
+        writeFileSync(projectFile, "sequencers:\n  - id: seq0\n    file: seq0.q1asm\n");
+      }
+      writeFileSync(join(rootB, "seq0.q1asm"), "stop\n");
+      const previousIr = { analysis: { parameters: [{ name: "DURATION" }] }, events: [{ id: "old-A" }] };
+      controller.timelineIr = controller.lastAnalyzerTimelineIr = previousIr;
+      controller.parameterOverrides.set("DURATION", "128");
+      const messages: any[] = [];
+      controller.panel.webview.postMessage = (message) => messages.push(message);
+      const execFile = controller.execFile.bind(controller);
+      const analyzers: any[] = [];
+      let release!: () => void;
+      let started!: () => void;
+      const waiting = new Promise<void>((resolve) => { started = resolve; });
+      controller.execFile = async (...args) => {
+        if (args[5] === "analyzer") {
+          analyzers.push(args[1]);
+          if (analyzers.length === 1) await new Promise<void>((resolve) => { release = resolve; started(); });
+          else throw new Error("New A analysis failed");
+        }
+        return execFile(...args);
+      };
+      let editing: Promise<void> | undefined;
+      try {
+        editing = controller.handleWebviewMessage({ type: "setAnalysisParameter", name: "DURATION", valueJson: "256", projectFile: projectA });
+        await waiting;
+        await controller.openTarget({ projectFile: projectB });
+        await controller.openTarget({ projectFile: projectA });
+        const inputs = ["DURATION", "256"];
+        vscode.window.showInputBox = async () => inputs.shift();
+        await controller.setAnalysisParameter();
+        assert.equal(controller.parameterOverrides.get("DURATION"), "256");
+        release();
+        await editing;
+        await setup.settle();
+        assert.equal(analyzers.length, 2);
+        assert.ok(analyzers.every((args) => args[args.indexOf("--project") + 1] === projectA));
+        assert.equal(controller.parameterOverrides.get("DURATION"), "256",
+          "Failure of the new A request must not restore the first A session's previous override");
+        assert.equal(controller.lastAnalyzerTimelineIr, undefined);
+        assert.equal(messages.filter((message) => message.type === "analysisParameterError").length, 0,
+          "The old inline editor must not receive a failure reply belonging to the new A request");
+      } finally {
+        release?.();
+        await editing;
+        await setup.settle();
+        controller.dispose();
+      }
     });
   });
 
@@ -2633,6 +5819,304 @@ describe("q1timeline controller", () => {
       controller.dispose();
     });
   });
+
+  for (const firstAction of ["save", "clear"]) {
+    const secondAction = firstAction === "save" ? "clear" : "save";
+    it(`serializes comparison baseline ${firstAction} then ${secondAction} while filesystem preparation is pending`, async () => {
+      const vscode = createMockVscode();
+      const root = mkdtempSync(join(tmpdir(), "q1-baseline-order-"));
+      const outputDir = join(root, ".q1timeline");
+      mkdirSync(outputDir);
+      const baselinePath = join(outputDir, "comparison-baseline.json");
+      const timelinePath = join(outputDir, "timeline_ir.json");
+      const previousIr = { events: [{ id: "previous" }] };
+      const freshIr = { events: [{ id: "fresh" }] };
+      writeFileSync(baselinePath, JSON.stringify(previousIr));
+      writeFileSync(timelinePath, JSON.stringify(freshIr));
+      const fsPromises = require("node:fs").promises;
+      const originalMkdir = fsPromises.mkdir;
+      const originalRm = fsPromises.rm;
+      let release!: () => void;
+      let started!: () => void;
+      let secondStarted = false;
+      const waiting = new Promise<void>((resolve) => { started = resolve; });
+      const pause = () => new Promise<void>((resolve) => { release = resolve; started(); });
+      fsPromises.mkdir = async (...args: any[]) => {
+        if (args[0] === outputDir) {
+          if (firstAction === "save") await pause();
+          else secondStarted = true;
+        }
+        return originalMkdir(...args);
+      };
+      fsPromises.rm = async (...args: any[]) => {
+        if (args[0] === baselinePath) {
+          if (firstAction === "clear") await pause();
+          else secondStarted = true;
+        }
+        return originalRm(...args);
+      };
+      try {
+        await withMockedVscode(vscode, async ({ TimelineController }) => {
+          const controller = new TimelineController(createContext());
+          try {
+            controller.setProjectUri(vscode.Uri.file(join(root, "q1timeline.yml")));
+            controller.outputDir = outputDir;
+            controller.lastAnalyzerTimelineIr = previousIr;
+            if (secondAction === "save") {
+              await controller.prepareTimelineIrForRender(timelinePath);
+              assert.deepEqual(controller.lastAnalyzerTimelineIr, freshIr);
+            }
+            const first = firstAction === "save" ? controller.saveComparisonBaseline() : controller.clearComparisonBaseline();
+            await waiting;
+            const second = secondAction === "save" ? controller.saveComparisonBaseline() : controller.clearComparisonBaseline();
+            await Promise.resolve();
+            const secondStartedWhileFirstPending = secondStarted;
+            release();
+            await Promise.all([first, second]);
+            assert.equal(secondStartedWhileFirstPending, false, "A later baseline mutation must wait for the earlier filesystem operation");
+            if (secondAction === "save") {
+              assert.deepEqual(JSON.parse(readFileSync(baselinePath, "utf8")), freshIr);
+            } else {
+              assert.equal(existsSync(baselinePath), false);
+            }
+            assert.equal(controller.comparison.nextMode, secondAction === "save" ? "saved" : "previous");
+          } finally {
+            controller.dispose();
+          }
+        });
+      } finally {
+        release?.();
+        fsPromises.mkdir = originalMkdir;
+        fsPromises.rm = originalRm;
+      }
+    });
+  }
+
+  it("finishes loading a comparison baseline before a later save or clear begins", async () => {
+    const observations: any[] = [];
+    for (const action of ["save", "clear"]) {
+      const vscode = createMockVscode();
+      const root = mkdtempSync(join(tmpdir(), "q1-baseline-read-first-"));
+      const outputDir = join(root, ".q1timeline");
+      mkdirSync(outputDir);
+      const baselinePath = join(outputDir, "comparison-baseline.json");
+      const originalIr = { events: [{ id: "original" }] };
+      const nextIr = { events: [{ id: "next" }] };
+      writeFileSync(baselinePath, JSON.stringify(originalIr));
+      const fsPromises = require("node:fs").promises;
+      const originalReadFile = fsPromises.readFile;
+      const originalMkdir = fsPromises.mkdir;
+      const method = action === "save" ? "writeFile" : "rm";
+      const originalMutation = fsPromises[method];
+      let release!: () => void;
+      let started!: () => void;
+      let mutationStarted = false;
+      const waiting = new Promise<void>((resolve) => { started = resolve; });
+      fsPromises.readFile = async (...args: any[]) => {
+        if (args[0] === baselinePath) {
+          await new Promise<void>((resolve) => { release = resolve; started(); });
+        }
+        return originalReadFile(...args);
+      };
+      fsPromises.mkdir = async (...args: any[]) => {
+        if (args[0] === outputDir) return mkdirSync(args[0], args[1]);
+        return originalMkdir(...args);
+      };
+      fsPromises[method] = async (...args: any[]) => {
+        if (args[0] === baselinePath) mutationStarted = true;
+        return originalMutation(...args);
+      };
+      try {
+        await withMockedVscode(vscode, async ({ TimelineController }) => {
+          const controller = new TimelineController(createContext());
+          try {
+            controller.setProjectUri(vscode.Uri.file(join(root, "q1timeline.yml")));
+            controller.outputDir = outputDir;
+            controller.lastAnalyzerTimelineIr = nextIr;
+            const loading = controller.loadComparisonBaseline();
+            await waiting;
+            const mutation = action === "save" ? controller.saveComparisonBaseline() : controller.clearComparisonBaseline();
+            await Promise.resolve();
+            await Promise.resolve();
+            const mutationStartedWhileReadPending = mutationStarted;
+            release();
+            const [baseline] = await Promise.all([loading, mutation]);
+            observations.push({ action, mutationStartedWhileReadPending, baseline });
+            if (action === "save") assert.deepEqual(JSON.parse(readFileSync(baselinePath, "utf8")), nextIr);
+            else assert.equal(existsSync(baselinePath), false);
+          } finally {
+            controller.dispose();
+          }
+        });
+      } finally {
+        release?.();
+        fsPromises.readFile = originalReadFile;
+        fsPromises.mkdir = originalMkdir;
+        fsPromises[method] = originalMutation;
+      }
+    }
+    assert.deepEqual(observations, ["save", "clear"].map((action) => ({
+      action, mutationStartedWhileReadPending: false, baseline: { events: [{ id: "original" }] },
+    })), "Baseline writes and removals must wait for an earlier baseline read to finish");
+  });
+
+  for (const action of ["save", "clear"]) {
+    it(`waits for a pending comparison baseline ${action} before loading the next analysis baseline`, async () => {
+      const vscode = createMockVscode();
+      const root = mkdtempSync(join(tmpdir(), "q1-baseline-load-order-"));
+      const outputDir = join(root, ".q1timeline");
+      mkdirSync(outputDir);
+      const baselinePath = join(outputDir, "comparison-baseline.json");
+      const savedIr = { events: [{ id: "saved" }] };
+      if (action === "clear") writeFileSync(baselinePath, JSON.stringify(savedIr));
+      const fsPromises = require("node:fs").promises;
+      const method = action === "save" ? "writeFile" : "rm";
+      const originalMutation = fsPromises[method];
+      const originalReadFile = fsPromises.readFile;
+      let release!: () => void;
+      let started!: () => void;
+      let readStarted = false;
+      const waiting = new Promise<void>((resolve) => { started = resolve; });
+      fsPromises[method] = async (...args: any[]) => {
+        if (args[0] === baselinePath) {
+          await new Promise<void>((resolve) => { release = resolve; started(); });
+        }
+        return originalMutation(...args);
+      };
+      fsPromises.readFile = async (...args: any[]) => {
+        if (args[0] === baselinePath) readStarted = true;
+        return originalReadFile(...args);
+      };
+      try {
+        await withMockedVscode(vscode, async ({ TimelineController }) => {
+          const controller = new TimelineController(createContext());
+          try {
+            controller.setProjectUri(vscode.Uri.file(join(root, "q1timeline.yml")));
+            controller.outputDir = outputDir;
+            controller.lastAnalyzerTimelineIr = savedIr;
+            const mutation = action === "save" ? controller.saveComparisonBaseline() : controller.clearComparisonBaseline();
+            await waiting;
+            const loading = controller.loadComparisonBaseline();
+            await Promise.resolve();
+            const readStartedWhileMutationPending = readStarted;
+            release();
+            const [, baseline] = await Promise.all([mutation, loading]);
+            assert.equal(readStartedWhileMutationPending, false, "The next analysis must wait for the requested baseline mutation before reading");
+            assert.deepEqual(baseline, action === "save" ? savedIr : undefined);
+          } finally {
+            controller.dispose();
+          }
+        });
+      } finally {
+        release?.();
+        fsPromises[method] = originalMutation;
+        fsPromises.readFile = originalReadFile;
+      }
+    });
+  }
+
+  for (const action of ["save", "clear"]) {
+    it(`keeps a pending comparison baseline ${action} attached to its original project`, async () => {
+      const vscode = createMockVscode();
+      const root = mkdtempSync(join(tmpdir(), "q1-baseline-switch-"));
+      const outputA = join(root, "a", ".q1timeline");
+      const outputB = join(root, "b", ".q1timeline");
+      mkdirSync(outputA, { recursive: true });
+      mkdirSync(outputB, { recursive: true });
+      const baselineA = join(outputA, "comparison-baseline.json");
+      const baselineB = join(outputB, "comparison-baseline.json");
+      const irA = { events: [{ id: "a" }] };
+      const irB = { events: [{ id: "b" }] };
+      writeFileSync(baselineA, JSON.stringify({ events: [] }));
+      const fsPromises = require("node:fs").promises;
+      const method = action === "save" ? "mkdir" : "rm";
+      const original = fsPromises[method];
+      let release!: () => void;
+      let started!: () => void;
+      const waiting = new Promise<void>((resolve) => { started = resolve; });
+      fsPromises[method] = async (...args: any[]) => {
+        if (args[0] === (action === "save" ? outputA : baselineA)) {
+          await new Promise<void>((resolve) => { release = resolve; started(); });
+        }
+        return original(...args);
+      };
+      try {
+        await withMockedVscode(vscode, async ({ TimelineController }) => {
+          const controller = new TimelineController(createContext());
+          controller.setProjectUri(vscode.Uri.file(join(root, "a", "q1timeline.yml")));
+          controller.outputDir = outputA;
+          controller.lastAnalyzerTimelineIr = irA;
+          const posted: any[] = [];
+          controller.postWebviewMessage = (message) => posted.push(message);
+          const operation = action === "save" ? controller.saveComparisonBaseline() : controller.clearComparisonBaseline();
+          await waiting;
+          controller.setProjectUri(vscode.Uri.file(join(root, "b", "q1timeline.yml")));
+          controller.outputDir = outputB;
+          controller.lastAnalyzerTimelineIr = irB;
+          controller.comparison = { mode: "saved" };
+          controller.comparisonBaselineWarningPath = baselineB;
+          posted.length = 0;
+          release();
+          await operation;
+          if (action === "save") assert.deepEqual(JSON.parse(readFileSync(baselineA, "utf8")), irA);
+          else assert.equal(existsSync(baselineA), false);
+          assert.deepEqual(controller.comparison, { mode: "saved" }, "The new project's comparison mode must stay unchanged");
+          assert.equal(controller.comparisonBaselineWarningPath, baselineB);
+          assert.deepEqual(posted, []);
+          controller.dispose();
+        });
+      } finally {
+        fsPromises[method] = original;
+      }
+    });
+  }
+
+  for (const stage of ["timeline", "baseline"]) {
+    it(`drops comparison preparation after a project switch during its ${stage} read`, async () => {
+      const vscode = createMockVscode();
+      const root = mkdtempSync(join(tmpdir(), "q1-diff-project-switch-"));
+      const outputA = join(root, "a", ".q1timeline");
+      const outputB = join(root, "b", ".q1timeline");
+      mkdirSync(outputA, { recursive: true });
+      mkdirSync(outputB, { recursive: true });
+      const timelinePath = join(outputA, "timeline_ir.json");
+      const baselinePath = join(outputA, "comparison-baseline.json");
+      const irA = { events: [{ id: "a" }] };
+      const irB = { events: [{ id: "b" }] };
+      writeFileSync(timelinePath, JSON.stringify(irA));
+      writeFileSync(baselinePath, JSON.stringify({ events: [] }));
+      const fsPromises = require("node:fs").promises;
+      const original = fsPromises.readFile;
+      let release!: () => void;
+      let started!: () => void;
+      const waiting = new Promise<void>((resolve) => { started = resolve; });
+      fsPromises.readFile = async (...args) => {
+        if (args[0] === (stage === "timeline" ? timelinePath : baselinePath)) {
+          await new Promise<void>((resolve) => { release = resolve; started(); });
+        }
+        return original(...args);
+      };
+      try {
+        await withMockedVscode(vscode, async ({ TimelineController }) => {
+          const controller = new TimelineController(createContext());
+          controller.setProjectUri(vscode.Uri.file(join(root, "a", "q1timeline.yml")));
+          controller.outputDir = outputA;
+          const preparation = controller.prepareTimelineIrForRender(timelinePath);
+          await waiting;
+          controller.setProjectUri(vscode.Uri.file(join(root, "b", "q1timeline.yml")));
+          controller.outputDir = outputB;
+          controller.lastAnalyzerTimelineIr = irB;
+          controller.comparison = { mode: "saved" };
+          release();
+          await preparation;
+          assert.deepEqual(controller.lastAnalyzerTimelineIr, irB, "Project A's late result must not become B's comparison history");
+          assert.deepEqual(controller.comparison, { mode: "saved" });
+          assert.deepEqual(JSON.parse(readFileSync(timelinePath, "utf8")), irA);
+          controller.dispose();
+        });
+      } finally { fsPromises.readFile = original; }
+    });
+  }
 
   it("keeps a saved comparison baseline stable across controller instances and projects", async () => {
     const vscode = createMockVscode();
@@ -3505,6 +6989,193 @@ describe("q1timeline controller", () => {
     });
   });
 
+  async function webviewSourceRequests(TimelineController, vscode) {
+    const errors: string[] = [], output: string[] = [], shown: any[] = [], requests: Promise<any>[] = [];
+    let receive: any, close: any;
+    vscode.window.showErrorMessage = (message) => { errors.push(message); return new Promise(() => {}); };
+    vscode.window.createOutputChannel = () => ({ appendLine: (line) => output.push(line), show() {}, dispose() {} });
+    const createPanel = vscode.window.createWebviewPanel;
+    vscode.window.createWebviewPanel = (...args) => {
+      const panel = createPanel(...args);
+      panel.webview.onDidReceiveMessage = (listener) => { receive = listener; return { dispose() {} }; };
+      panel.onDidDispose = (listener) => { close = listener; return { dispose() {} }; };
+      return panel;
+    };
+    const root = mkdtempSync(join(tmpdir(), "q1-webview-source-error-"));
+    const file = join(root, "source.q1asm");
+    writeFileSync(file, "wait 4\nstop\n");
+    vscode.workspace.openTextDocument = async (uri) => {
+      const text = await require("node:fs").promises.readFile(uri.fsPath, "utf8");
+      return { uri, lineCount: text.split("\n").length, lineAt: (line) => ({ text: text.split("\n")[line] }) };
+    };
+    vscode.window.showTextDocument = async (document) => {
+      const editor = { document, viewColumn: 1, selection: sourceSelection(0, 0, 0), setDecorations() {}, revealRange() {} };
+      shown.push(editor); return editor;
+    };
+    const controller = new TimelineController(createContext());
+    controller.projectUri = vscode.Uri.file(join(root, "q1timeline.yml"));
+    controller.outputDir = root;
+    controller.timelineIr = { events: [{ id: "e", source: { file, line: 1 } }],
+      feedback_flows: [{ id: "flow", from_event_id: "e", to_event_id: "e" }] };
+    controller.analyzerDiagnostics = [{ source: { file, line: 1 } }];
+    for (const method of ["openSourceForEvent", "openSourceForDiagnostic", "openSourceForFeedbackFlow"]) {
+      const actual = controller[method].bind(controller);
+      controller[method] = (...args) => {
+        const request = actual(...args);
+        requests.push(request);
+        // Observe detached pre-fix promises so the regression reports the missing UI rather than leaking into Mocha.
+        void request.catch(() => {});
+        return request;
+      };
+    }
+    await controller.createPreviewPanel();
+    return { controller, file, root, errors, output, shown, receive: (message) => receive(message), close: () => close(),
+      async settle() { for (let index = 0; index < requests.length; index += 1) await Promise.allSettled([requests[index]]); } };
+  }
+
+  for (const type of ["eventClick", "diagnosticClick", "sourceClick", "feedbackFlowClick"]) {
+    it(`reports a missing source from the registered ${type} callback and accepts the next source request`, async () => {
+      const vscode = createMockVscode();
+      await withMockedVscode(vscode, async ({ TimelineController }) => {
+        const setup = await webviewSourceRequests(TimelineController, vscode);
+        const { controller, file, errors, output, shown } = setup;
+        require("node:fs").unlinkSync(file);
+        const message = type === "eventClick" ? { type, eventId: "e" }
+          : type === "diagnosticClick" ? { type, diagnosticIndex: 0 }
+          : type === "feedbackFlowClick" ? { type, flowId: "flow", role: "source" }
+          : { type, file, line: 1, column: 1, preserveHardwareCursor: true };
+        try {
+          await assert.doesNotReject(setup.receive(message), "The registered webview callback must handle a current file-open failure");
+          await setup.settle();
+          assert.equal(errors.length, 1, "The missing source must be explained to the user");
+          assert.ok(errors[0].includes(file));
+          assert.ok(output.some((line) => line.includes(file) && /could not open source/i.test(line)));
+          writeFileSync(file, "wait 4\nstop\n");
+          await setup.receive({ type: "sourceClick", file, line: 2, column: 1, preserveHardwareCursor: true });
+          assert.equal(shown.at(-1).document.uri.fsPath, file);
+          assert.equal(shown.at(-1).selection.active.line, 1);
+          assert.equal(errors.length, 1, "Source recovery must not wait for the previous error notification to be dismissed");
+        } finally { await setup.settle(); controller.dispose(); }
+      });
+    });
+  }
+
+  for (const replacement of ["a newer source request", "a different project", "the preview closing"]) {
+    it(`ignores a missing-source failure that completes after ${replacement}`, async () => {
+      const vscode = createMockVscode();
+      await withMockedVscode(vscode, async ({ TimelineController }) => {
+        const setup = await webviewSourceRequests(TimelineController, vscode);
+        const { controller, file, root, errors, shown } = setup;
+        require("node:fs").unlinkSync(file);
+        const openTextDocument = vscode.workspace.openTextDocument;
+        let release!: () => void;
+        let started!: () => void;
+        const waiting = new Promise<void>((resolve) => { started = resolve; });
+        vscode.workspace.openTextDocument = async (uri) => {
+          if (uri.fsPath === file) await new Promise<void>((resolve) => { release = resolve; started(); });
+          return openTextDocument(uri);
+        };
+        let pending: Promise<void> | undefined;
+        try {
+          pending = setup.receive({ type: "sourceClick", file, line: 1, column: 1, preserveHardwareCursor: true });
+          // Observe the pre-fix rejection while another user action supersedes the request.
+          void pending.catch(() => {});
+          await waiting;
+          if (replacement === "a newer source request") {
+            const next = join(root, "next.q1asm");
+            writeFileSync(next, "stop\n");
+            await setup.receive({ type: "sourceClick", file: next, line: 1, column: 1, preserveHardwareCursor: true });
+            assert.equal(shown.at(-1).document.uri.fsPath, next);
+          } else if (replacement === "a different project") {
+            const folderB = mkdtempSync(join(tmpdir(), "q1-webview-source-error-b-"));
+            const projectFile = join(folderB, "q1timeline.yml");
+            writeFileSync(projectFile, "sequencers: []\n");
+            controller.runAnalysis = async () => {};
+            await controller.openTarget({ projectFile });
+          } else setup.close();
+          release();
+          await assert.doesNotReject(pending, "An obsolete source failure must be consumed without reaching the webview event emitter");
+          assert.deepEqual(errors, [], "An old source failure must not display a notification over the current target");
+        } finally { release?.(); await pending?.catch(() => {}); await setup.settle(); controller.dispose(); }
+      });
+    });
+  }
+
+  for (const replacement of ["another source click", "a newer line in the same file", "a project switch", "a source edit", "a superseded feedback flow", "a newer click during source display"]) {
+    it(`drops pending source navigation after ${replacement}`, async () => {
+      const vscode = createMockVscode();
+      const notifications = sourceFileNotifications(vscode);
+      const inFlightShow = replacement === "a newer click during source display";
+      await withMockedVscode(vscode, async ({ TimelineController }) => {
+        const { controller } = fileEnvironmentController(TimelineController, vscode);
+        controller.config = () => ({ get: (key, fallback) => key === "updateMode" ? "manual" : fallback });
+        const coldPath = join(controller.outputDir, "cold.q1asm"), hotPath = join(controller.outputDir, "hot.q1asm");
+        const documents = [coldPath, hotPath].map((file) => {
+          writeFileSync(file, "wait 4\nstop\n");
+          return { uri: vscode.Uri.file(file), lineCount: 3, version: 1, isDirty: false, text: "wait 4\nstop\n",
+            getText() { return this.text; }, lineAt(line) { return { text: this.text.split("\n")[line] }; } };
+        });
+        const decorated = [[], []], shown: string[] = [];
+        const editors = documents.map((document, index) => ({ document, viewColumn: 1, selection: sourceSelection(0, 0, 0),
+          setDecorations(_type, ranges) { decorated[index].push(ranges); }, revealRange() {} }));
+        vscode.workspace.textDocuments = [documents[1]];
+        vscode.window.visibleTextEditors = [editors[1]];
+        vscode.TabInputText = class { constructor(public uri) {} };
+        vscode.window.tabGroups.all = [{ viewColumn: 1, tabs: [{ input: new vscode.TabInputText(documents[1].uri) }] }];
+        controller.projectRelatedPaths = new Set([coldPath, hotPath]);
+        let release!: () => void;
+        let started!: () => void;
+        const waiting = new Promise<void>((resolve) => { started = resolve; });
+        let coldReads = 0;
+        vscode.workspace.openTextDocument = async (uri) => {
+          assert.equal(uri.fsPath, coldPath);
+          if (++coldReads === 1 && !inFlightShow) await new Promise<void>((resolve) => { release = resolve; started(); });
+          if (!vscode.workspace.textDocuments.includes(documents[0])) vscode.workspace.textDocuments.push(documents[0]);
+          return documents[0];
+        };
+        vscode.window.showTextDocument = async (document) => {
+          if (document === documents[0] && inFlightShow) await new Promise<void>((resolve) => { release = resolve; started(); });
+          shown.push(document.uri.fsPath);
+          return document === documents[0] ? editors[0] : editors[1];
+        };
+        const click = (file, line) => controller.handleWebviewMessage({ type: "sourceClick", file, line, column: 1, preserveHardwareCursor: true });
+        let first: Promise<void> | undefined;
+        let newer: Promise<void> | undefined;
+        try {
+          if (replacement === "a superseded feedback flow") {
+            controller.timelineIr = { events: [{ id: "send", source: { file: coldPath, line: 2 } }, { id: "receive", source: { file: hotPath, line: 2 } }],
+              feedback_flows: [{ id: "flow", from_event_id: "send", to_event_id: "receive" }] };
+            first = controller.handleWebviewMessage({ type: "feedbackFlowClick", flowId: "flow" });
+          } else first = click(coldPath, 2);
+          await waiting;
+          if (replacement === "a project switch") {
+            const folderB = mkdtempSync(join(tmpdir(), "q1-source-navigation-b-"));
+            const projectFile = join(folderB, "q1timeline.yml");
+            writeFileSync(projectFile, "sequencers: []\n");
+            await controller.openTarget({ projectFile });
+          } else if (replacement === "a source edit") {
+            documents[1].text = "wait 8\nstop\n";
+            documents[1].isDirty = true;
+            documents[1].version += 1;
+            notifications.edit({ document: documents[1], contentChanges: [{ text: "8" }] });
+          } else if (inFlightShow) newer = click(hotPath, 1);
+          else await click(replacement === "a newer line in the same file" ? coldPath : hotPath, 1);
+          if (inFlightShow) await new Promise((resolve) => setImmediate(resolve));
+          release(); await first; await newer;
+          const expected = inFlightShow ? [coldPath, hotPath] : replacement === "a project switch" || replacement === "a source edit" ? []
+            : [replacement === "a newer line in the same file" ? coldPath : hotPath];
+          assert.deepEqual(shown, expected, "An obsolete document load must not reclaim focus or continue another endpoint");
+          if (expected.length) assert.equal(editors[replacement === "a newer line in the same file" ? 0 : 1].selection.active.line, 0);
+          if (replacement === "a source edit") {
+            assert.equal(controller.hardwareSourceReveal, undefined, "A dropped reveal must not suppress future source-follow");
+            await click(hotPath, 1);
+            assert.deepEqual(shown, [hotPath], "A new explicit source click is still allowed in a dirty document");
+          }
+        } finally { release?.(); await first; await newer; controller.dispose(); }
+      });
+    });
+  }
+
   it("preserves a hardware source reveal while allowing subsequent manual source-follow", async () => {
     const vscode = createMockVscode();
     vscode.TextEditorSelectionChangeKind = { Keyboard: 1, Mouse: 2, Command: 3 };
@@ -3585,6 +7256,52 @@ describe("q1timeline controller", () => {
       controller.dispose();
     });
   });
+  for (const supersededBy of ["another project", "a newer analysis", "controller disposal"]) {
+    it(`ignores a missing-analyzer notification action after ${supersededBy}`, async () => {
+      const vscode = createMockVscode();
+      const checks: any[] = [];
+      let chooseAction!: (action?: string) => void;
+      let started!: () => void;
+      const notifying = new Promise<void>((resolve) => { started = resolve; });
+      vscode.window.showErrorMessage = async (message) => {
+        if (!message.includes("Q1Lens is unavailable")) return undefined;
+        return new Promise((resolve) => { chooseAction = resolve; started(); });
+      };
+      vscode.commands.executeCommand = async (...args) => { checks.push(args); };
+      await withMockedVscode(vscode, async ({ TimelineController }) => {
+        const { controller } = fileEnvironmentController(TimelineController, vscode);
+        const execute = controller.execFile.bind(controller);
+        let missing = true;
+        controller.execFile = async (...args) => {
+          if (missing && args[5] === "analyzer") throw new Error("No module named q1lens");
+          return execute(...args);
+        };
+        try {
+          const analyzing = controller.runAnalysis();
+          await notifying;
+          await analyzing;
+          missing = false;
+          if (supersededBy === "another project") {
+            const root = mkdtempSync(join(tmpdir(), "q1-late-analyzer-notification-"));
+            const projectFile = join(root, "q1timeline.yml");
+            writeFileSync(projectFile, "sequencers: []\n");
+            await controller.openTarget({ projectFile });
+          } else if (supersededBy === "a newer analysis") {
+            await controller.refreshPreview();
+          } else {
+            controller.dispose();
+          }
+          chooseAction("Check Python Environment");
+          await new Promise((resolve) => setImmediate(resolve));
+          assert.deepEqual(checks, [], "An obsolete failure notification must not check or refresh the current project");
+        } finally {
+          chooseAction?.();
+          controller.dispose();
+        }
+      });
+    });
+  }
+
   it("offers a source-scoped Python environment check with a retry when the analyzer is missing", async () => {
     const vscode = createMockVscode();
     const calls: any[] = [];
@@ -3932,7 +7649,7 @@ describe("q1timeline controller", () => {
       changed({ document: editor.document });
       assert.equal(controller.sourceRangeTimer, undefined);
       editor.document.isDirty = false;
-      saved(editor.document);
+      await saved(editor.document);
       const savedRevision = controller.sourceRevision;
       assert.ok(savedRevision >= 2);
       await controller.onWatchedFile(editor.document.uri);

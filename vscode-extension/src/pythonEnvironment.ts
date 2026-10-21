@@ -1,8 +1,32 @@
 import type * as vscodeTypes from "vscode";
+import { normalize } from "node:path";
 import { explicitConfigValue, readSharedPythonSettings } from "./qbs/settingsCore";
 import { q1timelineConfigValue } from "./q1timeline/settings";
 
 export type PythonEnvironmentKind = "qbs" | "q1asm";
+
+const selections = new WeakMap<object, { targets: Map<string, { requestId: number }>; updates: Promise<void> }>();
+
+export function beginPythonEnvironmentSelection(vscode: typeof vscodeTypes, resource: vscodeTypes.Uri) {
+  let state = selections.get(vscode.workspace);
+  if (!state) { state = { targets: new Map(), updates: Promise.resolve() }; selections.set(vscode.workspace, state); }
+  const folder = vscode.workspace.getWorkspaceFolder(resource);
+  const key = folder ? `folder:${folder.uri.fsPath}` : "unscoped";
+  const selection = state.targets.get(key) ?? { requestId: 0 };
+  state.targets.set(key, selection);
+  const requestId = ++selection.requestId;
+  const isCurrent = () => selection.requestId === requestId;
+  return {
+    isCurrent,
+    updateSettings: async (update: () => Promise<void>) => {
+      // A global mode write can change the effective selection in another folder.
+      const pending = state.updates.then(async () => { if (isCurrent()) await update(); });
+      state.updates = pending.catch(() => {});
+      await pending;
+      return isCurrent();
+    },
+  };
+}
 
 export interface ResolvedPythonEnvironment {
   pythonPath: string;
@@ -11,6 +35,7 @@ export interface ResolvedPythonEnvironment {
   sourceLabel: string;
   resource: vscodeTypes.Uri;
   manualSetting?: string;
+  assertCurrentSelection?: () => void;
 }
 
 interface PythonExtensionApi {
@@ -22,10 +47,12 @@ interface PythonExtensionApi {
   };
 }
 
-export async function selectVSCodeInterpreter(vscode: typeof vscodeTypes, resource: vscodeTypes.Uri): Promise<void> {
+export async function selectVSCodeInterpreter(vscode: typeof vscodeTypes, resource: vscodeTypes.Uri, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return;
   if (!vscode.workspace.workspaceFolders?.some((folder) => folder.uri.fsPath === resource.fsPath)) {
     await vscode.window.showTextDocument(resource);
   }
+  if (signal?.aborted) return;
   await vscode.commands.executeCommand("python.setInterpreter");
 }
 
@@ -92,7 +119,19 @@ export async function resolveFilePythonEnvironment(
     throw new Error("The Microsoft Python extension's environment API is unavailable. Update or enable the extension, then use Python: Select Interpreter.");
   }
   const selected = environments.getActiveEnvironmentPath(resource);
-  const environment = selected ? await environments.resolveEnvironment(selected) : undefined;
+  const selectedId = selected?.id;
+  const selectedPath = selected && normalize(selected.path);
+  const assertCurrentSelection = () => {
+    const current = environments.getActiveEnvironmentPath(resource);
+    const currentPath = current && normalize(current.path);
+    const samePath = process.platform === "win32"
+      ? selectedPath?.toLowerCase() === currentPath?.toLowerCase()
+      : selectedPath === currentPath;
+    if (selectedId !== current?.id || !samePath) {
+      throw new Error("The VS Code Python selection changed while resolving this file's environment. Please try again.");
+    }
+  };
+  const environment = selected ? await environments.resolveEnvironment(selected).finally(assertCurrentSelection) : undefined;
   const pythonPath = environment?.executable?.uri?.fsPath;
   if (!pythonPath) {
     throw new Error("The VS Code Python environment selected for this file has no usable Python executable. Use Python: Select Interpreter for this file's project, then try again.");
@@ -103,5 +142,6 @@ export async function resolveFilePythonEnvironment(
     source: "vscode",
     sourceLabel: "VS Code selected interpreter",
     resource,
+    assertCurrentSelection,
   };
 }

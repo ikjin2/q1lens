@@ -1,8 +1,9 @@
+import { existsSync } from "node:fs";
 import { access, mkdir, readdir, readFile, rm } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { computeDiagnostics } from "./diagnosticsCore";
 import { buildAnalyzeInvocation, buildQ1TimelineAnalyzeInvocation, buildRenderInvocation, runProcessWithSpawn } from "./qbsCli";
-import { OutputPaths, ProjectConfigLite, chooseProjectFile, deriveOutputPaths, parseProjectConfigLite } from "./projectDiscovery";
+import { OutputPaths, ProjectConfigLite, chooseProjectFile, deriveOutputPaths, isProjectFile, parseProjectConfigLite } from "./projectDiscovery";
 import { parseQbsIrText, Q1TimelineDiagnostic, QbsIr } from "./qbsIr";
 import { QbsTimelineSettings, readSettings } from "./settings";
 import { ensureNotebookEnvironment } from "../notebookEnvironment";
@@ -34,7 +35,7 @@ export const QBS_ANALYSIS_REQUIRED_MESSAGE = "Run Q1Lens: Analyze and Open first
 export const QBS_ANALYZE_AND_OPEN_ACTION = "Analyze and Open";
 
 interface AutoRefreshConfigurationEvent {
-  affectsConfiguration(section: string): boolean;
+  affectsConfiguration(section: string, resource?: vscodeTypes.Uri): boolean;
 }
 
 interface AutoRefreshWatcher {
@@ -44,18 +45,59 @@ interface AutoRefreshWatcher {
   dispose(): void;
 }
 
+function createSourceWatcher(vscode: typeof vscodeTypes, file: string): AutoRefreshWatcher {
+  const directory = dirname(file);
+  type Change = "change" | "create" | "delete";
+  const listeners: Partial<Record<Change, (uri: vscodeTypes.Uri) => void>> = {};
+  let watcher: vscodeTypes.FileSystemWatcher | undefined;
+  let generation = 0;
+  let disposed = false;
+  const bind = () => {
+    const currentGeneration = ++generation;
+    watcher?.dispose();
+    let base = directory;
+    while (!existsSync(base) && dirname(base) !== base) base = dirname(base);
+    const missingParent = base !== directory;
+    watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(vscode.Uri.file(base), missingParent ? "**/*" : "*"));
+    const receive = (change: Change) => (uri: vscodeTypes.Uri) => {
+      if (disposed || generation !== currentGeneration) return;
+      const descendant = relative(uri.fsPath, file);
+      const deletedAncestor = change === "delete" && descendant !== "" && descendant !== ".." &&
+        !descendant.startsWith(`..${sep}`) && !isAbsolute(descendant);
+      if (relative(file, uri.fsPath) !== "" && !deletedAncestor) return;
+      if (deletedAncestor || (change === "delete" && !existsSync(directory)) || (missingParent && change === "create")) bind();
+      listeners[change]?.(deletedAncestor ? vscode.Uri.file(file) : uri);
+    };
+    watcher.onDidChange(receive("change"));
+    watcher.onDidCreate(receive("create"));
+    watcher.onDidDelete(receive("delete"));
+  };
+  const subscribe = (change: Change, listener: (uri: vscodeTypes.Uri) => void) => {
+    listeners[change] = listener;
+    return { dispose: () => { if (listeners[change] === listener) delete listeners[change]; } };
+  };
+  bind();
+  return {
+    onDidChange: (listener) => subscribe("change", listener),
+    onDidCreate: (listener) => subscribe("create", listener),
+    onDidDelete: (listener) => subscribe("delete", listener),
+    dispose: () => { disposed = true; generation += 1; watcher?.dispose(); },
+  };
+}
+
 export interface RegisterQbsAutoRefreshDeps {
+  resource?: () => vscodeTypes.Uri | undefined;
   readEnabled: () => boolean;
-  createWatcher: () => AutoRefreshWatcher;
+  createWatcher: () => AutoRefreshWatcher | AutoRefreshWatcher[];
   onDidChangeConfiguration: (
     listener: (event: AutoRefreshConfigurationEvent) => void,
   ) => vscodeTypes.Disposable;
   shouldRefresh: (uri: vscodeTypes.Uri) => boolean;
-  run: () => Promise<void>;
+  run: (isCancelled: () => boolean) => Promise<void>;
   delayMs: number;
 }
 
-export function registerQbsAutoRefresh(deps: RegisterQbsAutoRefreshDeps): vscodeTypes.Disposable {
+export function registerQbsAutoRefresh(deps: RegisterQbsAutoRefreshDeps): vscodeTypes.Disposable & { update(): void } {
   let active: vscodeTypes.Disposable | undefined;
   let disposed = false;
   const stopWatching = () => {
@@ -67,30 +109,37 @@ export function registerQbsAutoRefresh(deps: RegisterQbsAutoRefreshDeps): vscode
     if (disposed || !deps.readEnabled()) {
       return;
     }
-    const queue = new DebouncedRefreshQueue(deps.delayMs, deps.run);
-    const watcher = deps.createWatcher();
+    let cancelled = false;
+    const queue = new DebouncedRefreshQueue(deps.delayMs, () => deps.run(() => cancelled));
+    const created = deps.createWatcher();
+    const watchers = Array.isArray(created) ? created : [created];
     const requestIfCurrentProject = (uri: vscodeTypes.Uri) => {
       if (deps.shouldRefresh(uri)) {
         queue.request();
       }
     };
-    watcher.onDidChange(requestIfCurrentProject);
-    watcher.onDidCreate(requestIfCurrentProject);
-    watcher.onDidDelete(requestIfCurrentProject);
+    for (const watcher of watchers) {
+      watcher.onDidChange(requestIfCurrentProject);
+      watcher.onDidCreate(requestIfCurrentProject);
+      watcher.onDidDelete(requestIfCurrentProject);
+    }
     active = {
       dispose: () => {
+        cancelled = true;
         queue.dispose();
-        watcher.dispose();
+        for (const watcher of watchers) watcher.dispose();
       },
     };
   };
   syncWatcher();
   const configurationChanges = deps.onDidChangeConfiguration((event) => {
-    if (QBS_AUTO_REFRESH_CONFIGURATION_KEYS.some((key) => event.affectsConfiguration(key))) {
+    const resource = deps.resource?.();
+    if (QBS_AUTO_REFRESH_CONFIGURATION_KEYS.some((key) => event.affectsConfiguration(key, resource))) {
       syncWatcher();
     }
   });
   return {
+    update: syncWatcher,
     dispose: () => {
       disposed = true;
       configurationChanges.dispose();
@@ -116,6 +165,7 @@ export async function ensureQbsAnalysisAvailable(input: {
 }
 
 export interface AnalyzeAndOpenDeps {
+  isDisposed?: () => boolean;
   resolveProject: () => Promise<string | undefined>;
   readProjectConfig: (projectFile: string) => Promise<ProjectConfigLite>;
   derivePaths: (input: {
@@ -157,7 +207,7 @@ export interface ScheduleSourceSelection {
 
 export type SourceTarget =
   | { kind: "file"; file: string; line: number }
-  | { kind: "notebook"; file: string; cellIndex: number; cellLine?: number };
+  | { kind: "notebook"; file: string; cellIndex: number; cellLine?: number; cellId?: string };
 
 export function resolveQ1AsmSourceTarget(input: {
   ir: QbsIr;
@@ -201,6 +251,7 @@ export function resolveScheduleSourceTarget(input: {
         kind: "notebook",
         file: input.sourceNotebookFile ?? resolveSourceMapFile(location.notebook.file ?? location.file ?? "", input.projectDir),
         cellIndex: location.notebook.cell_index,
+        ...(location.notebook.cell_id ? { cellId: location.notebook.cell_id } : {}),
         ...(typeof location.notebook.cell_line === "number" ? { cellLine: location.notebook.cell_line } : {}),
       };
     }
@@ -236,12 +287,12 @@ export function isWatchedPathForCurrentProject(input: { changedFile: string; pro
   const changed = resolve(input.changedFile);
   const projectDir = resolve(input.projectDir);
   const rel = relative(projectDir, changed);
-  return rel === "" || (!!rel && !rel.startsWith("..") && !isAbsolute(rel));
+  return rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
 }
 
 export async function openSourceTarget(target: SourceTarget): Promise<void> {
   if (target.kind === "notebook") {
-    await openNotebookAtCell(target.file, target.cellIndex, target.cellLine);
+    await openNotebookAtCell(target.file, target.cellIndex, target.cellLine, target.cellId);
     return;
   }
   await openFileAtLine(target.file, target.line);
@@ -254,17 +305,37 @@ interface NotebookCellContext {
   cells: NotebookTimelineCell[];
 }
 
+interface ManagedNotebookPreparation {
+  projectFile: string;
+  snapshotFile: string;
+  sourceNotebookPath: string;
+  run: () => Promise<void>;
+}
+
 export function createAnalyzeAndOpenHandler(deps: AnalyzeAndOpenDeps): () => Promise<void> {
   return async () => {
+    if (deps.isDisposed?.()) return;
     const projectFile = await deps.resolveProject();
-    if (!projectFile) {
+    if (deps.isDisposed?.() || !projectFile) {
       return;
     }
 
     const config = await deps.readProjectConfig(projectFile);
+    if (deps.isDisposed?.()) return;
     const settings = await deps.readSettings(projectFile, config);
-    if (!settings) {
+    if (deps.isDisposed?.() || !settings) {
       return;
+    }
+    const currentConfig = await deps.readProjectConfig(projectFile);
+    if (deps.isDisposed?.()) return;
+    const projectDir = dirname(projectFile);
+    if ((["scheduleFile", "scheduleNotebook", "sourceNotebook", "outputDir"] as const).some((key) => {
+      const originalValue = key === "outputDir" ? settings.outputDirOverride ?? config[key] : config[key];
+      const currentValue = key === "outputDir" ? settings.outputDirOverride ?? currentConfig[key] : currentConfig[key];
+      return originalValue === undefined || currentValue === undefined ? originalValue !== currentValue
+        : relative(resolve(projectDir, originalValue), resolve(projectDir, currentValue)) !== "";
+    })) {
+      throw new Error("Q1Lens project source or output directory changed while selecting Python. Run Analyze and Open again.");
     }
     if (settings.revealOutputChannel) {
       deps.showOutput();
@@ -280,21 +351,28 @@ export function createAnalyzeAndOpenHandler(deps: AnalyzeAndOpenDeps): () => Pro
     });
 
     await deps.analyze(paths, settings);
+    if (deps.isDisposed?.()) return;
     await deps.render(paths, settings);
+    if (deps.isDisposed?.()) return;
     const ir = await deps.loadIr(paths);
+    if (deps.isDisposed?.()) return;
     if (deps.analyzeQ1Timeline && deps.loadQ1TimelineIr && ir.q1asm_programs.length > 0) {
       try {
         const analyzed = await deps.analyzeQ1Timeline(paths, settings);
+        if (deps.isDisposed?.()) return;
         if (analyzed !== false) {
           const q1timelineIr = await deps.loadQ1TimelineIr(paths);
+          if (deps.isDisposed?.()) return;
           if (q1timelineIr) {
             ir.q1timeline_ir = q1timelineIr;
           }
           if (deps.loadQ1TimelineDiagnostics) {
             ir.q1timeline_diagnostics = await deps.loadQ1TimelineDiagnostics(paths);
+            if (deps.isDisposed?.()) return;
           }
         }
       } catch (error) {
+        if (deps.isDisposed?.()) return;
         ir.q1timeline_diagnostics = [
           fallbackAnalyzerDiagnostic(
             paths.projectFile,
@@ -306,6 +384,7 @@ export function createAnalyzeAndOpenHandler(deps: AnalyzeAndOpenDeps): () => Pro
       }
     }
     const existingFiles = await deps.listExistingQ1asmFiles(paths);
+    if (deps.isDisposed?.()) return;
     deps.publishDiagnostics(paths, ir, existingFiles);
     deps.showPanel(ir, paths);
   };
@@ -325,8 +404,11 @@ export async function analyzeWithCli(paths: OutputPaths, settings: QbsTimelineSe
     pythonArgs: settings.pythonArgs,
     projectFile: paths.projectFile,
     irPath: paths.irPath,
+    ...(settings.outputDirOverride == null ? {} : { outputDir: paths.outputDir }),
   });
-  const result = await runProcessWithSpawn(invocation.command, invocation.args, { cwd: paths.projectDir, timeoutMs: QBS_SUBPROCESS_TIMEOUT_MS });
+  const notebookPath = paths.scheduleNotebookPath && (paths.sourceNotebookPath ?? paths.scheduleNotebookPath);
+  const cwd = notebookPath ? dirname(notebookPath) : paths.projectDir;
+  const result = await runProcessWithSpawn(invocation.command, invocation.args, { cwd, timeoutMs: QBS_SUBPROCESS_TIMEOUT_MS });
   if (result.exitCode !== 0) {
     throw new Error(result.stderr || result.stdout || "Q1Lens analyze failed");
   }
@@ -406,12 +488,18 @@ export async function loadQ1TimelineDiagnosticsFromDisk(paths: OutputPaths): Pro
   }
 }
 
-async function resolveProjectWithVscode(): Promise<string | undefined> {
+async function resolveProjectWithVscode(target?: vscodeTypes.Uri, isDisposed?: () => boolean): Promise<string | undefined> {
+  if (isDisposed?.()) return undefined;
   const vscode = require("vscode") as typeof vscodeTypes;
-  const activeFile = vscode.window.activeTextEditor?.document.uri.fsPath ?? null;
+  const activeFile = target?.fsPath ?? vscode.window.activeTextEditor?.document.uri.fsPath ?? null;
   const discovered = await vscode.workspace.findFiles("**/qbstimeline.y{ml,aml}", "**/.qbs_timeline/**");
+  if (isDisposed?.()) return undefined;
+  const targetProject = target && !isProjectFile(target.fsPath)
+    ? discovered.filter((uri) => isWatchedPathForCurrentProject({ changedFile: target.fsPath, projectDir: dirname(uri.fsPath) }))
+      .sort((left, right) => dirname(right.fsPath).length - dirname(left.fsPath).length)[0]
+    : undefined;
   return chooseProjectFile({
-    activeFile,
+    activeFile: targetProject?.fsPath ?? activeFile,
     discoveredFiles: discovered.map((uri) => uri.fsPath),
     choose: async (items) => {
       const picked = await vscode.window.showQuickPick(items, {
@@ -489,15 +577,20 @@ function explicitNotebookCell(cellArg: unknown): { notebook: any; index: number 
   return undefined;
 }
 
-function notebookCellsFromDocument(vscode: any, notebook: any): NotebookTimelineCell[] {
+export function notebookCellsFromDocument(vscode: any, notebook: any): NotebookTimelineCell[] {
   const cells = typeof notebook.getCells === "function"
     ? notebook.getCells()
     : Array.from({ length: Number(notebook.cellCount || 0) }, (_value, index) => notebook.cellAt(index));
-  return cells.map((cell: any) => ({
-    kind: cell.kind === vscode.NotebookCellKind?.Markup ? "markdown" : "code",
-    text: typeof cell.document?.getText === "function" ? cell.document.getText() : "",
-    metadata: isRecord(cell.metadata) ? { ...cell.metadata } : {},
-  }));
+  return cells.map((cell: any) => {
+    const apiMetadata = isRecord(cell.metadata) ? cell.metadata : {};
+    const notebookMetadata = isRecord(apiMetadata.custom) ? apiMetadata.custom : apiMetadata;
+    return {
+      ...(typeof notebookMetadata.id === "string" ? { id: notebookMetadata.id } : {}),
+      kind: cell.kind === vscode.NotebookCellKind?.Markup ? "markdown" : "code",
+      text: typeof cell.document?.getText === "function" ? cell.document.getText() : "",
+      metadata: isRecord(notebookMetadata.metadata) ? { ...notebookMetadata.metadata } : { ...notebookMetadata },
+    };
+  });
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -510,10 +603,22 @@ export function registerCommands(context: vscodeTypes.ExtensionContext, deps: Re
   const { TimelinePanel } = require("./webview/panel") as typeof import("./webview/panel");
   const output = vscode.window.createOutputChannel("Q1Lens");
   const diagnostics = vscode.languages.createDiagnosticCollection("qbsTimeline");
+  let disposed = false;
   let lastPaths: OutputPaths | undefined;
   let lastIr: QbsIr | undefined;
-  let analyzeHandler: () => Promise<void>;
-  let refreshHandler: () => Promise<void>;
+  let generatedSourceCurrent = true;
+  let openRequestId = 0;
+  let notebookOpenEnvironmentCheck: AbortController | undefined;
+  let analysisQueue = Promise.resolve();
+  let pendingAnalysis: { project: Promise<string | undefined>; prepareProject?: ManagedNotebookPreparation } | undefined;
+  let lastPrepareProject: ManagedNotebookPreparation | undefined;
+  const managedArtifactFiles = new Set<string>();
+  let autoRefresh: ReturnType<typeof registerQbsAutoRefresh> | undefined;
+  const settingsResourcePath = (paths?: OutputPaths) => paths && (paths.scheduleNotebookPath
+    ? paths.sourceNotebookPath ?? paths.scheduleNotebookPath
+    : paths.schedulePath ?? paths.projectFile);
+  let analyzeHandler: (target?: vscodeTypes.Uri) => Promise<void>;
+  let refreshHandler: (isCancelled?: () => boolean) => Promise<void>;
   const ensureAnalysis = () => ensureQbsAnalysisAvailable({
     isAvailable: () => Boolean(lastPaths && lastIr),
     analyze: () => analyzeHandler(),
@@ -521,6 +626,10 @@ export function registerCommands(context: vscodeTypes.ExtensionContext, deps: Re
   });
   const openQ1TimelineSelection = async (selection: Q1TimelineSelection) => {
     if (!(await ensureAnalysis())) {
+      return;
+    }
+    if (!generatedSourceCurrent) {
+      await vscode.window.showWarningMessage("Generated Q1ASM files no longer match this QBS result. Wait for analysis to finish or run Analyze and Open again.");
       return;
     }
     try {
@@ -541,6 +650,10 @@ export function registerCommands(context: vscodeTypes.ExtensionContext, deps: Re
     onOpenQ1AsmSource: async (message) => {
       if (!lastPaths || !lastIr) {
         await vscode.window.showWarningMessage("Run Q1Lens: Analyze and Open before opening Q1ASM source.");
+        return;
+      }
+      if (!generatedSourceCurrent) {
+        await vscode.window.showWarningMessage("Generated Q1ASM files no longer match this QBS result. Wait for analysis to finish or run Analyze and Open again.");
         return;
       }
       try {
@@ -600,18 +713,31 @@ export function registerCommands(context: vscodeTypes.ExtensionContext, deps: Re
       await openSourceTarget(target);
     },
   });
+  context.subscriptions.push({ dispose: () => {
+    disposed = true;
+    notebookOpenEnvironmentCheck?.abort();
+    pendingAnalysis = undefined;
+    lastPaths = undefined;
+    lastIr = undefined;
+    lastPrepareProject = undefined;
+    panel.dispose();
+  } });
 
   const createHandler = (
     resolveProject: () => Promise<string | undefined>,
     notebookEnvironment?: { pythonPath: string; pythonArgs: string[] },
     onEnvironmentResource?: (resource: vscodeTypes.Uri) => void,
+    revealPanel = false,
+    prepareProject?: ManagedNotebookPreparation,
   ) => createAnalyzeAndOpenHandler({
+      isDisposed: () => disposed,
       resolveProject,
       readProjectConfig: readProjectConfigFromDisk,
       derivePaths: (input) => {
         return deriveOutputPaths(input);
       },
       analyze: async (paths, settings) => {
+        if (lastPaths && relative(lastPaths.outputDir, paths.outputDir) === "") generatedSourceCurrent = false;
         output.appendLine(`Analyzing ${paths.projectFile}`);
         await analyzeWithCli(paths, settings);
       },
@@ -639,9 +765,15 @@ export function registerCommands(context: vscodeTypes.ExtensionContext, deps: Re
         });
       },
       showPanel: (ir, paths) => {
-        panel.show(ir, paths);
+        const changedProject = lastPaths?.projectFile !== paths.projectFile || settingsResourcePath(lastPaths) !== settingsResourcePath(paths) ||
+          lastPaths?.schedulePath !== paths.schedulePath || lastPaths?.scheduleNotebookPath !== paths.scheduleNotebookPath ||
+          Boolean(lastPrepareProject) !== Boolean(prepareProject);
+        panel.show(ir, paths, revealPanel);
         lastPaths = paths;
         lastIr = ir;
+        generatedSourceCurrent = true;
+        lastPrepareProject = prepareProject;
+        if (changedProject) autoRefresh?.update();
       },
       readSettings: async (projectFile, config) => {
         if (!config.scheduleNotebook) {
@@ -664,23 +796,74 @@ export function registerCommands(context: vscodeTypes.ExtensionContext, deps: Re
         const environment = notebookEnvironment ?? await ensureNotebookEnvironment(
           vscode, resource, output,
         );
+        if (disposed) return undefined;
+        if (environment) await prepareProject?.run();
         return environment ? { ...settings, ...environment, q1timelineCommand: null } : undefined;
       },
       showOutput: () => output.show(true),
     });
   const runAnalyzeAndOpenForProject = async (
-    projectFile?: string,
+    projectFile?: string | Promise<string | undefined>,
     notebookEnvironment?: { pythonPath: string; pythonArgs: string[] },
+    revealPanel = true,
+    prepareProject?: ManagedNotebookPreparation,
+    isCancelled?: () => boolean,
   ) => {
+    if (disposed) return;
+    const request = { project: typeof projectFile === "string" ? Promise.resolve(projectFile) : projectFile ?? resolveProjectWithVscode(undefined, () => disposed), prepareProject };
+    const projectResult = request.project.then((projectFile) => ({ projectFile }), (error: unknown) => ({ error }));
+    pendingAnalysis = request;
     let resource: vscodeTypes.Uri | undefined;
-    const runner = createHandler(
-      projectFile ? async () => projectFile : resolveProjectWithVscode,
-      notebookEnvironment,
-      (resolvedResource) => { resource = resolvedResource; },
-    );
+    const job = analysisQueue.then(async () => {
+      try {
+        if (disposed || isCancelled?.()) return;
+        if (!notebookEnvironment) {
+          const previousPrepare = prepareProject ?? lastPrepareProject;
+          prepareProject = undefined;
+          if (previousPrepare) {
+            const result = await projectResult;
+            if (disposed || isCancelled?.()) return;
+            if ("projectFile" in result && result.projectFile && relative(result.projectFile, previousPrepare.projectFile) === "") {
+              let config: ProjectConfigLite | undefined;
+              try {
+                config = await readProjectConfigFromDisk(result.projectFile);
+              } catch (error) {
+                if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+              }
+              if (disposed || isCancelled?.()) return;
+              if (!config || (config.scheduleNotebook &&
+                  relative(resolve(dirname(result.projectFile), config.scheduleNotebook), previousPrepare.snapshotFile) === "" &&
+                  config.sourceNotebook &&
+                  relative(resolve(dirname(result.projectFile), config.sourceNotebook), previousPrepare.sourceNotebookPath) === "")) {
+                prepareProject = previousPrepare;
+              }
+            }
+          }
+          request.prepareProject = prepareProject;
+        }
+        await prepareProject?.run();
+        if (disposed || isCancelled?.()) return;
+        const runner = createHandler(
+          async () => {
+            const result = await projectResult;
+            if ("error" in result) throw result.error;
+            return result.projectFile;
+          },
+          notebookEnvironment,
+          (resolvedResource) => { resource = resolvedResource; },
+          revealPanel,
+          prepareProject,
+        );
+        await runner();
+      } finally {
+        if (pendingAnalysis === request) pendingAnalysis = undefined;
+      }
+    });
+    analysisQueue = job.catch(() => undefined);
     try {
-      await runner();
+      await job;
     } catch (error) {
+      if (disposed) return;
       const processError = error as NodeJS.ErrnoException;
       const missingPython = processError.code === "ENOENT" && processError.syscall?.startsWith("spawn");
       output.appendLine(String(error));
@@ -692,58 +875,124 @@ export function registerCommands(context: vscodeTypes.ExtensionContext, deps: Re
         "Q1Lens is unavailable in the selected Python environment.",
         "Check Python Environment",
       );
-      if (action === "Check Python Environment") await vscode.commands.executeCommand("q1lens.checkEnvironment", "qbsTimeline.analyzeAndOpen", resource);
+      if (disposed) return;
+      if (action === "Check Python Environment") {
+        const result = await projectResult;
+        if (disposed) return;
+        const retryTarget = "projectFile" in result && result.projectFile ? vscode.Uri.file(result.projectFile) : resource;
+        await vscode.commands.executeCommand("q1lens.checkEnvironment", "qbsTimeline.analyzeAndOpen", resource, retryTarget);
+      }
     }
   };
-  analyzeHandler = () => runAnalyzeAndOpenForProject();
-  refreshHandler = () => runAnalyzeAndOpenForProject(lastPaths?.projectFile);
+  analyzeHandler = (target) => {
+    openRequestId += 1;
+    notebookOpenEnvironmentCheck?.abort();
+    return runAnalyzeAndOpenForProject(target ? resolveProjectWithVscode(target, () => disposed) : undefined);
+  };
+  refreshHandler = (isCancelled) => runAnalyzeAndOpenForProject(pendingAnalysis?.project ?? lastPaths?.projectFile, undefined, false,
+    pendingAnalysis ? pendingAnalysis.prepareProject : lastPrepareProject, isCancelled);
 
   const openNotebookTimelineFromCell = async (cellArg?: unknown) => {
+    if (disposed) return;
     let notebookContext = resolveNotebookCellContext(vscode, cellArg);
-    if (!notebookContext) {
+    if (!notebookContext || notebookContext.notebook.isUntitled) {
       await vscode.window.showWarningMessage("Open a saved notebook code cell before opening Q1Lens.");
       return;
     }
-    const selectedCell = notebookContext.notebook.cellAt(notebookContext.selectedCellIndex);
-    const environment = await ensureNotebookEnvironment(vscode, notebookContext.notebook.uri, output);
-    if (!environment) return;
-    notebookContext = notebookContext.notebook.isClosed || !notebookContext.notebook.getCells().includes(selectedCell)
-      ? undefined
-      : resolveNotebookCellContext(vscode, selectedCell);
-    if (!notebookContext) {
-      await vscode.window.showWarningMessage("The original notebook cell is no longer available. Open Q1Lens again from a saved notebook code cell.");
-      return;
+    const requestId = ++openRequestId;
+    notebookOpenEnvironmentCheck?.abort();
+    const environmentCheck = new AbortController();
+    notebookOpenEnvironmentCheck = environmentCheck;
+    let inputCancellation: vscodeTypes.CancellationTokenSource | undefined;
+    const abortInput = () => inputCancellation?.cancel();
+    environmentCheck.signal.addEventListener("abort", abortInput, { once: true });
+    try {
+      const selectedCell = notebookContext.notebook.cellAt(notebookContext.selectedCellIndex);
+      const environment = await ensureNotebookEnvironment(vscode, notebookContext.notebook.uri, output, undefined, environmentCheck.signal);
+      if (disposed || requestId !== openRequestId || !environment) return;
+      notebookContext = notebookContext.notebook.isClosed || !notebookContext.notebook.getCells().includes(selectedCell)
+        ? undefined
+        : resolveNotebookCellContext(vscode, selectedCell);
+      if (!notebookContext) {
+        await vscode.window.showWarningMessage("The original notebook cell is no longer available. Open Q1Lens again from a saved notebook code cell.");
+        return;
+      }
+      inputCancellation = new vscode.CancellationTokenSource();
+      const defaults = inferNotebookTimelineVariables(notebookContext.cells, notebookContext.selectedCellIndex);
+      const scheduleVariable = await vscode.window.showInputBox({
+        title: "Schedule variable",
+        prompt: "Name of the notebook variable containing the Qblox schedule.",
+        value: defaults.scheduleVariable,
+        ignoreFocusOut: true,
+      }, inputCancellation.token);
+      if (disposed || requestId !== openRequestId || !scheduleVariable) {
+        return;
+      }
+      const compilerVariable = await vscode.window.showInputBox({
+        title: "Compiler variable",
+        prompt: "Name of the notebook variable containing the compiler or hardware agent.",
+        value: defaults.compilerVariable,
+        ignoreFocusOut: true,
+      }, inputCancellation.token);
+      if (disposed || requestId !== openRequestId || !compilerVariable) {
+        return;
+      }
+      notebookContext = notebookContext.notebook.isClosed || !notebookContext.notebook.getCells().includes(selectedCell)
+        ? undefined
+        : resolveNotebookCellContext(vscode, selectedCell);
+      if (!notebookContext) {
+        await vscode.window.showWarningMessage("The original notebook cell is no longer available. Open Q1Lens again from a saved notebook code cell.");
+        return;
+      }
+      const projectInput = {
+        notebookPath: notebookContext.notebookPath,
+        selectedCellIndex: notebookContext.selectedCellIndex,
+        scheduleVariable,
+        compilerVariable,
+        cells: notebookContext.cells,
+      };
+      const project = createManagedNotebookTimelineProject(projectInput);
+      managedArtifactFiles.add(project.projectFile);
+      managedArtifactFiles.add(project.snapshotFile);
+      let projectInitialized = false;
+      const prepareProject = async () => {
+        if (disposed) return;
+        const current = selectedCell.notebook.isClosed || !selectedCell.notebook.getCells().includes(selectedCell)
+          ? undefined : resolveNotebookCellContext(vscode, selectedCell);
+        if (!current) throw new Error("The original notebook cell is no longer available. Open Q1Lens again from a saved notebook code cell.");
+        const snapshot = createManagedNotebookTimelineProject({
+          ...projectInput, selectedCellIndex: current.selectedCellIndex, cells: current.cells,
+        });
+        await vscode.workspace.fs.createDirectory(vscode.Uri.file(snapshot.projectDir));
+        if (disposed) return;
+        await vscode.workspace.fs.writeFile(vscode.Uri.file(snapshot.snapshotFile), Buffer.from(snapshot.snapshotJson, "utf8"));
+        if (disposed) return;
+        let initializeProject = !projectInitialized;
+        if (!initializeProject) {
+          try {
+            await access(snapshot.projectFile);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+            initializeProject = true;
+          }
+          if (disposed) return;
+        }
+        if (initializeProject) {
+          await vscode.workspace.fs.writeFile(vscode.Uri.file(snapshot.projectFile), Buffer.from(snapshot.projectYaml, "utf8"));
+          projectInitialized = true;
+        }
+      };
+      return runAnalyzeAndOpenForProject(project.projectFile, environment, true, {
+        projectFile: project.projectFile,
+        snapshotFile: project.snapshotFile,
+        sourceNotebookPath: projectInput.notebookPath,
+        run: prepareProject,
+      });
+    } finally {
+      environmentCheck.signal.removeEventListener("abort", abortInput);
+      inputCancellation?.dispose();
+      if (notebookOpenEnvironmentCheck === environmentCheck) notebookOpenEnvironmentCheck = undefined;
     }
-    const defaults = inferNotebookTimelineVariables(notebookContext.cells, notebookContext.selectedCellIndex);
-    const scheduleVariable = await vscode.window.showInputBox({
-      title: "Schedule variable",
-      prompt: "Name of the notebook variable containing the Qblox schedule.",
-      value: defaults.scheduleVariable,
-      ignoreFocusOut: true,
-    });
-    if (!scheduleVariable) {
-      return;
-    }
-    const compilerVariable = await vscode.window.showInputBox({
-      title: "Compiler variable",
-      prompt: "Name of the notebook variable containing the compiler or hardware agent.",
-      value: defaults.compilerVariable,
-      ignoreFocusOut: true,
-    });
-    if (!compilerVariable) {
-      return;
-    }
-    const project = createManagedNotebookTimelineProject({
-      notebookPath: notebookContext.notebookPath,
-      selectedCellIndex: notebookContext.selectedCellIndex,
-      scheduleVariable,
-      compilerVariable,
-      cells: notebookContext.cells,
-    });
-    await vscode.workspace.fs.createDirectory(vscode.Uri.file(project.projectDir));
-    await vscode.workspace.fs.writeFile(vscode.Uri.file(project.snapshotFile), Buffer.from(project.snapshotJson, "utf8"));
-    await vscode.workspace.fs.writeFile(vscode.Uri.file(project.projectFile), Buffer.from(project.projectYaml, "utf8"));
-    await runAnalyzeAndOpenForProject(project.projectFile, environment);
   };
 
   const markNotebookCell = async (tag: string, cellArg?: unknown) => {
@@ -764,7 +1013,13 @@ export function registerCommands(context: vscodeTypes.ExtensionContext, deps: Re
       const metadata = index === notebookContext.selectedCellIndex
         ? withNotebookCellTag(withoutSchedule, tag)
         : withoutSchedule;
-      return vscode.NotebookEdit.updateCellMetadata(index, metadata);
+      const apiMetadata = notebookContext.notebook.cellAt(index).metadata;
+      const updatedMetadata = isRecord(apiMetadata?.custom)
+        ? { ...apiMetadata, custom: { ...apiMetadata.custom, metadata } }
+        : isRecord(apiMetadata?.metadata) || typeof apiMetadata?.id === "string"
+          ? { ...apiMetadata, metadata }
+          : metadata;
+      return vscode.NotebookEdit.updateCellMetadata(index, updatedMetadata);
     });
     const edit = new vscode.WorkspaceEdit();
     edit.set(notebookContext.notebook.uri, edits);
@@ -776,7 +1031,7 @@ export function registerCommands(context: vscodeTypes.ExtensionContext, deps: Re
 
   context.subscriptions.push(output, diagnostics);
   context.subscriptions.push(vscode.commands.registerCommand("qbsTimeline.analyzeAndOpen", analyzeHandler));
-  context.subscriptions.push(vscode.commands.registerCommand("qbsTimeline.refresh", refreshHandler));
+  context.subscriptions.push(vscode.commands.registerCommand("qbsTimeline.refresh", () => refreshHandler()));
   context.subscriptions.push(
     vscode.commands.registerCommand("qbsTimeline.openIr", async () => {
       if (!(await ensureAnalysis())) {
@@ -832,15 +1087,46 @@ export function registerCommands(context: vscodeTypes.ExtensionContext, deps: Re
   const onDidChangeConfiguration = typeof vscode.workspace.onDidChangeConfiguration === "function"
     ? (listener: (event: AutoRefreshConfigurationEvent) => void) => vscode.workspace.onDidChangeConfiguration(listener)
     : () => ({ dispose: () => undefined });
-  context.subscriptions.push(registerQbsAutoRefresh({
-    readEnabled: () => readSettings().autoRefresh,
-    createWatcher: () => vscode.workspace.createFileSystemWatcher(QBS_AUTO_REFRESH_GLOB),
+  const autoRefreshResource = () => {
+    const resource = settingsResourcePath(lastPaths);
+    return resource ? vscode.Uri.file(resource) : undefined;
+  };
+  autoRefresh = registerQbsAutoRefresh({
+    resource: autoRefreshResource,
+    readEnabled: () => readSettings(autoRefreshResource()).autoRefresh,
+    createWatcher: () => {
+      const watchers: AutoRefreshWatcher[] = [vscode.workspace.createFileSystemWatcher(QBS_AUTO_REFRESH_GLOB)];
+      if (!lastPaths) return watchers;
+      const externalProject = !vscode.workspace.getWorkspaceFolder(vscode.Uri.file(lastPaths.projectDir));
+      if (externalProject) watchers.push(vscode.workspace.createFileSystemWatcher(
+        new vscode.RelativePattern(vscode.Uri.file(lastPaths.projectDir), QBS_AUTO_REFRESH_GLOB),
+      ));
+      const sources = lastPrepareProject
+        ? [lastPaths.sourceNotebookPath ?? lastPaths.scheduleNotebookPath]
+        : [lastPaths.schedulePath, lastPaths.scheduleNotebookPath];
+      for (const file of sources) {
+        if (!file) continue;
+        const coveredByGlob = /\.(?:py|ipynb)$/.test(file) || /(?:^|[\\/])qbstimeline\.ya?ml$/.test(file);
+        if (coveredByGlob && (vscode.workspace.getWorkspaceFolder(vscode.Uri.file(file)) ||
+            (externalProject && isWatchedPathForCurrentProject({ changedFile: file, projectDir: lastPaths.projectDir })))) continue;
+        watchers.push(createSourceWatcher(vscode, file));
+      }
+      return watchers;
+    },
     onDidChangeConfiguration,
-    shouldRefresh: (uri) => Boolean(
-      lastPaths
-      && isWatchedPathForCurrentProject({ changedFile: uri.fsPath, projectDir: lastPaths.projectDir }),
-    ),
+    shouldRefresh: (uri) => {
+      if (!lastPaths) return false;
+      if (lastPrepareProject) {
+        const source = lastPaths.sourceNotebookPath ?? lastPaths.scheduleNotebookPath;
+        if (source && relative(source, uri.fsPath) === "") return true;
+      }
+      if ([...managedArtifactFiles].some((file) => relative(file, uri.fsPath) === "")) return false;
+      if (lastPrepareProject) return false;
+      if ([lastPaths.schedulePath, lastPaths.scheduleNotebookPath].some((file) => file && relative(file, uri.fsPath) === "")) return true;
+      return isWatchedPathForCurrentProject({ changedFile: uri.fsPath, projectDir: lastPaths.projectDir });
+    },
     run: refreshHandler,
     delayMs: 750,
-  }));
+  });
+  context.subscriptions.push(autoRefresh);
 }

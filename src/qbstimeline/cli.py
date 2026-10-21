@@ -58,6 +58,7 @@ def _build_parser(*, prog: str = "qbstimeline") -> argparse.ArgumentParser:
     analyze = subparsers.add_parser("analyze", help="Compile a qbstimeline project into QBS IR")
     analyze.add_argument("--project", required=True, help="Path to qbstimeline.yml")
     analyze.add_argument("--out", required=True, help="Output QBS IR JSON path")
+    analyze.add_argument("--out-dir", type=Path, help="Override the generated artifact directory")
     analyze.add_argument("--strict", action="store_true", help="Return exit code 1 for analysis warnings")
 
     build = subparsers.add_parser("build", help="Analyze and render a qbstimeline project")
@@ -99,6 +100,11 @@ def _build_parser(*, prog: str = "qbstimeline") -> argparse.ArgumentParser:
 def _analyze_command(args: argparse.Namespace) -> int:
     try:
         config = load_project_config(args.project)
+        if args.out_dir is not None:
+            output_dir = args.out_dir.expanduser()
+            if not output_dir.is_absolute():
+                output_dir = config.root / output_dir
+            config = replace(config, output_dir=output_dir.resolve())
         result = analyze_project(config)
         write_qbs_ir(result.ir, Path(args.out))
     except (ConfigLoadError, RuntimeError, OSError) as exc:

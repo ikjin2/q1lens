@@ -6,7 +6,7 @@ import type * as vscodeTypes from "vscode";
 import { probePythonEnvironment, type PythonEnvironmentReport } from "./environment";
 import { notebookInstallCommand, type NotebookInstaller } from "./notebookInstallCommand";
 import { notebookSetupHtml } from "./notebookSetupHtml";
-import { publishPythonEnvironment } from "./pythonEnvironmentStatus";
+import { beginPythonEnvironmentCheck, publishPythonEnvironment, type PythonEnvironmentCheck } from "./pythonEnvironmentStatus";
 
 interface NotebookKernel {
   readonly language: string;
@@ -33,7 +33,9 @@ interface KernelEnvironment {
 async function kernelEnvironment(
   vscode: typeof vscodeTypes,
   kernel: NotebookKernel,
+  signal?: AbortSignal,
 ): Promise<KernelEnvironment> {
+  signal?.throwIfAborted();
   const directory = await mkdtemp(join(tmpdir(), "q1lens-kernel-"));
   const nonce = randomUUID();
   const proofFile = join(directory, "host-proof");
@@ -47,6 +49,7 @@ except OSError:
 print(${JSON.stringify(marker)} + json.dumps({"executable": sys.executable, "hostname": socket.gethostname(), "proof": proof}))`;
   try {
     await writeFile(proofFile, nonce, { mode: 0o600 });
+    signal?.throwIfAborted();
     return await vscode.window.withProgress({
       location: vscode.ProgressLocation.Notification,
       title: "Q1Lens: Checking notebook environment…", cancellable: true,
@@ -54,20 +57,20 @@ print(${JSON.stringify(marker)} + json.dumps({"executable": sys.executable, "hos
       const cancellation = new vscode.CancellationTokenSource();
       let timer: NodeJS.Timeout | undefined;
       let subscription: vscodeTypes.Disposable | undefined;
+      let abort: (() => void) | undefined;
       try {
         const stopped = new Promise<never>((_resolve, reject) => {
-          subscription = token.onCancellationRequested(() => {
+          abort = () => {
             cancellation.cancel();
             reject(new vscode.CancellationError());
-          });
+          };
+          subscription = token.onCancellationRequested(abort);
+          signal?.addEventListener("abort", abort, { once: true });
           timer = setTimeout(() => {
             cancellation.cancel();
             reject(new Error("The notebook kernel did not respond within 60 seconds. Allow Jupyter kernel access for Q1Lens if prompted, or wait for the current cell to finish, then try again."));
           }, 60000);
-          if (token.isCancellationRequested) {
-            cancellation.cancel();
-            reject(new vscode.CancellationError());
-          }
+          if (token.isCancellationRequested || signal?.aborted) abort();
         });
         const execution = (async () => {
           let stdout = "";
@@ -94,6 +97,7 @@ print(${JSON.stringify(marker)} + json.dumps({"executable": sys.executable, "hos
       } finally {
         if (timer) clearTimeout(timer);
         subscription?.dispose();
+        if (abort) signal?.removeEventListener("abort", abort);
         cancellation.cancel();
         cancellation.dispose();
       }
@@ -123,7 +127,9 @@ export async function showNotebookSetup(
   check: () => Promise<NotebookEnvironmentState>,
   openNotebook: () => PromiseLike<unknown>,
   fileEnvironment = false,
+  signal?: AbortSignal,
 ): Promise<NotebookPythonEnvironment | undefined> {
+  if (signal?.aborted) return undefined;
   const panel = vscode.window.createWebviewPanel(
     "q1lens.notebookSetup", fileEnvironment ? "Q1Lens: Python Setup" : "Q1Lens: Notebook Setup", vscode.ViewColumn.Active,
     { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [] },
@@ -147,8 +153,10 @@ export async function showNotebookSetup(
   return new Promise((resolve) => {
     let closed = false;
     let busy = false;
+    const abort = () => panel.dispose();
     const disposal = panel.onDidDispose(() => {
       closed = true;
+      signal?.removeEventListener("abort", abort);
       messages.dispose();
       disposal.dispose();
       resolve(undefined);
@@ -214,6 +222,8 @@ export async function showNotebookSetup(
         if (!closed) void panel.webview.postMessage({ type: "idle" });
       }
     });
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
   });
 }
 
@@ -222,27 +232,49 @@ export async function ensureNotebookEnvironment(
   vscode: typeof vscodeTypes,
   notebookUri: vscodeTypes.Uri,
   output: vscodeTypes.OutputChannel,
+  owner?: PythonEnvironmentCheck,
+  signal?: AbortSignal,
 ): Promise<NotebookPythonEnvironment | undefined> {
-  const openNotebook = async () => vscode.window.showNotebookDocument(await vscode.workspace.openNotebookDocument(notebookUri));
+  if (signal?.aborted) return undefined;
+  let initialCheck: PythonEnvironmentCheck | undefined = owner ? { ...owner } : beginPythonEnvironmentCheck();
+  const openNotebook = async () => {
+    if (signal?.aborted) return;
+    const notebook = await vscode.workspace.openNotebookDocument(notebookUri);
+    if (signal?.aborted) return;
+    return vscode.window.showNotebookDocument(notebook);
+  };
   try {
     if (vscode.workspace.isTrusted === false) throw new Error("Trust this workspace before Q1Lens uses the notebook kernel.");
     const extension = vscode.extensions.getExtension<JupyterApi>("ms-toolsai.jupyter");
     if (!extension) {
       const action = await vscode.window.showErrorMessage("Q1Lens needs the Microsoft Jupyter extension to use this notebook's Python environment.", "Open Jupyter Extension");
+      signal?.throwIfAborted();
       if (action) await vscode.commands.executeCommand("extension.open", "ms-toolsai.jupyter");
       return undefined;
     }
     const api = await extension.activate();
+    signal?.throwIfAborted();
     if (!api.kernels?.getKernel) throw new Error("Update the Microsoft Jupyter extension to use the notebook's Python environment.");
     const check = async (): Promise<NotebookEnvironmentState> => {
+      signal?.throwIfAborted();
+      const checking = initialCheck ?? beginPythonEnvironmentCheck(owner);
+      initialCheck = undefined;
       const kernel = await api.kernels!.getKernel(notebookUri);
+      signal?.throwIfAborted();
       if (!kernel) throw new Error("Select a Python kernel for this notebook and run a cell once, then open Q1Lens again.");
       if (kernel.language.toLowerCase() !== "python") throw new Error("Select a Python kernel for this notebook, run a cell, then open Q1Lens again.");
-      const environment = await kernelEnvironment(vscode, kernel);
+      const environment = await kernelEnvironment(vscode, kernel, signal);
+      signal?.throwIfAborted();
       output.appendLine(`Notebook ${notebookUri.toString()}: Python ${environment.executable}`);
       const report = await probePythonEnvironment(environment.executable, [], { cwd: tmpdir(), env: { PYTHONPATH: "" } });
+      signal?.throwIfAborted();
+      const currentKernel = await api.kernels!.getKernel(notebookUri);
+      signal?.throwIfAborted();
+      if (currentKernel !== kernel) {
+        throw new Error("The notebook kernel changed while checking its Python environment. Run Q1Lens again or choose Check Again for the current kernel.");
+      }
       publishPythonEnvironment({ pythonPath: environment.executable, pythonArgs: [], source: "notebook",
-        sourceLabel: "Notebook kernel", resource: notebookUri, report });
+        sourceLabel: "Notebook kernel", resource: notebookUri, report }, checking);
       if (!report.supported) throw new Error(`The notebook uses Python ${report.version} (${environment.executable}). Q1Lens requires Python 3.10 or newer; select a compatible notebook kernel.`);
       if (report.qbsError || report.q1asmError) output.appendLine(report.qbsError || report.q1asmError || "");
       return { environment, report };
@@ -253,6 +285,7 @@ export async function ensureNotebookEnvironment(
         `${environmentIssue(current.report)} Notebook: ${basename(notebookUri.fsPath)}. Python: ${current.environment.executable}`,
         "Show Setup", "Check Again", "Open Notebook",
       );
+      signal?.throwIfAborted();
       if (action === "Open Notebook") await openNotebook();
       if (action === "Check Again") {
         current = await check();
@@ -263,14 +296,15 @@ export async function ensureNotebookEnvironment(
       if (typeof version !== "string" || !/^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(version)) {
         throw new Error("Cannot determine the Q1Lens extension version for the suggested install command.");
       }
-      return await showNotebookSetup(vscode, notebookUri, current, version, check, openNotebook);
+      return await showNotebookSetup(vscode, notebookUri, current, version, check, openNotebook, false, signal);
     }
     return { pythonPath: current.environment.executable, pythonArgs: [] };
   } catch (error) {
-    if (error instanceof vscode.CancellationError) return undefined;
+    if (signal?.aborted || error instanceof vscode.CancellationError) return undefined;
     const message = error instanceof Error ? error.message : String(error);
     output.appendLine(message);
     const action = await vscode.window.showErrorMessage(`Q1Lens: ${message}`, "Open Notebook", "Show Output");
+    if (signal?.aborted) return undefined;
     if (action === "Open Notebook") await openNotebook();
     if (action === "Show Output") output.show(true);
     return undefined;

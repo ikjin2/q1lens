@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { basename, dirname } from "node:path";
 import type * as vscodeTypes from "vscode";
 import type { PythonEnvironmentReport } from "./environment";
-import { selectVSCodeInterpreter } from "./pythonEnvironment";
+import { beginPythonEnvironmentSelection, selectVSCodeInterpreter } from "./pythonEnvironment";
 
 export interface PythonEnvironmentDisplay {
   pythonPath: string;
@@ -18,10 +18,26 @@ export interface PythonEnvironmentDisplay {
 
 let current: PythonEnvironmentDisplay | undefined;
 let update: (() => void) | undefined;
+let checkGeneration = 0;
+
+export interface PythonEnvironmentCheck { generation: number; }
+
+export function beginPythonEnvironmentCheck(owner?: PythonEnvironmentCheck): PythonEnvironmentCheck {
+  const check = { generation: ++checkGeneration };
+  // A notebook setup recheck also renews the command waiting for that notebook.
+  if (owner) owner.generation = check.generation;
+  return check;
+}
+
+export function isCurrentPythonEnvironmentCheck(check: PythonEnvironmentCheck): boolean {
+  return check.generation === checkGeneration;
+}
 
 export function lastPythonEnvironment(): PythonEnvironmentDisplay | undefined { return current; }
 
-export function publishPythonEnvironment(environment: PythonEnvironmentDisplay): void {
+export function publishPythonEnvironment(environment: PythonEnvironmentDisplay, check?: PythonEnvironmentCheck): void {
+  if (check && !isCurrentPythonEnvironmentCheck(check)) return;
+  if (!check) checkGeneration += 1;
   current = environment;
   update?.();
 }
@@ -35,6 +51,7 @@ export function pythonEnvironmentHtml(environment: PythonEnvironmentDisplay): st
   const error = environment.error || (report && (!report.supported ? "Python 3.10 or newer is required." : report.qbsError || report.q1asmError));
   const state = error ? "Needs attention" : report ? "Ready" : "Checking…";
   const command = JSON.stringify([environment.pythonPath, ...environment.pythonArgs]);
+  const target = JSON.stringify(environment.resource.toString()).replace(/</g, "\\u003c");
   return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';">
@@ -63,7 +80,7 @@ ${error ? `<p role="alert">${escape(error)}</p>` : ""}
 <p class="muted">This is the environment checked for the analysis target above.</p>
 <button data-action="check">Check Again</button><button data-action="select">${environment.source === "manual" ? "Open Python Settings" : environment.source === "notebook" ? "Open Notebook" : "Select Interpreter"}</button>
 ${environment.source === "manual" ? '<button data-action="follow">Follow VS Code Selection</button><p class="muted">Keeps your saved Q1Lens paths and launcher arguments. You can restore them by setting Python Environment to Auto.</p>' : ""}
-<script nonce="${nonce}">const vscode=acquireVsCodeApi();document.querySelectorAll('button').forEach(button=>button.addEventListener('click',()=>vscode.postMessage({type:button.dataset.action})));</script>
+<script nonce="${nonce}">const vscode=acquireVsCodeApi();document.querySelectorAll('button').forEach(button=>button.addEventListener('click',()=>vscode.postMessage({type:button.dataset.action,target:${target}})));</script>
 </main></body></html>`;
 }
 
@@ -84,7 +101,7 @@ export function registerPythonEnvironmentStatus(context: vscodeTypes.ExtensionCo
     status.show();
     if (panel) panel.webview.html = pythonEnvironmentHtml(current);
   };
-  context.subscriptions.push(status, { dispose: () => { update = undefined; current = undefined; panel?.dispose(); } },
+  context.subscriptions.push(status, { dispose: () => { checkGeneration += 1; update = undefined; current = undefined; panel?.dispose(); } },
     vscode.commands.registerCommand("q1lens.showPythonEnvironment", async () => {
       if (!current) { await vscode.commands.executeCommand("q1lens.checkEnvironment"); if (!current) return; }
       if (panel) { panel.reveal(); return; }
@@ -93,13 +110,18 @@ export function registerPythonEnvironmentStatus(context: vscodeTypes.ExtensionCo
       panel.webview.html = pythonEnvironmentHtml(current);
       const messages = panel.webview.onDidReceiveMessage(async (message: unknown) => {
         if (!current || !message || typeof message !== "object") return;
-        const type = (message as { type?: string }).type;
+        const { type, target } = message as { type?: string; target?: string };
+        if (target !== current.resource.toString()) return;
         if (type === "check") await vscode.commands.executeCommand("q1lens.checkEnvironment", undefined, current.resource);
         if (type === "follow" && current.source === "manual") {
           const resource = current.resource;
+          const generation = checkGeneration;
           const scope = vscode.workspace.getWorkspaceFolder(resource) ? vscode.ConfigurationTarget.WorkspaceFolder : vscode.ConfigurationTarget.Global;
-          await vscode.workspace.getConfiguration("q1lens", resource).update("pythonEnvironment", "vscode", scope);
-          await vscode.commands.executeCommand("q1lens.checkEnvironment", undefined, resource);
+          const { isCurrent, updateSettings } = beginPythonEnvironmentSelection(vscode, resource);
+          await updateSettings(async () => {
+            await vscode.workspace.getConfiguration("q1lens", resource).update("pythonEnvironment", "vscode", scope);
+          });
+          if (isCurrent() && generation === checkGeneration) await vscode.commands.executeCommand("q1lens.checkEnvironment", undefined, resource);
         }
         if (type === "select") {
           if (current.source === "manual") await vscode.commands.executeCommand("workbench.action.openSettings", "@ext:q1lens.q1lens python");

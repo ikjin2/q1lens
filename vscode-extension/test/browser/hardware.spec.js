@@ -3,6 +3,57 @@ const { createHash } = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 
+test("replay generation can retry after an analysis failure or completion without a remount", async ({ page }) => {
+  await page.goto("about:blank");
+  await page.setContent('<!doctype html><html><head></head><body><main id="timeline-root"></main></body></html>');
+  await page.evaluate(() => {
+    let saved = { hardwareState: { level: "detail", sequencerId: "seq", replayOpen: true } };
+    window.messages = [];
+    window.acquireVsCodeApi = () => ({
+      getState: () => saved, setState: (state) => { saved = state; },
+      postMessage: (message) => window.messages.push(message),
+    });
+    const data = document.createElement("script");
+    data.id = "timeline-ir";
+    data.type = "application/json";
+    data.textContent = JSON.stringify({
+      sequencers: [{ id: "seq" }], register_history: [],
+      execution: { seq: { mode: "analysis" } },
+      events: [{ id: "issue", kind: "q1_issue", sequencer_id: "seq", lane: "q1.issue",
+        t0: 0, t1: 4, meta: {}, source: { file: "seq.q1asm", line: 1 } }],
+    });
+    document.body.append(data);
+  });
+  const assets = path.resolve(__dirname, "../../src");
+  for (const file of ["shared/timeline/renderer.css", "q1timeline/media/timeline.css", "q1timeline/media/hardwareView.css"]) {
+    await page.addStyleTag({ path: path.join(assets, file) });
+  }
+  for (const file of ["shared/timeline/instructionColors.js", "shared/timeline/renderer.js", "q1timeline/media/timelineAdapter.js",
+    "q1timeline/media/hardwareState.js", "q1timeline/media/hardwareView.js", "q1timeline/media/timeline.js"]) {
+    await page.addScriptTag({ path: path.join(assets, file) });
+  }
+  const prepare = page.locator('[data-action="replay-prepare"]');
+  await expect(prepare).toBeVisible();
+  for (const terminalStatus of ["error", "idle"]) {
+    await prepare.click();
+    await expect(prepare).toHaveText("Generating execution trace…");
+    await expect(prepare).toBeDisabled();
+    for (const status of ["analyzing", "stale", "rendering"]) {
+      await page.evaluate((status) => window.dispatchEvent(new MessageEvent("message", {
+        data: { type: "setAnalysisStatus", status },
+      })), status);
+      await expect(prepare).toBeDisabled();
+    }
+    await page.evaluate((status) => window.dispatchEvent(new MessageEvent("message", {
+      data: { type: "setAnalysisStatus", status },
+    })), terminalStatus);
+    await expect(prepare).toHaveText("Generate execution trace");
+    await expect(prepare).toBeEnabled();
+  }
+  await prepare.click();
+  expect(await page.evaluate(() => window.messages.filter((message) => message.type === "prepareExecutionReplay").length)).toBe(3);
+});
+
 test("removed comparison events do not create hardware state or move its cursor", async ({ page }) => {
   const source = { file: "seq.q1asm", line: 1, raw: "upd_param 4" };
   const event = (id, kind, t0, t1, meta) => ({
@@ -34,6 +85,149 @@ test("removed comparison events do not create hardware state or move its cursor"
   await page.getByRole("button", { name: "Execution replay", exact: true }).click();
   await expect(page.locator('[data-action="replay-run"]')).toBeVisible();
   await expect(value(page, "replay-progress")).toHaveText("1 / 1 instructions");
+});
+
+test("refresh restores the inspected register together with its cursor and number format", async ({ page }) => {
+  await open(page, "01-digital", "QCM0", "counter");
+  await at(page, 32);
+  await page.evaluate(() => {
+    const initialState = window.hardwarePreview.getState();
+    window.hardwarePreview.destroy();
+    window.hardwarePreview = window.q1lensHardwareView.mount(document.getElementById("hardware"), window.demoIr, {
+      initialState, onStateChange(state) { window.persistedHardwareState = state; },
+    });
+  });
+  await page.locator('[data-register="R1"]').click();
+  await page.getByRole("combobox", { name: "Register number format" }).selectOption("hex");
+  await page.evaluate(() => {
+    window.hardwarePreview.destroy();
+    window.hardwarePreview = window.q1lensHardwareView.mount(document.getElementById("hardware"), window.demoIr, {
+      initialState: window.persistedHardwareState,
+      onSourceClick(source) { window.revealedSource = source; },
+    });
+  });
+  await expect(page.getByRole("spinbutton")).toHaveValue("32");
+  await expect(page.getByRole("combobox", { name: "Register number format" })).toHaveValue("hex");
+  await expect(page.locator('[data-register="R1"]')).toHaveAttribute("aria-pressed", "true");
+  await expect(value(page, "register-detail")).toContainText("R1 = 0x00000001");
+  expect(await page.evaluate(() => window.hardwarePreview.getState().selectedRegister)).toBe("R1");
+  await page.getByRole("button", { name: "Open source", exact: true }).click();
+  expect((await page.evaluate(() => window.revealedSource)).line).toBe(6);
+});
+
+test("refresh restores the selected bin history and its page", async ({ page }) => {
+  await page.route("**/ir/01-digital.json", (route) => route.fulfill({ json: {
+    sequencers: [{ id: "seq", module: "QRM0" }], register_history: [],
+    events: Array.from({ length: 17 }, (_, bin) => ({
+      id: `acquire-${bin}`, kind: "acquire", sequencer_id: "seq", lane: "rt.acquire",
+      t0: bin * 4, t1: (bin + 1) * 4,
+      source: { file: "bins.q1asm", line: bin + 1, raw: `acquire 0,${bin},4` },
+      meta: { acquisition_index: 0, bin_index: bin, rt_packet_id: `packet-${bin}` },
+    })),
+  } }));
+  await open(page, "01-digital", "QRM0", "seq");
+  await at(page, 68);
+  await page.evaluate(() => {
+    const initialState = window.hardwarePreview.getState();
+    window.hardwarePreview.destroy();
+    window.hardwarePreview = window.q1lensHardwareView.mount(document.getElementById("hardware"), window.demoIr, {
+      initialState, onStateChange(state) { window.persistedBinState = state; },
+    });
+  });
+  await tab(page, "Bins");
+  await page.locator('[data-action="bins-next"]').click();
+  await page.locator('[data-bin="0:16"]').click();
+  await expect(value(page, "bin-history")).toContainText("Acquisition 0 · bin 16");
+  await page.evaluate(() => {
+    window.hardwarePreview.destroy();
+    window.hardwarePreview = window.q1lensHardwareView.mount(document.getElementById("hardware"), window.demoIr, {
+      initialState: window.persistedBinState,
+      onSourceClick(source) { window.revealedBinSource = source; },
+    });
+  });
+  await expect(value(page, "bin-count")).toHaveText("17–17 of 17 targets");
+  await expect(value(page, "bin-history")).toContainText("Acquisition 0 · bin 16");
+  await page.getByRole("button", { name: "Open source", exact: true }).click();
+  expect((await page.evaluate(() => window.revealedBinSource)).line).toBe(17);
+  await at(page, 67);
+  await expect(value(page, "bin-count")).toHaveText("17–17 of 17 targets");
+  await expect(value(page, "bin-history")).toContainText("Acquisition 0 · bin 16");
+  await value(page, "bins").getByRole("button", { name: "64 ns", exact: true }).click();
+  await expect(page.getByRole("spinbutton")).toHaveValue("64");
+  await expect(value(page, "bin-count")).toHaveText("17–17 of 17 targets");
+  await expect(value(page, "bin-history")).toContainText("Acquisition 0 · bin 16");
+  await at(page, 63);
+  await expect(value(page, "bin-count")).toHaveText("1–16 of 16 targets");
+  await expect(value(page, "bin-history")).toContainText("Select a bin number");
+  await page.evaluate(() => {
+    const initialState = window.hardwarePreview.getState();
+    window.hardwarePreview.destroy();
+    const shorterIr = { ...window.demoIr, events: window.demoIr.events.slice(0, 1) };
+    window.hardwarePreview = window.q1lensHardwareView.mount(document.getElementById("hardware"), shorterIr, { initialState });
+  });
+  await expect(value(page, "bin-count")).toHaveText("1–1 of 1 targets");
+  await expect(value(page, "bin-history")).toContainText("Select a bin number");
+  await expect(page.locator('[data-action="bins-previous"]')).toBeDisabled();
+});
+
+test("bin paging resets consistently when choosing a different sequencer", async ({ page }) => {
+  await page.route("**/ir/01-digital.json", (route) => route.fulfill({ json: {
+    sequencers: ["first", "second"].map((id) => ({ id, module: "QRM0" })), register_history: [],
+    events: ["first", "second"].flatMap((sequencer_id) => Array.from({ length: 17 }, (_, bin) => ({
+      id: `${sequencer_id}-${bin}`, kind: "acquire", sequencer_id, lane: "rt.acquire",
+      t0: bin * 4, t1: (bin + 1) * 4,
+      source: { file: `${sequencer_id}.q1asm`, line: bin + 1 },
+      meta: { acquisition_index: 0, bin_index: bin, rt_packet_id: `${sequencer_id}-${bin}` },
+    }))),
+  } }));
+  await page.goto("/?case=01-digital");
+  await page.getByRole("button", { name: "Open QRM0: 2 sequencers", exact: true }).click();
+  await page.getByRole("button", { name: "Inspect sequencer first", exact: true }).click();
+  await at(page, 68);
+  await tab(page, "Bins");
+  await page.locator('[data-action="bins-next"]').click();
+  await expect(value(page, "bin-count")).toHaveText("17–17 of 17 targets");
+  await page.getByRole("button", { name: "Zoom out one hardware level", exact: true }).click();
+  await page.getByRole("button", { name: "Inspect sequencer second", exact: true }).click();
+  await expect(value(page, "bin-count")).toHaveText("1–16 of 17 targets");
+  await page.locator('[data-action="bins-next"]').click();
+  await page.evaluate(() => window.hardwarePreview.selectEvent("first-16"));
+  await expect(value(page, "bin-count")).toHaveText("1–16 of 17 targets");
+  await expect(page.getByRole("combobox", { name: "Hardware sequencer" })).toHaveValue("first");
+});
+
+test("rewinding or refreshing before a selected bin exists cannot open another bin's source", async ({ page }) => {
+  await page.route("**/ir/01-digital.json", (route) => route.fulfill({ json: {
+    sequencers: [{ id: "seq", module: "QRM0" }], register_history: [],
+    events: [0, 1].map((bin) => ({
+      id: `acquire-${bin}`, kind: "acquire", sequencer_id: "seq", lane: "rt.acquire",
+      t0: bin * 4, t1: (bin + 1) * 4, source: { file: "bins.q1asm", line: bin + 1 },
+      meta: { acquisition_index: 0, bin_index: bin, rt_packet_id: `packet-${bin}` },
+    })),
+  } }));
+  await open(page, "01-digital", "QRM0", "seq");
+  await at(page, 8);
+  await tab(page, "Bins");
+  await page.locator('[data-bin="0:1"]').click();
+  const openSource = page.getByRole("button", { name: "Open source", exact: true });
+  await openSource.click();
+  expect((await page.evaluate(() => window.revealedSource)).line).toBe(2);
+  await at(page, 3);
+  await expect(value(page, "bin-history")).toContainText("Select a bin number");
+  await expect(openSource).toBeDisabled();
+  await at(page, 8);
+  await expect(value(page, "bin-history")).toContainText("Acquisition 0 · bin 1");
+  await openSource.click();
+  expect((await page.evaluate(() => window.revealedSource)).line).toBe(2);
+  await page.evaluate(() => {
+    const initialState = window.hardwarePreview.getState();
+    window.hardwarePreview.destroy();
+    window.hardwarePreview = window.q1lensHardwareView.mount(document.getElementById("hardware"), {
+      ...window.demoIr, events: window.demoIr.events.slice(0, 1),
+    }, { initialState, onSourceClick(source) { window.revealedSource = source; } });
+  });
+  await expect(value(page, "bin-history")).toContainText("Select a bin number");
+  await expect(openSource).toBeDisabled();
 });
 
 test("missing signal samples leave chart gaps and real zero samples remain visible", async ({ page }) => {

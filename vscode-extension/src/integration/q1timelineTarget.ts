@@ -64,7 +64,8 @@ function findMapping(ir: QbsIr, selection: Q1TimelineSelection): QbsProvenanceMa
   if (exactSourceMatches.length) {
     return preferredMapping(exactSourceMatches, selection);
   }
-  const exactSchedulableIds = [block?.schedulable_id].filter((value): value is string => typeof value === "string" && value.length > 0);
+  const operation = selection.blockId ? ir.operations.find((candidate) => candidate.id === selection.blockId) : undefined;
+  const exactSchedulableIds = [block?.schedulable_id, operation?.id].filter((value): value is string => typeof value === "string" && value.length > 0);
   const exactSchedulableMatches = ir.q1asm_provenance.filter((candidate) => exactSchedulableIds.includes(candidate.schedulable_id ?? ""));
   if (exactSchedulableMatches.length) {
     return preferredMapping(exactSchedulableMatches, selection);

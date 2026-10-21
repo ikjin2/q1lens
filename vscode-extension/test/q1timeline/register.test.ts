@@ -21,6 +21,7 @@ function quickFixApi() {
     },
     workspace: {
       onDidChangeTextDocument: () => ({ dispose: () => undefined }),
+      onDidOpenTextDocument: () => ({ dispose: () => undefined }),
     },
     CodeActionKind: { QuickFix: "quickfix" },
     languages: {
@@ -34,6 +35,7 @@ describe("q1timeline registration", () => {
     const registeredCommands = new Map<string, (...args: any[]) => any>();
     const previewCalls: any[] = [];
     let selectionZoomCalls = 0;
+    let controllerDisposals = 0;
     const vscode = {
       ...quickFixApi(),
       commands: {
@@ -52,6 +54,7 @@ describe("q1timeline registration", () => {
       if (request === "./controller") {
         return {
           TimelineController: class {
+            dispose() { controllerDisposals += 1; }
             openPreview(options?: any) {
               previewCalls.push(options);
             }
@@ -71,7 +74,8 @@ describe("q1timeline registration", () => {
     delete require.cache[modulePath];
     try {
       const { registerQ1Timeline } = require("../../src/q1timeline/register");
-      registerQ1Timeline({ subscriptions: [] });
+      const context = { subscriptions: [] as Array<{ dispose(): void }> };
+      registerQ1Timeline(context);
       const selectedUri = createUri("C:\\repo\\clicked.q1asm");
 
       await registeredCommands.get("q1timeline.openPreview")?.(selectedUri);
@@ -79,6 +83,8 @@ describe("q1timeline registration", () => {
 
       assert.equal(previewCalls[0].sourceUri.fsPath, selectedUri.fsPath);
       assert.equal(selectionZoomCalls, 1);
+      for (const subscription of context.subscriptions) subscription.dispose();
+      assert.equal(controllerDisposals, 1, "Extension shutdown must dispose its timeline controller");
     } finally {
       delete require.cache[modulePath];
       Module._load = originalLoad;

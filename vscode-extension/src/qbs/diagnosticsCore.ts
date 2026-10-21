@@ -26,6 +26,7 @@ interface SpanNs {
 }
 
 const QBS_TO_Q1TIMELINE_NS = 1e9;
+const OPERATION_WINDOW_TOLERANCE_SECONDS = 1e-15;
 const CROSS_LAYER_TOLERANCE_NS = 0.001;
 const IGNORED_CROSS_LAYER_EVENT_KINDS = new Set([
   "branch_region",
@@ -48,7 +49,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function findOperation(ir: QbsIr, block: QbsSymbolicBlock): QbsOperation | undefined {
-  return ir.operations.find((operation) => operation.id === block.operation_id || operation.operation_id === block.operation_id);
+  return ir.operations.find((operation) => operation.id === block.schedulable_id)
+    ?? ir.operations.find((operation) => operation.id === block.operation_id || operation.operation_id === block.operation_id);
 }
 
 function q1asmText(ir: QbsIr, sequencer: string): string {
@@ -70,7 +72,7 @@ function q1asmLines(text: string): string[] {
 }
 
 function q1asmOpcode(line: string): string {
-  return line.trimStart().split(/[,\s#]+/, 1)[0] ?? "";
+  return line.trimStart().replace(/^[A-Za-z_][A-Za-z0-9_]*\s*:\s*/, "").split(/[,\s#]+/, 1)[0] ?? "";
 }
 
 function q1asmOpcodeMatches(line: string, expected: string): boolean {
@@ -144,6 +146,9 @@ function sequencerAliases(ir: QbsIr, sequencer: string): Set<string> {
 function provenanceMatchesBlock(mapping: QbsIr["q1asm_provenance"][number], block: QbsSymbolicBlock): boolean {
   if (mapping.source_id) {
     return mapping.source_id === block.id;
+  }
+  if (mapping.schedulable_id && block.schedulable_id) {
+    return mapping.schedulable_id === block.schedulable_id;
   }
   const candidates = new Set(
     [block.id, block.operation_id, block.schedulable_id].filter((value): value is string => typeof value === "string" && value.length > 0),
@@ -369,7 +374,10 @@ export function computeDiagnostics(ir: QbsIr, context: DiagnosticContext): QbsDi
 
   for (const block of ir.symbolic_pulses) {
     const operation = findOperation(ir, block);
-    if (operation && (block.abs_time < operation.abs_time || endTime(block) > endTime(operation))) {
+    if (operation && (
+      block.abs_time < operation.abs_time - OPERATION_WINDOW_TOLERANCE_SECONDS
+      || endTime(block) > endTime(operation) + OPERATION_WINDOW_TOLERANCE_SECONDS
+    )) {
       diagnostics.push({
         code: "QBST001",
         severity: "error",

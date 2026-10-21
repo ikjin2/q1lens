@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { computeDiagnostics } from "../src/qbs/diagnosticsCore";
-import { QbsIr } from "../src/qbs/qbsIr";
+import { parseQbsIrText, QbsIr } from "../src/qbs/qbsIr";
 
 function baseIr(): QbsIr {
   return {
@@ -52,6 +56,116 @@ function crossLayerWarnings(ir: QbsIr) {
 }
 
 describe("diagnosticsCore", () => {
+  it("accepts matching provenance after valid labels in a real compiled program", function () {
+    this.timeout(30000);
+    const repo = resolve(__dirname, "../../..");
+    const directory = mkdtempSync(join(tmpdir(), "qbs-labeled-provenance-"));
+    const outputDir = join(directory, "artifacts"), irFile = join(outputDir, "qbs_ir.json");
+    mkdirSync(outputDir);
+    const source = readFileSync(join(repo, "examples/basic-transmon/schedule.py"), "utf8")
+      .replace("set_awg_gain 32767,0\\n", "   _gain_1 : set_awg_gain 32767,0 # setter\\n")
+      .replace("play 0,1,4\\n", "_pulse2:play 0,1,4 # pulse\\n")
+      .replace("wait 36\\n", "tail_3 :\twait 36 # remaining\\n");
+    writeFileSync(join(directory, "schedule.py"), source);
+    const project = join(directory, "qbstimeline.yml");
+    writeFileSync(project, "schedule:\n  file: schedule.py\noutputs:\n  dir: artifacts\nlow_level:\n  q1timeline: false\n");
+    const options = { cwd: repo, env: { ...process.env, PYTHONPATH: join(repo, "src") }, encoding: "utf8" as const, windowsHide: true };
+    execFileSync("python", ["-B", "-m", "q1lens", "analyze", "--project", project, "--out", irFile], options);
+    const ir = parseQbsIrText(readFileSync(irFile, "utf8"));
+    const program = ir.q1asm_programs[0];
+    const parsed = JSON.parse(execFileSync("python", ["-B", "-c",
+      "import json,sys; from pathlib import Path; from q1timeline.q1asm.parser import parse_q1asm; p=parse_q1asm(Path(sys.argv[1]).read_text()); print(json.dumps({'instructions':[(i.op,i.source.line) for i in p.instructions if i.label], 'diagnostics':[d.message for d in p.diagnostics]}))",
+      join(outputDir, program.file),
+    ], options));
+    assert.deepEqual(parsed.diagnostics, []);
+    assert.deepEqual(parsed.instructions, [["set_awg_gain", 4], ["play", 5], ["wait", 6]]);
+    const diagnostics = computeDiagnostics(ir, { outputDir, existingFiles: new Set(ir.q1asm_programs.map((item) => item.file)) });
+    assert.deepEqual(diagnostics.filter((item) => item.code === "QBST003"), []);
+    assert.ok(!diagnostics.some((item) => item.code === "QBST-IR-q1asm_instruction_mismatch" || item.message.includes("IR invariant q1asm_instruction_mismatch")),
+      "The compiler's invariant validator must also recognize the actual labeled instruction");
+  });
+
+  for (const instruction of ["pulse: wait 4", "pulse: # play 0,1,5", "first: second:play 0,1,5", "@pulse: play 0,1,5", "9pulse:play 0,1,5", "pulse: PLAY 0,1,5"]) {
+    it(`retains provenance mismatch errors for ${instruction}`, () => {
+      const ir = baseIr();
+      ir.q1asm_by_sequencer!.seq0 = `wait 10\n${instruction}\nstop\n`;
+      const diagnostics = computeDiagnostics(ir, { outputDir: "/repo/.qbs_timeline", existingFiles: new Set(["q1asm/seq0.q1asm"]) });
+      assert.equal(diagnostics.some((item) => item.code === "QBST003"), true);
+    });
+  }
+
+  it("validates repeated operation windows against the block's schedulable", () => {
+    const ir = baseIr();
+    ir.operations = [
+      { id: "first", operation_id: "shared", label: "First", abs_time: 0, duration: 10 },
+      { id: "second", operation_id: "shared", label: "Second", abs_time: 20, duration: 10 },
+    ];
+    ir.symbolic_pulses[0] = { ...ir.symbolic_pulses[0], operation_id: "shared", schedulable_id: "second", abs_time: 20, duration: 10 };
+    const context = { outputDir: "/repo/.qbs_timeline", existingFiles: new Set(["q1asm/seq0.q1asm"]) };
+    assert.equal(computeDiagnostics(ir, context).some((diagnostic) => diagnostic.code === "QBST001"), false);
+
+    ir.symbolic_pulses[0].duration = 11;
+    const exceeded = computeDiagnostics(ir, context).filter((diagnostic) => diagnostic.code === "QBST001");
+    assert.equal(exceeded.length, 1);
+    assert.equal(exceeded[0].operationId, "second");
+  });
+
+  it("accepts a real compiled pulse ending at its operation's floating-point boundary", function () {
+    this.timeout(30000);
+    const repo = resolve(__dirname, "../../..");
+    const directory = mkdtempSync(join(tmpdir(), "qbs-window-precision-"));
+    try {
+      writeFileSync(join(directory, "schedule.py"), `class Compiler:
+    def compile(self, schedule):
+        return {
+            "name": schedule["name"],
+            "schedulables": {"drive": {"operation_id": "delayed_pulse", "abs_time": 0.0}},
+            "operations": {"delayed_pulse": {
+                "name": "Delayed pulse", "duration": 12e-9,
+                "pulse_info": [{"name": "SquarePulse", "port": "q0:mw", "clock": "q0.01", "t0": 4e-9, "duration": 8e-9, "amp": 0.5}]
+            }},
+            "compiled_instructions": {"cluster0": {"module1": {"sequencers": {"seq0": {"sequence": {
+                "program": "wait_sync 4\\nwait 4\\nplay 0,1,8\\nstop\\n",
+                "waveforms": {"i": {"index": 0, "data": [0.0, 0.5, 0.0]}, "q": {"index": 1, "data": [0.0, 0.0, 0.0]}}
+            }}}}}}
+        }
+def build_schedule():
+    return {"name": "Delayed pulse"}
+def build_compiler():
+    return Compiler()
+`);
+      const project = join(directory, "qbstimeline.yml"), outputDir = join(directory, "artifacts"), irFile = join(outputDir, "qbs_ir.json");
+      writeFileSync(project, "schedule:\n  file: schedule.py\noutputs:\n  dir: artifacts\nlow_level:\n  q1timeline: false\n");
+      execFileSync("python", ["-B", "-m", "q1lens", "analyze", "--project", project, "--out", irFile], {
+        cwd: repo, env: { ...process.env, PYTHONPATH: join(repo, "src") }, encoding: "utf8", windowsHide: true,
+      });
+      const ir = parseQbsIrText(readFileSync(irFile, "utf8"));
+      const context = { outputDir, existingFiles: new Set(ir.q1asm_programs.map((program) => program.file)) };
+      assert.deepEqual(ir.ir_diagnostics, []);
+      assert.equal(ir.operations[0].duration, 12e-9);
+      assert.equal(ir.symbolic_pulses[0].abs_time, 4e-9);
+      assert.equal(ir.symbolic_pulses[0].duration, 8e-9);
+      assert.equal(computeDiagnostics(ir, context).filter((diagnostic) => diagnostic.code === "QBST001").length, 0);
+
+      ir.symbolic_pulses[0].duration += 4e-9;
+      assert.equal(computeDiagnostics(ir, context).filter((diagnostic) => diagnostic.code === "QBST001").length, 1);
+    } finally {
+      assert.equal(resolve(directory, ".."), resolve(tmpdir()));
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores roundoff at an operation's start but reports a pulse starting 4 ns early", () => {
+    const ir = baseIr();
+    ir.operations[0] = { ...ir.operations[0], abs_time: 0, duration: 8e-9 };
+    ir.symbolic_pulses[0] = { ...ir.symbolic_pulses[0], abs_time: 12e-9 - (4e-9 + 8e-9), duration: 8e-9 };
+    const context = { outputDir: "/repo/.qbs_timeline", existingFiles: new Set(["q1asm/seq0.q1asm"]) };
+    assert.equal(computeDiagnostics(ir, context).filter((diagnostic) => diagnostic.code === "QBST001").length, 0);
+
+    ir.symbolic_pulses[0].abs_time = -4e-9;
+    assert.equal(computeDiagnostics(ir, context).filter((diagnostic) => diagnostic.code === "QBST001").length, 1);
+  });
+
   it("reports QBST001 when a symbolic block exceeds its operation window", () => {
     const ir = baseIr();
     ir.symbolic_pulses[0] = { ...ir.symbolic_pulses[0], abs_time: 14, duration: 3 };
@@ -242,6 +356,31 @@ describe("diagnosticsCore", () => {
     });
 
     assert.equal(diagnostics.some((diagnostic) => diagnostic.code === "QBST003"), true);
+  });
+
+  it("compares repeated pulses only with provenance from their own schedulable", () => {
+    const ir = baseIr();
+    ir.operations = [
+      { id: "first", operation_id: "shared", label: "First", abs_time: 0, duration: 10e-9 },
+      { id: "second", operation_id: "shared", label: "Second", abs_time: 20e-9, duration: 10e-9 },
+    ];
+    ir.symbolic_pulses = ir.operations.map((operation) => ({
+      ...ir.symbolic_pulses[0], id: `pulse:${operation.id}`, schedulable_id: operation.id,
+      operation_id: "shared", abs_time: operation.abs_time, duration: operation.duration,
+    }));
+    ir.q1asm_by_sequencer = { seq0: "play 0,0,10\nwait 10\nplay 0,0,10\nstop\n" };
+    ir.q1asm_programs[0].text = ir.q1asm_by_sequencer.seq0;
+    ir.q1asm_provenance = ir.operations.map((operation, index) => ({
+      sequencer: "seq0", operation_id: "shared", schedulable_id: operation.id, line: index * 2 + 1, instruction: "play",
+    }));
+    ir.q1timeline_ir = { events: [event("play", 0, 10, 1, "play 0,0,10"), event("play", 20, 30, 3, "play 0,0,10")] };
+    assert.deepEqual(crossLayerWarnings(ir), []);
+
+    (ir.q1timeline_ir as any).events[1] = event("play", 24, 34, 3, "play 0,0,10");
+    const warnings = crossLayerWarnings(ir);
+    assert.equal(warnings.length, 1);
+    assert.equal(warnings[0].blockId, "pulse:second");
+    assert.match(warnings[0].message, /QBS 20-30 ns, q1timeline 24-34 ns/);
   });
 
   it("reports QBST007 when provenance-mapped q1timeline spans drift from QBS intent", () => {

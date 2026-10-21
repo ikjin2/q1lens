@@ -187,6 +187,10 @@ body.mode-normal .event.loop-collapsed {
   display: none;
 }
 
+#timeline-root .event.is-filtered {
+  display: none;
+}
+
 .q1timeline-toolbar {
   display: flex;
   flex-wrap: wrap;

@@ -41,6 +41,521 @@ async function mount(page, status = "completed", actualIr, initialState = {}, ho
   await page.addScriptTag({path: path.join(assets, "q1timeline/media/timeline.js")});
 }
 
+test("restores Q1ASM view state only for the same project", async ({page}) => {
+  const ir = {sequencers: [{id: "seq", module: "QCM0"}], events: [
+    event("play", "play", 0, 1000), event("stop", "stop", 1000, 1000),
+  ]};
+  const projectA = {parameterProjectFile: "C:/project-a/q1timeline.yml"};
+  await mount(page, "idle", ir, {}, projectA);
+  const fullWindow = await page.locator("#q1timeline-time-window").getAttribute("title");
+  await page.getByRole("button", {name: "Open QCM0: 1 sequencer", exact: true}).click();
+  await page.getByRole("button", {name: "Inspect sequencer seq", exact: true}).click();
+  const time = page.getByRole("spinbutton", {name: "Selected time in nanoseconds"});
+  await time.fill("600");
+  await time.press("Enter");
+  await page.getByRole("button", {name: "Zoom in", exact: true}).click();
+  await expect.poll(() => page.evaluate(() => window.getSavedTimelineState().hardwareState?.time)).toBe(600);
+  const saved = await page.evaluate(() => window.getSavedTimelineState());
+  const zoomedWindow = await page.locator("#q1timeline-time-window").getAttribute("title");
+  expect(zoomedWindow).not.toBe(fullWindow);
+
+  await mount(page, "idle", ir, saved, projectA);
+  await expect(page.locator("#q1timeline-hardware")).toHaveAttribute("data-navigation-level", "detail");
+  await expect(time).toHaveValue("600");
+  await expect(page.locator("#q1timeline-time-window")).toHaveAttribute("title", zoomedWindow);
+
+  const legacy = {...saved};
+  delete legacy.timelineProjectFile;
+  await mount(page, "idle", ir, legacy, projectA);
+  await expect(page.locator("#q1timeline-hardware")).toHaveAttribute("data-navigation-level", "detail");
+  await expect(time).toHaveValue("600");
+  await expect(page.locator("#q1timeline-time-window")).toHaveAttribute("title", zoomedWindow);
+
+  const refreshed = await page.evaluate(() => window.getSavedTimelineState());
+  await mount(page, "idle", ir, refreshed, {parameterProjectFile: "C:/project-b/q1timeline.yml"});
+  await expect(page.locator("#q1timeline-hardware")).toHaveAttribute("data-navigation-level", "modules");
+  await expect(time).toHaveValue("0");
+  await expect(page.locator("#q1timeline-time-window")).toHaveAttribute("title", fullWindow);
+});
+
+test("parameter errors restore keyboard retry without taking focus from another control", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const {ir, html} = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json,tempfile", "from pathlib import Path", "from q1timeline.playback import PlaybackSession",
+    "from q1timeline.render.html import render_html", "directory=tempfile.TemporaryDirectory()", "root=Path(directory.name)",
+    'root.joinpath("parameters.q1asm").write_text("wait {WAIT}\\nstop\\n")',
+    'root.joinpath("params.json").write_text(json.dumps({"WAIT":64}))',
+    'root.joinpath("q1timeline.yml").write_text("params: {file: params.json}\\nalignment: {mode: none}\\nsequencers: [{id: seq, file: parameters.q1asm}]\\n")',
+    'session=PlaybackSession.from_project(root/"q1timeline.yml")', "session.run(budget_ms=1000,max_steps=100)",
+    "ir=session.snapshot()", "print(json.dumps({'ir':ir,'html':render_html(ir,default_mode='debug')}))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+    /type=["']application\/json["']/i.test(attributes) ? tag : "");
+  await mount(page, "completed", ir, {parametersOpen: true}, {parameterProjectFile: "C:/project/q1timeline.yml"}, shell);
+  await page.getByRole("button", {name: "Edit WAIT", exact: true}).click();
+  const input = page.getByRole("textbox", {name: "WAIT JSON value", exact: true});
+  await expect(input).toBeFocused();
+  await input.fill("invalid");
+  await input.press("Enter");
+  await expect(input).toBeDisabled();
+  // Flush the disabled input's browser blur before the asynchronous host reply.
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  await expect(input).not.toBeFocused();
+  const error = (message) => page.evaluate((message) => window.dispatchEvent(new MessageEvent("message", {
+    data: {type: "analysisParameterError", name: "WAIT", message},
+  })), message);
+  await error("Enter a valid JSON value.");
+  await expect(input).toBeEnabled();
+  await expect(input).toBeFocused();
+  await expect(input).toHaveValue("invalid");
+  await expect(page.locator(".parameter-error")).toHaveText("Enter a valid JSON value.");
+  await page.keyboard.press("ControlOrMeta+A");
+  await page.keyboard.type("128");
+  await page.keyboard.press("Enter");
+  await expect(input).toBeDisabled();
+  const requests = () => page.evaluate(() => window.messages.filter((message) => message.type === "setAnalysisParameter"));
+  expect((await requests()).map((message) => message.valueJson)).toEqual(["invalid", "128"]);
+  const zoom = page.getByRole("button", {name: "Zoom in", exact: true});
+  await zoom.focus();
+  await error("Analysis could not complete.");
+  await expect(zoom).toBeFocused();
+  await expect(input).toBeEnabled();
+  await expect(input).toHaveValue("128");
+  await expect(page.locator(".parameter-status")).toHaveText("");
+  await expect(page.locator(".parameter-value > code")).toHaveText("64");
+  expect(await page.evaluate(() => JSON.parse(document.getElementById("timeline-ir").textContent))).toEqual(ir);
+  await page.screenshot({path: test.info().outputPath("parameter-keyboard-error-retry.png"), fullPage: true});
+});
+
+test("reset errors keep the overridden value and restore keyboard retry", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const {ir, html} = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json,tempfile", "from pathlib import Path", "from q1timeline.playback import PlaybackSession",
+    "from q1timeline.render.html import render_html", "directory=tempfile.TemporaryDirectory()", "root=Path(directory.name)",
+    'root.joinpath("parameters.q1asm").write_text("wait {WAIT}\\nstop\\n")',
+    'root.joinpath("params.json").write_text(json.dumps({"WAIT":64}))',
+    'root.joinpath("q1timeline.yml").write_text("params: {file: params.json}\\nalignment: {mode: none}\\nsequencers: [{id: seq, file: parameters.q1asm}]\\n")',
+    'session=PlaybackSession.from_project(root/"q1timeline.yml",params={"WAIT":128})', "session.run(budget_ms=1000,max_steps=100)",
+    "ir=session.snapshot()", "print(json.dumps({'ir':ir,'html':render_html(ir,default_mode='debug')}))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+    /type=["']application\/json["']/i.test(attributes) ? tag : "");
+  await mount(page, "completed", ir, {parametersOpen: true},
+    {parameterProjectFile: "C:/project/q1timeline.yml", parameterOverrideNames: ["WAIT"]}, shell);
+  const edit = page.getByRole("button", {name: "Edit WAIT", exact: true});
+  await edit.click();
+  const input = page.getByRole("textbox", {name: "WAIT JSON value", exact: true});
+  await expect(input).toHaveValue("128");
+  await input.fill("256");
+  await input.press("Escape");
+  await expect(edit).toBeFocused();
+  const requests = () => page.evaluate(() => window.messages.filter((message) => /AnalysisParameter$/.test(message.type)));
+  expect(await requests()).toEqual([]);
+  const reset = page.getByRole("button", {name: "Remove temporary override for WAIT", exact: true});
+  await reset.focus();
+  await reset.press("Enter");
+  await expect(reset).toBeDisabled();
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  const error = () => page.evaluate(() => window.dispatchEvent(new MessageEvent("message", {
+    data: {type: "analysisParameterError", name: "WAIT", message: "Parameter change was not applied: environment unavailable"},
+  })));
+  await error();
+  await expect(reset).toBeEnabled();
+  await expect(reset).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect(reset).toBeDisabled();
+  expect((await requests()).map((message) => message.type)).toEqual(["resetAnalysisParameter", "resetAnalysisParameter"]);
+  const zoom = page.getByRole("button", {name: "Zoom in", exact: true});
+  await zoom.focus();
+  await error();
+  await expect(zoom).toBeFocused();
+  await expect(reset).toBeEnabled();
+  await expect(page.locator(".parameter-editor")).toBeHidden();
+  await expect(page.locator(".parameter-status")).toHaveText("");
+  await expect(page.locator(".parameter-value > code")).toHaveText("128");
+  await expect(page.locator(".parameter-base")).toHaveText("← base 64");
+  expect(await page.evaluate(() => JSON.parse(document.getElementById("timeline-ir").textContent))).toEqual(ir);
+  await page.screenshot({path: test.info().outputPath("parameter-reset-keyboard-retry.png"), fullPage: true});
+});
+
+test("successful parameter reanalysis keeps the source filter only for the same project", async ({page}) => {
+  const fs = require("node:fs"), repo = path.resolve(__dirname, "../../..");
+  function project(name) {
+    const directory = test.info().outputPath(name);
+    fs.mkdirSync(directory, {recursive: true});
+    fs.writeFileSync(path.join(directory, "seq.q1asm"), "move 7,R0\nset_freq 100\nupd_param 4\nwait {WAIT}\nstop\n");
+    fs.writeFileSync(path.join(directory, "params.json"), JSON.stringify({WAIT: 64}));
+    const file = path.join(directory, "q1timeline.yml");
+    fs.writeFileSync(file, "params: {file: params.json}\nalignment: {mode: none}\nsequencers: [{id: seq, file: seq.q1asm, module: QCM0}]\n");
+    return file;
+  }
+  function analyze(projectFile, overrides = {}) {
+    return JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+      "import json,sys", "from q1timeline.playback import PlaybackSession", "from q1timeline.render.html import render_html",
+      "session=PlaybackSession.from_project(sys.argv[1],params=json.loads(sys.argv[2]))", "session.run(budget_ms=1000,max_steps=100)",
+      "ir=session.snapshot()", "assert ir['playback']['status']=='completed'",
+      "print(json.dumps({'ir':ir,'html':render_html(ir,default_mode='debug')}))",
+    ].join("\n"), projectFile, JSON.stringify(overrides)], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  }
+  const projectA = project("project-a");
+  async function show(data, saved, projectFile = projectA) {
+    const shell = data.html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+      /type=["']application\/json["']/i.test(attributes) ? tag : "");
+    await mount(page, "completed", data.ir, saved, {parameterProjectFile: projectFile,
+      parameterOverrideNames: data.ir.analysis.parameters.filter((item) => item.overridden).map((item) => item.name)}, shell);
+  }
+  const first = analyze(projectA);
+  await show(first, {parametersOpen: true, hardwareState: {level: "detail", sequencerId: "seq", time: 16}});
+  const stop = () => page.locator(`.timeline-block[data-event-id="${first.ir.events.find((event) => event.kind === "stop").id}"]`).first();
+  await expect(stop()).toBeVisible();
+  await page.getByRole("button", {name: "Search parameters", exact: true}).click();
+  const parameterSearch = page.getByRole("searchbox", {name: "Search parameters by name", exact: true});
+  await parameterSearch.fill("WAIT");
+  await page.locator("#q1timeline-analysis-details > summary").click();
+  const filter = page.getByRole("searchbox", {name: "Filter source or kind", exact: true});
+  await filter.fill("wait");
+  await expect(stop()).toBeHidden();
+  const edit = page.getByRole("button", {name: "Edit WAIT", exact: true});
+  await edit.click();
+  const input = page.getByRole("textbox", {name: "WAIT JSON value", exact: true});
+  await input.fill("999"); await input.press("Escape"); await expect(edit).toBeFocused();
+  expect(await page.evaluate(() => window.messages.filter((message) => /AnalysisParameter$/.test(message.type)))).toEqual([]);
+  await edit.click(); await input.fill("128"); await input.press("Enter"); await expect(input).toBeDisabled();
+  const request = await page.evaluate(() => window.messages.find((message) => message.type === "setAnalysisParameter"));
+  const updated = analyze(request.projectFile, {[request.name]: JSON.parse(request.valueJson)});
+  await show(updated, await page.evaluate(() => window.getSavedTimelineState()));
+  await expect(page.locator(".parameter-value > code")).toHaveText("128");
+  await expect(page.locator(".parameter-base")).toHaveText("← base 64");
+  await expect(parameterSearch).toHaveValue("WAIT");
+  await expect(page.getByRole("spinbutton", {name: "Selected time in nanoseconds", exact: true})).toHaveValue("16");
+  await expect(filter).toHaveValue("wait");
+  await expect(stop()).toBeHidden();
+  await filter.clear();
+  await expect(stop()).toBeVisible();
+  await show(updated, await page.evaluate(() => window.getSavedTimelineState()));
+  await expect(filter).toHaveValue(""); await expect(stop()).toBeVisible();
+  await filter.fill("wait");
+  const projectB = project("project-b");
+  await show(analyze(projectB), await page.evaluate(() => window.getSavedTimelineState()), projectB);
+  await page.locator("#q1timeline-analysis-details > summary").click();
+  await expect(filter).toHaveValue(""); await expect(stop()).toBeVisible();
+  await page.screenshot({path: test.info().outputPath("parameter-success-filter-project-scope.png"), fullPage: true});
+});
+
+test("hardware register writers keep the exact instruction inspector inside a collapsed loop", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const {ir, html} = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json", "from q1timeline.playback import PlaybackSession", "from q1timeline.render.html import render_html",
+    "session=PlaybackSession.from_project('examples/concrete-register-execution/q1timeline.yml')",
+    "session.run(budget_ms=1000,max_steps=100)", "ir=session.snapshot()", "assert ir['playback']['status']=='completed'",
+    "print(json.dumps({'ir':ir,'html':render_html(ir,default_mode='debug')}))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+    /type=["']application\/json["']/i.test(attributes) ? tag : "");
+  await mount(page, "completed", ir, {hardwareState: {level: "detail", sequencerId: "counter", time: 140}}, {}, shell);
+  const time = page.getByRole("spinbutton", {name: "Selected time in nanoseconds", exact: true});
+  const register = (name) => page.locator(`[data-register="${name}"] strong`);
+  const detail = page.locator('[data-value="register-detail"]');
+  const sourceDetail = page.locator('[data-value="selection-detail"]');
+  const source = page.getByRole("button", {name: "Open source", exact: true});
+  const inspector = page.locator("#event-inspector-fields");
+  const loop = page.getByRole("button", {name: "Executed loop options", exact: true});
+  await expect(loop).toHaveAttribute("data-state", "1");
+  await page.locator('[data-register="R2"]').click();
+  await expect(register("R2")).toHaveText("3");
+  const file = ir.register_history.find((entry) => entry.register === "R2").source.file;
+  await expect(sourceDetail).toHaveText(`${file}:10`); await source.click();
+  const writers = ir.register_history.filter((entry) => entry.register === "R1").reverse();
+  expect(writers.map((entry) => [entry.time.value, entry.value.value, entry.source.line]))
+    .toEqual([[120,3,6],[76,2,6],[32,1,6],[16,0,4]]);
+  for (const writer of writers) {
+    await detail.locator('[data-writer-register="R1"]').click();
+    const event = ir.events.find((entry) => entry.id === writer.event_id);
+    await expect(time).toHaveValue(String(writer.time.value));
+    await expect(register("R1")).toHaveText(String(writer.value.value));
+    await expect(sourceDetail).toHaveText(`${file}:${writer.source.line}`);
+    await expect(inspector).toContainText(`${event.t0.value} -> ${event.t1.value}`);
+    await expect(inspector).toContainText(event.label);
+    await source.click(); await expect(time).toHaveValue(String(writer.time.value));
+    await expect(loop).toHaveAttribute("data-state", "1");
+  }
+  await expect(page.locator('[data-action="register-previous"]')).toBeDisabled();
+  await page.locator('[data-control="register-format"]').selectOption("hex");
+  await page.getByRole("button", {name: "Next change ›", exact: true}).click();
+  await expect(time).toHaveValue("32"); await expect(register("R1")).toHaveText("0x00000001");
+  await expect(inspector).toContainText("16 -> 28");
+  await page.getByRole("button", {name: "Next change ›", exact: true}).click();
+  await expect(time).toHaveValue("76"); await expect(register("R1")).toHaveText("0x00000002");
+  await expect(inspector).toContainText("60 -> 72");
+  await page.getByRole("button", {name: "‹ Previous change", exact: true}).click();
+  await expect(time).toHaveValue("32"); await expect(register("R1")).toHaveText("0x00000001");
+  await expect(inspector).toContainText("16 -> 28");
+  await expect(loop).toHaveAttribute("data-state", "1");
+  const messages = await page.evaluate(() => window.messages);
+  expect(messages.filter((message) => message.type === "sourceClick").map((message) => message.line)).toEqual([10,6,6,6,4]);
+  expect(messages.filter((message) => message.type === "eventClick")).toEqual([]);
+  await page.screenshot({path: test.info().outputPath("register-first-loop-writer-inspector.png"), fullPage: true});
+});
+
+test("keeps a source filter active across layout switches and wait folding", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const {ir, html} = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json,re", "from q1timeline.analysis.interpreter import interpret_program",
+    "from q1timeline.analysis.alignment import align_timelines",
+    "from q1timeline.q1asm.parser import parse_q1asm_file", "from q1timeline.ir.serialize import timeline_ir_from_states",
+    "from q1timeline.render.html import render_html",
+    "state=interpret_program(parse_q1asm_file('examples/set-cond-review/01-disabled/disabled.q1asm'),sequencer_id='disabled')",
+    "align_timelines([state],mode='none')",
+    "html=render_html(timeline_ir_from_states([state]),default_mode='debug')",
+    "ir=json.loads(re.search(r'<script id=\"timeline-ir\" type=\"application/json\">(.*?)</script>',html,re.S).group(1))",
+    "print(json.dumps({'ir':ir,'html':html}))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+    /type=["']application\/json["']/i.test(attributes) ? tag : "");
+  await mount(page, "idle", ir, {}, {}, shell);
+  const wait = ir.events.find((item) => item.kind === "wait");
+  const waitBlock = page.locator(`.timeline-block[data-event-id="${wait.id}"]`);
+  await expect(waitBlock).toBeVisible();
+  await page.locator("#q1timeline-analysis-details > summary").click();
+  const filter = page.getByRole("searchbox", {name: "Filter source or kind"});
+  await filter.fill("upd_param");
+  for (const layout of ["Instruction", "Time scale"]) {
+    await page.getByRole("button", {name: layout, exact: true}).click();
+    await expect(filter).toHaveValue("upd_param");
+    await expect(waitBlock).toHaveClass(/is-filtered/);
+    await expect(waitBlock).toBeHidden();
+    expect(await page.locator(".timeline-block.event:not(.is-filtered)").count()).toBeGreaterThan(0);
+  }
+  for (let count = 0; count < 2; count += 1) {
+    await page.locator("#q1timeline-wait-fold-button").click();
+    await expect(waitBlock).toHaveClass(/is-filtered/);
+    await expect(waitBlock).toBeHidden();
+  }
+  await page.screenshot({path: test.info().outputPath("retained-source-filter.png"), fullPage: true});
+  await filter.fill("");
+  await expect(waitBlock).not.toHaveClass(/is-filtered/);
+  await expect(waitBlock).toBeVisible();
+});
+
+test("an empty source highlight clears event and range selection without moving the hardware cursor or viewport", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const {ir, html} = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json", "from q1timeline.analysis.api import analyze_text", "from q1timeline.render.html import render_html",
+    'ir=analyze_text("play 0,0,4\\nwait 100\\nstop\\n",file="source.q1asm",sequencer_id="seq")',
+    "print(json.dumps({'ir':ir,'html':render_html(ir,default_mode='debug')}))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+    /type=["']application\/json["']/i.test(attributes) ? tag : "");
+  await mount(page, "idle", ir, {}, {}, shell);
+  const play = ir.events.find((item) => item.kind === "play");
+  const wait = ir.events.find((item) => item.kind === "wait");
+  const time = page.getByRole("spinbutton", {name: "Selected time in nanoseconds"});
+  const highlight = (data) => page.evaluate((data) => window.dispatchEvent(new MessageEvent("message", {
+    data: {type: "highlightEventIds", ...data},
+  })), data);
+  const assertCleared = async () => {
+    await expect(page.locator(".timeline-block.is-selected")).toHaveCount(0);
+    await expect(page.locator('.timeline-block[aria-selected="true"]')).toHaveCount(0);
+    await expect(page.locator(".time-selection")).toHaveCount(0);
+    await expect(page.locator("#q1timeline-zoom-event-button")).toBeDisabled();
+    await expect(page.locator("#q1timeline-zoom-selection-button")).toBeDisabled();
+    await expect(page.locator("#event-inspector-fields dd")).toHaveText("None");
+  };
+  for (const selection of ["event", "range"]) {
+    if (selection === "event") await page.locator(`.timeline-block[data-event-id="${play.id}"]`).click();
+    else {
+      await highlight({highlightEventIds: [play.id, wait.id], zoomToRange: true,
+        sourceRange: {file: play.source.file, startLine: 1, endLine: 2}});
+      await expect(page.locator(".time-selection").first()).toBeVisible();
+    }
+    await time.fill("32");
+    await time.press("Enter");
+    const windowBefore = await page.locator("#q1timeline-time-window").getAttribute("title");
+    await highlight({highlightEventIds: []});
+    await assertCleared();
+    await expect(time).toHaveValue("32");
+    await expect(page.locator("#q1timeline-time-window")).toHaveAttribute("title", windowBefore);
+    for (const layout of ["Instruction", "Time scale"]) {
+      await page.getByRole("button", {name: layout, exact: true}).click();
+      await assertCleared();
+    }
+    await page.getByRole("button", {name: "Zoom in", exact: true}).click();
+    await assertCleared();
+    await expect(time).toHaveValue("32");
+    await highlight({highlightEventIds: [play.id]});
+    await expect(page.locator(`.timeline-block[data-event-id="${play.id}"]`)).toHaveAttribute("aria-selected", "true");
+    await expect(page.locator("#q1timeline-zoom-event-button")).toBeEnabled();
+  }
+});
+
+test("a source highlight hidden by the filter updates the inspector and selection before being revealed", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const {ir, html} = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json", "from q1timeline.analysis.api import analyze_text", "from q1timeline.render.html import render_html",
+    'ir=analyze_text("play 0,0,4\\nwait 100\\nstop\\n",file="source.q1asm",sequencer_id="seq")',
+    "print(json.dumps({'ir':ir,'html':render_html(ir,default_mode='debug')}))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+    /type=["']application\/json["']/i.test(attributes) ? tag : "");
+  await mount(page, "idle", ir, {}, {}, shell);
+  const play = ir.events.find((item) => item.kind === "play");
+  const wait = ir.events.find((item) => item.kind === "wait");
+  const playBlock = page.locator(`.timeline-block[data-event-id="${play.id}"]`);
+  const waitBlock = page.locator(`.timeline-block[data-event-id="${wait.id}"]`);
+  const time = page.getByRole("spinbutton", {name: "Selected time in nanoseconds"});
+  const fullWindow = await page.locator("#q1timeline-time-window").getAttribute("title");
+  const assertWaitSelected = async () => {
+    await expect(waitBlock).toHaveClass(/is-selected/);
+    await expect(waitBlock).toHaveAttribute("aria-selected", "true");
+    await expect(page.locator(`.timeline-block[data-event-id="${play.id}"][aria-selected="true"]`)).toHaveCount(0);
+    await expect(page.locator('.timeline-block[aria-selected="true"]')).toHaveCount(1);
+    await expect(page.locator("#event-inspector-fields")).toContainText("source.q1asm:2");
+    await expect(time).toHaveValue("4");
+  };
+  await playBlock.click();
+  await expect(playBlock).toHaveAttribute("aria-selected", "true");
+  await page.locator("#q1timeline-analysis-details > summary").click();
+  const filter = page.getByRole("searchbox", {name: "Filter source or kind"});
+  await filter.fill("play");
+  await expect(waitBlock).toBeHidden();
+  await page.evaluate((eventId) => window.dispatchEvent(new MessageEvent("message", {
+    data: {type: "highlightEventIds", highlightEventIds: [eventId]},
+  })), wait.id);
+  await assertWaitSelected();
+  await expect(filter).toHaveValue("play");
+  await expect(waitBlock).toBeHidden();
+  await expect(page.locator("#q1timeline-time-window")).toHaveAttribute("title", fullWindow);
+  await filter.fill("");
+  await expect(waitBlock).toBeVisible();
+  await assertWaitSelected();
+  for (const layout of ["Instruction", "Time scale"]) {
+    await page.getByRole("button", {name: layout, exact: true}).click();
+    await assertWaitSelected();
+  }
+  await page.getByRole("button", {name: "Zoom in", exact: true}).click();
+  await assertWaitSelected();
+  await expect(page.locator("#q1timeline-time-window")).not.toHaveAttribute("title", fullWindow);
+  await page.locator("#q1timeline-zoom-event-button").click();
+  await expect(page.locator("#q1timeline-time-window")).toHaveAttribute("title", fullWindow);
+  await assertWaitSelected();
+});
+
+test("diagnostic event links reveal an offscreen target and notify its source once per activation", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const {ir, html} = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json", "from q1timeline.analysis.api import analyze_text", "from q1timeline.render.html import render_html",
+    'ir=analyze_text("wait 4\\nnop\\nnop\\nnop\\nplay 0,0,4\\nwait 1000\\nstop\\n",file="diagnostic.q1asm",sequencer_id="seq")',
+    "print(json.dumps({'ir':ir,'html':render_html(ir,default_mode='debug')}))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+    /type=["']application\/json["']/i.test(attributes) ? tag : "");
+  await mount(page, "idle", ir, {}, {}, shell);
+  const diagnostic = ir.diagnostics.find((item) => item.category === "definite_underflow");
+  const eventId = diagnostic.related_events[0];
+  const target = page.locator(`.timeline-block[data-event-id="${eventId}"]`);
+  const link = page.locator(`[data-related-event-id="${eventId}"]`).first();
+  const time = page.getByRole("spinbutton", {name: "Selected time in nanoseconds"});
+  await page.locator("#q1timeline-analysis-details > summary").click();
+  await page.locator(".diagnostics-secondary > summary").click();
+  await expect(target).toBeVisible();
+  await link.click();
+  await expect(target).toHaveClass(/is-selected/);
+  await expect(page.locator("#event-inspector-fields")).toContainText("diagnostic.q1asm:5");
+  await expect(time).toHaveValue("4");
+  expect(await page.evaluate(() => window.messages.filter((message) => message.type === "eventClick")))
+    .toEqual([{type: "eventClick", eventId}]);
+  await page.getByRole("button", {name: "Zoom in", exact: true}).click();
+  await page.getByRole("button", {name: "Zoom in", exact: true}).click();
+  await expect(target).toHaveCount(0);
+  await time.fill("600");
+  await time.press("Enter");
+  const zoomedWindow = await page.locator("#q1timeline-time-window").getAttribute("title");
+  await link.click();
+  await expect(target).toBeVisible();
+  await expect(target).toHaveAttribute("aria-selected", "true");
+  await expect(page.locator("#event-inspector-fields")).toContainText("diagnostic.q1asm:5");
+  await expect(page.locator("#q1timeline-time-window")).not.toHaveAttribute("title", zoomedWindow);
+  await expect(time).toHaveValue("4");
+  expect(await page.evaluate(() => window.messages.filter((message) => message.type === "eventClick")))
+    .toEqual([{type: "eventClick", eventId}, {type: "eventClick", eventId}]);
+});
+
+test("diagnostic event links select pending setters without adding a separate timeline row", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const {ir, html} = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json", "from q1timeline.analysis.api import analyze_text", "from q1timeline.render.html import render_html",
+    'ir=analyze_text("play 0,0,4\\nwait 1000\\nset_freq 100\\nstop\\n",file="pending.q1asm",sequencer_id="seq",hardware_readiness=True)',
+    "print(json.dumps({'ir':ir,'html':render_html(ir,default_mode='debug')}))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+    /type=["']application\/json["']/i.test(attributes) ? tag : "");
+  await mount(page, "idle", ir, {}, {}, shell);
+  const diagnostic = ir.diagnostics.find((item) => item.category === "pending_hardware_state");
+  const eventId = diagnostic.related_events[0];
+  const target = page.locator(`.timeline-block[data-event-id="${eventId}"]`);
+  await expect(target).toHaveCount(0);
+  await page.locator("#q1timeline-analysis-details > summary").click();
+  await page.locator(".diagnostics-secondary > summary").click();
+  await page.locator(`[data-related-event-id="${eventId}"]`).first().click();
+  await expect(page.locator("#event-inspector-fields")).toContainText("pending.q1asm:3");
+  await expect(page.getByRole("spinbutton", {name: "Selected time in nanoseconds"})).toHaveValue("1004");
+  await expect(page.locator("#q1timeline-zoom-event-button")).toBeEnabled();
+  await expect(target).toHaveCount(0);
+  expect(await page.evaluate(() => window.messages.filter((message) => message.type === "eventClick")))
+    .toEqual([{type: "eventClick", eventId}]);
+});
+
+for (const initialSelection of ["none", "source range"]) {
+  test(`offscreen hardware replay selection updates zoom and clears stale source selection from ${initialSelection}`, async ({page}) => {
+    const repo = path.resolve(__dirname, "../../..");
+    const {ir, html} = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+      "import json", "from q1timeline.playback import PlaybackSession", "from q1timeline.render.html import render_html",
+      's=PlaybackSession({"seq":("replay.q1asm","wait 1000\\nnop\\nstop\\n")})',
+      "s.run(budget_ms=1000,max_steps=50)", "ir=s.snapshot()",
+      "print(json.dumps({'ir':ir,'html':render_html(ir,default_mode='debug')}))",
+    ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+    const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+      /type=["']application\/json["']/i.test(attributes) ? tag : "");
+    await mount(page, ir.playback.status, ir, {}, {}, shell);
+    const issues = ir.events.filter((item) => item.kind === "q1_issue");
+    const first = page.locator(`.timeline-block[data-event-id="${issues[0].id}"]`);
+    if (initialSelection === "source range") {
+      await page.evaluate((ids) => window.dispatchEvent(new MessageEvent("message", {data: {
+        type: "highlightEventIds", highlightEventIds: ids, zoomToRange: true,
+        sourceRange: {file: "replay.q1asm", startLine: 1, endLine: 1},
+      }})), ir.source_map.by_source["replay.q1asm:1"]);
+      await expect(page.locator(".time-selection").first()).toBeVisible();
+    }
+    await page.getByRole("button", {name: "Zoom in", exact: true}).click();
+    await page.getByRole("button", {name: "Zoom in", exact: true}).click();
+    await expect(first).toHaveCount(0);
+    await page.locator("[data-module-card]").click();
+    await page.locator('[data-sequencer-card="seq"]').click();
+    await page.getByRole("button", {name: "Execution replay", exact: true}).click();
+    const time = page.getByRole("spinbutton", {name: "Selected time in nanoseconds"});
+    const zoomEvent = page.locator("#q1timeline-zoom-event-button");
+    await expect(zoomEvent).toBeDisabled();
+    const windowBefore = await page.locator("#q1timeline-time-window").getAttribute("title");
+    await page.locator('[data-action="replay-step"]').click();
+    await expect(time).toHaveValue("4");
+    await expect(page.locator("#event-inspector-fields")).toContainText("replay.q1asm:1");
+    await expect(page.locator("#q1timeline-time-window")).toHaveAttribute("title", windowBefore);
+    if (initialSelection === "source range") await expect(page.locator(".time-selection")).toHaveCount(0);
+    await expect(zoomEvent).toBeEnabled();
+    await expect(page.locator("#q1timeline-zoom-selection-button")).toBeDisabled();
+    await expect(page.locator('.timeline-block[aria-selected="true"], .timeline-block.is-selected')).toHaveCount(0);
+    await zoomEvent.click();
+    await expect(first).toBeVisible();
+    await expect(first).toHaveAttribute("aria-selected", "true");
+    await expect(time).toHaveValue("4");
+    await page.locator('[data-action="replay-step"]').click();
+    await expect(time).toHaveValue("8");
+    await expect(page.locator(`.timeline-block[data-event-id="${issues[1].id}"]`)).toHaveAttribute("aria-selected", "true");
+    await expect(page.locator("#event-inspector-fields")).toContainText("replay.q1asm:2");
+    expect(await page.evaluate(() => window.messages.filter((message) => message.type === "eventClick" || message.type === "sourceClick"))).toEqual([]);
+  });
+}
+
 test("static disabled example renders RT commands once without overlapping loop summaries", async ({page}) => {
   const repo = path.resolve(__dirname, "../../..");
   const {ir, html} = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
@@ -466,6 +981,111 @@ test("playback toolbar follows host state and allows one branch occurrence to be
   await expect(page.getByRole("button", {name: "Compare both", exact: true})).toHaveCount(0);
   await page.getByRole("button", {name: "Jump · @done", exact: true}).click();
   expect(await page.evaluate(() => window.messages.at(-1))).toEqual({type: "setExecutionBranch", eventId: "branch", branchId: "branch:2", path: "taken"});
+});
+
+for (const [mode, count] of [["playback", 3], ["analysis", 1], ["analysis", 3], ["preview", 3]]) {
+  test(`loop options support keyboard focus and Escape in ${mode} with ${count} iterations`, async ({page}) => {
+    const repo = path.resolve(__dirname, "../../..");
+    const {ir, html} = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+      "import json", "from q1timeline.analysis.api import analyze_text", "from q1timeline.playback import PlaybackSession",
+      "from q1timeline.render.html import render_html",
+      `program="move ${count},R0\\nnop\\nbody: wait 100\\nloop R0,@body\\nstop\\n"`,
+      ...(mode === "playback" ? [
+        's=PlaybackSession({"seq":("keyboard-loop.q1asm",program)})',
+        "s.run(budget_ms=1000,max_steps=50)", "ir=s.snapshot()",
+      ] : ['ir=analyze_text(program,file="keyboard-loop.q1asm",sequencer_id="seq")']),
+      ...(mode === "preview" ? [
+        "from q1timeline.analysis.interpreter import interpret_program", "from q1timeline.q1asm.parser import parse_q1asm",
+        "from q1timeline.analysis.alignment import align_timelines", "from q1timeline.ir.serialize import timeline_ir_from_states",
+        "key=next(e['meta']['loop_preview_key'] for e in ir['events'] if e['kind']=='loop_block')",
+        'state=interpret_program(parse_q1asm(program,file="keyboard-loop.q1asm"),sequencer_id="seq",loop_preview_counts={key:2})',
+        "align_timelines([state],mode='none')", "ir=timeline_ir_from_states([state])",
+      ] : []),
+      "print(json.dumps({'ir':ir,'html':render_html(ir,default_mode='debug')}))",
+    ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+    const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+      /type=["']application\/json["']/i.test(attributes) ? tag : "");
+    await mount(page, ir.playback?.status || "idle", ir, {}, {}, shell);
+    const loop = ir.events.find((item) => item.kind === "loop_block");
+    const owner = page.locator(`.timeline-loop-range[data-event-id="${loop.id}"]`);
+    const popover = page.locator("#q1timeline-control-popover");
+    await owner.press("Enter");
+    if (count === 1) {
+      await expect(popover.getByRole("button", {name: "Show next iteration", exact: true})).toBeDisabled();
+      await expect(popover.getByRole("button", {name: "Reset loop preview", exact: true})).toBeDisabled();
+      await expect(popover).toBeFocused();
+      await popover.press("Escape");
+    } else {
+      const next = popover.getByRole("button", {name: mode === "playback" ? "Expand executed iterations" : "Show next iteration", exact: true});
+      await expect(next).toBeFocused();
+      await next.press("Escape");
+    }
+    await expect(popover).toHaveCount(0);
+    await expect(owner).toBeFocused();
+    if (count > 1) {
+      await owner.press(" ");
+      const next = popover.getByRole("button", {name: mode === "playback" ? "Expand executed iterations" : "Show next iteration", exact: true});
+      await expect(next).toBeFocused();
+      if (mode === "preview") {
+        await next.press("Tab");
+        const reset = popover.getByRole("button", {name: "Reset loop preview", exact: true});
+        await expect(reset).toBeFocused();
+        await reset.press("Enter");
+        await expect(owner).toHaveAttribute("data-state", "1");
+      } else await next.press("Enter");
+      await expect(owner).toBeFocused();
+      if (mode === "playback") {
+        const hiddenWait = ir.events.find((item) => item.kind === "wait" && loop.meta.hidden_event_ids.includes(item.id));
+        const hidden = page.locator(`.timeline-block[data-event-id="${hiddenWait.id}"]`);
+        await expect(hidden).toBeVisible();
+        await owner.press("Enter");
+        const collapse = popover.getByRole("button", {name: "Collapse executed iterations", exact: true});
+        await expect(collapse).toBeFocused();
+        await collapse.press("Enter");
+        await expect(hidden).toHaveCount(0);
+        await expect(owner).toBeFocused();
+      } else {
+        expect(await page.evaluate(() => window.messages.filter((message) => message.type === "setLoopPreview")))
+          .toEqual([{type: "setLoopPreview", loopKey: loop.meta.loop_preview_key, visibleIterations: mode === "preview" ? 1 : 2}]);
+      }
+    }
+    expect(await page.evaluate(() => window.messages.filter((message) => message.type === "eventClick" || message.type === "sourceClick"))).toEqual([]);
+  });
+}
+
+test("loop options stay local for clicks and keyboard activation while ordinary blocks still open their source", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const {ir, html} = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json", "from q1timeline.playback import PlaybackSession", "from q1timeline.render.html import render_html",
+    's=PlaybackSession({"seq":("loop.q1asm","move 3,R0\\nnop\\nbody: wait 100\\nloop R0,@body\\nstop\\n")})',
+    "s.run(budget_ms=1000,max_steps=50)", "ir=s.snapshot()",
+    "print(json.dumps({'ir':ir,'html':render_html(ir,default_mode='debug')}))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+    /type=["']application\/json["']/i.test(attributes) ? tag : "");
+  const loop = ir.events.find((item) => item.kind === "loop_block" && item.meta.playback);
+  const hiddenWait = ir.events.find((item) => item.kind === "wait" && loop.meta.hidden_event_ids.includes(item.id));
+  const firstWait = ir.events.find((item) => item.kind === "wait" && loop.meta.first_iteration_event_ids.includes(item.id));
+  for (const action of ["click", "Enter", " "]) {
+    await mount(page, ir.playback.status, ir, {}, {}, shell);
+    const loopNode = page.locator(`.timeline-loop-range[data-event-id="${loop.id}"]`);
+    const hidden = page.locator(`.timeline-block[data-event-id="${hiddenWait.id}"]`);
+    await expect(hidden).toHaveCount(0);
+    if (action === "click") await loopNode.click();
+    else await loopNode.press(action);
+    const expand = page.getByRole("button", {name: "Expand executed iterations", exact: true});
+    await expect(expand).toBeVisible();
+    expect(await page.evaluate(() => window.messages.filter((message) => message.type === "eventClick" || message.type === "sourceClick"))).toEqual([]);
+    await expand.click();
+    await expect(hidden).toBeVisible();
+    await loopNode.click();
+    await page.getByRole("button", {name: "Collapse executed iterations", exact: true}).click();
+    await expect(hidden).toHaveCount(0);
+    expect(await page.evaluate(() => window.messages.filter((message) => ["eventClick", "sourceClick", "setLoopPreview"].includes(message.type)))).toEqual([]);
+    await page.locator(`.timeline-block[data-event-id="${firstWait.id}"]`).click();
+    expect(await page.evaluate(() => window.messages.filter((message) => message.type === "eventClick")))
+      .toEqual([{type: "eventClick", eventId: firstWait.id}]);
+  }
 });
 
 test("executed loop expands locally while the original trace stays available", async ({page}) => {

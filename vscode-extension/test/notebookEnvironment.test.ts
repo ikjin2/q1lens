@@ -4,6 +4,7 @@ import { hostname, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type * as vscode from "vscode";
 import type { PythonEnvironmentReport } from "../src/environment";
+import { beginPythonEnvironmentCheck, isCurrentPythonEnvironmentCheck, lastPythonEnvironment, publishPythonEnvironment, type PythonEnvironmentCheck } from "../src/pythonEnvironmentStatus";
 
 const Module = require("node:module");
 
@@ -47,14 +48,19 @@ function harness() {
   const state = {
     trusted: true, jupyter: true, started: true, language: "python", remote: false,
     pythonPath: executable, action: undefined as string | undefined,
-    report: ready, cancelProbe: false, kernelCancelled: false,
+    report: ready, cancelProbe: false, kernelCancelled: false, kernelIdentity: 0,
     openedNotebook: undefined as unknown, onInformation: undefined as (() => void) | undefined,
     probeGate: undefined as Promise<void> | undefined,
+    kernelGate: undefined as Promise<void> | undefined, kernelStarted: false,
+    openNotebookGate: undefined as Promise<void> | undefined, notebookOpening: false,
+    errorAction: undefined as string | undefined,
   };
   const kernel = {
     get language() { return state.language; },
     async *executeCode(code: string, token: CancellationTokenSource["token"]) {
+      state.kernelStarted = true;
       token.onCancellationRequested(() => { state.kernelCancelled = true; });
+      await state.kernelGate;
       if (state.cancelProbe) {
         await new Promise<void>(() => {});
         return;
@@ -68,6 +74,7 @@ function harness() {
       }
     },
   };
+  const otherKernel = { get language() { return state.language; }, executeCode: kernel.executeCode };
   let receiveMessage: ((message: unknown) => unknown) | undefined;
   let disposeListener: (() => unknown) | undefined;
   const panel = {
@@ -90,12 +97,16 @@ function harness() {
     CancellationTokenSource, CancellationError: class extends Error {}, ProgressLocation: { Notification: 15 },
     ViewColumn: { Active: -1, Beside: -2, One: 1 },
     env: { clipboard: { writeText: async (text: string) => { copied.push(text); } } },
-    workspace: { get isTrusted() { return state.trusted; }, openNotebookDocument: async (uri: unknown) => uri },
+    workspace: { get isTrusted() { return state.trusted; }, openNotebookDocument: async (uri: unknown) => {
+      state.notebookOpening = true;
+      await state.openNotebookGate;
+      return uri;
+    } },
     extensions: {
       getExtension: (id: string) => id === "q1lens.q1lens" ? { packageJSON: { version: "0.2.2" } }
         : state.jupyter ? { activate: async () => ({ kernels: { getKernel: async (uri: unknown) => {
           kernelUris.push(uri);
-          return state.started ? kernel : undefined;
+          return state.started ? state.kernelIdentity === 0 ? kernel : otherKernel : undefined;
         } } }) } : undefined,
     },
     window: {
@@ -107,7 +118,7 @@ function harness() {
       },
       showErrorMessage: async (message: string, ...actions: string[]) => {
         messages.push({ message, actions });
-        return undefined;
+        return state.errorAction;
       },
       showNotebookDocument: async (uri: unknown) => { state.openedNotebook = uri; },
       createWebviewPanel: (_viewType: string, _title: string, _column: unknown, options: vscode.WebviewPanelOptions & vscode.WebviewOptions) => {
@@ -136,8 +147,9 @@ function harness() {
     if (request === "./environment") return {
       probePythonEnvironment: async (pythonPath: string, _args: string[], options: { cwd: string; env: Record<string, string> }) => {
         probes.push({ pythonPath, options });
+        const report = state.report;
         await state.probeGate;
-        return state.report;
+        return report;
       },
     };
     if (request === "node:child_process") return {
@@ -149,16 +161,16 @@ function harness() {
   const modulePath = require.resolve("../src/notebookEnvironment");
   delete require.cache[modulePath];
   const { ensureNotebookEnvironment } = require("../src/notebookEnvironment") as typeof import("../src/notebookEnvironment");
-  const run = () => ensureNotebookEnvironment(fakeVscode as unknown as typeof vscode, notebookUri as vscode.Uri, {
+  const run = (owner?: PythonEnvironmentCheck, signal?: AbortSignal) => ensureNotebookEnvironment(fakeVscode as unknown as typeof vscode, notebookUri as vscode.Uri, {
     append: (line: string) => lines.push(line), appendLine: (line: string) => lines.push(line), show: () => undefined,
-  } as unknown as vscode.OutputChannel);
+  } as unknown as vscode.OutputChannel, owner, signal);
   return {
     state, messages, probes, executions, kernelUris, notebookUri, executable, lines, ready, missing,
     panel, copied, terminals, run,
-    openSetup: async () => {
+    openSetup: async (owner?: PythonEnvironmentCheck, signal?: AbortSignal) => {
       state.report = missing;
       state.action = "Show Setup";
-      const pending = run();
+      const pending = run(owner, signal);
       await waitFor(() => panel.created && !!receiveMessage);
       return { pending };
     },
@@ -178,14 +190,144 @@ describe("notebook Python environment", () => {
     assert.equal(test.executions.length, 0, "The extension must never install packages or bootstrap pip");
   });
 
+  it("cancels an obsolete notebook kernel check without waiting for kernel output", async () => {
+    const cancellation = new AbortController();
+    let release!: () => void;
+    test.state.kernelGate = new Promise<void>((resolve) => { release = resolve; });
+    const pending = test.run(undefined, cancellation.signal);
+    try {
+      await waitFor(() => test.state.kernelStarted);
+      cancellation.abort();
+      const result = await Promise.race([pending.then((value) => ({ value })), new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 1000))]);
+      assert.deepEqual(result, { value: undefined }, "An obsolete open must stop even if the kernel ignores cancellation");
+      assert.equal(test.state.kernelCancelled, true);
+      assert.equal(test.probes.length, 0);
+      assert.equal(test.messages.length, 0);
+    } finally { release(); await pending; }
+  });
+
+  it("suppresses a late environment failure after its notebook open is cancelled", async () => {
+    const cancellation = new AbortController();
+    let reject!: (error: Error) => void;
+    test.state.probeGate = new Promise<void>((_resolve, fail) => { reject = fail; });
+    const pending = test.run(undefined, cancellation.signal);
+    await waitFor(() => test.probes.length === 1);
+    cancellation.abort();
+    reject(new Error("The previous notebook probe failed late"));
+    assert.equal(await pending, undefined);
+    assert.equal(test.messages.length, 0, "A superseded notebook must not show an error over the current file");
+    assert.equal(test.panel.created, false);
+  });
+
+  it("closes the obsolete notebook setup when its open is cancelled", async () => {
+    const cancellation = new AbortController();
+    const { pending } = await test.openSetup(undefined, cancellation.signal);
+    try {
+      cancellation.abort();
+      assert.equal(test.panel.disposed, true);
+      assert.equal(await pending, undefined);
+    } finally { test.panel.dispose(); await pending; }
+  });
+
+  it("quietly cancels an obsolete error recovery while its notebook document opens", async () => {
+    const cancellation = new AbortController();
+    let release!: () => void;
+    test.state.started = false;
+    test.state.errorAction = "Open Notebook";
+    test.state.openNotebookGate = new Promise<void>((resolve) => { release = resolve; });
+    const pending = test.run(undefined, cancellation.signal);
+    await waitFor(() => test.state.notebookOpening);
+    cancellation.abort();
+    release();
+    assert.equal(await pending, undefined);
+    assert.equal(test.state.openedNotebook, undefined, "Cancelled error recovery must not focus the previous notebook");
+  });
+
   it("uses the original notebook's live kernel, including after its environment changes", async () => {
     assert.deepEqual(await test.run(), { pythonPath: test.executable, pythonArgs: [] });
     test.state.pythonPath = join(tmpdir(), "new env", "python");
     assert.deepEqual(await test.run(), { pythonPath: test.state.pythonPath, pythonArgs: [] });
-    assert.deepEqual(test.kernelUris, [test.notebookUri, test.notebookUri]);
+    assert.deepEqual(test.kernelUris, [test.notebookUri, test.notebookUri, test.notebookUri, test.notebookUri]);
     assert.equal(test.probes[0].options.cwd, tmpdir());
     assert.equal(test.probes[0].options.env.PYTHONPATH, "");
     assert.equal(test.messages.length, 0);
+  });
+
+  for (const change of ["switched", "stopped"]) {
+    it(`rejects a kernel ${change} while its package probe waits and recovers on a new check`, async () => {
+      let release!: () => void;
+      test.state.probeGate = new Promise<void>((resolve) => { release = resolve; });
+      const previous = lastPythonEnvironment();
+      const pending = test.run();
+      await waitFor(() => test.probes.length === 1);
+      test.state.kernelIdentity = 1;
+      test.state.started = change !== "stopped";
+      test.state.pythonPath = join(tmpdir(), "latest kernel", "python");
+      test.state.report = { ...test.ready, executable: test.state.pythonPath };
+      release();
+      assert.equal(await pending, undefined, "The old kernel's successful probe must not authorize the new selection");
+      assert.equal(lastPythonEnvironment(), previous, "An obsolete kernel must not be published as the current environment");
+      assert.match(test.messages.at(-1)?.message ?? "", /kernel.*changed|kernel.*switch/i);
+      test.state.started = true;
+      test.state.probeGate = undefined;
+      assert.deepEqual(await test.run(), { pythonPath: test.state.pythonPath, pythonArgs: [] });
+    });
+  }
+
+  it("keeps Setup open when its ready probe belongs to a kernel replaced during Check Again", async () => {
+    const { pending } = await test.openSetup();
+    test.state.report = test.ready;
+    let release!: () => void;
+    test.state.probeGate = new Promise<void>((resolve) => { release = resolve; });
+    const checking = test.send({ type: "checkAgain" });
+    await waitFor(() => test.probes.length === 2);
+    test.state.kernelIdentity = 1;
+    test.state.pythonPath = join(tmpdir(), "latest setup kernel", "python");
+    test.state.report = { ...test.ready, executable: test.state.pythonPath };
+    release();
+    await checking;
+    assert.equal(test.panel.disposed, false, "The old kernel must not complete setup for a new selection");
+    assert.ok(test.panel.webview.messages.some((message: any) => message.type === "checkError" && /kernel.*changed|kernel.*switch/i.test(message.message)));
+    test.state.probeGate = undefined;
+    await test.send({ type: "checkAgain" });
+    assert.deepEqual(await pending, { pythonPath: test.state.pythonPath, pythonArgs: [] });
+  });
+
+  it("keeps a newer analysis target when a notebook environment probe finishes late", async () => {
+    let release!: () => void;
+    test.state.probeGate = new Promise<void>((resolve) => { release = resolve; });
+    const pending = test.run();
+    await waitFor(() => test.probes.length === 1);
+    const newer = { resource: { fsPath: join(tmpdir(), "newer.q1asm") } as vscode.Uri,
+      pythonPath: "/newer/python", pythonArgs: [], source: "vscode" as const, sourceLabel: "VS Code selected interpreter" };
+    publishPythonEnvironment(newer);
+    release();
+    assert.deepEqual(await pending, { pythonPath: test.executable, pythonArgs: [] });
+    assert.equal(lastPythonEnvironment(), newer);
+  });
+
+  it("does not renew a stale parent command when its initial notebook check starts late", async () => {
+    const owner = beginPythonEnvironmentCheck();
+    const newer = { resource: { fsPath: join(tmpdir(), "newer.q1asm") } as vscode.Uri,
+      pythonPath: "/newer/python", pythonArgs: [], source: "vscode" as const, sourceLabel: "VS Code selected interpreter" };
+    publishPythonEnvironment(newer);
+    assert.deepEqual(await test.run(owner), { pythonPath: test.executable, pythonArgs: [] });
+    assert.equal(lastPythonEnvironment(), newer);
+    assert.equal(isCurrentPythonEnvironmentCheck(owner), false);
+  });
+
+  it("renews the waiting notebook command when setup explicitly checks again after another target", async () => {
+    const owner = beginPythonEnvironmentCheck();
+    const { pending } = await test.openSetup(owner);
+    publishPythonEnvironment({ resource: { fsPath: join(tmpdir(), "newer.q1asm") } as vscode.Uri,
+      pythonPath: "/newer/python", pythonArgs: [], source: "vscode", sourceLabel: "VS Code selected interpreter" });
+    assert.equal(isCurrentPythonEnvironmentCheck(owner), false);
+    test.state.report = test.ready;
+    await test.send({ type: "checkAgain" });
+    assert.deepEqual(await pending, { pythonPath: test.executable, pythonArgs: [] });
+    assert.equal(isCurrentPythonEnvironmentCheck(owner), true);
+    assert.equal(lastPythonEnvironment()?.resource, test.notebookUri);
+    assert.equal(lastPythonEnvironment()?.report, test.ready);
   });
 
   it("offers setup and rechecking without installing or opening a terminal", async () => {
@@ -256,7 +398,7 @@ describe("notebook Python environment", () => {
     await test.send({ type: "checkAgain" });
     assert.deepEqual(await pending, { pythonPath: test.executable, pythonArgs: [] });
     assert.equal(test.panel.disposed, true);
-    assert.deepEqual(test.kernelUris, [test.notebookUri, test.notebookUri]);
+    assert.deepEqual(test.kernelUris, [test.notebookUri, test.notebookUri, test.notebookUri, test.notebookUri]);
   });
 
   it("does not copy or insert after the setup panel closes during a check", async () => {

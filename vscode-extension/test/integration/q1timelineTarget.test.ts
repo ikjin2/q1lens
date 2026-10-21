@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { join, parse, resolve } from "node:path";
 import { resolveQbsSelectionToQ1TimelineTarget } from "../../src/integration/q1timelineTarget";
-import { QbsIr } from "../../src/qbs/qbsIr";
+import { parseQbsIrText, QbsIr } from "../../src/qbs/qbsIr";
 
 function ir(): QbsIr {
   return {
@@ -33,6 +35,44 @@ function ir(): QbsIr {
 }
 
 describe("QBS to q1timeline target resolution", () => {
+  it("opens generated IR selections from an artifact output at a filesystem root", () => {
+    const payload = parseQbsIrText(readFileSync(join(__dirname, "..", "..", "..", "test", "fixtures", "two-qubit-ir.json"), "utf8"));
+    const selected = payload.symbolic_pulses[0];
+    const model = require("../../src/qbs/webview/assets/timelineModel.js").buildTimelineModel(payload, selected.id);
+    const selection = model.inspector.q1asmDrilldown.openMessage;
+    const program = payload.q1asm_programs.find((candidate) => candidate.sequencer === selection.sequencer)!;
+    const roots = [parse(resolve(".")).root];
+    if (process.platform === "win32") roots.push("\\\\server\\share\\");
+    for (const outputDir of roots) {
+      const target = resolveQbsSelectionToQ1TimelineTarget({ ir: payload, selection, outputDir });
+      assert.equal(target.q1asmFile, join(outputDir, program.file));
+      assert.equal(target.sequencer, selection.sequencer);
+      assert.equal(target.line, 4);
+    }
+  });
+
+  it("opens the selected repeated operation from the inspector and Q1ASM preview messages", () => {
+    const payload = ir();
+    payload.operations = [
+      { id: "first", operation_id: "shared", label: "First occurrence", abs_time: 0, duration: 10e-9 },
+      { id: "second", operation_id: "shared", label: "Second occurrence", abs_time: 20e-9, duration: 10e-9 },
+    ];
+    payload.symbolic_pulses = [];
+    payload.q1asm_programs = [{ sequencer: "seq0", file: "q1asm/seq0.q1asm" }];
+    payload.q1asm_provenance = [
+      { source_id: "pulse:first", operation_id: "shared", schedulable_id: "first", sequencer: "seq0", line: 3 },
+      { source_id: "pulse:second", operation_id: "shared", schedulable_id: "second", sequencer: "seq0", q1asm_line_start: 7,
+        q1asm_line_end: 9, operand_mappings: [{ instruction: "play", line: 9 }] },
+    ];
+    const model = require("../../src/qbs/webview/assets/timelineModel.js").buildTimelineModel(payload, "second");
+    for (const selection of [model.inspector.actions[0].message, model.inspector.q1asmDrilldown.openMessage]) {
+      const target = resolveQbsSelectionToQ1TimelineTarget({ ir: payload, selection, outputDir: "C:\\repo\\.qbs_timeline" });
+      assert.equal(target.line, 9);
+      assert.equal(target.blockId, "second");
+      assert.equal(target.sequencer, "seq0");
+    }
+  });
+
   it("builds an explicit q1timeline target from QBS provenance", () => {
     const target = resolveQbsSelectionToQ1TimelineTarget({
       outputDir: "C:\\repo\\.qbs_timeline",

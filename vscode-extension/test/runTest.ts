@@ -22,16 +22,20 @@ async function main(): Promise<void> {
   }
   const python = execFileSync(process.env.PYTHON ?? "python", ["-c", "import sys; print(sys.executable)"], { encoding: "utf8", windowsHide: true }).trim();
   mkdirSync(join(workspacePath, ".vscode"));
-  writeFileSync(join(workspacePath, ".vscode", "settings.json"), JSON.stringify({
+  const settings = {
     "q1lens.pythonPath": python,
     "q1lens.q1timeline.pythonPath": python,
-  }, null, 2));
+  };
+  writeFileSync(join(workspacePath, ".vscode", "settings.json"), JSON.stringify(settings, null, 2));
+  // A saved workspace supports adding another folder without restarting the test host.
+  const workspaceFile = join(outputPath, `${basename(workspacePath)}.code-workspace`);
+  writeFileSync(workspaceFile, JSON.stringify({ folders: [{ path: workspacePath }], settings }, null, 2));
 
   await runTests({
     ...(process.env.Q1LENS_VSCODE_TEST_VERSION ? { version: process.env.Q1LENS_VSCODE_TEST_VERSION } : {}),
     extensionDevelopmentPath,
     extensionTestsPath,
-    launchArgs: ["--disable-extensions", "--user-data-dir", userDataPath, workspacePath],
+    launchArgs: ["--disable-extensions", "--user-data-dir", userDataPath, workspaceFile],
   });
 }
 

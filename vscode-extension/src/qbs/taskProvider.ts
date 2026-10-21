@@ -1,7 +1,8 @@
 import type * as vscodeTypes from "vscode";
 import { spawn } from "node:child_process";
-import { dirname, resolve } from "node:path";
+import { dirname, posix, resolve } from "node:path";
 import { resolveFilePythonEnvironment } from "../pythonEnvironment";
+import { parseProjectConfigLite } from "./projectDiscovery";
 
 export interface QbsTimelineTaskProject {
   project: string;
@@ -30,7 +31,8 @@ function projectLabel(project: string): string {
 }
 
 function normalizeTaskPath(path: string): string {
-  return path.replace(/\\/g, "/").replace(/\/+/g, "/");
+  const normalized = path.replace(/\\/g, "/");
+  return (normalized.startsWith("//") ? "/" : "") + normalized.replace(/\/+/g, "/");
 }
 
 function isAbsoluteTaskPath(path: string): boolean {
@@ -48,7 +50,7 @@ function taskProject(input: string | QbsTimelineTaskProject): QbsTimelineTaskPro
 
 function buildArtifactPaths(project: string, configuredOutputDir: string, outputDirOverride: string | null): { irPath: string; htmlPath: string } {
   const outputDir = normalizeTaskPath(outputDirOverride ?? configuredOutputDir);
-  const outputBase = isAbsoluteTaskPath(outputDir) ? outputDir : joinTaskPath(projectLabel(project), outputDir);
+  const outputBase = isAbsoluteTaskPath(outputDir) ? outputDir : joinTaskPath(posix.dirname(normalizeTaskPath(project)), outputDir);
   return {
     irPath: joinTaskPath(outputBase, "qbs_ir.json"),
     htmlPath: joinTaskPath(outputBase, "index.html"),
@@ -139,8 +141,9 @@ export function resolveTaskDefinition(
 export function buildTaskExecution(
   definition: QbsTimelineTaskDefinition,
   settings: QbsTimelineTaskExecutionSettings,
+  artifactDir = definition.outputDir ?? ".qbs_timeline",
 ): { command: string; args: string[] } {
-  const analyzeArgs = ["analyze", "--project", definition.project, "--out", definition.irPath];
+  const analyzeArgs = ["analyze", "--project", definition.project, "--out-dir", artifactDir, "--out", definition.irPath];
   const renderArgs = ["render", "--ir", definition.irPath, "--out", definition.htmlPath];
 
   if (definition.command === "analyze") {
@@ -168,6 +171,7 @@ export class QbsTimelineTaskProvider implements vscodeTypes.TaskProvider {
     resource?: vscodeTypes.Uri,
     scope: vscodeTypes.Task["scope"] = vscode.TaskScope.Workspace,
     name = definition.label,
+    useProjectOutput = false,
   ): vscodeTypes.Task {
     const task = new vscode.Task(
       definition,
@@ -193,19 +197,29 @@ export class QbsTimelineTaskProvider implements vscodeTypes.TaskProvider {
           open: () => {
             void (async () => {
               try {
-                const resolved = resolveTaskDefinition({ ...definition, ...resolvedDefinition });
-                if (!resolved) throw new Error("Invalid Q1Lens task definition.");
-                const target = resource ?? taskResource(vscode, resolved.project, scope);
+                const target = resource ?? (typeof resolvedDefinition.project === "string"
+                  ? taskResource(vscode, resolvedDefinition.project, scope) : undefined);
                 if (!target) throw new Error("Set this Q1Lens task's workspace folder or use an absolute project path.");
+                const { readSettings } = require("./settings") as typeof import("./settings");
+                const settings = readSettings(target);
+                let resolved = resolveTaskDefinition(resolvedDefinition, settings.outputDirOverride);
+                if (!resolved) throw new Error("Invalid Q1Lens task definition.");
                 const environment = await resolveFilePythonEnvironment(vscode, target, "qbs");
                 if (closed) return;
+                if (useProjectOutput && resolvedDefinition.outputDir === undefined && settings.outputDirOverride === null) {
+                  const bytes = await vscode.workspace.fs.readFile(target);
+                  if (closed) return;
+                  const outputDir = parseProjectConfigLite(Buffer.from(bytes).toString("utf8")).outputDir;
+                  resolved = resolveTaskDefinition({ ...resolvedDefinition, outputDir }, settings.outputDirOverride)!;
+                }
                 const workspaceDir = vscode.workspace.getWorkspaceFolder(target)?.uri.fsPath ?? dirname(target.fsPath);
+                const artifactDir = resolve(dirname(target.fsPath), settings.outputDirOverride ?? resolved.outputDir ?? ".qbs_timeline");
                 const execution = buildTaskExecution({
                   ...resolved,
                   project: target.fsPath,
                   irPath: resolve(workspaceDir, resolved.irPath),
                   htmlPath: resolve(workspaceDir, resolved.htmlPath),
-                }, environment);
+                }, environment, artifactDir);
                 print(`Python: ${environment.pythonPath}\nSource: ${environment.sourceLabel}\nCommand: ${JSON.stringify([execution.command, ...execution.args])}\n\n`);
                 child = spawn(execution.command, execution.args, {
                   cwd: dirname(target.fsPath),
@@ -246,7 +260,15 @@ export class QbsTimelineTaskProvider implements vscodeTypes.TaskProvider {
       const settings = readSettings(resource);
       const scope = resource ? vscode.workspace.getWorkspaceFolder(resource) : undefined;
       return buildTaskDefinitions([info], settings.outputDirOverride)
-        .map((definition) => this.createTask(vscode, definition, resource, scope));
+        .map((definition) => {
+          const task = this.createTask(vscode, definition, resource, scope, definition.label, true);
+          // Discovered artifact paths are defaults, resolved from the settings at execution time.
+          task.definition = {
+            type: definition.type, command: definition.command, project: definition.project,
+            label: definition.label,
+          };
+          return task;
+        });
     });
   }
 

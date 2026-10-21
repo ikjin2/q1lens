@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createQ1TimelineControllerState, q1timelineProjectOutputDir } from "../../src/q1timeline/register";
@@ -77,6 +77,25 @@ describe("q1timeline internal API", () => {
       lookupEventIdsForSourceLine(timelineIr, "C:\\repo\\a\\seq0.q1asm", 3),
       ["a:e3"],
     );
+  });
+
+  it("keeps UNC project roots intact while resolving relative source maps", () => {
+    const roots = process.platform === "win32"
+      ? [String.raw`\\q1lens-host\share\project`, "//q1lens-host/share/project"]
+      : ["/q1lens-host/share/project"];
+    for (const root of roots) {
+      for (const project of [{ project: { root } }, { project_root: root }]) {
+        for (const mapping of [
+          { source_map: { by_source: { "q1asm/seq0.q1asm:7": ["expected"] } } },
+          { source_map: { by_event_id: { expected: { file: "q1asm/seq0.q1asm", line: 7 } } } },
+          { events: [{ id: "expected", source: { file: "q1asm/seq0.q1asm", line: 7 } }] },
+        ]) {
+          const timelineIr = { ...project, ...mapping };
+          assert.deepEqual(lookupEventIdsForSourceLine(timelineIr, join(root, "q1asm", "seq0.q1asm"), 7), ["expected"]);
+          assert.deepEqual(lookupEventIdsForSourceLine(timelineIr, join(root, "other", "seq0.q1asm"), 7), []);
+        }
+      }
+    }
   });
 
   it("keeps root-level and nested source files with the same basename separate", () => {
@@ -376,6 +395,31 @@ describe("q1timeline internal API", () => {
       }),
       false,
     );
+  });
+
+  it("finds projects inside workspace child directories whose names start with two dots", () => {
+    const root = mkdtempSync(join(tmpdir(), "q1lens-dot-prefix-project-"));
+    try {
+      const projectDir = join(root, "..experiment");
+      mkdirSync(projectDir);
+      const projectFile = join(projectDir, "q1timeline.yml");
+      writeFileSync(projectFile, "sequencers: []\n", "utf8");
+
+      assert.equal(findProjectFileUpward(join(projectDir, "seq0.q1asm"), "q1timeline.yml", root), projectFile);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("retains stored projects in two-dot-prefixed child directories without accepting parent paths", () => {
+    const root = join(tmpdir(), "q1lens-stored-project-workspace");
+    for (const [storedProjectFile, expected] of [
+      [join(root, "..experiment", "q1timeline.yml"), true],
+      [join(root, "..", "other", "q1timeline.yml"), false],
+      [join(root, "..other", "q1timeline.yml"), true],
+    ] as const) {
+      assert.equal(usableStoredProjectFile({ storedProjectFile, workspaceFolders: [root], exists: () => true }), expected);
+    }
   });
 
   it("finds the active q1timeline project for mixed-case Windows Q1ASM paths", () => {

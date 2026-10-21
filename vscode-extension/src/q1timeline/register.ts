@@ -29,6 +29,7 @@ export function registerQ1Timeline(context: vscodeTypes.ExtensionContext): Q1Tim
   const vscode = require("vscode") as typeof vscodeTypes;
   const { TimelineController } = require("./controller") as typeof import("./controller");
   const controller = new TimelineController(context);
+  context.subscriptions.push(controller);
 
   registerQ1asmQuickFixes(context, vscode);
   registerQ1asmColors(context, vscode);

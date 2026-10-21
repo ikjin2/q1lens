@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import Module = require("node:module");
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join, resolve } from "node:path";
 import {
   QBS_ANALYSIS_REQUIRED_MESSAGE,
   QBS_ANALYZE_AND_OPEN_ACTION,
@@ -12,13 +12,308 @@ import {
   ensureQbsAnalysisAvailable,
   isWatchedPathForCurrentProject,
   loadQ1TimelineDiagnosticsFromDisk,
+  notebookCellsFromDocument,
   openSourceTarget,
   registerQbsAutoRefresh,
   resolveQ1AsmSourceTarget,
   resolveScheduleSourceTarget,
 } from "../src/qbs/commands";
+import { createManagedNotebookTimelineProject } from "../src/qbs/notebookProject";
+import { deriveOutputPaths, parseProjectConfigLite } from "../src/qbs/projectDiscovery";
+
+class CancellationTokenSource {
+  token = { isCancellationRequested: false };
+  cancel() { this.token.isCancellationRequested = true; }
+  dispose() {}
+}
 
 describe("commands", () => {
+  it("opens an external schedule's literal source map instead of a same-named file beside the config", async function () {
+    this.timeout(30000);
+    const root = mkdtempSync(join(tmpdir(), "qbs-external-source-map-"));
+    const projectDir = join(root, "config"), sourceDir = join(root, "shared");
+    const projectFile = join(projectDir, "qbstimeline.yml"), scheduleFile = join(sourceDir, "schedule.py");
+    const originalPythonPath = process.env.PYTHONPATH;
+    const pythonSource = resolve(__dirname, "../../../src");
+    process.env.PYTHONPATH = originalPythonPath ? `${pythonSource}${delimiter}${originalPythonPath}` : pythonSource;
+    try {
+      mkdirSync(projectDir);
+      mkdirSync(sourceDir);
+      writeFileSync(join(projectDir, "schedule.py"), "raise RuntimeError('Unrelated same-named source')\n", "utf8");
+      const source = [
+        "class Schedule:", '    name = "external source"',
+        "    def add(self, operation, *, label):", "        return None",
+        "def build_schedule():", "    schedule = Schedule()",
+        '    schedule.add(object(), label="measure")', "    return schedule",
+        "class Compiler:", "    def compile(self, schedule):",
+        '        return {"name": schedule.name, "schedulables": {"measure": {"operation_id": "measure_op", "abs_time": 0.0}}, "operations": {"measure_op": {"name": "Measure(q0)", "duration": 4e-9}}, "compiled_instructions": {}}',
+        "def build_compiler():", "    return Compiler()",
+      ];
+      writeFileSync(scheduleFile, source.join("\n"), "utf8");
+      const yaml = "schedule:\n  file: ../shared/schedule.py\nlow_level:\n  q1timeline: false\n";
+      writeFileSync(projectFile, yaml, "utf8");
+      const paths = deriveOutputPaths({ projectFile, ...parseProjectConfigLite(yaml), overrideOutputDir: null });
+
+      await require("../src/qbs/commands").analyzeWithCli(paths, { pythonPath: process.env.PYTHON ?? "python", pythonArgs: ["-B"], outputDirOverride: null });
+      const ir = JSON.parse(readFileSync(paths.irPath, "utf8"));
+      const target = resolveScheduleSourceTarget({ ir, projectDir, scheduleFile, selection: { blockId: ir.operations[0].id } });
+
+      assert.equal(target.kind, "file");
+      assert.equal(target.file, scheduleFile);
+      if (target.kind === "file") assert.equal(target.line, source.indexOf('    schedule.add(object(), label="measure")') + 1);
+    } finally {
+      if (originalPythonPath === undefined) delete process.env.PYTHONPATH;
+      else process.env.PYTHONPATH = originalPythonPath;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  for (const scenario of ["file schedule", "file schedule with notebook source map"]) {
+    it(`runs a ${scenario} analysis from its original execution directory`, async () => {
+      const invocations: any[] = [];
+      const root = join(tmpdir(), "qbs-notebook-context");
+      const projectDir = join(root, ".qbs_timeline", "notebook");
+      const notebookPath = join(root, "experiment.ipynb");
+      const paths = {
+        projectFile: join(projectDir, "qbstimeline.yml"), projectDir,
+        outputDir: join(root, ".qbs_timeline"), irPath: join(root, ".qbs_timeline", "qbs_ir.json"),
+        ...(scenario === "file schedule with notebook source map" ? { sourceNotebookPath: notebookPath } : {}),
+      };
+      const originalLoad = (Module as any)._load;
+      (Module as any)._load = function patchedLoad(request: string, parent: any, isMain: boolean) {
+        if (request === "./qbsCli") return {
+          ...originalLoad.call(this, request, parent, isMain),
+          runProcessWithSpawn: async (_command: string, args: string[], options: any) => {
+            invocations.push({ args, options });
+            return { exitCode: 0, stdout: "", stderr: "" };
+          },
+        };
+        return originalLoad.call(this, request, parent, isMain);
+      };
+      const modulePath = require.resolve("../src/qbs/commands");
+      delete require.cache[modulePath];
+      try {
+        await require("../src/qbs/commands").analyzeWithCli(paths, { pythonPath: "python", pythonArgs: [], outputDirOverride: null });
+        assert.equal(invocations.length, 1);
+        assert.equal(invocations[0].options.cwd, projectDir);
+        assert.ok(invocations[0].args.includes(paths.projectFile));
+      } finally {
+        delete require.cache[modulePath];
+        (Module as any)._load = originalLoad;
+      }
+    });
+  }
+
+  for (const scenario of ["sibling import", "selected cell relative read", "compiler relative read"]) {
+    it(`analyzes the live managed notebook snapshot with its original ${scenario}`, async function () {
+      this.timeout(30000);
+      const root = mkdtempSync(join(tmpdir(), "qbs-notebook-execution-"));
+      const notebookPath = join(root, "experiment.ipynb");
+      const originalPythonPath = process.env.PYTHONPATH;
+      const pythonSource = resolve(__dirname, "../../../src");
+      process.env.PYTHONPATH = originalPythonPath ? `${pythonSource}${delimiter}${originalPythonPath}` : pythonSource;
+      try {
+        writeFileSync(join(root, "local_helper.py"), "VALUE = 'live snapshot'\n", "utf8");
+        writeFileSync(join(root, "calibration.txt"), "live snapshot", "utf8");
+        const setup = [
+          "from types import SimpleNamespace",
+          "class LocalCompiler:",
+          "    def compile(self, schedule):",
+          ...(scenario === "compiler relative read" ? [
+            "        from pathlib import Path",
+            "        schedule.name = Path('calibration.txt').read_text()",
+          ] : []),
+          "        schedule.compiled_instructions = {}",
+          "        return schedule",
+        ].join("\n");
+        const schedule = [
+          ...(scenario === "sibling import" ? ["from local_helper import VALUE"] : []),
+          ...(scenario === "selected cell relative read" ? ["from pathlib import Path", "VALUE = Path('calibration.txt').read_text()"] : []),
+          ...(scenario === "compiler relative read" ? ["VALUE = 'awaiting compiler'"] : []),
+          "schedule = SimpleNamespace(name=VALUE, schedulables={}, operations={})",
+          "compiler = LocalCompiler()",
+        ].join("\n");
+        const cells = [
+          { id: "ignored", kind: "code" as const, text: "raise RuntimeError('untagged cell must not run')", metadata: {} },
+          { id: "setup", kind: "code" as const, text: setup, metadata: { tags: ["qbstimeline-setup"] } },
+          { id: "selected", kind: "code" as const, text: schedule, metadata: {} },
+        ];
+        writeFileSync(notebookPath, JSON.stringify({
+          cells: [{ cell_type: "code", source: "raise RuntimeError('persisted original must not run')", metadata: { tags: ["qbstimeline-schedule"] } }],
+          metadata: {}, nbformat: 4, nbformat_minor: 5,
+        }), "utf8");
+        const managed = createManagedNotebookTimelineProject({ notebookPath, selectedCellIndex: 2, scheduleVariable: "schedule", compilerVariable: "compiler", cells });
+        mkdirSync(managed.projectDir, { recursive: true });
+        writeFileSync(managed.projectFile, managed.projectYaml, "utf8");
+        writeFileSync(managed.snapshotFile, managed.snapshotJson, "utf8");
+        const config = parseProjectConfigLite(managed.projectYaml);
+        const paths = deriveOutputPaths({ projectFile: managed.projectFile, ...config, overrideOutputDir: null });
+        await require("../src/qbs/commands").analyzeWithCli(paths, { pythonPath: process.env.PYTHON ?? "python", pythonArgs: ["-B"], outputDirOverride: null });
+        assert.equal(JSON.parse(readFileSync(paths.irPath, "utf8")).schedule.name, "live snapshot");
+      } finally {
+        if (originalPythonPath === undefined) delete process.env.PYTHONPATH;
+        else process.env.PYTHONPATH = originalPythonPath;
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it("asks to save an untitled notebook before checking its kernel or preparing a managed project", async () => {
+    const callbacks: Record<string, (...args: any[]) => Promise<void>> = {};
+    const warnings: string[] = [];
+    const prompts: string[] = [];
+    const subscriptions: Array<{ dispose(): void }> = [];
+    let kernelChecks = 0;
+    let artifactPreparations = 0;
+    const cells: any[] = [];
+    const notebook = {
+      uri: { scheme: "untitled", fsPath: "Untitled-1.ipynb" }, isUntitled: true,
+      getCells: () => cells, cellAt: (index: number) => cells[index],
+    };
+    cells.push({ notebook, index: 0, kind: 2, metadata: {}, document: { getText: () => "compiler = object()\nschedule = object()\n" } });
+    const originalLoad = (Module as any)._load;
+    (Module as any)._load = function patchedLoad(request: string, parent: any, isMain: boolean) {
+      if (request === "vscode") return {
+        Uri: { file: (fsPath: string) => ({ fsPath }) }, NotebookCellKind: { Markup: 1, Code: 2 },
+        window: {
+          createOutputChannel: () => ({ appendLine() {}, dispose() {} }),
+          showWarningMessage: async (message: string) => { warnings.push(message); },
+          showInputBox: async (options: any) => { prompts.push(options.title); return options.value; },
+          showErrorMessage: async () => undefined,
+        },
+        workspace: {
+          getConfiguration: () => ({ get: (_key: string, fallback: any) => fallback }),
+          fs: { createDirectory: async () => { artifactPreparations += 1; throw new Error("An untitled notebook has no managed project directory"); } },
+        },
+        languages: { createDiagnosticCollection: () => ({ dispose() {} }) },
+        commands: { registerCommand: (name: string, callback: any) => { callbacks[name] = callback; return { dispose() {} }; } },
+      };
+      if (request === "../notebookEnvironment") return { ensureNotebookEnvironment: async () => {
+        kernelChecks += 1;
+        return { pythonPath: "python", pythonArgs: [] };
+      } };
+      if (request === "./webview/panel") return { TimelinePanel: class { dispose() {} } };
+      if (request === "./diagnostics") return { publishDiagnostics() {} };
+      return originalLoad.call(this, request, parent, isMain);
+    };
+    const modulePath = require.resolve("../src/qbs/commands");
+    delete require.cache[modulePath];
+    try {
+      require("../src/qbs/commands").registerCommands({ extensionUri: {}, subscriptions }, { openQ1TimelineTarget: async () => undefined });
+      await callbacks["qbsTimeline.openNotebookTimelineFromCell"](cells[0]);
+      assert.equal(kernelChecks, 0);
+      assert.deepEqual(prompts, []);
+      assert.equal(artifactPreparations, 0);
+      assert.deepEqual(warnings, ["Open a saved notebook code cell before opening Q1Lens."]);
+    } finally {
+      subscriptions.forEach((subscription) => subscription.dispose());
+      delete require.cache[modulePath];
+      (Module as any)._load = originalLoad;
+    }
+  });
+
+  it("passes the UI artifact directory to analyze only when an output override is configured", async () => {
+    const invocations: any[] = [];
+    const originalLoad = (Module as any)._load;
+    (Module as any)._load = function patchedLoad(request: string, parent: any, isMain: boolean) {
+      if (request === "./qbsCli") return {
+        ...originalLoad.call(this, request, parent, isMain),
+        buildAnalyzeInvocation: (input: any) => { invocations.push(input); return { command: "python", args: [] }; },
+        runProcessWithSpawn: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      };
+      return originalLoad.call(this, request, parent, isMain);
+    };
+    const modulePath = require.resolve("../src/qbs/commands");
+    delete require.cache[modulePath];
+    try {
+      const { analyzeWithCli } = require("../src/qbs/commands");
+      const paths = { projectFile: "C:\\repo\\qbstimeline.yml", projectDir: "C:\\repo", outputDir: "C:\\repo\\generated", irPath: "C:\\repo\\generated\\qbs_ir.json" };
+      for (const outputDirOverride of [null, "generated"]) {
+        await analyzeWithCli(paths, { pythonPath: "python", pythonArgs: [], outputDirOverride });
+      }
+      assert.deepEqual(invocations.map((input) => input.outputDir), [undefined, paths.outputDir]);
+    } finally {
+      delete require.cache[modulePath];
+      (Module as any)._load = originalLoad;
+    }
+  });
+
+  for (const legacy of [false, true]) {
+    it(`preserves ${legacy ? "legacy" : "default"} API notebook IDs and setup tags in managed snapshots`, () => {
+      const metadata = (id: string, tags: string[]) => {
+        const value = { id, metadata: { tags, customSetting: "keep" }, execution_count: 3 };
+        return legacy ? { custom: value } : value;
+      };
+      const cells = notebookCellsFromDocument({ NotebookCellKind: { Markup: 1 } }, {
+        getCells: () => [
+          { kind: 2, metadata: metadata("setup-cell", ["qbstimeline-setup"]), document: { getText: () => "compiler = 'ready'\n" } },
+          { kind: 2, metadata: metadata("schedule-cell", []), document: { getText: () => "schedule = compiler\n" } },
+        ],
+      });
+      const project = createManagedNotebookTimelineProject({
+        notebookPath: "C:\\repo\\experiment.ipynb", selectedCellIndex: 1,
+        scheduleVariable: "schedule", compilerVariable: "compiler", cells,
+      });
+      const snapshot = JSON.parse(project.snapshotJson);
+      assert.deepEqual(snapshot.cells.map((cell: any) => cell.id), ["setup-cell", "schedule-cell"]);
+      assert.deepEqual(snapshot.cells[0].metadata, { tags: ["qbstimeline-setup"], customSetting: "keep" });
+      assert.deepEqual(snapshot.cells[1].metadata, { tags: ["qbstimeline-schedule"], customSetting: "keep" });
+    });
+
+    it(`marks setup and schedule cells in ${legacy ? "legacy" : "default"} API metadata without losing IDs or saved tags`, async () => {
+      const callbacks: Record<string, (...args: any[]) => Promise<void>> = {};
+      const wrapped = (id: string, tags: string[]) => {
+        const value = { id, metadata: { tags, customSetting: "keep" }, execution_count: 3 };
+        return legacy ? { custom: value, attachments: { image: "keep" } } : value;
+      };
+      const cells: any[] = [
+        { kind: 2, metadata: wrapped("setup-cell", []), document: { getText: () => "compiler = 'ready'\n" } },
+        { kind: 2, metadata: wrapped("old-schedule", ["qbstimeline-schedule", "other"]), document: { getText: () => "old = 1\n" } },
+        { kind: 2, metadata: wrapped("schedule-cell", []), document: { getText: () => "schedule = compiler\n" } },
+      ];
+      const notebook = { uri: { fsPath: "C:\\repo\\experiment.ipynb" }, getCells: () => cells, cellAt: (index: number) => cells[index] };
+      cells.forEach((cell, index) => { cell.notebook = notebook; cell.index = index; });
+      const originalLoad = (Module as any)._load;
+      (Module as any)._load = function patchedLoad(request: string, parent: any, isMain: boolean) {
+        if (request === "vscode") return {
+          NotebookCellKind: { Markup: 1, Code: 2 },
+          WorkspaceEdit: class { edits: any[] = []; set(_uri: any, edits: any[]) { this.edits = edits; } },
+          NotebookEdit: { updateCellMetadata: (index: number, metadata: any) => ({ index, metadata }) },
+          window: {
+            createOutputChannel: () => ({ dispose() {} }),
+            showInformationMessage: async () => undefined,
+          },
+          workspace: {
+            getConfiguration: () => ({ get: (_key: string, fallback: any) => fallback }),
+            applyEdit: async (edit: any) => {
+              for (const cellEdit of edit.edits) cells[cellEdit.index].metadata = cellEdit.metadata;
+              return true;
+            },
+          },
+          languages: { createDiagnosticCollection: () => ({ dispose() {} }) },
+          commands: { registerCommand: (name: string, callback: any) => { callbacks[name] = callback; return { dispose() {} }; } },
+        };
+        if (request === "./webview/panel") return { TimelinePanel: class {} };
+        if (request === "./diagnostics") return { publishDiagnostics() {} };
+        return originalLoad.call(this, request, parent, isMain);
+      };
+      const modulePath = require.resolve("../src/qbs/commands");
+      delete require.cache[modulePath];
+      try {
+        require("../src/qbs/commands").registerCommands({ extensionUri: {}, subscriptions: [] }, { openQ1TimelineTarget: async () => undefined });
+        await callbacks["qbsTimeline.markNotebookSetupCell"](cells[0]);
+        await callbacks["qbsTimeline.markNotebookScheduleCell"](cells[2]);
+        const savedCells = cells.map((cell) => legacy ? cell.metadata.custom : cell.metadata);
+        assert.deepEqual(savedCells.map((cell) => cell.id), ["setup-cell", "old-schedule", "schedule-cell"]);
+        assert.deepEqual(savedCells.map((cell) => cell.metadata.tags), [["qbstimeline-setup"], ["other"], ["qbstimeline-schedule"]]);
+        assert.equal(savedCells.every((cell) => cell.execution_count === 3 && cell.metadata.customSetting === "keep"), true);
+        if (legacy) assert.deepEqual(cells[0].metadata.attachments, { image: "keep" });
+      } finally {
+        delete require.cache[modulePath];
+        (Module as any)._load = originalLoad;
+      }
+    });
+  }
   it("runs analyze, render, load, diagnostics, and Webview update in order", async () => {
     const calls: string[] = [];
     const handler = createAnalyzeAndOpenHandler({
@@ -656,7 +951,7 @@ describe("commands", () => {
             measure: {
               kind: "notebook",
               file: "examples/050.ipynb",
-              notebook: { file: "examples/050.ipynb", cell_index: 12, cell_line: 4 },
+              notebook: { file: "examples/050.ipynb", cell_index: 12, cell_line: 4, cell_id: "schedule-cell" },
             },
           },
         },
@@ -670,6 +965,7 @@ describe("commands", () => {
       file: "examples/050.ipynb",
       cellIndex: 12,
       cellLine: 4,
+      cellId: "schedule-cell",
     });
   });
 
@@ -707,6 +1003,7 @@ describe("commands", () => {
 
   it("opens notebook source targets at the mapped cell line", async () => {
     const shownTextSelections: Array<{ line: number; character: number }> = [];
+    const cell = { index: 13, metadata: { id: "schedule-cell" }, document: { uri: { fsPath: "vscode-notebook-cell://cell" } } };
     const originalLoad = (Module as any)._load;
     (Module as any)._load = function patchedLoad(request: string, parent: any, isMain: boolean) {
       if (request === "vscode") {
@@ -727,17 +1024,22 @@ describe("commands", () => {
           },
           workspace: {
             openNotebookDocument: async () => ({
-              cellAt: () => ({ document: { uri: { fsPath: "vscode-notebook-cell://cell" } } }),
+              cellCount: 14,
+              cellAt: (index: number) => index === 13 ? cell : { index, metadata: { id: `other-${index}` }, document: {} },
             }),
           },
           window: {
+            tabGroups: { all: [] },
             showNotebookDocument: async () => ({}),
-            showTextDocument: async () => ({
-              set selection(value: any) {
-                shownTextSelections.push(value.start);
-              },
-              revealRange: () => undefined,
-            }),
+            showTextDocument: async (document: any) => {
+              assert.equal(document, cell.document, "Open source must follow the mapped cell ID after insertion");
+              return {
+                set selection(value: any) {
+                  shownTextSelections.push(value.start);
+                },
+                revealRange: () => undefined,
+              };
+            },
           },
           TextEditorRevealType: { InCenter: 1 },
         };
@@ -745,7 +1047,7 @@ describe("commands", () => {
       return originalLoad.call(this, request, parent, isMain);
     };
     try {
-      await openSourceTarget({ kind: "notebook", file: "C:\\repo\\notebook.ipynb", cellIndex: 12, cellLine: 4 });
+      await openSourceTarget({ kind: "notebook", file: "C:\\repo\\notebook.ipynb", cellIndex: 12, cellLine: 4, cellId: "schedule-cell" });
     } finally {
       (Module as any)._load = originalLoad;
     }
@@ -794,6 +1096,12 @@ describe("commands", () => {
     );
   });
 
+  it("includes two-dot-prefixed child directories in QBS project watching without accepting parent paths", () => {
+    const projectDir = join(tmpdir(), "q1lens-watched-project");
+    assert.equal(isWatchedPathForCurrentProject({ changedFile: join(projectDir, "..experiment", "schedule.py"), projectDir }), true);
+    assert.equal(isWatchedPathForCurrentProject({ changedFile: join(projectDir, "..", "other", "schedule.py"), projectDir }), false);
+  });
+
   it("uses the original notebook's current kernel for opening and refreshing a managed project", async () => {
     const root = mkdtempSync(join(tmpdir(), "qbs-notebook-cell-"));
     const notebookPath = join(root, "experiment.ipynb");
@@ -819,12 +1127,21 @@ describe("commands", () => {
       },
       ViewColumn: { Beside: 2 },
       NotebookCellKind: { Markup: 1, Code: 2 },
+      CancellationTokenSource,
       window: {
         createOutputChannel: () => ({ appendLine: () => {}, show: () => {}, dispose: () => {} }),
         showWarningMessage: async () => undefined,
         showQuickPick: async (items: any[]) => items[0],
         showInputBox: async (options: any) => {
           variablePrompts += 1;
+          if (options.title === "Compiler variable") {
+            cells.unshift({
+              notebook, kind: vscode.NotebookCellKind.Markup, metadata: {},
+              document: { getText: () => "Inserted during the variable prompts" },
+            });
+            cells.forEach((cell, index) => { cell.index = index; });
+            scheduleText = "updated_sched = Schedule('edited during prompts')\n";
+          }
           return options.value;
         },
         activeTextEditor: undefined,
@@ -845,6 +1162,7 @@ describe("commands", () => {
           update: async () => { configurationWrites += 1; },
         }),
         findFiles: async () => [],
+        getWorkspaceFolder: () => ({ uri: { fsPath: root } }),
         fs: {
           createDirectory: async (uri: any) => mkdirSync(uri.fsPath, { recursive: true }),
           writeFile: async (uri: any, bytes: Uint8Array) => writeFileSync(uri.fsPath, Buffer.from(bytes)),
@@ -1006,8 +1324,9 @@ describe("commands", () => {
       assert.match(projectText, /schedule_variable: updated_sched/);
       assert.match(projectText, /compiler_variable: hw_agent/);
       const snapshotText = readFileSync(join(root, ".qbs_timeline", "notebook", "selected.ipynb"), "utf8");
-      assert.equal(JSON.parse(snapshotText).cells[1].metadata.tags.includes("qbstimeline-schedule"), true);
-      assert.equal(JSON.parse(snapshotText).cells[1].source.join(""), scheduleText);
+      assert.equal(JSON.parse(snapshotText).metadata.qbstimeline.selected_cell_index, 2);
+      assert.equal(JSON.parse(snapshotText).cells[2].metadata.tags.includes("qbstimeline-schedule"), true);
+      assert.equal(JSON.parse(snapshotText).cells[2].source.join(""), scheduleText);
       assert.deepEqual(invocations.map(({ stage, pythonPath, pythonArgs }) => ({ stage, pythonPath, pythonArgs })), [
         { stage: "analyze", ...notebookEnvironment },
         { stage: "render", ...notebookEnvironment },
@@ -1041,8 +1360,10 @@ describe("commands", () => {
     }
   });
 
-  for (const unavailable of ["closed", "deleted"] as const) {
-    it(`stops opening a notebook when its original cell is ${unavailable} during environment setup`, async () => {
+  for (const { stage, unavailable } of ["environment setup", "Schedule variable", "Compiler variable"].flatMap(
+    (stage) => ["closed", "deleted"].map((unavailable) => ({ stage, unavailable })),
+  )) {
+    it(`stops opening a notebook when its original cell is ${unavailable} during ${stage}`, async () => {
       const commands: Record<string, (...args: any[]) => Promise<void>> = {};
       const warnings: string[] = [];
       const cells: any[] = [];
@@ -1053,14 +1374,23 @@ describe("commands", () => {
         cellAt: (index: number) => cells[index],
       };
       cells.push({ notebook, index: 0, kind: 2, document: { getText: () => "schedule = Schedule('demo')\n" } });
+      const invalidateCell = () => {
+        if (unavailable === "closed") notebook.isClosed = true;
+        else cells.splice(0, 1);
+      };
       const originalLoad = (Module as any)._load;
       (Module as any)._load = function patchedLoad(request: string, parent: any, isMain: boolean) {
         if (request === "vscode") return {
           NotebookCellKind: { Markup: 1, Code: 2 },
+          CancellationTokenSource,
           window: {
             createOutputChannel: () => ({ appendLine: () => {}, show: () => {}, dispose: () => {} }),
             showWarningMessage: async (message: string) => { warnings.push(message); },
-            showInputBox: async () => { assert.fail("Variable prompts must not open for an unavailable cell"); },
+            showInputBox: async (options: { title: string }) => {
+              if (stage === "environment setup") assert.fail("Variable prompts must not open for an unavailable cell");
+              if (options.title === stage) invalidateCell();
+              return options.title === "Schedule variable" ? "schedule" : "compiler";
+            },
           },
           workspace: {
             getConfiguration: () => ({ get: (_key: string, fallback: any) => fallback }),
@@ -1080,10 +1410,13 @@ describe("commands", () => {
         };
         if (request === "../notebookEnvironment") return {
           ensureNotebookEnvironment: async () => {
-            if (unavailable === "closed") notebook.isClosed = true;
-            else cells.splice(0, 1);
+            if (stage === "environment setup") invalidateCell();
             return { pythonPath: "notebook-python", pythonArgs: [] };
           },
+        };
+        if (request === "./notebookProject") return {
+          ...originalLoad.call(this, request, parent, isMain),
+          createManagedNotebookTimelineProject: () => assert.fail("No project should be generated for an unavailable cell"),
         };
         if (request === "./webview/panel") return { TimelinePanel: class {} };
         if (request === "./diagnostics") return { publishDiagnostics: () => {} };
@@ -1136,6 +1469,7 @@ describe("commands", () => {
       };
       let kernelLookups = 0;
       let panelShows = 0;
+      const panelRevealRequests: boolean[] = [];
       let panelHandlers: any;
       const originalLoad = (Module as any)._load;
       (Module as any)._load = function patchedLoad(request: string, parent: any, isMain: boolean) {
@@ -1189,7 +1523,10 @@ describe("commands", () => {
         if (request === "./webview/panel") {
           return { TimelinePanel: class {
             constructor(_extensionUri: any, handlers: any) { panelHandlers = handlers; }
-            show() { panelShows += 1; }
+            show(_ir: any, _paths: any, reveal: boolean) {
+              panelShows += 1;
+              panelRevealRequests.push(reveal);
+            }
           } };
         }
         if (request === "./diagnostics") {
@@ -1220,6 +1557,7 @@ describe("commands", () => {
           { openQ1TimelineTarget: async () => undefined },
         );
         await commands["qbsTimeline.analyzeAndOpen"]();
+        assert.deepEqual(panelRevealRequests, [true], "Explicit analysis must reveal the successful result");
         assert.deepEqual(invocations.map(({ stage, pythonPath, pythonArgs }) => ({ stage, pythonPath, pythonArgs })), [
           { stage: "analyze", ...selectedEnvironment },
           { stage: "render", ...selectedEnvironment },
@@ -1236,19 +1574,25 @@ describe("commands", () => {
           { stage: "q1timeline", ...selectedEnvironment },
         ]);
         assert.equal(invocations[5].q1timelineCommand, expectedQ1timelineCommand);
+        assert.deepEqual(panelRevealRequests, [true, false], "Refresh must update without revealing the panel");
 
         selectedEnvironment = undefined;
         await panelHandlers.onRefresh();
         assert.equal(invocations.length, 6, "An unavailable environment must not fall back to configured Python");
         assert.equal(kernelLookups, 0);
         assert.deepEqual(environmentResources, Array(3).fill(scheduleFile));
-        assert.equal(configurationResources.length, 9);
+        assert.equal(configurationResources.length, 12);
         assert.equal(configurationResources.every((resource) => resource === scheduleFile), true);
         assert.equal(panelShows, 2);
 
+        activeFile = scheduleFile;
+        await commands["qbsTimeline.analyzeAndOpen"]();
+        assert.deepEqual(panelRevealRequests, [true, false], "Canceled explicit analysis must not reveal the previous result");
+
         selectedEnvironment = { pythonPath: "selected-python", pythonArgs: [] };
         failAnalysis = true;
-        await commands["qbsTimeline.refresh"]();
+        await commands["qbsTimeline.analyzeAndOpen"]();
+        assert.deepEqual(panelRevealRequests, [true, false], "Failed explicit analysis must not reveal the previous result");
         assert.equal(recoveryCommands[0][0], "q1lens.checkEnvironment");
         assert.equal(recoveryCommands[0][2].fsPath, scheduleFile);
       } finally {
@@ -1382,6 +1726,7 @@ describe("commands", () => {
         },
         workspace: {
           getConfiguration: () => ({ get: (_key: string, fallback: any) => fallback }),
+          getWorkspaceFolder: () => ({ uri: { fsPath: root } }),
           findFiles: async () => {
             findFilesCalls += 1;
             return [{ fsPath: findFilesCalls === 1 ? join(projectA, "qbstimeline.yml") : join(projectB, "qbstimeline.yml") }];
@@ -1472,9 +1817,11 @@ describe("commands", () => {
 
       assert.equal(findFilesCalls, 1);
       assert.equal(analyzedProjects[1], join(projectA, "qbstimeline.yml"));
-      assert.equal(openedTargets[0].q1asmFile.replace(/\\/g, "/").includes("/project-a/.qbs_timeline/"), true);
+      assert.equal(openedTargets.length, 0, "The displayed output is being regenerated, so its old source mapping is unavailable");
       releaseSecondAnalyze();
       await secondRun;
+      await panelHandlers.onOpenQ1Timeline({ type: "openQ1Timeline", operationId: "op" });
+      assert.equal(openedTargets[0].q1asmFile.replace(/\\/g, "/").includes("/project-a/.qbs_timeline/"), true);
 
       await commands["qbsTimeline.analyzeAndOpen"]();
       assert.equal(findFilesCalls, 2);

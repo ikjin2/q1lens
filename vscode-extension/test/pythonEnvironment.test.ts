@@ -59,6 +59,27 @@ function harness(values: Record<string, unknown> = {}) {
 }
 
 describe("file Python environment resolution", () => {
+  for (const timing of ["before opening", "while opening"] as const) {
+    it(`does not open a cancelled interpreter picker ${timing} the original file`, async () => {
+      const resource = uri("/original-project/file.q1asm");
+      const actions: string[] = [];
+      let release!: () => void;
+      const opening = new Promise<void>((resolve) => { release = resolve; });
+      const vscode = {
+        workspace: {},
+        window: { showTextDocument: async () => { actions.push("open"); await opening; } },
+        commands: { executeCommand: async () => { actions.push("select"); } },
+      } as unknown as typeof vscodeTypes;
+      const cancellation = new AbortController();
+      if (timing === "before opening") cancellation.abort();
+      const pending = selectVSCodeInterpreter(vscode, resource, cancellation.signal);
+      cancellation.abort();
+      release();
+      await pending;
+      assert.deepEqual(actions, timing === "before opening" ? [] : ["open"]);
+    });
+  }
+
   it("focuses the original file before opening Python's interpreter picker without unsupported arguments", async () => {
     const resource = uri("/original-project/file.q1asm");
     const actions: unknown[] = [];
@@ -88,14 +109,16 @@ describe("file Python environment resolution", () => {
       const test = harness();
       const resource = uri("/project/timeline.yml");
       const result = await resolveFilePythonEnvironment(test.vscode, resource, kind);
-      assert.deepEqual(result, {
+      const { assertCurrentSelection, ...details } = result;
+      assert.equal(typeof assertCurrentSelection, "function");
+      assert.deepEqual(details, {
         pythonPath: "/project/.venv/bin/python",
         pythonArgs: [],
         source: "vscode",
         sourceLabel: "VS Code selected interpreter",
         resource,
       });
-      assert.deepEqual(test.resources, [resource]);
+      assert.deepEqual(test.resources, [resource, resource]);
       assert.deepEqual(test.resolutions, [{ id: "selected-env", path: "/project/.venv" }]);
       assert.ok(test.configurations.every(value => value === resource));
     });
@@ -143,7 +166,7 @@ describe("file Python environment resolution", () => {
       assert.equal(result.source, "vscode");
       assert.equal(result.manualSetting, undefined);
       assert.ok(test.configurations.every(value => value === resource));
-      assert.deepEqual(test.resources, [resource]);
+      assert.deepEqual(test.resources, [resource, resource]);
       assert.deepEqual(values, originalValues);
     });
 
@@ -250,9 +273,55 @@ describe("file Python environment resolution", () => {
     test.setExecutable("/second-workspace/.new-venv/bin/python");
     const refreshed = await resolveFilePythonEnvironment(test.vscode, resource, "q1asm");
     assert.equal(refreshed.pythonPath, "/second-workspace/.new-venv/bin/python");
-    assert.deepEqual(test.resources, [resource, resource]);
+    assert.deepEqual(test.resources, [resource, resource, resource, resource]);
     assert.ok(test.configurations.every(value => value === resource));
   });
+
+  for (const kind of ["qbs", "q1asm"] as const) {
+    for (const failed of [false, true]) {
+      it(`rejects an obsolete ${kind} interpreter when its ${failed ? "failed" : "successful"} resolution finishes after selection changes`, async () => {
+        const test = harness();
+        const resource = uri("/original-project/source.py");
+        let active = { id: "python-a", path: "/env/a/python" };
+        test.api.environments.getActiveEnvironmentPath = (target) => {
+          assert.equal(target, resource);
+          return { ...active };
+        };
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => { release = resolve; });
+        test.api.environments.resolveEnvironment = async () => {
+          await gate;
+          if (failed) throw new Error("Obsolete A resolution failed");
+          return { executable: { uri: uri("/env/a/python") } };
+        };
+        const pending = resolveFilePythonEnvironment(test.vscode, resource, kind);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        active = { id: "python-b", path: "/env/b/python" };
+        release();
+        await assert.rejects(pending, /Python selection changed.*try again/i);
+
+        test.api.environments.resolveEnvironment = async () => ({ executable: { uri: uri("/env/b/python") } });
+        assert.equal((await resolveFilePythonEnvironment(test.vscode, resource, kind)).pythonPath, "/env/b/python");
+      });
+    }
+
+    it(`accepts a fresh ${kind} selection wrapper with the same environment and equivalent path`, async () => {
+      const test = harness();
+      const resource = uri("/original-project/source.py");
+      const initialPath = process.platform === "win32" ? "C:\\Project\\.venv\\python.exe" : "/project/.venv/python";
+      const equivalentPath = process.platform === "win32" ? "c:/project/.venv/python.exe" : initialPath;
+      let activePath = initialPath;
+      test.api.environments.getActiveEnvironmentPath = (target) => {
+        assert.equal(target, resource);
+        return { id: "same-environment", path: activePath };
+      };
+      test.api.environments.resolveEnvironment = async () => {
+        activePath = equivalentPath;
+        return { executable: { uri: uri(initialPath) } };
+      };
+      assert.equal((await resolveFilePythonEnvironment(test.vscode, resource, kind)).pythonPath, initialPath);
+    });
+  }
 
   it("returns Windows executable paths without modifying them", async () => {
     const test = harness();

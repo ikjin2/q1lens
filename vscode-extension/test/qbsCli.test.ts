@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import Module = require("node:module");
+import { PassThrough } from "node:stream";
 import {
   buildAnalyzeInvocation,
   buildQ1TimelineAnalyzeInvocation,
@@ -7,6 +10,15 @@ import {
 } from "../src/qbs/qbsCli";
 
 describe("qbsCli", () => {
+  it("passes an explicit artifact output directory independently of the IR output path", () => {
+    const invocation = buildAnalyzeInvocation({
+      pythonPath: "python", pythonArgs: [], projectFile: "C:\\repo\\qbstimeline.yml",
+      irPath: "C:\\reports\\custom-ir.json", outputDir: "C:\\repo\\generated",
+    });
+    assert.equal(invocation.args[invocation.args.indexOf("--out-dir") + 1], "C:\\repo\\generated");
+    assert.equal(invocation.args[invocation.args.indexOf("--out") + 1], "C:\\reports\\custom-ir.json");
+  });
+
   it("builds analyze invocation with paths as separate arguments", () => {
     const invocation = buildAnalyzeInvocation({
       pythonPath: "C:\\Python 312\\python.exe",
@@ -104,6 +116,37 @@ describe("qbsCli", () => {
     assert.equal(result.exitCode, 0);
     assert.match(result.stdout, /ok/);
     assert.match(result.stderr, /warn/);
+  });
+
+  it("keeps UTF-8 diagnostic text intact when a pipe splits inside a character", async () => {
+    const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough() });
+    const originalLoad = (Module as any)._load;
+    const modulePath = require.resolve("../src/qbs/qbsCli");
+    const cachedModule = require.cache[modulePath];
+    (Module as any)._load = function patchedLoad(request: string, parent: any, isMain: boolean) {
+      return request === "node:child_process" ? { spawn: () => child } : originalLoad.call(this, request, parent, isMain);
+    };
+    delete require.cache[modulePath];
+    try {
+      const chunks: string[] = [];
+      const result = require("../src/qbs/qbsCli").runProcessWithSpawn("python", [], {
+        cwd: process.cwd(), onOutput: (chunk: string) => chunks.push(chunk),
+      });
+      const text = "경로 확인 ⚛";
+      const bytes = Buffer.from(text);
+      for (const stream of [child.stdout, child.stderr]) {
+        stream.write(bytes.subarray(0, 1));
+        stream.write(bytes.subarray(1, 5));
+        stream.write(bytes.subarray(5));
+      }
+      child.emit("close", 1);
+      assert.deepEqual(await result, { exitCode: 1, stdout: text, stderr: text });
+      assert.equal(chunks.join(""), text + text);
+    } finally {
+      if (cachedModule) require.cache[modulePath] = cachedModule;
+      else delete require.cache[modulePath];
+      (Module as any)._load = originalLoad;
+    }
   });
 
   it("rejects spawned commands that exceed the configured timeout", async () => {

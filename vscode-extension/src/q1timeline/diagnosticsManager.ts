@@ -9,7 +9,11 @@ class DiagnosticsManager {
     this.resolveSourcePath = resolveSourcePath;
   }
 
-  apply(diagnostics) {
+  invalidateSuggestedEdits() {
+    clearSuggestedEdits();
+  }
+
+  apply(diagnostics, allowSuggestedEdits = true) {
     clearSuggestedEdits();
     const byUri = new Map();
     for (const item of diagnostics) {
@@ -28,7 +32,7 @@ class DiagnosticsManager {
       const diagnostic = new this.vscode.Diagnostic(range, mapped.message, this.toSeverity(mapped.severity));
       diagnostic.source = mapped.source;
       diagnostic.code = mapped.code;
-      if (mapped.suggestedEdit) {
+      if (allowSuggestedEdits && mapped.suggestedEdit) {
         preserveSuggestedEdit(mapped.file, diagnostic, mapped.suggestedEdit);
       }
       const relatedInformation = this.toRelatedInformation(mapped);

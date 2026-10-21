@@ -8,10 +8,10 @@ export interface TimelineSourceContext {
 }
 
 export type ExtensionToWebviewMessage =
-  | { type: "render"; ir: QbsIr; sourceContext?: TimelineSourceContext; selectedOperationId?: string; selectedSequencer?: string }
+  | { type: "render"; renderId: number; ir: QbsIr; sourceContext?: TimelineSourceContext; selectedOperationId?: string; selectedSequencer?: string }
   | { type: "stale"; reason: string };
 
-export type WebviewToExtensionMessage =
+export type WebviewToExtensionMessage = (
   | { type: "ready" }
   | { type: "refresh" }
   | { type: "openQ1Timeline"; operationId?: string; blockId?: string; sequencer?: string; file?: string; line?: number }
@@ -22,4 +22,5 @@ export type WebviewToExtensionMessage =
   | { type: "openScheduleFile" }
   | { type: "openNotebookFile" }
   | { type: "selectOperation"; operationId: string }
-  | { type: "selectSequencer"; sequencer: string };
+  | { type: "selectSequencer"; sequencer: string }
+) & { renderId?: number };

@@ -43,6 +43,43 @@ def test_build_cli_uses_configured_output_dir(tmp_path: Path) -> None:
     assert (output_dir / "q1asm" / "cluster0_module0_seq0.q1asm").is_file()
 
 
+@pytest.mark.parametrize("absolute_override", [False, True])
+def test_analyze_cli_keeps_artifacts_in_requested_output_dir_with_separate_ir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    absolute_override: bool,
+) -> None:
+    project_dir = tmp_path / "project"
+    project_file = _write_fake_project(project_dir, output_dir="configured-output")
+    output_dir = project_dir / "generated" / "artifacts"
+    out_file = tmp_path / "reports" / "custom-ir.json"
+    override = str(output_dir) if absolute_override else "generated/artifacts"
+    monkeypatch.chdir(tmp_path)
+
+    exit_code = main([
+        "analyze", "--project", str(project_file), "--out-dir", override, "--out", str(out_file),
+    ])
+
+    assert exit_code == 0
+    ir = json.loads(out_file.read_text(encoding="utf-8"))
+    assert (output_dir / ir["q1asm_programs"][0]["file"]).is_file()
+    assert (output_dir / "q1timeline.yml").is_file()
+    assert not (project_dir / "configured-output").exists()
+    assert not (out_file.parent / "q1asm").exists()
+
+
+def test_analyze_cli_keeps_yaml_artifact_directory_when_only_ir_output_changes(tmp_path: Path) -> None:
+    project_file = _write_fake_project(tmp_path / "project", output_dir="configured-output")
+    out_file = tmp_path / "reports" / "custom-ir.json"
+
+    exit_code = main(["analyze", "--project", str(project_file), "--out", str(out_file)])
+
+    assert exit_code == 0
+    assert out_file.is_file()
+    assert (project_file.parent / "configured-output" / "q1asm" / "cluster0_module0_seq0.q1asm").is_file()
+    assert not (out_file.parent / "q1asm").exists()
+
+
 def test_build_cli_resolves_relative_override_from_project_root_and_opens(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

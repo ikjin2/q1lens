@@ -45,12 +45,12 @@
     }
   }
 
-  function writePersistedWebviewState(patch) {
+  function writePersistedWebviewState(patch, reset = false) {
     if (typeof vscode.setState !== "function") {
       return;
     }
     try {
-      vscode.setState({ ...readPersistedWebviewState(), ...patch });
+      vscode.setState({ ...(reset ? {} : readPersistedWebviewState()), ...patch });
     } catch (_error) {
       // VS Code state persistence is best-effort; the UI remains usable without it.
     }
@@ -227,6 +227,22 @@
       const eventIds = String(node.dataset.eventIds || "").split(/\s+/).filter(Boolean);
       node.classList.toggle("is-selected", selectedId !== "" && eventIds.includes(selectedId));
     }
+  }
+
+  function revealTimelineLinkedEvent(eventId) {
+    const event = timelineEventsById.get(String(eventId));
+    if (!event) return;
+    const visibleEvent = visiblePlaybackEvent(event);
+    expandQ1IssueLanesForHighlight([String(visibleEvent.id)]);
+    zoomTimelineToHighlightedEvent(visibleEvent);
+    const target = findVisibleEventNodeByIds([String(visibleEvent.id), String(event.id)]);
+    selectEventNode(target, { eventId: String(visibleEvent.id), notify: false, syncHardware: visibleEvent === event });
+    if (visibleEvent !== event) {
+      if (hardwareView) hardwareView.selectEvent(event.id);
+      renderSharedEventInspector(event.id);
+    }
+    target?.scrollIntoView({ block: "center", inline: "center" });
+    vscode.postMessage({ type: "eventClick", eventId: String(event.id) });
   }
 
   function syncTimelineRelatedSelection(eventId) {
@@ -838,6 +854,7 @@
     popover.dataset.ownerChipId = chip.dataset.controlChipId || "";
     chip.setAttribute("aria-expanded", "true");
     activeTimelineControlChip = chip;
+    const restoreLoopFocus = () => findVisibleEventNodeByIds([String(event.id)])?.focus({ preventScroll: true });
     if (actionKind === "branch") {
       renderBranchControls(popover, event);
     } else if (actionKind === "feedback") {
@@ -853,6 +870,7 @@
         writePersistedWebviewState({ expandedPlaybackLoops: Array.from(expandedPlaybackLoops) });
         closeTimelineControlPopover();
         renderSharedTimelineIfAvailable();
+        restoreLoopFocus();
       }, { text: true, active: expanded, disabled: !(meta.hidden_event_ids || []).length });
     } else if (actionKind === "loop") {
       const loopKey = String(meta.loop_preview_key || "");
@@ -862,17 +880,19 @@
         const visibleIterations = visible + 1;
         vscode.postMessage({ type: "setLoopPreview", loopKey, visibleIterations });
         closeTimelineControlPopover();
+        restoreLoopFocus();
       }, { active: visible > 1, disabled: !canShowNextTimelineControlLoopIteration(meta) });
       addTimelineControlAction(popover, "reset", "Reset loop preview", () => {
         const visibleIterations = 1;
         applyLoopPreviewResetOptimistically(loopKey);
         vscode.postMessage({ type: "setLoopPreview", loopKey, visibleIterations });
         closeTimelineControlPopover();
+        restoreLoopFocus();
         }, { danger: true, disabled: visible <= 1 });
     }
     ensureTimelineControlOverlay().append(popover);
     positionTimelineControlPopover(popover, chip);
-    if (actionKind === "branch" || actionKind === "feedback") {
+    if (actionKind === "branch" || actionKind === "feedback" || actionKind === "loop") {
       popover.addEventListener("keydown", (keyEvent) => {
         if (keyEvent.key === "Escape") {
           keyEvent.preventDefault();
@@ -881,7 +901,8 @@
         }
       });
       const focus = popover.querySelector("input:not(:disabled)") || popover.querySelector('button[aria-pressed="true"]:not(:disabled)') || popover.querySelector("button:not(:disabled)");
-      if (focus) focus.focus();
+      if (!focus) popover.tabIndex = -1;
+      (focus || popover).focus();
     }
   }
 
@@ -1300,6 +1321,7 @@
         if (event && typeof event.stopPropagation === "function") {
           event.stopPropagation();
         }
+        if (node.classList.contains("q1timeline-control-loop-lane")) return;
         const flow = annotation.domain?.kind === "feedback" ? annotation.domain.flow : undefined;
         if (flow) {
           const role = event?.target?.closest?.("[data-feedback-role]")?.dataset.feedbackRole || node.dataset.feedbackRole;
@@ -1346,7 +1368,18 @@
     renderWaitFolds();
     renderPlaybackFolds();
     renderHardwareCursor();
+    applyTimelineEventFilter();
     return true;
+  }
+
+  function applyTimelineEventFilter() {
+    const filterInput = document.getElementById("event-filter");
+    if (!filterInput) return;
+    const query = filterInput.value.trim().toLowerCase();
+    for (const eventNode of document.querySelectorAll(".event")) {
+      const searchable = eventNode.dataset.search || "";
+      eventNode.classList.toggle("is-filtered", query !== "" && !searchable.includes(query));
+    }
   }
 
   function initializeRenderedTimeline() {
@@ -1596,11 +1629,8 @@
     const filterInput = document.getElementById("event-filter");
     if (filterInput) {
       filterInput.addEventListener("input", () => {
-        const query = filterInput.value.trim().toLowerCase();
-        for (const eventNode of document.querySelectorAll(".event")) {
-          const searchable = eventNode.dataset.search || "";
-          eventNode.classList.toggle("is-filtered", query !== "" && !searchable.includes(query));
-        }
+        if (state.parameterProjectFile) writePersistedWebviewState({ eventFilterQuery: filterInput.value });
+        applyTimelineEventFilter();
       });
     }
 
@@ -1653,22 +1683,16 @@
     installDiagnosticBadgeInteractions();
 
     for (const link of document.querySelectorAll("[data-related-event-id]")) {
-      link.addEventListener("click", () => {
-        const eventId = link.dataset.relatedEventId;
-        const eventNode = document.querySelector(`[data-event-id="${eventId}"]`);
-        if (eventNode) {
-          selectEventNode(eventNode);
-        }
+      link.addEventListener("click", (event) => {
+        event.preventDefault();
+        revealTimelineLinkedEvent(link.dataset.relatedEventId);
       });
     }
 
     for (const link of document.querySelectorAll("[data-semantic-event-id]")) {
-      link.addEventListener("click", () => {
-        const eventId = link.dataset.semanticEventId;
-        const eventNode = document.querySelector(`[data-event-id="${eventId}"]`);
-        if (eventNode) {
-          selectEventNode(eventNode);
-        }
+      link.addEventListener("click", (event) => {
+        event.preventDefault();
+        revealTimelineLinkedEvent(link.dataset.semanticEventId);
       });
     }
 
@@ -1690,6 +1714,16 @@
   }
 
   const state = initialState();
+  const persistedProjectFile = readPersistedWebviewState().timelineProjectFile;
+  if (state.parameterProjectFile) {
+    writePersistedWebviewState({ timelineProjectFile: state.parameterProjectFile },
+      Boolean(persistedProjectFile && persistedProjectFile !== state.parameterProjectFile));
+  }
+  const eventFilter = document.getElementById("event-filter");
+  const savedEventFilterQuery = readPersistedWebviewState().eventFilterQuery;
+  if (state.parameterProjectFile && eventFilter && typeof savedEventFilterQuery === "string") {
+    eventFilter.value = savedEventFilterQuery;
+  }
   let timelineExecutionState = state.executionState || timelineIr.playback || { status: "idle" };
   const savedFoldState = readPersistedWebviewState();
   const currentFoldState = savedFoldState.timelineFoldStateVersion === 2 && savedFoldState.timelineFoldSnapshotId === state.playbackSnapshotId;
@@ -1940,8 +1974,12 @@
       pendingEditor.status.textContent = "";
       pendingEditor.error.textContent = message.message;
       pendingEditor.error.hidden = false;
+      const focusTarget = activeEditor ? activeEditor.input : pendingEditor.reset;
       pendingEditor = undefined;
       syncControls();
+      if (document.activeElement === document.body) {
+        focusTarget.focus({ preventScroll: true });
+      }
     });
     details.dataset.parameterEditors = "true";
   }
@@ -4239,11 +4277,9 @@
         const node = findVisibleEventNodeByIds([event && event.id || eventId]);
         if (node) {
           selectEventNode(node, { notify: false, syncHardware: false });
-          if (event && event.id !== eventId) renderSharedEventInspector(eventId);
+          if (node.dataset.eventId !== String(eventId)) renderSharedEventInspector(eventId);
         } else {
-          selectedTimelineEventId = eventId;
-          syncTimelineRelatedSelection(eventId);
-          renderSharedEventInspector(eventId);
+          selectEventNode(undefined, { eventId, notify: false, syncHardware: false });
         }
       },
       onSourceClick(source) {
@@ -4293,6 +4329,7 @@
   if (!sharedTimelineRendered) {
     restoreTimelineZoom();
     installTimelineMouseInteractions();
+    applyTimelineEventFilter();
   }
   initializeHardwareView();
   vscode.postMessage({ type: "webviewReady" });
@@ -4320,6 +4357,10 @@
   });
 
   window.addEventListener("message", (event) => {
+    if (event.data && event.data.type === "setAnalysisStatus") {
+      if (["error", "idle"].includes(event.data.status)) hardwareView?.finishReplayPreparation();
+      return;
+    }
     if (event.data && event.data.type === "setExecutionState") {
       timelineExecutionState = event.data.state || { status: "idle" };
       renderExecutionControls();
@@ -4343,6 +4384,23 @@
       return;
     }
     syncTimelineRelatedSelection(undefined);
+    if (!event.data.zoomToRange && !(event.data.highlightEventIds || []).length) {
+      selectedTimelineEventId = undefined;
+      if (selectedSourceEventIds.size) {
+        timelineSelectionRange = undefined;
+        document.querySelectorAll(".time-selection, #q1timeline-selection-overlay").forEach((node) => node.remove());
+      }
+      selectedSourceEventIds.clear();
+      document.querySelectorAll("[data-event-id]").forEach((node) => {
+        node.classList.remove("is-selected");
+        node.setAttribute("aria-selected", "false");
+      });
+      syncSharedAnnotationSelection(undefined);
+      renderSharedEventInspector(null);
+      renderRelatedBlockSummary([]);
+      syncTimelineZoomActionState();
+      return;
+    }
     if (event.data.zoomToRange) {
       if (timelineLayout === "instruction") {
         const ids = new Set((event.data.highlightEventIds || []).map((id) => visiblePlaybackEvent(timelineEventsById.get(String(id)))?.id || String(id)));
@@ -4401,10 +4459,14 @@
       }
       target.scrollIntoView({ block: "center", inline: "center" });
     } else {
-      syncTimelineRelatedSelection(undefined);
+      if (highlightedEvent) {
+        selectEventNode(undefined, { eventId: String(highlightedEvent.id), notify: false, syncHardware: false });
+      }
       const ids = new Set(highlightEventIds);
       document.querySelectorAll("[data-event-id]").forEach((node) => {
-        node.classList.toggle("is-selected", ids.has(node.dataset.eventId));
+        const selected = ids.has(node.dataset.eventId);
+        node.classList.toggle("is-selected", selected);
+        node.setAttribute("aria-selected", String(selected));
       });
       if (hardwareView && highlightedEvent) {
         hardwareView.selectEvent(highlightedEvent.id);

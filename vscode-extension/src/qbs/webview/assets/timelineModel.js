@@ -489,7 +489,10 @@
     }));
   }
 
-  function blockStyle(start, duration, viewport) {
+  function blockStyle(start, duration, viewport, isPoint = false) {
+    if (isPoint && start === viewport.end) {
+      start = Math.max(viewport.start, start - duration);
+    }
     const span = viewportDuration(viewport);
     const end = start + duration;
     const visibleStart = Math.max(start, viewport.start);
@@ -509,7 +512,7 @@
       const start = position?.start ?? operation.abs_time ?? 0;
       const actualDuration = positiveDuration(operation.duration);
       const duration = position?.duration || actualDuration || viewportDuration(viewport) * 0.02;
-      const style = blockStyle(start, duration, viewport);
+      const style = blockStyle(start, duration, viewport, !actualDuration && !position?.duration);
       if (!style) {
         return [];
       }
@@ -550,7 +553,7 @@
       if (suppressedOperationIds.has(block.id)) {
         continue;
       }
-      const operation = findOperation(ir, block.operationId || block.id);
+      const operation = findOperation(ir, block.id) || findOperation(ir, block.operationId);
       const label = operation ? groupLabelForOperation(operation) : "Schedule operations";
       const blocks = lanes.get(label) || [];
       blocks.push(block);
@@ -1067,7 +1070,7 @@
     };
   }
 
-  function q1timelineInlinePreviewsForBlock(ir, block, mapping) {
+  function q1timelineInlinePreviewsForBlock(ir, block, mapping, viewport) {
     const events = uniqueQ1timelineEvents(q1timelineEventsForMapping(ir, mapping).filter(isVisibleQ1timelineEvent));
     const qbsStartNs = Number.isFinite(block.startSeconds) ? block.startSeconds * 1e9 : undefined;
     const qbsDurationNs = positiveDuration(block.durationSeconds) ? block.durationSeconds * 1e9 : undefined;
@@ -1084,7 +1087,7 @@
         return entry.span.start >= qbsStartNs && entry.span.end <= qbsEndNs;
       });
     if (!spans.length) {
-      return [];
+      return undefined;
     }
     spans.sort((a, b) => {
       const lineDiff = (q1timelineEventLine(a.event) || 0) - (q1timelineEventLine(b.event) || 0);
@@ -1100,16 +1103,19 @@
     const eventSpan = timelineEnd - timelineStart;
     const timelineSpan = Number.isFinite(qbsStartNs) ? Math.max(eventSpan, qbsDurationNs || 0) : eventSpan;
     if (!Number.isFinite(timelineSpan) || timelineSpan <= 0) {
-      return [];
+      return undefined;
     }
-    return spans.map((entry) => (
-      q1timelineInlineBlockForEvent(ir, block, mapping, entry.event, entry.span, timelineStart, timelineSpan)
-    ));
+    const clipped = Number.isFinite(qbsEndNs) && (qbsStartNs < viewport.start * 1e9 || qbsEndNs > viewport.end * 1e9);
+    return spans.flatMap((entry) => {
+      const style = clipped ? blockStyle(entry.span.start / 1e9, (entry.span.end - entry.span.start) / 1e9, viewport) : undefined;
+      if (clipped && !style) return [];
+      return [{ ...q1timelineInlineBlockForEvent(ir, block, mapping, entry.event, entry.span, timelineStart, timelineSpan), ...style }];
+    });
   }
 
-  function inlineQ1PreviewsForBlock(ir, block, mapping) {
-    const q1timelineBlocks = q1timelineInlinePreviewsForBlock(ir, block, mapping);
-    if (q1timelineBlocks.length) {
+  function inlineQ1PreviewsForBlock(ir, block, mapping, viewport) {
+    const q1timelineBlocks = q1timelineInlinePreviewsForBlock(ir, block, mapping, viewport);
+    if (q1timelineBlocks) {
       return q1timelineBlocks;
     }
     return [inlineQ1PreviewForBlock(ir, block, mapping)];
@@ -1158,8 +1164,9 @@
     for (const pulse of ir.symbolic_pulses || []) {
       const position = pulseLayoutPosition(pulse, layout);
       const start = (pulse.abs_time > 0 ? pulse.abs_time : undefined) ?? position?.start ?? pulse.abs_time ?? 0;
-      const duration = positiveDuration(pulse.duration) || position?.duration || viewportDuration(viewport) * 0.02;
-      const style = blockStyle(start, duration, viewport);
+      const actualDuration = positiveDuration(pulse.duration);
+      const duration = actualDuration || position?.duration || viewportDuration(viewport) * 0.02;
+      const style = blockStyle(start, duration, viewport, !actualDuration && !position?.duration);
       if (!style) {
         continue;
       }
@@ -1191,7 +1198,7 @@
       block.provenanceDescription = provenance.description;
       if (mapping?.sequencer) {
         block.q1timelineMessage = q1timelinePreviewMessage(block, mapping);
-        block.inlineQ1Preview = inlineQ1PreviewsForBlock(ir, block, mapping);
+        block.inlineQ1Preview = inlineQ1PreviewsForBlock(ir, block, mapping, viewport);
       }
       list.push(block);
       lanes.set(pulse.lane, list);
@@ -1201,14 +1208,11 @@
     ));
   }
 
-  function findSelectedBlock(lanes, selectedId) {
-    for (const lane of lanes) {
-      const block = lane.blocks.find((candidate) => candidate.id === selectedId || candidate.operationId === selectedId);
-      if (block) {
-        return block;
-      }
-    }
-    return lanes[0]?.blocks[0];
+  function findSelectedBlock(lanes, selectedId, exactSelection = false) {
+    const blocks = lanes.flatMap((lane) => lane.blocks);
+    return blocks.find((block) => block.id === selectedId)
+      || (!exactSelection && blocks.find((block) => block.operationId === selectedId))
+      || (selectedId ? undefined : blocks[0]);
   }
 
   function findPulse(ir, id) {
@@ -1216,7 +1220,9 @@
   }
 
   function findOperation(ir, id) {
-    return (ir.operations || []).find((operation) => operation.id === id || operation.operation_id === id);
+    const operations = ir.operations || [];
+    return operations.find((operation) => operation.id === id)
+      || operations.find((operation) => operation.operation_id === id);
   }
 
   function findProvenanceForOperation(ir, ...ids) {
@@ -1274,7 +1280,8 @@
 
   function buildOperationInspector(ir, operation, selectedBlock) {
     const operationId = operation.operation_id || operation.id;
-    const mapping = findProvenanceForOperation(ir, operation.id, operationId, operation.schedulable_id);
+    const mapping = provenanceForSelection(ir, selectedBlock)
+      || findProvenanceForOperation(ir, operation.id, operationId, operation.schedulable_id);
     const line = provenanceStartLine(mapping);
     return {
       title: operation.label || operation.id,
@@ -1286,7 +1293,7 @@
         { label: "Q1ASM", value: mapping ? `${mapping.sequencer}:L${line}` : "" },
       ]),
       actions: [
-        { label: "Open Full Q1ASM Timeline", message: { type: "openQ1Timeline", operationId } },
+        { label: "Open Full Q1ASM Timeline", message: { type: "openQ1Timeline", operationId, blockId: selectedBlock.id } },
       ],
       selectedId: selectedBlock.id,
     };
@@ -1324,7 +1331,7 @@
     if (pulse) {
       return buildPulseInspector(ir, pulse, selectedBlock, values);
     }
-    const operation = findOperation(ir, selectedBlock.operationId || selectedBlock.id);
+    const operation = findOperation(ir, selectedBlock.id) || findOperation(ir, selectedBlock.operationId);
     if (selectedBlock.type === "operation" && operation) {
       return buildOperationInspector(ir, operation, selectedBlock);
     }
@@ -1642,7 +1649,15 @@
       ...controlFlowRawLanes,
       ...scheduleRawLanes,
     ];
-    const selectedBlock = findSelectedBlock(rawLanes, selectedId);
+    let selectedBlock = findSelectedBlock(rawLanes, selectedId, viewState?.exactSelection);
+    if (selectedId && selectedBlock?.id !== selectedId) {
+      const fullViewport = { start: 0, end: total };
+      selectedBlock = findSelectedBlock([
+        ...controlFlowLanes(ir, fullViewport, viewState?.expandedGroups, logicalLayout),
+        ...operationLanes(ir, fullViewport, logicalLayout),
+        ...pulseLanes(ir, fullViewport, logicalLayout),
+      ], selectedId, viewState?.exactSelection);
+    }
     const lanes = [
       ...applySelectionState(controlFlowRawLanes, selectedBlock),
       ...groupTimelineLanes(

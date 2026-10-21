@@ -45,7 +45,7 @@ function loadInstructionRuntime(options: { count?: number; clientWidth?: number;
     });
     return stage;
   }
-  const names = ["clamp", "instructionPlotWidth", "setInstructionView", "fitInstructionSelection", "handleInstructionWheel", "installTimelineMouseInteractions", "renderSharedTimelineIfAvailable", "setTimelineLayout", "timelineControlChipLeft"];
+  const names = ["clamp", "instructionPlotWidth", "setInstructionView", "fitInstructionSelection", "handleInstructionWheel", "installTimelineMouseInteractions", "renderSharedTimelineIfAvailable", "applyTimelineEventFilter", "setTimelineLayout", "timelineControlChipLeft"];
   const noops = ["renderTimelineLayoutToggle", "renderTimelineWindowStatus", "renderTimeBasisToggle", "installSharedQ1IssueControls", "syncSharedSequencerFoldControls", "installTimelineControlChips", "applySharedSelection", "renderWaitFolds", "renderPlaybackFolds", "renderHardwareCursor"];
   return Function("createStage", "adapter", "count", `
     let stage = createStage(count);
@@ -63,7 +63,7 @@ function loadInstructionRuntime(options: { count?: number; clientWidth?: number;
       id: "q1-" + index, kind: "q1_issue", sequencer_id: "Control", t0: index * 4, t1: (index + 1) * 4,
     }))) };
     const root = { querySelector: selector => selector === ".shared-timeline-stage" ? stage : undefined };
-    const document = { getElementById: () => root };
+    const document = { getElementById: id => id === "timeline-root" ? root : undefined };
     const window = { q1timelineTimelineAdapter: adapter, q1lensSharedTimeline: {
       renderTimeline(_root, model) {
         stage.isConnected = false;

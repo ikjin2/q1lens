@@ -141,7 +141,7 @@ function sourceFileMatches(mappedFile, requestedFile, timelineIr) {
   if (mapped === requested) {
     return true;
   }
-  const projectRoot = normalizePathText(timelineIr?.project?.root || timelineIr?.project_root || "");
+  const projectRoot = timelineIr?.project?.root || timelineIr?.project_root || "";
   if (projectRoot) {
     const mappedAbsolute = normalizePathText(path.resolve(projectRoot, mappedFile));
     const requestedAbsolute = normalizePathText(path.resolve(projectRoot, requestedFile));

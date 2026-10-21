@@ -2,11 +2,115 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import Module = require("node:module");
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, win32 } from "node:path";
 import { PassThrough } from "node:stream";
 import { buildTaskDefinitions, buildTaskExecution, resolveTaskDefinition } from "../src/qbs/taskProvider";
 
 describe("taskProvider", () => {
+  for (const command of ["analyze", "render", "analyzeAndRender"]) {
+    it(`uses the current YAML output when a discovered ${command} task is reused`, async () => {
+      await withProviderMocks(async (fixture) => {
+        fixture.projectOutput("old-artifacts");
+        const tasks = await fixture.provider.provideTasks();
+        const task = tasks.find((candidate: any) => candidate.definition.command === command);
+        fixture.projectOutput("new-artifacts");
+        const running = await fixture.start(task);
+        const args = fixture.processes[0].args as string[];
+        const output = join(fixture.folderA.uri.fsPath, "experiment", "new-artifacts");
+        const irPath = join(output, "qbs_ir.json"), htmlPath = join(output, "index.html");
+        if (command === "analyzeAndRender") {
+          assert.ok(args.at(-1)!.includes(JSON.stringify(irPath)), args.at(-1));
+          assert.ok(args.at(-1)!.includes(JSON.stringify(htmlPath)), args.at(-1));
+          assert.ok(args.at(-1)!.includes(JSON.stringify(output)), args.at(-1));
+        } else {
+          assert.equal(args[args.indexOf(command === "analyze" ? "--out" : "--ir") + 1], irPath);
+          if (command === "analyze") assert.equal(args[args.indexOf("--out-dir") + 1], output);
+          else assert.equal(args[args.indexOf("--out") + 1], htmlPath);
+        }
+        fixture.processes[0].child.emit("close", 0);
+        assert.deepEqual(running.exits, [0]);
+      });
+    });
+  }
+
+  it("does not launch a discovered task cancelled while its current project output is read", async () => {
+    await withProviderMocks(async (fixture) => {
+      const tasks = await fixture.provider.provideTasks();
+      let release!: () => void;
+      fixture.waitForProject(new Promise<void>((resolve) => { release = resolve; }));
+      const running = await fixture.start(tasks[0]);
+      running.terminal.close();
+      fixture.failProject(new Error("The project disappeared after task cancellation"));
+      release();
+      await new Promise(setImmediate);
+      assert.deepEqual(fixture.processes, []);
+      assert.deepEqual(running.output, [], "A late project read failure must not write to the closed task terminal");
+      assert.deepEqual(running.exits, []);
+    });
+  });
+
+  it("reports a current YAML read failure without launching a discovered task with its old output", async () => {
+    await withProviderMocks(async (fixture) => {
+      const tasks = await fixture.provider.provideTasks();
+      fixture.failProject(new Error("The current project cannot be read"));
+      const running = await fixture.start(tasks[0]);
+      assert.deepEqual(fixture.processes, []);
+      assert.deepEqual(running.exits, [1]);
+      assert.match(running.output.join(""), /current project cannot be read/);
+    });
+  });
+
+  for (const previous of [null, "old-artifacts"]) {
+    for (const command of ["analyze", "render", "analyzeAndRender"]) {
+      it(`uses current output paths when a discovered ${command} task is reused after ${previous ? "removing" : "adding"} an override`, async () => {
+        await withProviderMocks(async (fixture) => {
+          fixture.overrideOutput(previous);
+          const tasks = await fixture.provider.provideTasks();
+          const task = tasks.find((candidate: any) => candidate.definition.command === command);
+          const current = previous ? null : "new-artifacts";
+          fixture.overrideOutput(current);
+          const running = await fixture.start(task);
+          const args = fixture.processes[0].args as string[];
+          const output = join(fixture.folderA.uri.fsPath, "experiment", current ?? ".qbs_timeline");
+          const irPath = join(output, "qbs_ir.json");
+          const htmlPath = join(output, "index.html");
+          if (command === "analyzeAndRender") {
+            assert.ok(args.at(-1)!.includes(JSON.stringify(irPath)), args.at(-1));
+            assert.ok(args.at(-1)!.includes(JSON.stringify(htmlPath)), args.at(-1));
+            assert.ok(args.at(-1)!.includes(JSON.stringify(output)), args.at(-1));
+          } else {
+            assert.equal(args[args.indexOf(command === "analyze" ? "--out" : "--ir") + 1], irPath);
+            if (command === "analyze") assert.equal(args[args.indexOf("--out-dir") + 1], output);
+            else assert.equal(args[args.indexOf("--out") + 1], htmlPath);
+          }
+          fixture.processes[0].child.emit("close", 0);
+          assert.deepEqual(running.exits, [0]);
+        });
+      });
+    }
+  }
+
+  for (const override of [null, "setting-artifacts"]) {
+    it(`keeps ${override ? "the settings override" : "task.outputDir"} separate from explicit task IR and HTML paths`, async () => {
+      await withProviderMocks(async (fixture) => {
+        fixture.overrideOutput(override);
+        const irPath = join(fixture.folderA.uri.fsPath, "reports", "custom-ir.json");
+        const htmlPath = join(fixture.folderA.uri.fsPath, "reports", "custom-view.html");
+        const task = fixture.provider.resolveTask({
+          definition: { type: "qbs-timeline", command: "analyze", project: "experiment/qbstimeline.yml", outputDir: "task-artifacts", irPath, htmlPath },
+          scope: fixture.folderA, name: "Separate artifacts",
+        });
+        const running = await fixture.start(task);
+        const args = fixture.processes[0].args;
+        assert.equal(args[args.indexOf("--out-dir") + 1], join(fixture.folderA.uri.fsPath, "experiment", override ?? "task-artifacts"));
+        assert.equal(args[args.indexOf("--out") + 1], irPath);
+        assert.equal(task.definition.htmlPath, htmlPath);
+        fixture.processes[0].child.emit("close", 0);
+        assert.deepEqual(running.exits, [0]);
+      });
+    });
+  }
+
   it("builds analyze, render, and combined tasks for each project", () => {
     const tasks = buildTaskDefinitions(["examples/basic-transmon/qbstimeline.yml"]);
 
@@ -15,6 +119,43 @@ describe("taskProvider", () => {
       "Q1Lens: Render examples/basic-transmon",
       "Q1Lens: Analyze and Render examples/basic-transmon",
     ]);
+  });
+
+  it("places task artifacts beside root-level and custom-named project files", () => {
+    for (const [project, outputBase] of [
+      ["qbstimeline.yml", "./.qbs_timeline"],
+      ["custom.yaml", "./.qbs_timeline"],
+      ["experiments/custom.yml", "experiments/.qbs_timeline"],
+      ["C:\\repo\\custom.yml", "C:/repo/.qbs_timeline"],
+    ]) {
+      const tasks = buildTaskDefinitions([project]);
+      const resolved = resolveTaskDefinition({ type: "qbs-timeline", command: "analyze", project });
+      for (const task of [...tasks, resolved!]) {
+        assert.equal(task.irPath, `${outputBase}/qbs_ir.json`, project);
+        assert.equal(task.htmlPath, `${outputBase}/index.html`, project);
+      }
+    }
+  });
+
+  it("preserves network shares in project and configured output artifact paths", () => {
+    const cases = [
+      { project: "\\\\server\\share\\experiment\\custom.yml", outputBase: "//server/share/experiment/.qbs_timeline" },
+      { project: "//server/share/custom.yml", outputBase: "//server/share/.qbs_timeline" },
+      { project: "experiment/custom.yml", outputDir: "\\\\server\\share\\results", outputBase: "//server/share/results" },
+      { project: "experiment/custom.yml", override: "//server/share//results", outputBase: "//server/share/results" },
+    ];
+    for (const example of cases) {
+      const project = { project: example.project, outputDir: example.outputDir ?? ".qbs_timeline" };
+      const definitions = [
+        ...buildTaskDefinitions([project], example.override ?? null),
+        resolveTaskDefinition({ type: "qbs-timeline", command: "analyze", ...project }, example.override ?? null)!,
+      ];
+      for (const definition of definitions) {
+        assert.equal(definition.irPath, `${example.outputBase}/qbs_ir.json`);
+        assert.equal(definition.htmlPath, `${example.outputBase}/index.html`);
+        assert.equal(win32.resolve("C:/workspace", definition.irPath), win32.join(example.outputBase, "qbs_ir.json"));
+      }
+    }
   });
 
   it("passes required Q1Lens CLI arguments for analyze and render tasks", () => {
@@ -29,6 +170,8 @@ describe("taskProvider", () => {
         "analyze",
         "--project",
         "examples/basic-transmon/qbstimeline.yml",
+        "--out-dir",
+        ".qbs_timeline",
         "--out",
         "examples/basic-transmon/.qbs_timeline/qbs_ir.json",
       ],
@@ -137,6 +280,79 @@ describe("taskProvider", () => {
     });
   });
 
+  it("derives default artifact paths after VS Code expands project and output variables", async () => {
+    await withProviderMocks(async (fixture) => {
+      const examples = [
+        {
+          definition: { type: "qbs-timeline", command: "analyze", project: "${workspaceFolder}/experiment/qbstimeline.yml" },
+          expanded: { project: fixture.projectA.fsPath },
+          output: join(fixture.folderA.uri.fsPath, "experiment", ".qbs_timeline", "qbs_ir.json"),
+        },
+        {
+          definition: { type: "qbs-timeline", command: "analyze", project: "experiment/qbstimeline.yml", outputDir: "${input:artifacts}" },
+          expanded: { outputDir: "generated" },
+          output: join(fixture.folderA.uri.fsPath, "experiment", "generated", "qbs_ir.json"),
+        },
+      ];
+      for (const example of examples) {
+        const task = fixture.provider.resolveTask({ definition: example.definition, scope: fixture.folderA, name: "Variable task" });
+        const running = await fixture.start(task, { ...example.definition, ...example.expanded });
+        const launched = fixture.processes.at(-1);
+        assert.equal(launched.args.at(-1), example.output);
+        assert.equal(launched.args.includes(fixture.projectA.fsPath), true);
+        launched.child.emit("close", 0);
+        assert.deepEqual(running.exits, [0]);
+      }
+    });
+  });
+
+  it("reads folder output overrides once the task's project variable has resolved", async () => {
+    await withProviderMocks(async (fixture) => {
+      fixture.overrideOutput("build/qbs");
+      const definition = { type: "qbs-timeline", command: "analyze", project: "${workspaceFolder}/experiment/qbstimeline.yml" };
+      const task = fixture.provider.resolveTask({ definition, scope: fixture.folderA, name: "Scoped task" });
+      const running = await fixture.start(task, { ...definition, project: fixture.projectA.fsPath });
+      assert.equal(fixture.processes[0].args.at(-1), join(fixture.folderA.uri.fsPath, "experiment", "build", "qbs", "qbs_ir.json"));
+      fixture.processes[0].child.emit("close", 0);
+      assert.deepEqual(running.exits, [0]);
+    });
+  });
+
+  it("preserves explicit artifact paths after task-variable substitution", async () => {
+    await withProviderMocks(async (fixture) => {
+      const definition = { type: "qbs-timeline", command: "render", project: "${workspaceFolder}/experiment/qbstimeline.yml",
+        irPath: "${workspaceFolder}/manual/ir.json", htmlPath: "${workspaceFolder}/manual/view.html" };
+      const task = fixture.provider.resolveTask({ definition, scope: fixture.folderA, name: "Explicit artifacts" });
+      const irPath = join(fixture.folderA.uri.fsPath, "manual", "ir.json");
+      const htmlPath = join(fixture.folderA.uri.fsPath, "manual", "view.html");
+      const running = await fixture.start(task, { ...definition, project: fixture.projectA.fsPath, irPath, htmlPath });
+      assert.deepEqual(fixture.processes[0].args.slice(-5), ["render", "--ir", irPath, "--out", htmlPath]);
+      fixture.processes[0].child.emit("close", 0);
+      assert.deepEqual(running.exits, [0]);
+    });
+  });
+
+  it("passes network project and output paths unchanged to Python on Windows", async function () {
+    if (process.platform !== "win32") this.skip();
+    await withProviderMocks(async (fixture) => {
+      const examples = [
+        { project: "qbstimeline.yml", outputDir: "\\\\server\\share\\results", expected: "\\\\server\\share\\results\\qbs_ir.json" },
+        { project: "\\\\server\\share\\experiment\\custom.yml", expected: "\\\\server\\share\\experiment\\.qbs_timeline\\qbs_ir.json" },
+      ];
+      for (const example of examples) {
+        const task = fixture.provider.resolveTask({
+          definition: { type: "qbs-timeline", command: "analyze", ...example },
+          scope: fixture.folderB, name: "Network task",
+        });
+        const running = await fixture.start(task);
+        const launched = fixture.processes.at(-1);
+        assert.equal(launched.args.at(-1), example.expected);
+        launched.child.emit("close", 0);
+        assert.deepEqual(running.exits, [0]);
+      }
+    });
+  });
+
   it("fails only the invoked task when its environment cannot resolve, without a Python fallback", async () => {
     await withProviderMocks(async (fixture) => {
       const tasks = await fixture.provider.provideTasks();
@@ -176,6 +392,10 @@ async function withProviderMocks(run: (fixture: any) => Promise<void>): Promise<
   let selected = { pythonPath: "selected-python-a", pythonArgs: [], sourceLabel: "VS Code selected interpreter" };
   let failure: Error | undefined;
   let waiting = Promise.resolve();
+  let outputOverride: string | null = null;
+  let projectOutput = ".qbs_timeline";
+  let projectWaiting = Promise.resolve();
+  let projectFailure: Error | undefined;
   class MockEventEmitter<T> {
     private emitter = new EventEmitter();
     event = (listener: (value: T) => void) => { this.emitter.on("value", listener); return { dispose: () => {} }; };
@@ -191,13 +411,18 @@ async function withProviderMocks(run: (fixture: any) => Promise<void>): Promise<
     workspace: {
       workspaceFolders: [folderA, folderB],
       getWorkspaceFolder: (resource: any) => [folderA, folderB].find((folder) => resource.fsPath.startsWith(folder.uri.fsPath)),
+      fs: { readFile: async () => {
+        await projectWaiting;
+        if (projectFailure) throw projectFailure;
+        return Buffer.from(`schedule:\n  file: schedule.py\noutputs:\n  dir: ${projectOutput}\n`);
+      } },
     },
   };
   (Module as any)._load = function patchedLoad(request: string, parent: any, isMain: boolean) {
     if (request === "vscode") return vscode;
     if (request === "./settings") return { readSettings: (resource: any) => {
       if (resource) settingsResources.push(resource.fsPath);
-      return { outputDirOverride: null };
+      return { outputDirOverride: resource ? outputOverride : null };
     } };
     if (request === "../pythonEnvironment") return { resolveFilePythonEnvironment: async (_vscode: any, resource: any) => {
       lookups.push(resource.fsPath);
@@ -220,16 +445,20 @@ async function withProviderMocks(run: (fixture: any) => Promise<void>): Promise<
   try {
     const { QbsTimelineTaskProvider } = require("../src/qbs/taskProvider");
     const provider = new QbsTimelineTaskProvider(async () => [
-      { project: "experiment/qbstimeline.yml", resource: projectA, outputDir: ".qbs_timeline" },
-      { project: "qbstimeline.yml", resource: projectB, outputDir: ".qbs_timeline" },
+      { project: "experiment/qbstimeline.yml", resource: projectA, outputDir: projectOutput },
+      { project: "qbstimeline.yml", resource: projectB, outputDir: projectOutput },
     ]);
     await run({
       provider, folderA, folderB, projectA, projectB, lookups, settingsResources, processes,
       select: (value: any) => { selected = { ...selected, ...value }; },
       fail: (error: Error) => { failure = error; },
       wait: (promise: Promise<void>) => { waiting = promise; },
-      start: async (task: any) => {
-        const terminal = await task.execution.callback(task.definition);
+      overrideOutput: (value: string | null) => { outputOverride = value; },
+      projectOutput: (value: string) => { projectOutput = value; },
+      waitForProject: (promise: Promise<void>) => { projectWaiting = promise; },
+      failProject: (error: Error) => { projectFailure = error; },
+      start: async (task: any, resolvedDefinition = task.definition) => {
+        const terminal = await task.execution.callback(resolvedDefinition);
         const output: string[] = [];
         const exits: number[] = [];
         terminal.onDidWrite((text: string) => output.push(text));

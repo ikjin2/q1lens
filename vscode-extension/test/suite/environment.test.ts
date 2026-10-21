@@ -3,6 +3,7 @@ import * as vscode from "vscode";
 import { isDeepStrictEqual } from "node:util";
 import { readSettings } from "../../src/qbs/settings";
 import { q1timelineConfigValue } from "../../src/q1timeline/settings";
+import { registerEnvironmentCommands } from "../../src/environment";
 
 describe("Q1Lens Python environment in VS Code", function () {
   this.timeout(60000);
@@ -78,6 +79,111 @@ describe("Q1Lens Python environment in VS Code", function () {
       assert.ok(result.report.version);
       assert.ok(result.report.packagePath);
       assert.ok(result.report.q1asmPath);
+    }
+  });
+
+  it("applies project Python, discovery and refresh settings only to their workspace folder", async () => {
+    await vscode.extensions.getExtension("q1lens.q1lens")?.activate();
+    const originalFolder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(originalFolder);
+    const folder = vscode.Uri.joinPath(originalFolder.uri, "..", `folder-settings-${Date.now()}`);
+    const source = vscode.Uri.joinPath(folder, "sequence.q1asm");
+    await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(folder, ".vscode"));
+    await vscode.workspace.fs.writeFile(vscode.Uri.joinPath(folder, ".vscode", "settings.json"), Buffer.from(JSON.stringify({
+      "q1lens.pythonPath": "folder-python",
+      "q1lens.pythonArgs": ["-X", "utf8"],
+      "q1lens.qbs.autoRefresh": true,
+      "q1lens.q1timeline.projectFile": "folder.q1timeline.yml",
+      "q1lens.q1timeline.executionMode": "simulation",
+      "q1lens.q1timeline.analyzer.env": { FOLDER_TEST: "B" },
+      "qbloxTimeline.qbs.outputDirOverride": "folder-output",
+      "qbsTimeline.revealOutputChannel": false,
+      "q1timeline.updateMode": "manual",
+    })));
+    const changeFolders = (index: number, count: number, ...folders: { uri: vscode.Uri }[]) => new Promise<void>((resolve, reject) => {
+      const subscription = vscode.workspace.onDidChangeWorkspaceFolders(() => { subscription.dispose(); resolve(); });
+      if (!vscode.workspace.updateWorkspaceFolders(index, count, ...folders)) {
+        subscription.dispose();
+        reject(new Error("Could not change test workspace folders"));
+      }
+    });
+    await changeFolders(vscode.workspace.workspaceFolders!.length, 0, { uri: folder });
+    try {
+      const config = vscode.workspace.getConfiguration("q1lens", source);
+      assert.equal(config.get("pythonPath"), "folder-python");
+      assert.deepEqual(config.get("pythonArgs"), ["-X", "utf8"]);
+      assert.equal(config.get("qbs.autoRefresh"), true);
+      assert.equal(config.get("q1timeline.projectFile"), "folder.q1timeline.yml");
+      assert.equal(config.get("q1timeline.executionMode"), "simulation");
+      assert.deepEqual(config.get("q1timeline.analyzer.env"), { FOLDER_TEST: "B" });
+      assert.equal(readSettings(source).pythonPath, "folder-python");
+      assert.equal(readSettings(source).autoRefresh, true);
+      assert.equal(readSettings(source).outputDirOverride, "folder-output");
+      assert.equal(readSettings(source).revealOutputChannel, false);
+      assert.equal(vscode.workspace.getConfiguration("q1timeline", source).get("updateMode"), "manual");
+      assert.notEqual(readSettings(originalFolder.uri).pythonPath, "folder-python");
+      assert.notEqual(vscode.workspace.getConfiguration("q1lens", originalFolder.uri).get("q1timeline.projectFile"), "folder.q1timeline.yml");
+    } finally {
+      const index = vscode.workspace.workspaceFolders!.findIndex((item) => item.uri.toString() === folder.toString());
+      if (index >= 0) await changeFolders(index, 1);
+    }
+  });
+
+  it("selects Python through existing folder overrides in a saved one-folder workspace", async () => {
+    assert.equal(vscode.workspace.workspaceFolders?.length, 1);
+    assert.equal(vscode.workspace.workspaceFile?.scheme, "file");
+    const folder = vscode.workspace.workspaceFolders![0];
+    const resource = vscode.Uri.joinPath(folder.uri, "python-selection.q1asm");
+    const config = vscode.workspace.getConfiguration("q1lens", resource);
+    const python = config.get<string>("pythonPath")!;
+    const keys = ["pythonPath", "pythonArgs", "q1timeline.pythonPath", "q1timeline.pythonArgs", "pythonEnvironment"];
+    const original = keys.map((key) => ({ key, folder: config.inspect(key)?.workspaceFolderValue, workspace: config.inspect(key)?.workspaceValue }));
+    const callbacks = new Map<string, (...args: unknown[]) => Promise<unknown>>();
+    const subscriptions: vscode.Disposable[] = [];
+    const output = { clear() {}, show() {}, appendLine() {}, dispose() {} };
+    const proxy = {
+      ConfigurationTarget: vscode.ConfigurationTarget, workspace: vscode.workspace, extensions: vscode.extensions,
+      window: { get activeTextEditor() { return vscode.window.activeTextEditor; },
+        get activeNotebookEditor() { return vscode.window.activeNotebookEditor; },
+        createOutputChannel: () => output,
+        showQuickPick: async (choices: { label: string }[]) => choices.find((choice) => choice.label === "Enter Python path…"),
+        showInputBox: async () => python,
+        showInformationMessage: async () => undefined, showErrorMessage: async () => undefined },
+      commands: { executeCommand: vscode.commands.executeCommand, registerCommand: (id: string, callback: (...args: unknown[]) => Promise<unknown>) => {
+        callbacks.set(id, callback);
+        return { dispose() {} };
+      } },
+    };
+    const Module = require("node:module");
+    const originalLoad = Module._load;
+    const environmentPath = require.resolve("../../src/environment");
+    try {
+      await vscode.workspace.fs.writeFile(resource, Buffer.from("stop\n"));
+      for (const key of keys) await config.update(key,
+        key === "pythonEnvironment" ? "auto" : key.endsWith("Args") ? ["-X", "dev"] : "old-folder-python",
+        vscode.ConfigurationTarget.WorkspaceFolder);
+      assert.equal(vscode.workspace.getConfiguration("q1lens", resource).get("pythonPath"), "old-folder-python");
+      Module._load = function (request: string, parent: { filename: string }, isMain: boolean) {
+        return request === "vscode" && parent.filename === environmentPath ? proxy : originalLoad.call(this, request, parent, isMain);
+      };
+      try {
+        registerEnvironmentCommands({ subscriptions } as unknown as vscode.ExtensionContext);
+      } finally {
+        Module._load = originalLoad;
+      }
+      await callbacks.get("q1lens.selectPythonEnvironment")!(undefined, resource);
+
+      const selected = vscode.workspace.getConfiguration("q1lens", resource);
+      for (const key of ["pythonPath", "q1timeline.pythonPath"]) assert.equal(selected.get(key), python);
+      for (const key of ["pythonArgs", "q1timeline.pythonArgs"]) assert.deepEqual(selected.get(key), []);
+    } finally {
+      Module._load = originalLoad;
+      subscriptions.forEach((item) => item.dispose());
+      for (const value of original) {
+        await config.update(value.key, value.folder, vscode.ConfigurationTarget.WorkspaceFolder);
+        await config.update(value.key, value.workspace, vscode.ConfigurationTarget.Workspace);
+      }
+      await vscode.workspace.fs.delete(resource);
     }
   });
 });

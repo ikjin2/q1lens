@@ -4,6 +4,7 @@ export const QBS_NOTEBOOK_SETUP_TAG = "qbstimeline-setup";
 export const QBS_NOTEBOOK_SCHEDULE_TAG = "qbstimeline-schedule";
 
 export interface NotebookTimelineCell {
+  id?: string;
   kind: "code" | "markdown";
   text: string;
   metadata?: Record<string, unknown>;
@@ -98,6 +99,7 @@ function selectedNotebookSnapshotJson(input: ManagedNotebookTimelineProjectInput
         ? withNotebookCellTag(metadataWithoutSchedule, QBS_NOTEBOOK_SCHEDULE_TAG)
         : metadataWithoutSchedule;
       return {
+        ...(cell.id ? { id: cell.id } : {}),
         cell_type: cell.kind === "markdown" ? "markdown" : "code",
         source: sourceLines(cell.text),
         metadata,

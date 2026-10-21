@@ -711,9 +711,15 @@ function q1asmTabGroupColumn(tabGroups) {
 export class TimelineController {
   constructor(context) {
     this.context = context;
+    this.disposed = false;
     this.panel = undefined;
+    this.panelCreation = undefined;
+    this.openPreviewRequestId = 0;
+    this.fallbackProjectRequestId = 0;
+    this.fallbackProjectCreations = new Map();
     this.panelDisposables = [];
     this.projectUri = undefined;
+    this.projectSessionId = 0;
     this.singleFileUri = undefined;
     this.pythonEnvironment = undefined;
     this.singleFileMode = false;
@@ -721,17 +727,23 @@ export class TimelineController {
     this.timelineIr = undefined;
     this.lastAnalyzerTimelineIr = undefined;
     this.comparisonBaselineWarningPath = undefined;
+    this.comparisonBaselineQueue = Promise.resolve();
     this.comparison = { mode: "none" };
     this.analyzerResult = undefined;
     this.lastPreviewHtml = undefined;
     this.changeTimer = undefined;
+    this.changeTimerRefreshPolicy = undefined;
     this.sourceRangeTimer = undefined;
+    this.sourceNavigationRequestId = 0;
+    this.sourceNavigationQueue = Promise.resolve();
     this.webviewReady = false;
     this.sourceRevision = 0;
     this.analyzedSourceRevision = 0;
     this.analysisRequestId = 0;
     this.analysisInFlight = false;
+    this.analysisEnvironmentCheck = undefined;
     this.analysisQueued = false;
+    this.analysisQueuedRefreshPolicy = undefined;
     this.analysisFailureCount = 0;
     this.analysisStatus = { status: "idle", message: "Idle" };
     this.diagnosticSummary = summarizeDiagnostics([]);
@@ -741,6 +753,8 @@ export class TimelineController {
     this.loopPreviewOverrides = new Map();
     this.executionReplayOverride = undefined;
     this.playbackClient = undefined;
+    this.playbackEnvironmentCheck = undefined;
+    this.playbackRequestId = 0;
     this.playbackInFlight = false;
     this.playbackRunning = false;
     this.playbackSnapshotId = undefined;
@@ -749,6 +763,9 @@ export class TimelineController {
     this.pendingTarget = undefined;
     this.pendingBranchSelection = undefined;
     this.projectRelatedPaths = new Set();
+    this.projectRelatedPathsRequestId = 0;
+    this.relatedFileWatchers = [];
+    this.sourceFileSnapshots = new Map();
     this.lastSourceViewColumn = undefined;
     this.output = vscode.window.createOutputChannel("Q1ASM Timeline");
     this.diagnostics = vscode.languages.createDiagnosticCollection("q1timeline");
@@ -775,19 +792,23 @@ export class TimelineController {
     context.subscriptions.push(
       vscode.workspace.onDidSaveTextDocument((document) => {
         if (this.isProjectRelated(document.uri)) {
-          this.invalidateSourceAnalysis();
           this.setUnsavedChangesStatus();
-          if (this.shouldAnalyzeOnSave()) {
-            this.runAnalysis();
-          }
+          return this.onWatchedFile(document.uri, "save");
         }
       })
     );
     context.subscriptions.push(
       vscode.workspace.onDidChangeTextDocument((event) => {
         if (this.isProjectRelated(event.document.uri)) {
-          this.invalidateSourceAnalysis();
           this.setUnsavedChangesStatus();
+          if (event.contentChanges?.length === 0) return;
+          const snapshot = this.sourceFileSnapshots.get(normalizedFsPath(event.document.uri.fsPath));
+          if (snapshot?.content && event.document.isDirty === false &&
+              event.document.getText?.() === snapshot.content.toString("utf8").replace(/^\uFEFF/, "")) {
+            return this.onWatchedFile(event.document.uri);
+          }
+          if (snapshot) snapshot.edited = true;
+          this.invalidateSourceAnalysis();
           if (this.shouldAnalyzeOnType()) {
             this.scheduleAnalysis();
           }
@@ -821,6 +842,16 @@ export class TimelineController {
 
   setProjectUri(uri) {
     if (!this.projectUri || this.projectUri.fsPath !== uri.fsPath) {
+      this.projectSessionId += 1;
+      this.analysisEnvironmentCheck?.abort();
+      if (this.changeTimer) {
+        clearTimeout(this.changeTimer);
+        this.changeTimer = undefined;
+      }
+      this.sourceFileSnapshots = new Map();
+      this.analysisQueued = false;
+      this.analysisQueuedRefreshPolicy = undefined;
+      this.analysisRequestId += 1;
       this.invalidateSourceAnalysis();
       this.webviewReady = false;
       this.lastAnalyzerTimelineIr = undefined;
@@ -854,6 +885,12 @@ export class TimelineController {
     return path.join(this.outputDir, COMPARISON_BASELINE_FILENAME);
   }
 
+  queueComparisonBaselineOperation(operation) {
+    const pending = this.comparisonBaselineQueue.then(operation);
+    this.comparisonBaselineQueue = pending.catch(() => {});
+    return pending;
+  }
+
   async saveComparisonBaseline() {
     if (!isTimelineIr(this.lastAnalyzerTimelineIr)) {
       vscode.window.showWarningMessage(
@@ -868,24 +905,30 @@ export class TimelineController {
       );
       return;
     }
-    try {
-      await fsPromises.mkdir(this.outputDir, { recursive: true });
-      await fsPromises.writeFile(
-        baselinePath,
-        `${JSON.stringify(this.lastAnalyzerTimelineIr, null, 2)}\n`,
-        "utf-8"
-      );
-      this.comparisonBaselineWarningPath = undefined;
-      this.output.appendLine(`Saved timeline comparison baseline: ${baselinePath}`);
-      this.comparison = { ...this.comparison, nextMode: "saved", pending: true };
-      this.postWebviewMessage({ type: "setComparison", comparison: this.comparison });
-      vscode.window.showInformationMessage(
-        `Timeline comparison baseline saved for ${path.basename(this.projectUri.fsPath)}.`
-      );
-    } catch (error) {
-      this.output.appendLine(`Unable to save timeline comparison baseline: ${error.message}`);
-      vscode.window.showErrorMessage(`Unable to save timeline comparison baseline: ${error.message}`);
-    }
+    const projectFile = this.projectUri.fsPath;
+    const outputDir = this.outputDir;
+    const baselineText = `${JSON.stringify(this.lastAnalyzerTimelineIr, null, 2)}\n`;
+    return this.queueComparisonBaselineOperation(async () => {
+      try {
+        await fsPromises.mkdir(outputDir, { recursive: true });
+        await fsPromises.writeFile(
+          baselinePath,
+          baselineText,
+          "utf-8"
+        );
+        if (this.disposed || this.projectUri?.fsPath !== projectFile || this.outputDir !== outputDir) return;
+        this.comparisonBaselineWarningPath = undefined;
+        this.output.appendLine(`Saved timeline comparison baseline: ${baselinePath}`);
+        this.comparison = { ...this.comparison, nextMode: "saved", pending: true };
+        this.postWebviewMessage({ type: "setComparison", comparison: this.comparison });
+        vscode.window.showInformationMessage(
+          `Timeline comparison baseline saved for ${path.basename(this.projectUri.fsPath)}.`
+        );
+      } catch (error) {
+        this.output.appendLine(`Unable to save timeline comparison baseline: ${error.message}`);
+        vscode.window.showErrorMessage(`Unable to save timeline comparison baseline: ${error.message}`);
+      }
+    });
   }
 
   async clearComparisonBaseline() {
@@ -896,19 +939,24 @@ export class TimelineController {
       );
       return;
     }
-    try {
-      await fsPromises.rm(baselinePath, { force: true });
-      this.comparisonBaselineWarningPath = undefined;
-      this.output.appendLine(`Cleared timeline comparison baseline: ${baselinePath}`);
-      this.comparison = { ...this.comparison, nextMode: "previous", pending: true };
-      this.postWebviewMessage({ type: "setComparison", comparison: this.comparison });
-      vscode.window.showInformationMessage(
-        "Timeline comparison baseline cleared. Future runs will compare with the previous run."
-      );
-    } catch (error) {
-      this.output.appendLine(`Unable to clear timeline comparison baseline: ${error.message}`);
-      vscode.window.showErrorMessage(`Unable to clear timeline comparison baseline: ${error.message}`);
-    }
+    const projectFile = this.projectUri.fsPath;
+    const outputDir = this.outputDir;
+    return this.queueComparisonBaselineOperation(async () => {
+      try {
+        await fsPromises.rm(baselinePath, { force: true });
+        if (this.disposed || this.projectUri?.fsPath !== projectFile || this.outputDir !== outputDir) return;
+        this.comparisonBaselineWarningPath = undefined;
+        this.output.appendLine(`Cleared timeline comparison baseline: ${baselinePath}`);
+        this.comparison = { ...this.comparison, nextMode: "previous", pending: true };
+        this.postWebviewMessage({ type: "setComparison", comparison: this.comparison });
+        vscode.window.showInformationMessage(
+          "Timeline comparison baseline cleared. Future runs will compare with the previous run."
+        );
+      } catch (error) {
+        this.output.appendLine(`Unable to clear timeline comparison baseline: ${error.message}`);
+        vscode.window.showErrorMessage(`Unable to clear timeline comparison baseline: ${error.message}`);
+      }
+    });
   }
 
   async loadComparisonBaseline() {
@@ -916,23 +964,30 @@ export class TimelineController {
     if (!baselinePath) {
       return undefined;
     }
-    let parsed;
-    try {
-      parsed = JSON.parse(await fsPromises.readFile(baselinePath, "utf-8"));
-    } catch (error) {
-      if (error && error.code === "ENOENT") {
+    const projectFile = this.projectUri?.fsPath;
+    const isCurrent = () => !this.disposed && this.projectUri?.fsPath === projectFile && this.comparisonBaselinePath() === baselinePath;
+    return this.queueComparisonBaselineOperation(async () => {
+      if (!isCurrent()) return undefined;
+      let parsed;
+      try {
+        parsed = JSON.parse(await fsPromises.readFile(baselinePath, "utf-8"));
+      } catch (error) {
+        if (!isCurrent()) return undefined;
+        if (error && error.code === "ENOENT") {
+          return undefined;
+        }
+        this.warnInvalidComparisonBaseline(baselinePath, error.message);
         return undefined;
       }
-      this.warnInvalidComparisonBaseline(baselinePath, error.message);
-      return undefined;
-    }
-    if (!isTimelineIr(parsed)) {
-      this.warnInvalidComparisonBaseline(baselinePath, "expected an object with an events array");
-      return undefined;
-    }
-    this.comparisonBaselineWarningPath = undefined;
-    this.output.appendLine(`Using saved timeline comparison baseline: ${baselinePath}`);
-    return parsed;
+      if (!isCurrent()) return undefined;
+      if (!isTimelineIr(parsed)) {
+        this.warnInvalidComparisonBaseline(baselinePath, "expected an object with an events array");
+        return undefined;
+      }
+      this.comparisonBaselineWarningPath = undefined;
+      this.output.appendLine(`Using saved timeline comparison baseline: ${baselinePath}`);
+      return parsed;
+    });
   }
 
   warnInvalidComparisonBaseline(baselinePath, reason) {
@@ -956,13 +1011,20 @@ export class TimelineController {
     await this.openPreview({ preserveProject: true });
   }
 
+  beginOpenPreviewRequest() {
+    const requestId = ++this.openPreviewRequestId;
+    return () => !this.disposed && this.openPreviewRequestId === requestId;
+  }
+
   async openPreview(options = {}) {
+    if (this.disposed) return;
+    const isCurrent = this.beginOpenPreviewRequest();
     this.cancelSourceRangeZoom();
     const sourceUri = this.previewSourceUri(options);
     const explicitSourceUri = options.sourceUri && options.sourceUri.fsPath ? options.sourceUri : undefined;
     let skipProjectDiscovery = false;
     if (!options.preserveProject) {
-      const projectFile = this.config().get("projectFile", "q1timeline.yml").replace(/\\/g, "/");
+      const projectFile = this.config(sourceUri).get("projectFile", "q1timeline.yml").replace(/\\/g, "/");
       if (explicitSourceUri && isQ1asmPath(explicitSourceUri.fsPath)) {
         const folderProjectUri = this.findProjectFileInQ1asmFolder(explicitSourceUri, projectFile);
         if (folderProjectUri) {
@@ -970,6 +1032,8 @@ export class TimelineController {
           this.singleFileUri = undefined;
           this.singleFileMode = false;
         } else {
+          this.analysisRequestId += 1;
+          this.analysisEnvironmentCheck?.abort();
           this.projectUri = undefined;
           this.outputDir = undefined;
           this.singleFileUri = undefined;
@@ -980,6 +1044,8 @@ export class TimelineController {
           skipProjectDiscovery = true;
         }
       } else if (this.shouldUseSingleFileForActiveQ1asm(sourceUri)) {
+        this.analysisRequestId += 1;
+        this.analysisEnvironmentCheck?.abort();
         this.projectUri = undefined;
         this.outputDir = undefined;
         this.singleFileUri = undefined;
@@ -988,6 +1054,8 @@ export class TimelineController {
         this.lastAnalyzerTimelineIr = undefined;
         this.lastPreviewHtml = undefined;
       } else if (this.singleFileMode && this.activeQ1asmChanged(sourceUri)) {
+        this.analysisRequestId += 1;
+        this.analysisEnvironmentCheck?.abort();
         this.projectUri = undefined;
         this.outputDir = undefined;
         this.singleFileUri = undefined;
@@ -1008,7 +1076,14 @@ export class TimelineController {
       }
     }
     if (!this.projectUri && !skipProjectDiscovery) {
-      const projectUri = await this.findProjectFile(sourceUri);
+      let projectUri;
+      try {
+        projectUri = await this.findProjectFile(sourceUri, isCurrent);
+      } catch (error) {
+        if (!isCurrent()) return;
+        throw error;
+      }
+      if (!isCurrent()) return;
       if (projectUri) {
         this.setProjectUri(projectUri);
       }
@@ -1020,7 +1095,8 @@ export class TimelineController {
         );
         return;
       }
-      const singleFileProject = await this.createSingleFileProject(sourceUri);
+      const singleFileProject = await this.createSingleFileProject(sourceUri, { isCurrent });
+      if (!isCurrent()) return;
       if (singleFileProject) {
         this.setProjectUri(singleFileProject);
       }
@@ -1033,14 +1109,28 @@ export class TimelineController {
       this.outputDir = path.join(path.dirname(this.projectUri.fsPath), ".q1timeline");
     }
     await this.refreshProjectRelatedPaths();
+    if (!isCurrent()) return;
     this.startWatchers();
     if (this.panel) {
       this.output.appendLine("Reusing existing Q1Lens preview panel.");
-      this.panel.reveal();
+      this.panel.reveal(this.panel.viewColumn);
       await this.runAnalysis();
       return;
     }
+    if (!this.panelCreation) {
+      this.panelCreation = this.createPreviewPanel().finally(() => {
+        this.panelCreation = undefined;
+      });
+    }
+    await this.panelCreation;
+    if (!isCurrent()) return;
+    await this.runAnalysis();
+  }
+
+  async createPreviewPanel() {
+    if (this.disposed) return;
     const previewColumn = await this.previewPanelViewColumn();
+    if (this.disposed) return;
     this.panel = vscode.window.createWebviewPanel(
       "q1timeline.preview",
       "Q1Lens",
@@ -1056,6 +1146,14 @@ export class TimelineController {
     this.panelDisposables.push(
       this.panel.webview.onDidReceiveMessage((message) => this.handleWebviewMessage(message)),
       this.panel.onDidDispose(() => {
+        this.openPreviewRequestId += 1;
+        this.analysisRequestId += 1;
+        this.analysisEnvironmentCheck?.abort();
+        this.analysisQueued = false;
+        if (this.changeTimer) {
+          clearTimeout(this.changeTimer);
+          this.changeTimer = undefined;
+        }
         this.resetPlayback();
         this.cancelSourceRangeZoom();
         this.pendingBranchSelection = undefined;
@@ -1064,7 +1162,6 @@ export class TimelineController {
         this.panel = undefined;
       })
     );
-    await this.runAnalysis();
   }
 
   async previewPanelViewColumn() {
@@ -1093,14 +1190,17 @@ export class TimelineController {
   }
 
   async selectProjectFile() {
-    const projectFile = this.config().get("projectFile", "q1timeline.yml").replace(/\\/g, "/");
+    if (this.disposed) return;
+    const isCurrent = this.beginOpenPreviewRequest();
+    const projectFile = this.config(vscode.window.activeTextEditor?.document.uri).get("projectFile", "q1timeline.yml").replace(/\\/g, "/");
     const matches = await this.findWorkspaceProjectFiles(projectFile);
+    if (!isCurrent()) return;
     if (!matches.length) {
       vscode.window.showWarningMessage(`No ${projectFile} found in this workspace.`);
       return;
     }
-    const selectedUri = await this.pickProjectFile(matches, `Select ${projectFile}`);
-    if (!selectedUri) {
+    const selectedUri = await this.pickProjectFile(matches, `Select ${projectFile}`, isCurrent);
+    if (!selectedUri || !isCurrent()) {
       return;
     }
     this.setProjectUri(selectedUri);
@@ -1110,12 +1210,15 @@ export class TimelineController {
   }
 
   async selectQ1asmFilesInFolder(sourceUri) {
+    if (this.disposed) return;
     sourceUri = this.activeQ1asmUri(sourceUri);
     if (!sourceUri) {
       vscode.window.showWarningMessage("Open or select a .q1asm file before choosing Q1ASM files.");
       return;
     }
-    const q1asmUris = await this.q1asmFilesInFolder(sourceUri);
+    const isCurrent = this.beginOpenPreviewRequest();
+    const q1asmUris = await this.q1asmFilesInFolder(sourceUri, isCurrent);
+    if (!isCurrent()) return;
     if (!q1asmUris.length) {
       vscode.window.showWarningMessage("No Q1ASM files found in this folder.");
       return;
@@ -1130,11 +1233,11 @@ export class TimelineController {
       canPickMany: true,
       placeHolder: "Select Q1ASM files to show in this timeline",
     });
-    if (!selected || !selected.length) {
+    if (!selected || !selected.length || !isCurrent()) {
       return;
     }
-    const projectUri = await this.createSelectedFolderProject(sourceUri, selected.map((item) => item.uri));
-    if (!projectUri) {
+    const projectUri = await this.createSelectedFolderProject(sourceUri, selected.map((item) => item.uri), { isCurrent });
+    if (!projectUri || !isCurrent()) {
       return;
     }
     this.setProjectUri(projectUri);
@@ -1142,17 +1245,19 @@ export class TimelineController {
   }
 
   async openQ1asmFilesInFolder(sourceUri) {
+    if (this.disposed) return;
     sourceUri = this.activeQ1asmUri(sourceUri);
     if (!sourceUri) {
       vscode.window.showWarningMessage("Open or select a .q1asm file before opening Q1ASM files.");
       return;
     }
+    const isCurrent = this.beginOpenPreviewRequest();
     const projectCandidates = this.findProjectFileCandidatesUpward(sourceUri);
     if (projectCandidates.length) {
       const existingProjectUri = projectCandidates.length === 1
         ? projectCandidates[0]
-        : await this.pickProjectFile(projectCandidates, "Select q1timeline project");
-      if (!existingProjectUri) {
+        : await this.pickProjectFile(projectCandidates, "Select q1timeline project", isCurrent);
+      if (!existingProjectUri || !isCurrent()) {
         return;
       }
       this.singleFileUri = undefined;
@@ -1161,17 +1266,20 @@ export class TimelineController {
       await this.openPreview({ preserveProject: true });
       return;
     }
-    const q1asmUris = await this.q1asmFilesInFolder(sourceUri);
+    const q1asmUris = await this.q1asmFilesInFolder(sourceUri, isCurrent);
+    if (!isCurrent()) return;
     if (!q1asmUris.length) {
       vscode.window.showWarningMessage("No Q1ASM files found in this folder.");
       return;
     }
     const paramsFile = await this.paramsFileForAutoGeneratedProject(sourceUri);
+    if (!isCurrent()) return;
     const projectUri = await this.createSelectedFolderProject(sourceUri, q1asmUris, {
       paramsFile,
       showMissingProjectWarning: false,
+      isCurrent,
     });
-    if (!projectUri) {
+    if (!projectUri || !isCurrent()) {
       return;
     }
     this.setProjectUri(projectUri);
@@ -1242,7 +1350,7 @@ export class TimelineController {
     if (!editor || !editor.document || !editor.document.uri) {
       return undefined;
     }
-    const projectFile = this.config().get("projectFile", "q1timeline.yml").replace(/\\/g, "/");
+    const projectFile = this.config(editor.document.uri).get("projectFile", "q1timeline.yml").replace(/\\/g, "/");
     return this.findProjectFileUpward(editor.document.uri, projectFile);
   }
 
@@ -1300,8 +1408,7 @@ export class TimelineController {
     return vscode.commands.executeCommand("q1lens.checkEnvironment", "q1timeline.refreshPreview", this.singleFileUri || this.projectUri);
   }
 
-  config() {
-    const resource = this.singleFileUri || this.projectUri || vscode.window.activeTextEditor?.document.uri;
+  config(resource = this.singleFileUri || this.projectUri || vscode.window.activeTextEditor?.document.uri) {
     const q1lensConfig = vscode.workspace.getConfiguration("q1lens", resource);
     const qbloxConfig = vscode.workspace.getConfiguration("qbloxTimeline", resource);
     const legacyConfig = vscode.workspace.getConfiguration("q1timeline", resource);
@@ -1360,7 +1467,11 @@ export class TimelineController {
   resetPlayback() {
     const client = this.playbackClient;
     const wasActive = Boolean(client || this.executionState?.status !== "idle");
+    this.playbackRequestId += 1;
+    this.playbackEnvironmentCheck?.abort();
+    this.playbackEnvironmentCheck = undefined;
     this.playbackClient = undefined;
+    this.playbackInFlight = false;
     this.playbackRunning = false;
     this.playbackSnapshotId = undefined;
     client?.dispose();
@@ -1405,8 +1516,16 @@ export class TimelineController {
       this.setExecutionState({ status: "blocked", can_resume: false, reason: "Save the source before calculating its execution." });
       return;
     }
+    if (this.changeTimer) {
+      clearTimeout(this.changeTimer);
+      this.changeTimer = undefined;
+    }
     const sourceRevision = this.sourceRevision;
-    const analysisRequestId = this.analysisRequestId;
+    const analysisRequestId = ++this.analysisRequestId;
+    const playbackRequestId = ++this.playbackRequestId;
+    const isCurrent = () => this.playbackRequestId === playbackRequestId;
+    const environmentCheck = new AbortController();
+    this.playbackEnvironmentCheck = environmentCheck;
     let client;
     this.playbackInFlight = true;
     this.playbackRunning = true;
@@ -1418,8 +1537,9 @@ export class TimelineController {
         const environment = await ensureFilePythonEnvironment(vscode, this.singleFileUri || this.projectUri, "q1asm", this.output, {
           cwd: this.projectRootCwd(),
           env: this.normaliseAnalyzerEnv(this.config().get("analyzer.env", {})),
+          signal: environmentCheck.signal,
         });
-        if (!this.panel || this.sourceRevision !== sourceRevision || !this.isCurrentAnalysis(analysisRequestId)) return;
+        if (!isCurrent() || !this.panel || this.sourceRevision !== sourceRevision || !this.isCurrentAnalysis(analysisRequestId)) return;
         if (!environment) {
           this.setExecutionState({ status: "blocked", can_resume: true, reason: "Select a Python environment and complete setup before calculating execution." });
           return;
@@ -1431,28 +1551,31 @@ export class TimelineController {
       const deadline = Date.now() + 5000;
       while (this.playbackClient === client && this.playbackRunning) {
         const result = await client.request({ command: "run", budget_ms: 100, max_steps: 1000 });
-        if (this.playbackClient !== client || this.sourceRevision !== sourceRevision) return;
+        if (!isCurrent() || this.playbackClient !== client || this.sourceRevision !== sourceRevision) return;
         const state = result.playback;
         if (!state || typeof state.can_resume !== "boolean") throw new Error("Invalid playback state response.");
         this.setExecutionState({ ...state, status: "running" });
         if (!state.can_resume || Date.now() >= deadline) break;
       }
-      if (this.playbackClient !== client || this.sourceRevision !== sourceRevision) return;
+      if (!isCurrent() || this.playbackClient !== client || this.sourceRevision !== sourceRevision) return;
       const result = await client.request({ command: "snapshot" });
-      if (this.playbackClient !== client || this.sourceRevision !== sourceRevision) return;
+      if (!isCurrent() || this.playbackClient !== client || this.sourceRevision !== sourceRevision) return;
       if (!isTimelineIr(result.ir) || !result.ir.playback) throw new Error("Invalid playback timeline response.");
       this.playbackSnapshotId = crypto.randomUUID();
       await this.publishPlaybackSnapshot(result.ir, client);
-      if (this.playbackClient === client && this.sourceRevision === sourceRevision) this.setExecutionState(result.ir.playback);
+      if (isCurrent() && this.playbackClient === client && this.sourceRevision === sourceRevision) this.setExecutionState(result.ir.playback);
     } catch (error) {
-      if (client && this.playbackClient !== client) return;
+      if (!isCurrent() || client && this.playbackClient !== client) return;
       this.output.appendLine(`Playback failed: ${error.message}`);
       this.playbackClient?.dispose();
       this.playbackClient = undefined;
       this.setExecutionState({ status: "error", can_resume: true, reason: error.message });
     } finally {
-      this.playbackInFlight = false;
-      this.playbackRunning = false;
+      if (this.playbackEnvironmentCheck === environmentCheck) this.playbackEnvironmentCheck = undefined;
+      if (isCurrent()) {
+        this.playbackInFlight = false;
+        this.playbackRunning = false;
+      }
     }
   }
 
@@ -1479,7 +1602,7 @@ export class TimelineController {
       this.lastAnalyzerTimelineIr = undefined;
       this.comparison = { mode: "none" };
       this.setAnalysisStatus("idle", "Execution calculated.");
-      if (await this.refreshWebview({ ir, html, isCurrent }) && isCurrent()) this.analyzedSourceRevision = sourceRevision;
+      if (await this.refreshWebview({ ir, html, isCurrent }, sourceRevision) && isCurrent()) this.analyzedSourceRevision = sourceRevision;
     } finally {
       await Promise.all([irPath, htmlPath].map((file) => fsPromises.rm(file, { force: true }).catch(() => {})));
     }
@@ -1525,6 +1648,11 @@ export class TimelineController {
       vscode.window.showWarningMessage("Open a Q1ASM timeline project before setting analysis parameters.");
       return;
     }
+    const projectFile = this.projectUri.fsPath;
+    const sourceFile = this.singleFileUri?.fsPath;
+    const outputDir = this.outputDir;
+    const isCurrentProject = () => !this.disposed && this.projectUri?.fsPath === projectFile &&
+      this.singleFileUri?.fsPath === sourceFile && this.outputDir === outputDir;
     const rawName = await vscode.window.showInputBox({
       prompt: "Analysis parameter name",
       placeHolder: "DRIVE_DURATION",
@@ -1538,7 +1666,7 @@ export class TimelineController {
         return undefined;
       },
     });
-    if (rawName === undefined) {
+    if (rawName === undefined || !isCurrentProject()) {
       return;
     }
     const name = rawName.trim();
@@ -1551,7 +1679,7 @@ export class TimelineController {
       placeHolder: "40",
       validateInput: analysisParameterJsonError,
     });
-    if (rawValue === undefined) {
+    if (rawValue === undefined || !isCurrentProject()) {
       return;
     }
     const value = rawValue.trim();
@@ -1720,7 +1848,9 @@ export class TimelineController {
     }
     if (this.analysisInFlight) {
       this.analysisQueued = true;
+      this.analysisQueuedRefreshPolicy = undefined;
       this.analysisRequestId += 1;
+      this.analysisEnvironmentCheck?.abort();
       this.output.appendLine("Analyzer already running; queued refresh for view mode change.");
       this.setAnalysisStatus("stale", "A newer analysis request is queued.");
       return;
@@ -1729,25 +1859,28 @@ export class TimelineController {
       await this.runAnalysis();
       return;
     }
+    const renderRequestId = ++this.analysisRequestId;
     const timelineIrPath = path.join(this.outputDir, "timeline_ir.json");
     const htmlPath = path.join(this.outputDir, "timeline.html");
     try {
       await fsPromises.access(timelineIrPath);
     } catch (error) {
+      if (!this.isCurrentAnalysis(renderRequestId)) return;
       if (error && error.code === "ENOENT") {
         await this.runAnalysis();
         return;
       }
       throw error;
     }
+    if (!this.isCurrentAnalysis(renderRequestId)) return;
     const configuration = this.config();
     const { pythonPath, pythonArgs } = this.pythonEnvironment;
     const timeoutMs = configuration.get("analyzer.timeoutMs", 30000);
     const extraEnv = this.normaliseAnalyzerEnv(configuration.get("analyzer.env", {}));
     const cwd = this.projectRootCwd();
-    const renderRequestId = ++this.analysisRequestId;
     this.setAnalysisStatus("rendering", `Rendering ${mode} timeline view.`);
     this.logAnalyzerEnv(extraEnv);
+    this.analysisInFlight = true;
     return this.runRender(pythonPath, pythonArgs, timelineIrPath, htmlPath, timeoutMs, cwd, extraEnv, mode, renderRequestId)
       .then(async (renderResult) => {
         if (!renderResult) {
@@ -1778,7 +1911,8 @@ export class TimelineController {
         } else {
           vscode.window.showErrorMessage(`q1timeline renderer failed: ${error.message}`);
         }
-      });
+      })
+      .finally(() => this.finishAnalysis());
   }
 
   shouldAnalyzeOnSave() {
@@ -1789,8 +1923,8 @@ export class TimelineController {
     return updatePolicy.shouldAnalyzeOnType(this.updateMode());
   }
 
-  async findProjectFile(sourceUri) {
-    const projectFile = this.config().get("projectFile", "q1timeline.yml").replace(/\\/g, "/");
+  async findProjectFile(sourceUri, isCurrent = () => !this.disposed) {
+    const projectFile = this.config(sourceUri).get("projectFile", "q1timeline.yml").replace(/\\/g, "/");
     const activeProjectUri = this.findProjectFileUpward(
       sourceUri || (vscode.window.activeTextEditor ? vscode.window.activeTextEditor.document.uri : undefined),
       projectFile
@@ -1812,11 +1946,13 @@ export class TimelineController {
       }
       this.output.appendLine(`Ignoring stale q1timeline project file: ${storedProjectUri}`);
       await this.context.workspaceState.update("q1timeline.projectFile", undefined);
+      if (!isCurrent()) return undefined;
     }
     this.output.appendLine(`Searching for q1timeline project file: ${projectFile}`);
     const matches = await this.findWorkspaceProjectFiles(projectFile);
+    if (!isCurrent()) return undefined;
     if (matches.length > 1) {
-      return this.pickProjectFile(matches, `Select ${projectFile}`);
+      return this.pickProjectFile(matches, `Select ${projectFile}`, isCurrent);
     }
     if (matches[0]) {
       this.output.appendLine(`Discovered q1timeline project file: ${matches[0].fsPath}`);
@@ -1848,55 +1984,74 @@ export class TimelineController {
       !this.isProjectRelated(sourceUri);
   }
 
-  async createSingleFileProject(sourceUri) {
-    return this.createSelectedFolderProject(sourceUri);
+  async createSingleFileProject(sourceUri, options = {}) {
+    return this.createSelectedFolderProject(sourceUri, undefined, options);
   }
 
   async createSelectedFolderProject(sourceUri, selectedUris, options = {}) {
     sourceUri = this.activeQ1asmUri(sourceUri);
-    if (!sourceUri) {
+    if (!sourceUri || this.disposed) {
       return undefined;
     }
+    const requestId = ++this.fallbackProjectRequestId;
+    const previousProjectFile = this.projectUri?.fsPath;
+    const isCurrent = () => !this.disposed && options.isCurrent?.() !== false &&
+      this.fallbackProjectRequestId === requestId && this.projectUri?.fsPath === previousProjectFile;
     const q1asmUris = selectedUris && selectedUris.length
       ? this.sortedUniqueQ1asmUris(selectedUris)
       : await this.q1asmFilesInFolder(sourceUri);
-    if (!q1asmUris.length) {
+    if (!q1asmUris.length || !isCurrent()) {
       return undefined;
     }
-    this.singleFileUri = sourceUri;
-    this.singleFileMode = true;
-    this.outputDir = path.join(path.dirname(sourceUri.fsPath), ".q1timeline");
-    await fsPromises.mkdir(this.outputDir, { recursive: true });
-    const projectPath = path.join(this.outputDir, "auto-generated.q1timeline.yml");
-    const paramsFilename = await this.paramsFilenameForSelectedFolderProject(q1asmUris, options.paramsFile);
-    const projectYaml = this.selectedFolderProjectYaml(q1asmUris, paramsFilename);
-    await fsPromises.writeFile(projectPath, projectYaml, "utf-8");
-    const includedFiles = q1asmUris.map((uri) => path.basename(uri.fsPath)).join(", ");
-    this.output.appendLine(
-      `Auto-generated q1timeline fallback includes ${q1asmUris.length} Q1ASM file(s): ${includedFiles}`
-    );
-    this.output.appendLine(`Auto-generated q1timeline fallback params: ${paramsFilename || "none"}`);
-    if (options.showMissingProjectWarning !== false) {
-      vscode.window.showWarningMessage(
-        paramsFilename
-          ? "No q1timeline.yml found; using a temporary Q1ASM folder selection with inferred placeholder params."
-          : "No q1timeline.yml found; using a temporary Q1ASM folder selection. Project-level params are unavailable."
+    const outputDir = path.join(path.dirname(sourceUri.fsPath), ".q1timeline");
+    const outputKey = normalizedFsPath(outputDir);
+    const previous = this.fallbackProjectCreations.get(outputKey) || Promise.resolve();
+    const creation = previous.catch(() => undefined).then(async () => {
+      if (!isCurrent()) return undefined;
+      await fsPromises.mkdir(outputDir, { recursive: true });
+      if (!isCurrent()) return undefined;
+      const projectPath = path.join(outputDir, "auto-generated.q1timeline.yml");
+      const paramsFilename = await this.paramsFilenameForSelectedFolderProject(q1asmUris, options.paramsFile, outputDir);
+      if (!isCurrent()) return undefined;
+      const projectYaml = this.selectedFolderProjectYaml(q1asmUris, paramsFilename, outputDir);
+      await fsPromises.writeFile(projectPath, projectYaml, "utf-8");
+      if (!isCurrent()) return undefined;
+      this.singleFileUri = sourceUri;
+      this.singleFileMode = true;
+      this.outputDir = outputDir;
+      const includedFiles = q1asmUris.map((uri) => path.basename(uri.fsPath)).join(", ");
+      this.output.appendLine(
+        `Auto-generated q1timeline fallback includes ${q1asmUris.length} Q1ASM file(s): ${includedFiles}`
       );
+      this.output.appendLine(`Auto-generated q1timeline fallback params: ${paramsFilename || "none"}`);
+      if (options.showMissingProjectWarning !== false) {
+        vscode.window.showWarningMessage(
+          paramsFilename
+            ? "No q1timeline.yml found; using a temporary Q1ASM folder selection with inferred placeholder params."
+            : "No q1timeline.yml found; using a temporary Q1ASM folder selection. Project-level params are unavailable."
+        );
+      }
+      this.output.appendLine(`Created auto-generated q1timeline fallback project: ${projectPath}`);
+      return vscode.Uri.file(projectPath);
+    });
+    this.fallbackProjectCreations.set(outputKey, creation);
+    try {
+      return await creation;
+    } finally {
+      if (this.fallbackProjectCreations.get(outputKey) === creation) this.fallbackProjectCreations.delete(outputKey);
     }
-    this.output.appendLine(`Created auto-generated q1timeline fallback project: ${projectPath}`);
-    return vscode.Uri.file(projectPath);
   }
 
-  async paramsFilenameForSelectedFolderProject(q1asmUris, paramsFile) {
+  async paramsFilenameForSelectedFolderProject(q1asmUris, paramsFile, outputDir = this.outputDir) {
     if (paramsFile) {
-      return path.relative(this.outputDir, paramsFile).replace(/\\/g, "/");
+      return path.relative(outputDir, paramsFile).replace(/\\/g, "/");
     }
     const inferredParams = await this.inferredPlaceholderParams(q1asmUris);
     if (!Object.keys(inferredParams).length) {
       return undefined;
     }
     const paramsFilename = "auto-generated.params.json";
-    const paramsPath = path.join(this.outputDir, paramsFilename);
+    const paramsPath = path.join(outputDir, paramsFilename);
     await fsPromises.writeFile(paramsPath, `${JSON.stringify(inferredParams, null, 2)}\n`, "utf-8");
     this.output.appendLine(`Created inferred q1timeline params fallback: ${paramsPath}`);
     return paramsFilename;
@@ -1917,9 +2072,15 @@ export class TimelineController {
     );
   }
 
-  async q1asmFilesInFolder(sourceUri) {
+  async q1asmFilesInFolder(sourceUri, isCurrent = () => true) {
     const folder = path.dirname(sourceUri.fsPath);
-    const entries = await fsPromises.readdir(folder, { withFileTypes: true });
+    let entries;
+    try {
+      entries = await fsPromises.readdir(folder, { withFileTypes: true });
+    } catch (error) {
+      if (!isCurrent()) return [];
+      throw error;
+    }
     const uris = entries
       .filter((entry) => entry.isFile && entry.isFile())
       .map((entry) => vscode.Uri.file(path.join(folder, entry.name)))
@@ -1945,13 +2106,13 @@ export class TimelineController {
     });
   }
 
-  selectedFolderProjectYaml(q1asmUris, paramsFilename) {
+  selectedFolderProjectYaml(q1asmUris, paramsFilename, outputDir = this.outputDir) {
     const seenIds = new Map();
     const lines = ["sequencers:"];
     for (const uri of q1asmUris) {
       const name = path.basename(uri.fsPath, path.extname(uri.fsPath));
       const id = this.uniqueSequencerId(name, seenIds);
-      const filePath = path.relative(this.outputDir, uri.fsPath).replace(/\\/g, "/");
+      const filePath = path.relative(outputDir, uri.fsPath).replace(/\\/g, "/");
       lines.push(
         `  - id: ${JSON.stringify(id)}`,
         `    name: ${JSON.stringify(name)}`,
@@ -2008,7 +2169,7 @@ export class TimelineController {
     const root = workspaceFolder ? workspaceFolder.uri.fsPath : path.parse(sourceUri.fsPath).root;
     const discovered = projectDiscovery.findProjectFileCandidatesUpward(
       sourceUri.fsPath,
-      this.projectFileCandidatePatterns(),
+      this.projectFileCandidatePatterns(sourceUri),
       root,
       ["auto-generated.q1timeline.yml", "auto-generated.q1timeline.yaml"],
     );
@@ -2017,8 +2178,8 @@ export class TimelineController {
       .map((item) => vscode.Uri.file(item));
   }
 
-  projectFileCandidatePatterns() {
-    const configured = this.config().get("projectFile", "q1timeline.yml").replace(/\\/g, "/");
+  projectFileCandidatePatterns(sourceUri) {
+    const configured = this.config(sourceUri).get("projectFile", "q1timeline.yml").replace(/\\/g, "/");
     return [
       configured,
       "q1timeline.yml",
@@ -2072,13 +2233,14 @@ export class TimelineController {
     return vscode.workspace.findFiles(`**/${projectFile}`, "**/{.git,node_modules,.q1timeline}/**");
   }
 
-  async pickProjectFile(matches, placeHolder) {
+  async pickProjectFile(matches, placeHolder, isCurrent = () => !this.disposed) {
     const items = matches.map((uri) => ({ label: vscode.workspace.asRelativePath(uri), uri }));
     const selected = await vscode.window.showQuickPick(items, { placeHolder });
-    if (!selected) {
+    if (!selected || !isCurrent()) {
       return undefined;
     }
     await this.context.workspaceState.update("q1timeline.projectFile", selected.uri.toString());
+    if (!isCurrent()) return undefined;
     this.output.appendLine(`Selected q1timeline project file: ${selected.uri.fsPath}`);
     return selected.uri;
   }
@@ -2090,24 +2252,106 @@ export class TimelineController {
     this.watcher = vscode.workspace.createFileSystemWatcher("**/*.{q1asm,json,yml,yaml}");
     this.context.subscriptions.push(this.watcher);
     this.watcher.onDidChange((uri) => this.onWatchedFile(uri));
-    this.watcher.onDidCreate((uri) => this.onWatchedFile(uri));
-    this.watcher.onDidDelete((uri) => this.onWatchedFile(uri));
+    this.watcher.onDidCreate((uri) => this.onWatchedFile(uri, "create"));
+    this.watcher.onDidDelete((uri) => this.onWatchedFile(uri, "delete"));
+    this.updateRelatedFileWatchers();
   }
 
-  async onWatchedFile(uri) {
-    if (this.isProjectRelated(uri)) {
-      this.invalidateSourceAnalysis();
+  disposeRelatedFileWatchers() {
+    for (const watcher of this.relatedFileWatchers) watcher.dispose();
+    this.relatedFileWatchers = [];
+  }
+
+  updateRelatedFileWatchers() {
+    this.disposeRelatedFileWatchers();
+    const watchers = this.relatedFileWatchers;
+    const projectSessionId = this.projectSessionId;
+    const isStrictDescendant = (ancestor, file) => {
+      const relative = path.relative(ancestor, file);
+      return relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+    };
+    const seen = new Set();
+    for (const relatedPath of this.projectRelatedPaths) {
+      const key = normalizedFsPath(relatedPath);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const coveredByGlob = (process.platform === "linux" ? /\.(?:q1asm|json|yml|yaml)$/ : /\.(?:q1asm|json|yml|yaml)$/i).test(relatedPath);
+      if (coveredByGlob && vscode.workspace.getWorkspaceFolder(vscode.Uri.file(relatedPath))) continue;
+      const directory = path.dirname(relatedPath);
+      let base = directory;
+      while (!fs.existsSync(base) && path.dirname(base) !== base) base = path.dirname(base);
+      const missingParent = base !== directory;
+      const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(vscode.Uri.file(base), missingParent ? "**/*" : "*"));
+      const receive = (change) => (uri) => {
+        if (this.relatedFileWatchers !== watchers || this.projectSessionId !== projectSessionId) return;
+        const changedPath = normalizedFsPath(uri.fsPath);
+        const deletedAncestor = change === "delete" && isStrictDescendant(changedPath, key);
+        if (changedPath !== key && !deletedAncestor) return;
+        let deletedDirectory = deletedAncestor ? changedPath
+          : change === "delete" && !fs.existsSync(directory) ? normalizedFsPath(directory) : undefined;
+        if (deletedDirectory) {
+          while (path.dirname(deletedDirectory) !== deletedDirectory && !fs.existsSync(path.dirname(deletedDirectory))) {
+            deletedDirectory = path.dirname(deletedDirectory);
+          }
+          // Rebinding can drop sibling delete callbacks and reads started before the directory disappeared.
+          for (const [file, snapshot] of this.sourceFileSnapshots) {
+            if (isStrictDescendant(deletedDirectory, file)) {
+              snapshot.content = undefined;
+              snapshot.token = {};
+            }
+          }
+          this.updateRelatedFileWatchers();
+        } else if (missingParent && change === "create") this.updateRelatedFileWatchers();
+        return this.onWatchedFile(deletedAncestor ? vscode.Uri.file(relatedPath) : uri, change);
+      };
+      watcher.onDidChange(receive("change"));
+      watcher.onDidCreate(receive("create"));
+      watcher.onDidDelete(receive("delete"));
+      this.relatedFileWatchers.push(watcher);
     }
-    if (this.projectUri && normalizedFsPath(uri.fsPath) === normalizedFsPath(this.projectUri.fsPath)) {
+  }
+
+  async onWatchedFile(uri, change = "change") {
+    if (this.disposed || !this.isProjectRelated(uri)) return;
+    const flushScheduledAnalysis = change === "save" && this.shouldAnalyzeOnSave() && Boolean(this.changeTimer);
+    if (flushScheduledAnalysis) {
+      clearTimeout(this.changeTimer);
+      this.changeTimer = undefined;
+    }
+    const projectFile = this.projectUri.fsPath;
+    const sourceFile = this.singleFileUri?.fsPath;
+    const snapshots = this.sourceFileSnapshots;
+    const key = normalizedFsPath(uri.fsPath);
+    const snapshot = snapshots.get(key) || {};
+    snapshots.set(key, snapshot);
+    const token = {};
+    snapshot.token = token;
+    const isCurrent = () => !this.disposed && this.sourceFileSnapshots === snapshots &&
+      this.projectUri?.fsPath === projectFile && this.singleFileUri?.fsPath === sourceFile && snapshot.token === token;
+    let content;
+    if (change === "delete") snapshot.content = undefined;
+    else {
+      try { content = await fsPromises.readFile(uri.fsPath); } catch { /* Without bytes, retain normal change handling. */ }
+    }
+    if (!isCurrent()) return;
+    if (key === normalizedFsPath(projectFile)) {
       await this.refreshProjectRelatedPaths();
     }
-    if (!this.isProjectRelated(uri) || !updatePolicy.shouldAnalyzeWatchedFile(this.updateMode())) {
+    if (!isCurrent()) return;
+    const mode = this.updateMode();
+    if (content && snapshot.content?.equals(content) && !snapshot.edited && snapshot.mode === mode) {
+      if (flushScheduledAnalysis) return this.runAnalysis({ refreshPolicy: "onSave" });
       return;
     }
-    if (updatePolicy.shouldDebounceWatchedFile(this.updateMode())) {
-      this.scheduleAnalysis();
+    this.invalidateSourceAnalysis();
+    snapshot.content = content;
+    snapshot.edited = false;
+    snapshot.mode = mode;
+    if (!updatePolicy.shouldAnalyzeWatchedFile(mode)) return;
+    if (change !== "save" && updatePolicy.shouldDebounceWatchedFile(mode)) {
+      this.scheduleAnalysis("onSave");
     } else {
-      this.runAnalysis();
+      return this.runAnalysis({ refreshPolicy: "onSave" });
     }
   }
 
@@ -2124,53 +2368,79 @@ export class TimelineController {
   }
 
   async refreshProjectRelatedPaths() {
+    const requestId = ++this.projectRelatedPathsRequestId;
+    const projectUri = this.projectUri;
+    const singleFileUri = this.singleFileUri;
     const related = new Set();
-    if (this.projectUri) {
+    if (projectUri) {
       try {
-        const projectText = await fsPromises.readFile(this.projectUri.fsPath, "utf-8").catch((error) => {
+        const projectText = await fsPromises.readFile(projectUri.fsPath, "utf-8").catch((error) => {
           if (error && error.code === "ENOENT") {
             return "";
           }
           throw error;
         });
-        for (const relatedPath of collectProjectRelatedPaths(this.projectUri.fsPath, projectText)) {
+        for (const relatedPath of collectProjectRelatedPaths(projectUri.fsPath, projectText)) {
           related.add(relatedPath);
         }
       } catch (error) {
-        related.add(path.resolve(this.projectUri.fsPath));
+        related.add(path.resolve(projectUri.fsPath));
         this.output.appendLine(`Unable to refresh project watch paths: ${error.message}`);
       }
     }
-    if (this.singleFileUri) {
-      related.add(path.resolve(this.singleFileUri.fsPath));
+    if (singleFileUri) {
+      related.add(path.resolve(singleFileUri.fsPath));
     }
+    if (this.disposed || requestId !== this.projectRelatedPathsRequestId ||
+        this.projectUri?.fsPath !== projectUri?.fsPath || this.singleFileUri?.fsPath !== singleFileUri?.fsPath) return;
     this.projectRelatedPaths = related;
+    if (this.watcher) this.updateRelatedFileWatchers();
   }
 
-  scheduleAnalysis() {
+  scheduleAnalysis(refreshPolicy = "onType") {
     if (this.changeTimer) {
       clearTimeout(this.changeTimer);
+      if (this.changeTimerRefreshPolicy === "onSave") refreshPolicy = "onSave";
     }
     const debounceMs = effectiveDebounceMs(this.config().get("debounceMs", 400), this.analyzerResult);
-    this.changeTimer = setTimeout(() => this.runAnalysis(), debounceMs);
+    this.changeTimerRefreshPolicy = refreshPolicy;
+    this.changeTimer = setTimeout(() => {
+      this.changeTimer = undefined;
+      this.changeTimerRefreshPolicy = undefined;
+      if (refreshPolicy === "onSave" ? this.shouldAnalyzeOnSave() : this.shouldAnalyzeOnType()) {
+        this.runAnalysis({ refreshPolicy });
+      }
+    }, debounceMs);
   }
 
-  async runAnalysis({ onFailure } = {}) {
-    if (!this.projectUri || !this.outputDir) {
+  async runAnalysis({ onFailure, refreshPolicy } = {}) {
+    if (this.disposed || !this.projectUri || !this.outputDir) {
       return Promise.resolve();
+    }
+    if (this.changeTimer) {
+      clearTimeout(this.changeTimer);
+      this.changeTimer = undefined;
     }
     this.resetPlayback();
     if (this.analysisInFlight) {
+      if (!this.analysisQueued || !refreshPolicy ||
+          (this.analysisQueuedRefreshPolicy === "onType" && refreshPolicy === "onSave")) {
+        this.analysisQueuedRefreshPolicy = refreshPolicy;
+      }
       this.analysisQueued = true;
       this.analysisRequestId += 1;
+      this.analysisEnvironmentCheck?.abort();
       this.output.appendLine("Analyzer already running; queued refresh.");
       this.setAnalysisStatus("stale", "A newer analysis request is queued.");
       return Promise.resolve();
     }
     this.analysisInFlight = true;
+    const environmentCheck = new AbortController();
+    this.analysisEnvironmentCheck = environmentCheck;
     this.cancelSourceRangeZoom();
-    const sourceRevision = this.sourceRevision;
+    let sourceRevision = this.sourceRevision;
     const analysisProjectFile = this.projectUri.fsPath;
+    const analysisProjectSessionId = this.projectSessionId;
     const environmentResource = this.singleFileUri || this.projectUri;
     const analysisRequestId = ++this.analysisRequestId;
     if (this.pendingBranchSelection) {
@@ -2220,11 +2490,12 @@ export class TimelineController {
     this.output.appendLine(`Analyzer working directory: ${cwd}`);
     return Promise.resolve()
       .then(async () => {
-        const environment = await ensureFilePythonEnvironment(vscode, environmentResource, "q1asm", this.output, { cwd, env: extraEnv });
+        const environment = await ensureFilePythonEnvironment(vscode, environmentResource, "q1asm", this.output, { cwd, env: extraEnv, signal: environmentCheck.signal });
         if (!this.isCurrentAnalysis(analysisRequestId) || this.projectUri?.fsPath !== analysisProjectFile ||
           (this.singleFileUri || this.projectUri)?.fsPath !== environmentResource.fsPath) return;
         if (!environment) {
           this.setAnalysisStatus("error", "Python environment setup is required.");
+          if (onFailure) onFailure("Python environment setup is required.");
           return;
         }
         this.pythonEnvironment = environment;
@@ -2233,6 +2504,8 @@ export class TimelineController {
         this.output.appendLine(`Analyzer command: ${[pythonPath, ...args].join(" ")}`);
         await fsPromises.mkdir(this.outputDir, { recursive: true });
         await this.clearAnalyzerOutputFiles(timelineIrPath, diagnosticsPath, htmlPath);
+        if (!this.isCurrentAnalysis(analysisRequestId)) return;
+        sourceRevision = this.sourceRevision;
         return this.execFile(pythonPath, args, timeoutMs, cwd, extraEnv, "analyzer");
       })
       .catch(async (error) => {
@@ -2284,7 +2557,7 @@ export class TimelineController {
         this.logAnalyzerOutputFiles();
         this.setAnalysisStatus("idle", "Analysis complete.");
         this.analysisFailureCount = 0;
-        if (await this.refreshWebview()) {
+        if (await this.refreshWebview(undefined, sourceRevision)) {
           this.analyzedSourceRevision = sourceRevision;
         }
       })
@@ -2304,6 +2577,7 @@ export class TimelineController {
           this.clearPreviewAfterAnalyzerFailure("q1timeline analyzer failed.");
         }
         const hasDiagnostics = failureDiagnostics.length > 0 || await this.hasAnalyzerDiagnostics();
+        if (!this.isCurrentAnalysis(analysisRequestId)) return;
         if (this.isAnalyzerTimeoutError(error)) {
           this.showSubprocessTimeoutMessage(timeoutMs, error.stage);
         } else if (this.isAnalyzerMissingError(error)) {
@@ -2315,17 +2589,34 @@ export class TimelineController {
         } else {
           this.recordAnalyzerFailure(error);
         }
-        const diagnostics = failureDiagnostics.length ? this.applyDiagnostics(failureDiagnostics) : await this.loadDiagnostics();
+        const diagnostics = failureDiagnostics.length ? this.applyDiagnostics(failureDiagnostics, this.sourceRevision === sourceRevision) : await this.loadDiagnostics(analysisRequestId, sourceRevision);
+        if (!diagnostics || !this.isCurrentAnalysis(analysisRequestId)) return;
         this.setAnalyzerDiagnostics(diagnostics);
         this.setDiagnosticSummary(summarizeDiagnostics(diagnostics));
       })
       .finally(() => {
-        this.analysisInFlight = false;
-        if (this.analysisQueued) {
-          this.analysisQueued = false;
-          this.runAnalysis({ onFailure: this.projectUri?.fsPath === analysisProjectFile ? onFailure : undefined });
-        }
+        if (this.analysisEnvironmentCheck === environmentCheck) this.analysisEnvironmentCheck = undefined;
+        const queuedOnFailure = this.projectSessionId === analysisProjectSessionId &&
+          this.projectUri?.fsPath === analysisProjectFile ? onFailure : undefined;
+        this.finishAnalysis(queuedOnFailure);
       });
+  }
+
+  finishAnalysis(onFailure) {
+    this.analysisInFlight = false;
+    if (this.analysisQueued) {
+      const queuedRefreshPolicy = this.analysisQueuedRefreshPolicy;
+      this.analysisQueued = false;
+      this.analysisQueuedRefreshPolicy = undefined;
+      const shouldRefresh = queuedRefreshPolicy === "onType" ? this.shouldAnalyzeOnType()
+        : queuedRefreshPolicy === "onSave" ? this.shouldAnalyzeOnSave() : true;
+      if (!shouldRefresh) {
+        this.setAnalysisStatus("stale", "Automatic refresh cancelled. Refresh the timeline to analyze saved source.");
+        onFailure?.("Automatic refresh was cancelled because the update policy changed.");
+        return;
+      }
+      this.runAnalysis({ onFailure, refreshPolicy: queuedRefreshPolicy });
+    }
   }
 
   runRender(pythonPath, pythonArgs, timelineIrPath, htmlPath, timeoutMs, cwd, extraEnv, viewMode, analysisRequestId) {
@@ -2355,6 +2646,12 @@ export class TimelineController {
   }
 
   async prepareTimelineIrForRender(timelineIrPath) {
+    const projectFile = this.projectUri?.fsPath;
+    const outputDir = this.outputDir;
+    const analysisRequestId = this.analysisRequestId;
+    const sourceRevision = this.sourceRevision;
+    const isCurrent = () => this.isCurrentAnalysis(analysisRequestId) && this.sourceRevision === sourceRevision &&
+      this.projectUri?.fsPath === projectFile && this.outputDir === outputDir;
     let nextTimelineIr;
     try {
       nextTimelineIr = JSON.parse(await fsPromises.readFile(timelineIrPath, "utf-8"));
@@ -2362,7 +2659,9 @@ export class TimelineController {
       this.output.appendLine(`Unable to prepare TimelineIR diff highlights: ${error.message}`);
       return;
     }
+    if (!isCurrent()) return;
     const savedComparisonBaseline = await this.loadComparisonBaseline();
+    if (!isCurrent()) return;
     const diffBaseline = savedComparisonBaseline || this.lastAnalyzerTimelineIr;
     const annotatedTimelineIr = annotateTimelineDiff(diffBaseline, nextTimelineIr);
     this.comparison = { mode: savedComparisonBaseline ? "saved" : isTimelineIr(diffBaseline) ? "previous" : "none" };
@@ -2371,7 +2670,7 @@ export class TimelineController {
   }
 
   isCurrentAnalysis(analysisRequestId) {
-    return analysisRequestId === this.analysisRequestId;
+    return !this.disposed && analysisRequestId === this.analysisRequestId;
   }
 
   isAnalyzerMissingError(error) {
@@ -2422,12 +2721,13 @@ export class TimelineController {
   }
 
   showAnalyzerMissingMessage(error) {
+    const analysisRequestId = this.analysisRequestId;
     const pythonPath = this.pythonEnvironment?.pythonPath || "unavailable";
     return vscode.window.showErrorMessage(
       `Q1Lens is unavailable in the selected Python environment (${pythonPath}). ${error.message}`,
       "Check Python Environment"
     ).then((action) => {
-      if (action === "Check Python Environment") return this.checkAnalyzerInstallation();
+      if (action === "Check Python Environment" && this.isCurrentAnalysis(analysisRequestId)) return this.checkAnalyzerInstallation();
       return undefined;
     });
   }
@@ -2523,7 +2823,7 @@ export class TimelineController {
   execFile(command, args, timeoutMs, cwd, extraEnv = {}, stage) {
     return new Promise((resolve, reject) => {
       const startedAt = Date.now();
-      childProcess.execFile(command, args, { cwd, timeout: timeoutMs, maxBuffer: 50 * 1024 * 1024, env: { ...process.env, ...extraEnv } }, (error, stdout, stderr) => {
+      childProcess.execFile(command, args, { cwd, timeout: timeoutMs, maxBuffer: 50 * 1024 * 1024, env: { ...process.env, ...extraEnv }, windowsHide: true }, (error, stdout, stderr) => {
         const elapsedMs = Date.now() - startedAt;
         if (error) {
           error.stdout = stdout;
@@ -2540,28 +2840,39 @@ export class TimelineController {
     });
   }
 
-  async refreshWebview(snapshot) {
-    if (snapshot && !snapshot.isCurrent()) return;
+  async refreshWebview(snapshot, sourceRevision = this.analyzedSourceRevision) {
+    const analysisRequestId = this.analysisRequestId;
+    const outputDir = this.outputDir;
+    const panel = this.panel;
+    const isCurrent = () => this.isCurrentAnalysis(analysisRequestId) && this.outputDir === outputDir && this.panel === panel &&
+      (!snapshot || snapshot.isCurrent());
+    if (!isCurrent()) return;
     this.cancelSourceRangeZoom();
     this.webviewReady = false;
     try {
-      this.timelineIr = snapshot ? snapshot.ir : await this.readJson("timeline_ir.json");
+      const timelineIr = snapshot ? snapshot.ir : await this.readJson("timeline_ir.json");
+      if (!isCurrent()) return;
+      this.timelineIr = timelineIr;
     } catch (error) {
+      if (!isCurrent()) return;
       this.applyFallbackDiagnostic(`Invalid analyzer TimelineIR JSON: ${error.message}`);
       return;
     }
-    const diagnostics = snapshot ? this.applyDiagnostics(snapshot.ir.diagnostics || []) : await this.loadDiagnostics();
+    const diagnostics = snapshot ? this.applyDiagnostics(snapshot.ir.diagnostics || [], this.sourceRevision === sourceRevision) : await this.loadDiagnostics(analysisRequestId, sourceRevision);
+    if (!isCurrent()) return;
     this.setAnalyzerDiagnostics(diagnostics);
     this.setDiagnosticSummary(summarizeDiagnostics(diagnostics));
     if (!this.panel) {
       return;
     }
-    const htmlPath = path.join(this.outputDir, "timeline.html");
+    const htmlPath = path.join(outputDir, "timeline.html");
     let html;
     try {
       html = snapshot ? snapshot.html : await fsPromises.readFile(htmlPath, "utf-8");
+      if (!isCurrent()) return;
       this.lastPreviewHtml = html;
     } catch (error) {
+      if (!isCurrent()) return;
       if (!error || error.code !== "ENOENT") {
         this.applyFallbackDiagnostic(`Invalid analyzer HTML output: ${error.message}`);
         return;
@@ -2583,7 +2894,7 @@ export class TimelineController {
     if (!snapshot && !this.pendingTarget?.zoomToRange) {
       await this.revealPendingTarget();
     }
-    return Boolean(this.timelineIr);
+    return isCurrent() && Boolean(this.timelineIr);
   }
 
   clearPreviewAfterAnalyzerFailure(message) {
@@ -2606,21 +2917,26 @@ export class TimelineController {
     return `<!doctype html><html><body><p>${text}</p></body></html>`;
   }
 
-  async loadDiagnostics() {
+  async loadDiagnostics(analysisRequestId = this.analysisRequestId, sourceRevision = this.analyzedSourceRevision) {
+    const projectFile = this.projectUri.fsPath;
+    const outputDir = this.outputDir;
+    const isCurrent = () => this.isCurrentAnalysis(analysisRequestId) && this.projectUri?.fsPath === projectFile && this.outputDir === outputDir;
     let diagnostics;
     try {
       diagnostics = await this.readJson("diagnostics.json") || [];
     } catch (error) {
+      if (!isCurrent()) return;
       const message = `Invalid analyzer diagnostics JSON: ${error.message}`;
       this.applyFallbackDiagnostic(message);
-      return this.applyDiagnostics([fallbackAnalyzerDiagnostic(this.projectUri.fsPath, message)]);
+      return this.applyDiagnostics([fallbackAnalyzerDiagnostic(projectFile, message)], this.sourceRevision === sourceRevision);
     }
-    diagnostics = normalizeAnalyzerDiagnostics(diagnostics, this.projectUri.fsPath);
-    return this.applyDiagnostics(diagnostics);
+    if (!isCurrent()) return;
+    diagnostics = normalizeAnalyzerDiagnostics(diagnostics, projectFile);
+    return this.applyDiagnostics(diagnostics, this.sourceRevision === sourceRevision);
   }
 
-  applyDiagnostics(diagnostics) {
-    return this.diagnosticsManager.apply(diagnostics);
+  applyDiagnostics(diagnostics, allowSuggestedEdits = true) {
+    return this.diagnosticsManager.apply(diagnostics, allowSuggestedEdits);
   }
 
   applyFallbackDiagnostic(message) {
@@ -2647,12 +2963,22 @@ export class TimelineController {
       this.logMalformedWebviewMessage(message);
       return;
     }
-    if (parsedMessage.type === "eventClick") {
-      this.openSourceForEvent(parsedMessage.eventId);
-      return;
-    }
-    if (parsedMessage.type === "feedbackFlowClick") {
-      await this.openSourceForFeedbackFlow(parsedMessage.flowId, parsedMessage.role);
+    if (parsedMessage.type === "eventClick" || parsedMessage.type === "diagnosticClick" ||
+        parsedMessage.type === "sourceClick" || parsedMessage.type === "feedbackFlowClick") {
+      try {
+        if (parsedMessage.type === "eventClick") await this.openSourceForEvent(parsedMessage.eventId);
+        else if (parsedMessage.type === "diagnosticClick") await this.openSourceForDiagnostic(parsedMessage.diagnosticIndex);
+        else if (parsedMessage.type === "feedbackFlowClick") await this.openSourceForFeedbackFlow(parsedMessage.flowId, parsedMessage.role);
+        else await this.openSourceLocation({
+          file: parsedMessage.file,
+          line: parsedMessage.line,
+          column: parsedMessage.column,
+        }, { preserveHardwareCursor: parsedMessage.preserveHardwareCursor });
+      } catch (error) {
+        const failure = `Q1Lens could not open source: ${error.message}`;
+        this.output.appendLine(failure);
+        void Promise.resolve(vscode.window.showErrorMessage(failure)).catch(() => undefined);
+      }
       return;
     }
     if (parsedMessage.type === "requestRefresh") {
@@ -2686,18 +3012,6 @@ export class TimelineController {
       } else if (!this.timelineIr?.playback && !this.pendingBranchSelection && vscode.window.activeTextEditor?.selection?.isEmpty === false) {
         this.followSourceEditor(vscode.window.activeTextEditor);
       }
-      return;
-    }
-    if (parsedMessage.type === "diagnosticClick") {
-      this.openSourceForDiagnostic(parsedMessage.diagnosticIndex);
-      return;
-    }
-    if (parsedMessage.type === "sourceClick") {
-      await this.openSourceLocation({
-        file: parsedMessage.file,
-        line: parsedMessage.line,
-        column: parsedMessage.column,
-      }, { preserveHardwareCursor: parsedMessage.preserveHardwareCursor });
       return;
     }
     if (parsedMessage.type === "setViewMode") {
@@ -2810,6 +3124,7 @@ export class TimelineController {
     const flow = this.timelineIr?.feedback_flows?.find((candidate) =>
       String(candidate.id || `${candidate.from_event_id}->${candidate.to_event_id}`) === flowId);
     if (!flow) return;
+    const isCurrent = this.beginSourceNavigation();
     const eventIds = role === "source" ? [flow.from_event_id]
       : role === "target" ? [flow.to_event_id] : [flow.from_event_id, flow.to_event_id];
     const sourcesByPath = new Map();
@@ -2824,9 +3139,10 @@ export class TimelineController {
     let appendSourceDecoration = false;
     try {
       for (const { source, lines } of sourcesByPath.values()) {
+        if (!isCurrent()) return;
         await this.openSourceLocation(source, {
           preserveHardwareCursor: true, sourceReveal,
-          sourceLines: [...lines], appendSourceDecoration,
+          sourceLines: [...lines], appendSourceDecoration, isCurrent,
         });
         appendSourceDecoration = true;
       }
@@ -2835,7 +3151,18 @@ export class TimelineController {
     }
   }
 
+  beginSourceNavigation() {
+    const requestId = ++this.sourceNavigationRequestId;
+    const projectSessionId = this.projectSessionId;
+    const sourceRevision = this.sourceRevision;
+    const panel = this.panel;
+    return () => !this.disposed && this.sourceNavigationRequestId === requestId &&
+      this.projectSessionId === projectSessionId && this.sourceRevision === sourceRevision && this.panel === panel;
+  }
+
   async openSourceLocation(source, options = {}) {
+    const isCurrent = options.isCurrent || this.beginSourceNavigation();
+    if (!isCurrent()) return;
     this.pendingBranchSelection = undefined;
     this.cancelSourceRangeZoom();
     const sourcePath = this.resolveSourcePath(source.file);
@@ -2848,8 +3175,16 @@ export class TimelineController {
     try {
       const existingDocument = workspaceTextDocumentForPath(sourcePath, vscode.workspace.textDocuments);
       const document = existingDocument || await vscode.workspace.openTextDocument(vscode.Uri.file(sourcePath));
-      const showOptions = await this.sourceShowTextDocumentOptions(sourcePath, Boolean(existingDocument));
-      const editor = await vscode.window.showTextDocument(document, showOptions);
+      if (!isCurrent()) return;
+      const showing = this.sourceNavigationQueue.then(async () => {
+        if (!isCurrent()) return;
+        const showOptions = await this.sourceShowTextDocumentOptions(sourcePath, Boolean(existingDocument));
+        if (!isCurrent()) return;
+        return vscode.window.showTextDocument(document, showOptions);
+      });
+      this.sourceNavigationQueue = showing.catch(() => undefined);
+      const editor = await showing;
+      if (!isCurrent()) return;
       this.rememberSourceViewColumn(editor);
       let range;
       if (options.sourceRange && options.sourceRange.endLine <= document.lineCount) {
@@ -2877,7 +3212,10 @@ export class TimelineController {
       }
     } catch (error) {
       if (this.hardwareSourceReveal === reveal) this.hardwareSourceReveal = undefined;
+      if (!isCurrent()) return;
       throw error;
+    } finally {
+      if (!isCurrent() && this.hardwareSourceReveal === reveal) this.hardwareSourceReveal = undefined;
     }
   }
 
@@ -2986,6 +3324,7 @@ export class TimelineController {
 
   invalidateSourceAnalysis() {
     this.resetPlayback();
+    this.diagnosticsManager.invalidateSuggestedEdits();
     this.sourceRevision += 1;
     this.pendingBranchSelection = undefined;
     this.cancelSourceRangeZoom();
@@ -3140,6 +3479,10 @@ export class TimelineController {
   }
 
   dispose() {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.analysisEnvironmentCheck?.abort();
+    this.analysisQueued = false;
     this.resetPlayback();
     this.cancelSourceRangeZoom();
     this.pendingBranchSelection = undefined;
@@ -3153,6 +3496,7 @@ export class TimelineController {
       this.watcher.dispose();
       this.watcher = undefined;
     }
+    this.disposeRelatedFileWatchers();
     this.disposePanelDisposables();
     if (this.panel) {
       this.panel.dispose();

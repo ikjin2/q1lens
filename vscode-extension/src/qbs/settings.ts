@@ -1,6 +1,6 @@
 import type * as vscodeTypes from "vscode";
 import { readMergedSetting } from "../settings";
-import { readSharedPythonSettings } from "./settingsCore";
+import { explicitConfigValue, readSharedPythonSettings } from "./settingsCore";
 
 export interface QbsTimelineSettings {
   pythonPath: string;
@@ -18,23 +18,23 @@ export function readSettings(resource?: vscodeTypes.Uri): QbsTimelineSettings {
   const qbsConfig = vscode.workspace.getConfiguration("qbsTimeline", resource);
   const settings = {
     q1lens: {
-      revealOutputChannel: q1lensConfig.get<boolean | undefined>("revealOutputChannel"),
+      revealOutputChannel: explicitConfigValue<boolean>(q1lensConfig, "revealOutputChannel"),
       q1timelineCommand: q1lensConfig.get<string | null | undefined>("q1timelineCommand"),
       qbs: {
-        autoRefresh: q1lensConfig.get<boolean | undefined>("qbs.autoRefresh"),
+        autoRefresh: explicitConfigValue<boolean>(q1lensConfig, "qbs.autoRefresh"),
         outputDirOverride: q1lensConfig.get<string | null | undefined>("qbs.outputDirOverride"),
       },
     },
     qbloxTimeline: {
       qbs: {
-        autoRefresh: qbloxConfig.get<boolean | undefined>("qbs.autoRefresh"),
+        autoRefresh: explicitConfigValue<boolean>(qbloxConfig, "qbs.autoRefresh"),
         outputDirOverride: qbloxConfig.get<string | null | undefined>("qbs.outputDirOverride"),
       },
     },
     qbsTimeline: {
-      autoRefresh: qbsConfig.get<boolean | undefined>("autoRefresh"),
+      autoRefresh: explicitConfigValue<boolean>(qbsConfig, "autoRefresh"),
       outputDirOverride: qbsConfig.get<string | null | undefined>("outputDirOverride"),
-      revealOutputChannel: qbsConfig.get<boolean | undefined>("revealOutputChannel"),
+      revealOutputChannel: explicitConfigValue<boolean>(qbsConfig, "revealOutputChannel"),
       q1timelineCommand: qbsConfig.get<string | null | undefined>("q1timelineCommand"),
     },
   };

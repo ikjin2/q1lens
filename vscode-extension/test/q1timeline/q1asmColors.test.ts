@@ -8,8 +8,9 @@ class Range {
   constructor(public startLine: number, public startColumn: number, public endLine: number, public endColumn: number) {}
 }
 
-function document(text: string, languageId = "q1asm") {
+function document(text: string, languageId = "q1asm", file = "file:///program.q1asm") {
   return {
+    uri: { toString: () => file },
     languageId,
     lines: text.split("\n"),
     get lineCount() { return this.lines.length; },
@@ -28,6 +29,7 @@ function editor(source: ReturnType<typeof document>) {
 function setup(editors: ReturnType<typeof editor>[]) {
   let visibleChanged: (items: any[]) => void;
   let documentChanged: (event: any) => void;
+  let documentOpened: ((source: ReturnType<typeof document>) => void) | undefined;
   const types: any[] = [];
   const subscriptions: any[] = [];
   const vscode = {
@@ -46,6 +48,10 @@ function setup(editors: ReturnType<typeof editor>[]) {
       },
     },
     workspace: {
+      onDidOpenTextDocument(listener: typeof documentOpened) {
+        documentOpened = listener;
+        return { dispose: () => undefined };
+      },
       onDidChangeTextDocument(listener: typeof documentChanged) {
         documentChanged = listener;
         return { dispose: () => undefined };
@@ -57,6 +63,7 @@ function setup(editors: ReturnType<typeof editor>[]) {
     vscode, types, subscriptions,
     show(items: typeof editors) { vscode.window.visibleTextEditors = items; visibleChanged(items); },
     change(source: ReturnType<typeof document>) { documentChanged({ document: source }); },
+    open(source: ReturnType<typeof document>) { documentOpened?.(source); },
   };
 }
 
@@ -69,6 +76,37 @@ function tokenText(target: ReturnType<typeof editor>, family: string) {
 }
 
 describe("Q1ASM instruction colors", () => {
+  for (const [from, to] of [["plaintext", "q1asm"], ["q1asm", "plaintext"]]) {
+    it(`updates visible colors when language changes from ${from} to ${to} before its editor document is replaced`, () => {
+      const source = document("play 0, 1, 4", from);
+      const first = editor(source);
+      const second = editor(source);
+      const unrelated = editor(document("move R0, 1", "plaintext", "file:///other.txt"));
+      const session = setup([first, second, unrelated]);
+      const replacement = document("play 0, 1, 4", to);
+
+      session.open(replacement);
+
+      for (const target of [first, second]) {
+        assert.equal(target.document, source, "The open event arrives before VS Code replaces the visible editor's document");
+        assert.deepEqual(ranges(target, "rt"), to === "q1asm" ? [new Range(0, 0, 0, 4)] : []);
+        target.document = replacement;
+      }
+      assert.equal(unrelated.applied.size, 0, "An unrelated plaintext editor must remain untouched");
+      if (to === "plaintext") {
+        assert.ok(Array.from(first.applied.values()).every((items) => items.length === 0));
+        const cleared = first.applied.get(families.rt.color);
+        session.change(replacement);
+        assert.equal(first.applied.get(families.rt.color), cleared, "Already-cleared plaintext must not be decorated again");
+      } else {
+        replacement.lines[0] = "set_freq 1";
+        session.change(replacement);
+        assert.deepEqual(ranges(first, "rt"), []);
+        assert.deepEqual(ranges(second, "latched"), [new Range(0, 0, 0, 8)]);
+      }
+    });
+  }
+
   it("keeps opcode categories separate from labels, arguments and comments", () => {
     const target = editor(document([
       "move: PLAY 0, 1, 4 # set_freq 1",

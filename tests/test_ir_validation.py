@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from qbstimeline.ir.validation import IrDiagnostic, validate_qbs_ir
+from q1timeline.q1asm.parser import parse_q1asm
 
 
 def valid_ir() -> dict:
@@ -83,6 +84,49 @@ def codes(ir: dict) -> list[str]:
 
 def test_valid_ir_has_no_invariant_diagnostics() -> None:
     assert validate_qbs_ir(valid_ir()) == []
+
+
+def test_operand_instruction_matches_after_one_valid_same_line_label() -> None:
+    for instruction in ["pulse:play 0,1,20", "  _pulse_2 \t: play 0,1,20 # pulse", "pulse :\tplay 0,1,20"]:
+        ir = valid_ir()
+        program = f"set_awg_gain 1,1\n{instruction}\nstop\n"
+        ir["q1asm_by_sequencer"]["cluster0_module2_seq0"] = program
+        parsed = parse_q1asm(program)
+        assert parsed.diagnostics == []
+        assert parsed.instructions[1].op == "play"
+        assert parsed.instructions[1].source.line == 2
+        assert "q1asm_instruction_mismatch" not in codes(ir)
+
+
+def test_operand_instruction_mismatch_remains_for_wrong_or_missing_labeled_instruction() -> None:
+    for instruction in ["pulse: wait 4", "pulse: # play 0,1,20", "first: second:play 0,1,20", "@pulse: play 0,1,20", "9pulse:play 0,1,20", "pulse: PLAY 0,1,20"]:
+        ir = valid_ir()
+        ir["q1asm_by_sequencer"]["cluster0_module2_seq0"] = f"set_awg_gain 1,1\n{instruction}\nstop\n"
+        assert "q1asm_instruction_mismatch" in codes(ir)
+
+
+def test_operand_instruction_rejects_labeled_and_unlabeled_opcode_prefix_collisions() -> None:
+    for label in ["", "pulse: "]:
+        for expected, actual in [("wait", "wait_sync 4"), ("play", "playback 0,1,20")]:
+            ir = valid_ir()
+            ir["q1asm_provenance"][0]["operand_mappings"][0]["instruction"] = expected
+            ir["q1asm_by_sequencer"]["cluster0_module2_seq0"] = f"set_awg_gain 1,1\n{label}{actual}\nstop\n"
+            assert "q1asm_instruction_mismatch" in codes(ir)
+
+
+def test_operand_instruction_preserves_generic_acquisition_variants_after_labels() -> None:
+    for instruction in ["acquire 0,0,4", "acquire_ttl 0,0,1,4", "acquire_weighed 0,0,0,1,4"]:
+        ir = valid_ir()
+        ir["q1asm_provenance"][0]["operand_mappings"][0]["instruction"] = "acquire"
+        ir["q1asm_by_sequencer"]["cluster0_module2_seq0"] = f"set_awg_gain 1,1\npulse: {instruction}\nstop\n"
+        assert "q1asm_instruction_mismatch" not in codes(ir)
+
+
+def test_operand_instruction_preserves_existing_full_literal_instruction_input() -> None:
+    ir = valid_ir()
+    ir["q1asm_provenance"][0]["operand_mappings"][0]["instruction"] = "play 0,1,20"
+    ir["q1asm_by_sequencer"]["cluster0_module2_seq0"] = "set_awg_gain 1,1\npulse: play 0,1,20 # pulse\nstop\n"
+    assert "q1asm_instruction_mismatch" not in codes(ir)
 
 
 def test_ir_diagnostic_serializes_to_stable_ir_shape() -> None:

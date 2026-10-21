@@ -1123,6 +1123,73 @@ describe("timeline webview assets", () => {
     assert.match(script, /model\.ticks = sharedTimelineTicks\(\)/);
   });
 
+  it("keeps the current source or kind filter after rebuilding shared timeline blocks", () => {
+    const script = readFileSync(join(__dirname, "..", "src", "q1timeline", "media", "timeline.js"), "utf-8");
+    const sources = ["initializeRenderedTimeline", "renderSharedTimelineIfAvailable", "applyTimelineEventFilter"]
+      .map((name) => extractFunctionSource(script, name)).filter(Boolean);
+    const adapter = require(join(__dirname, "..", "src", "q1timeline", "media", "timelineAdapter.js"));
+    let nodes: any[] = [];
+    let onInput!: () => void;
+    const savedState: Record<string, unknown> = {};
+    const filter = { value: "", addEventListener(_type: string, listener: () => void) { onInput = listener; } };
+    const stage = { scrollLeft: 0, dataset: {}, querySelectorAll: () => [] };
+    const root = { querySelector: (selector: string) => selector === ".shared-timeline-stage" ? stage : undefined };
+    const noopNames = [
+      "renderTimelineLayoutToggle", "renderTimelineWindowStatus", "renderTimeBasisToggle", "installSharedQ1IssueControls",
+      "syncSharedSequencerFoldControls", "installTimelineControlChips", "installTimelineMouseInteractions", "applySharedSelection",
+      "renderWaitFolds", "renderPlaybackFolds", "renderHardwareCursor", "setInstructionView",
+    ];
+    const runtime = Function("window", "document", "state", "writePersistedWebviewState", `
+      let timelineLayout = "time", timelineTimeBasis = "local", sharedTimelineActive = false;
+      let instructionView = { cellWidth: 112, leftOrdinal: 0 }, selectedTimelineEventId = "play";
+      const selectedSourceEventIds = new Set(), expandedQ1IssueSequencers = new Set(), expandedPlaybackLoops = new Set();
+      const timelineIr = { sequencers: [{ id: "seq" }], events: [
+        { id: "play", kind: "play", sequencer_id: "seq", t0: 0, t1: 4, source: { file: "drive.q1asm", line: 1 } },
+        { id: "wait", kind: "wait", sequencer_id: "seq", t0: 4, t1: 100, source: { file: "readout.q1asm", line: 2 } },
+      ] };
+      const timelineEventsById = new Map(timelineIr.events.map(event => [event.id, event]));
+      function currentTimelineMode() { return "normal"; }
+      function currentTimelineWindow() { return { min: 0, max: 100 }; }
+      function sharedTimelineViewport() { return { start: 0, end: 100 }; }
+      function sharedTimelineTicks() { return []; }
+      function sharedTimelineSelectionRange() {}
+      ${noopNames.map((name) => `function ${name}() {}`).join("\n")}
+      ${sources.join("\n")}
+      initializeRenderedTimeline();
+      return { render(layout) { timelineLayout = layout; return renderSharedTimelineIfAvailable(); } };
+    `)({ q1timelineTimelineAdapter: adapter, q1lensSharedTimeline: { renderTimeline(_root: any, model: any) {
+      nodes = model.lanes.flatMap((lane: any) => lane.blocks.map((block: any) => {
+        const classes = new Set();
+        return { dataset: { eventId: block.eventId, search: block.search }, selected: block.selected,
+          addEventListener() {}, classList: { contains: (name: string) => classes.has(name),
+            toggle(name: string, active: boolean) { if (active) classes.add(name); else classes.delete(name); } } };
+      }));
+    } } }, {
+      getElementById: (id: string) => id === "timeline-root" ? root : id === "event-filter" ? filter : undefined,
+      querySelectorAll: (selector: string) => selector === ".event" ? nodes : [],
+    }, { parameterProjectFile: "C:/project/q1timeline.yml" }, (patch: Record<string, unknown>) => Object.assign(savedState, patch));
+    const filteredIds = () => nodes.filter((node) => node.classList.contains("is-filtered")).map((node) => node.dataset.eventId);
+    runtime.render("time");
+    for (const query of [" PLAY ", "drive.q1asm"]) {
+      filter.value = query;
+      onInput();
+      assert.equal(savedState.eventFilterQuery, query);
+      assert.deepEqual(filteredIds(), ["wait"]);
+      for (const layout of ["instruction", "time"]) {
+        runtime.render(layout);
+        assert.equal(filter.value, query);
+        assert.deepEqual(filteredIds(), ["wait"], `The active filter must survive ${layout} rendering`);
+        assert.equal(nodes.find((node) => node.dataset.eventId === "play").selected, true);
+      }
+    }
+    filter.value = "";
+    onInput();
+    assert.equal(savedState.eventFilterQuery, "");
+    assert.deepEqual(filteredIds(), []);
+    runtime.render("time");
+    assert.deepEqual(filteredIds(), []);
+  });
+
   it("renders shared feedback and loop annotations without adding fixed feedback rows", () => {
     const sharedRenderer = readFileSync(join(__dirname, "..", "src", "shared", "timeline", "renderer.js"), "utf-8");
     const sharedCss = readFileSync(join(__dirname, "..", "src", "shared", "timeline", "renderer.css"), "utf-8");
@@ -2514,7 +2581,7 @@ describe("timeline webview assets", () => {
       "renderTimelineLayoutToggle", "renderTimelineWindowStatus", "renderTimeBasisToggle", "installSharedQ1IssueControls",
       "syncSharedSequencerFoldControls", "installTimelineControlChips", "installTimelineMouseInteractions", "applySharedSelection",
       "renderWaitFolds", "renderPlaybackFolds", "renderHardwareCursor",
-      "setInstructionView",
+      "setInstructionView", "applyTimelineEventFilter",
     ];
     const runtime = Function("window", "document", `
       let timelineLayout = "time", timelineTimeBasis = "local", sharedTimelineActive = false;

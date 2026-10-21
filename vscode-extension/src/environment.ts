@@ -1,10 +1,10 @@
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, extname, join } from "node:path";
 import type * as vscodeTypes from "vscode";
 import { q1timelineConfigValue } from "./q1timeline/settings";
-import { resolveFilePythonEnvironment, selectVSCodeInterpreter, type PythonEnvironmentKind } from "./pythonEnvironment";
-import { lastPythonEnvironment, publishPythonEnvironment } from "./pythonEnvironmentStatus";
+import { beginPythonEnvironmentSelection, resolveFilePythonEnvironment, selectVSCodeInterpreter, type PythonEnvironmentKind } from "./pythonEnvironment";
+import { beginPythonEnvironmentCheck, isCurrentPythonEnvironmentCheck, lastPythonEnvironment, publishPythonEnvironment } from "./pythonEnvironmentStatus";
 
 export interface PythonEnvironmentReport {
   executable: string;
@@ -88,7 +88,11 @@ export function registerEnvironmentCommands(context: vscodeTypes.ExtensionContex
   const selectLabel = "Select Python Environment";
 
   function targetResource(resource?: vscodeTypes.Uri) {
-    return resource ?? vscode.window.activeTextEditor?.document.uri ?? lastPythonEnvironment()?.resource
+    const textResource = vscode.window.activeTextEditor?.document.uri;
+    const activeResource = textResource?.scheme === "vscode-notebook-cell"
+      ? vscode.window.activeNotebookEditor?.notebook.uri ?? textResource
+      : textResource ?? vscode.window.activeNotebookEditor?.notebook.uri;
+    return resource ?? activeResource ?? lastPythonEnvironment()?.resource
       ?? vscode.workspace.workspaceFolders?.[0]?.uri;
   }
 
@@ -110,16 +114,18 @@ export function registerEnvironmentCommands(context: vscodeTypes.ExtensionContex
     }));
   }
 
-  async function checkEnvironment(retryCommand?: string, target?: vscodeTypes.Uri) {
+  async function checkEnvironment(retryCommand?: string, target?: vscodeTypes.Uri, retryTarget?: vscodeTypes.Uri) {
     const resource = targetResource(target);
     if (!resource) { await vscode.window.showInformationMessage("Open a project or a saved file to choose its Python environment."); return []; }
+    const request = beginPythonEnvironmentCheck();
+    const extension = extname(resource.fsPath).toLowerCase();
     output.clear();
     output.show(true);
     output.appendLine("Q1Lens Python environment check (Python 3.10 or newer required)");
     output.appendLine("Checks the Q1Lens CLI and Q1ASM bridge imports. Schedule-specific dependencies are checked when analyzing a project.");
-    if (resource.fsPath.endsWith(".ipynb")) {
+    if (extension === ".ipynb") {
       const { ensureNotebookEnvironment } = await import("./notebookEnvironment");
-      if (!await ensureNotebookEnvironment(vscode, resource, output)) return [];
+      if (!await ensureNotebookEnvironment(vscode, resource, output, request) || !isCurrentPythonEnvironmentCheck(request)) return [];
     }
     const latest = lastPythonEnvironment();
     const selected = latest?.source === "notebook" && latest.resource.fsPath === resource.fsPath
@@ -130,7 +136,9 @@ export function registerEnvironmentCommands(context: vscodeTypes.ExtensionContex
         if (environment.resolutionError) throw new Error(environment.resolutionError);
         const report = environment.source === "notebook" && latest?.report ? latest.report
           : await probePythonEnvironment(environment.pythonPath, environment.pythonArgs, {
-            cwd: latest?.resource.fsPath === resource.fsPath ? latest.cwd ?? workingDirectory(resource) : workingDirectory(resource), env: environment.env });
+            cwd: latest?.resource.fsPath === resource.fsPath ? latest.cwd ?? workingDirectory(resource) : workingDirectory(resource), env: environment.env }).finally(() => {
+              if ("assertCurrentSelection" in environment) environment.assertCurrentSelection?.();
+            });
         const error = !report.supported ? "Python 3.10 or newer is required."
           : report.qbsError || report.q1asmError;
         return { ...environment, report, error };
@@ -138,6 +146,7 @@ export function registerEnvironmentCommands(context: vscodeTypes.ExtensionContex
         return { ...environment, report: undefined, error: String(error) };
       }
     }));
+    if (!isCurrentPythonEnvironmentCheck(request)) return results;
     for (const result of results) {
       output.appendLine(`\n${result.label}: ${result.error ? "NOT READY" : "READY"}`);
       output.appendLine(`Selected by: ${result.sourceLabel}\nAnalysis target: ${resource.fsPath}`);
@@ -157,9 +166,9 @@ export function registerEnvironmentCommands(context: vscodeTypes.ExtensionContex
         } else output.appendLine("Select an installed Python 3.10+ environment that runs your project.");
       }
     }
-    const kind = latest?.resource.fsPath === resource.fsPath && latest.kind ? latest.kind : resource.fsPath.endsWith(".q1asm") ? "q1asm" : "qbs";
+    const kind = latest?.resource.fsPath === resource.fsPath && latest.kind ? latest.kind : extension === ".q1asm" ? "q1asm" : "qbs";
     const displayed = results.find((result) => result.label === (kind === "q1asm" ? "Q1ASM" : "QBS")) ?? results[0];
-    if (displayed) publishPythonEnvironment({ ...displayed, kind, cwd: latest?.resource.fsPath === resource.fsPath ? latest.cwd : undefined });
+    if (displayed) publishPythonEnvironment({ ...displayed, kind, cwd: latest?.resource.fsPath === resource.fsPath ? latest.cwd : undefined }, request);
     const ready = displayed && !displayed.error;
     const retryLabel = retryCommand ? "Retry Timeline" : "Open Timeline";
     const message = ready
@@ -169,22 +178,27 @@ export function registerEnvironmentCommands(context: vscodeTypes.ExtensionContex
       ? vscode.window.showInformationMessage(message, retryLabel, selectLabel)
       : vscode.window.showErrorMessage(message, selectLabel, "Check Again");
     void notification.then(async (action) => {
-      if (action === selectLabel) await selectEnvironment(retryCommand, resource);
-      else if (action === "Check Again") await checkEnvironment(retryCommand, resource);
+      if (action === selectLabel) await selectEnvironment(retryCommand, resource, retryTarget);
+      else if (action === "Check Again") await checkEnvironment(retryCommand, resource, retryTarget);
       else if (action === retryLabel) {
-        if (!retryCommand && resource.fsPath.endsWith(".ipynb")) {
+        if (!retryCommand && extension === ".ipynb") {
           await vscode.window.showNotebookDocument(await vscode.workspace.openNotebookDocument(resource));
           await vscode.commands.executeCommand("qbsTimeline.openNotebookTimelineFromCell");
-        } else await vscode.commands.executeCommand(retryCommand ?? (kind === "q1asm" ? "q1timeline.openPreview" : "qbsTimeline.analyzeAndOpen"), resource);
+        } else await vscode.commands.executeCommand(retryCommand ?? (kind === "q1asm" ? "q1timeline.openPreview" : "qbsTimeline.analyzeAndOpen"), retryTarget ?? resource);
       }
     });
     return results;
   }
 
-  async function selectEnvironment(retryCommand?: string, target?: vscodeTypes.Uri) {
+  async function selectEnvironment(retryCommand?: string, target?: vscodeTypes.Uri, retryTarget?: vscodeTypes.Uri) {
     const resource = targetResource(target);
     if (!resource) { await vscode.window.showInformationMessage("Open a project or saved file before choosing Python."); return; }
+    const folder = vscode.workspace.getWorkspaceFolder(resource);
+    const scope = folder ? vscode.ConfigurationTarget.WorkspaceFolder
+      : vscode.workspace.workspaceFolders?.length ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
+    const { isCurrent, updateSettings } = beginPythonEnvironmentSelection(vscode, resource);
     const currentEnvironments = await environments(resource);
+    if (!isCurrent()) return;
     const choices: PythonChoice[] = currentEnvironments.filter((item) => !item.resolutionError).map((item) => ({
       label: `Current ${item.label} Python`, description: item.pythonPath,
       detail: `${item.sourceLabel}${item.pythonArgs.length ? ` · Arguments: ${JSON.stringify(item.pythonArgs)}` : ""}`,
@@ -208,17 +222,21 @@ export function registerEnvironmentCommands(context: vscodeTypes.ExtensionContex
       placeHolder: "Use this Python for QBS and Q1ASM in this workspace",
       ignoreFocusOut: true,
     });
-    if (!choice) return;
+    if (!isCurrent() || !choice) return;
     if (choice.action === "vscode") {
       await selectVSCodeInterpreter(vscode, resource);
+      if (!isCurrent()) return;
       if (currentEnvironments.some((item) => item.source === "manual")) {
         const action = await vscode.window.showInformationMessage("Q1Lens still uses your explicit Python settings. Follow the VS Code selection for this project while keeping those settings saved?", "Follow VS Code Selection");
+        if (!isCurrent()) return;
         if (action) {
-          const scope = vscode.workspace.getWorkspaceFolder(resource) ? vscode.ConfigurationTarget.WorkspaceFolder : vscode.ConfigurationTarget.Global;
-          await vscode.workspace.getConfiguration("q1lens", resource).update("pythonEnvironment", "vscode", scope);
+          const followScope = folder ? vscode.ConfigurationTarget.WorkspaceFolder : vscode.ConfigurationTarget.Global;
+          if (!await updateSettings(async () => {
+            await vscode.workspace.getConfiguration("q1lens", resource).update("pythonEnvironment", "vscode", followScope);
+          })) return;
         }
       }
-      return checkEnvironment(retryCommand, resource);
+      return checkEnvironment(retryCommand, resource, retryTarget);
     }
     let pythonPath = choice.pythonPath;
     if (choice.action === "browse") {
@@ -232,29 +250,30 @@ export function registerEnvironmentCommands(context: vscodeTypes.ExtensionContex
         ignoreFocusOut: true,
       });
     }
-    if (!pythonPath?.trim()) return;
+    if (!isCurrent() || !pythonPath?.trim()) return;
     pythonPath = pythonPath.trim();
     const pythonArgs = choice.pythonArgs ?? [];
     try {
       const report = await probePythonEnvironment(pythonPath, pythonArgs, { cwd: workingDirectory(resource) });
+      if (!isCurrent()) return;
       if (!report.supported) throw new Error(`Python ${report.version} is too old. Select Python 3.10 or newer.`);
     } catch (error) {
+      if (!isCurrent()) return;
       void vscode.window.showErrorMessage(String(error), selectLabel).then((action) => {
-        if (action === selectLabel) return selectEnvironment(retryCommand, resource);
+        if (action === selectLabel) return selectEnvironment(retryCommand, resource, retryTarget);
         return undefined;
       });
       return;
     }
-    const config = vscode.workspace.getConfiguration("q1lens", resource);
-    const scope = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 1
-      && vscode.workspace.getWorkspaceFolder(resource) ? vscode.ConfigurationTarget.WorkspaceFolder
-      : vscode.workspace.workspaceFolders?.length ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
-    await config.update("pythonPath", pythonPath, scope);
-    await config.update("pythonArgs", pythonArgs, scope);
-    await config.update("q1timeline.pythonPath", pythonPath, scope);
-    await config.update("q1timeline.pythonArgs", pythonArgs, scope);
-    if (config.get<string>("pythonEnvironment", "auto") === "vscode") await config.update("pythonEnvironment", "auto", scope);
-    return checkEnvironment(retryCommand, resource);
+    if (!await updateSettings(async () => {
+      const config = vscode.workspace.getConfiguration("q1lens", resource);
+      await config.update("pythonPath", pythonPath, scope);
+      await config.update("pythonArgs", pythonArgs, scope);
+      await config.update("q1timeline.pythonPath", pythonPath, scope);
+      await config.update("q1timeline.pythonArgs", pythonArgs, scope);
+      if (config.get<string>("pythonEnvironment", "auto") === "vscode") await config.update("pythonEnvironment", "auto", scope);
+    })) return;
+    return checkEnvironment(retryCommand, resource, retryTarget);
   }
 
   context.subscriptions.push(

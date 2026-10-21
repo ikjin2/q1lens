@@ -288,11 +288,13 @@
           "description": "How file analysis selects Python. Notebook analysis always follows its kernel."
         },
         "q1lens.pythonPath": {
+          "scope": "resource",
           "type": "string",
           "default": "python",
           "description": "Optional manual Python executable for file analysis. When not explicitly set, Q1Lens uses the VS Code Python selection for the analysis target. Notebook analysis follows its kernel."
         },
         "q1lens.pythonArgs": {
+          "scope": "resource",
           "type": "array",
           "default": [],
           "items": {
@@ -301,11 +303,13 @@
           "description": "Manual Python launcher arguments inserted before Q1Lens module names (for example run, python with a uv executable). Nonempty arguments preserve the manual launcher instead of using automatic interpreter selection."
         },
         "q1lens.qbs.autoRefresh": {
+          "scope": "resource",
           "type": "boolean",
           "default": false,
           "description": "Automatically re-run QBS analysis after project or schedule files change."
         },
         "q1lens.qbs.outputDirOverride": {
+          "scope": "resource",
           "type": [
             "string",
             "null"
@@ -314,11 +318,13 @@
           "description": "Optional QBS generated artifact output directory."
         },
         "q1lens.revealOutputChannel": {
+          "scope": "resource",
           "type": "boolean",
           "default": true,
           "description": "Reveal the Q1Lens output channel during explicit analyze commands."
         },
         "q1lens.q1timelineCommand": {
+          "scope": "resource",
           "type": [
             "string",
             "null"
@@ -327,16 +333,19 @@
           "description": "Optional q1timeline CLI command used when no q1timeline VS Code command is available."
         },
         "q1lens.q1timeline.projectFile": {
+          "scope": "resource",
           "type": "string",
           "default": "q1timeline.yml",
           "description": "Q1ASM timeline project file name or relative path to search for in standalone Q1ASM workflows."
         },
         "q1lens.q1timeline.pythonPath": {
+          "scope": "resource",
           "type": "string",
           "default": "python",
           "description": "Manual Python executable override for standalone Q1ASM analysis. Otherwise uses a shared manual Python setting, or the target project's VS Code Python selection."
         },
         "q1lens.q1timeline.pythonArgs": {
+          "scope": "resource",
           "type": "array",
           "default": [],
           "items": {
@@ -345,6 +354,7 @@
           "description": "Optional Python launcher arguments for standalone Q1ASM timeline analysis."
         },
         "q1lens.q1timeline.updateMode": {
+          "scope": "resource",
           "type": "string",
           "enum": [
             "onSave",
@@ -355,12 +365,14 @@
           "description": "When standalone Q1ASM timeline previews refresh."
         },
         "q1lens.q1timeline.debounceMs": {
+          "scope": "resource",
           "type": "number",
           "default": 400,
           "minimum": 0,
           "description": "Debounce delay for on-type Q1ASM timeline refreshes."
         },
         "q1lens.q1timeline.view.defaultMode": {
+          "scope": "resource",
           "type": "string",
           "enum": [
             "normal",
@@ -370,12 +382,14 @@
           "description": "Initial Q1ASM timeline view mode."
         },
         "q1lens.q1timeline.analyzer.timeoutMs": {
+          "scope": "resource",
           "type": "number",
           "default": 30000,
           "minimum": 1000,
           "description": "Maximum Q1ASM timeline analyzer subprocess runtime."
         },
         "q1lens.q1timeline.analyzer.extraArgs": {
+          "scope": "resource",
           "type": "array",
           "default": [],
           "items": {
@@ -384,6 +398,7 @@
           "description": "Additional Q1ASM timeline analyzer arguments."
         },
         "q1lens.q1timeline.analyzer.env": {
+          "scope": "resource",
           "type": "object",
           "default": {},
           "additionalProperties": {
@@ -392,17 +407,20 @@
           "description": "Environment variables added to Q1ASM timeline analyzer subprocesses."
         },
         "q1lens.q1timeline.render.maxEventsBeforeSimplify": {
+          "scope": "resource",
           "type": "number",
           "default": 10000,
           "minimum": 1,
           "description": "Event count threshold for Q1ASM timeline simplification warnings."
         },
         "qbloxTimeline.pythonPath": {
+          "scope": "resource",
           "type": "string",
           "default": "python",
           "description": "Python executable used to run qbstimeline, including integrated q1timeline subcommands."
         },
         "qbloxTimeline.pythonArgs": {
+          "scope": "resource",
           "type": "array",
           "default": [],
           "items": {
@@ -411,11 +429,13 @@
           "description": "Additional Python launcher arguments inserted before module names."
         },
         "qbloxTimeline.qbs.autoRefresh": {
+          "scope": "resource",
           "type": "boolean",
           "default": false,
           "description": "Automatically re-run QBS analysis after project or schedule files change."
         },
         "qbloxTimeline.qbs.outputDirOverride": {
+          "scope": "resource",
           "type": [
             "string",
             "null"
@@ -424,21 +444,25 @@
           "description": "Optional QBS generated artifact output directory."
         },
         "qbloxTimeline.q1timeline.projectFile": {
+          "scope": "resource",
           "type": "string",
           "default": "q1timeline.yml",
           "description": "q1timeline project file name or relative path to search for in standalone Q1ASM workflows."
         },
         "qbsTimeline.pythonPath": {
+          "scope": "resource",
           "type": "string",
           "default": "python",
           "description": "Python executable used to run python -m qbstimeline."
         },
         "qbsTimeline.autoRefresh": {
+          "scope": "resource",
           "type": "boolean",
           "default": false,
           "description": "Automatically re-run analysis after project or schedule files change."
         },
         "qbsTimeline.outputDirOverride": {
+          "scope": "resource",
           "type": [
             "string",
             "null"
@@ -447,11 +471,13 @@
           "description": "Optional output directory override for generated Q1Lens artifacts."
         },
         "qbsTimeline.revealOutputChannel": {
+          "scope": "resource",
           "type": "boolean",
           "default": true,
           "description": "Reveal the Q1Lens output channel during explicit analyze commands."
         },
         "qbsTimeline.pythonArgs": {
+          "scope": "resource",
           "type": "array",
           "default": [],
           "items": {
@@ -460,6 +486,7 @@
           "description": "Additional arguments inserted before -m qbstimeline, such as -X or -3.12 when supported by the configured Python launcher."
         },
         "qbsTimeline.q1timelineCommand": {
+          "scope": "resource",
           "type": [
             "string",
             "null"
@@ -468,16 +495,19 @@
           "description": "Optional q1timeline CLI command used when no q1timeline VSCode command is available."
         },
         "q1timeline.pythonPath": {
+          "scope": "resource",
           "type": "string",
           "default": "python",
           "description": "Legacy Python executable setting for standalone q1timeline workflows; the extension invokes qbstimeline q1timeline."
         },
         "q1timeline.projectFile": {
+          "scope": "resource",
           "type": "string",
           "default": "q1timeline.yml",
           "description": "Legacy q1timeline project file name or relative path to search for."
         },
         "q1timeline.updateMode": {
+          "scope": "resource",
           "type": "string",
           "enum": [
             "onSave",
@@ -488,12 +518,14 @@
           "description": "Legacy setting for when standalone q1timeline preview should refresh."
         },
         "q1timeline.debounceMs": {
+          "scope": "resource",
           "type": "number",
           "default": 400,
           "minimum": 0,
           "description": "Legacy debounce delay for q1timeline on-type refreshes."
         },
         "q1timeline.view.defaultMode": {
+          "scope": "resource",
           "type": "string",
           "enum": [
             "normal",
@@ -503,12 +535,14 @@
           "description": "Legacy initial q1timeline view mode."
         },
         "q1timeline.analyzer.timeoutMs": {
+          "scope": "resource",
           "type": "number",
           "default": 30000,
           "minimum": 1000,
           "description": "Legacy maximum q1timeline analyzer subprocess runtime."
         },
         "q1timeline.analyzer.extraArgs": {
+          "scope": "resource",
           "type": "array",
           "default": [],
           "items": {
@@ -517,6 +551,7 @@
           "description": "Legacy additional q1timeline analyzer arguments."
         },
         "q1timeline.analyzer.env": {
+          "scope": "resource",
           "type": "object",
           "default": {},
           "additionalProperties": {
@@ -525,12 +560,14 @@
           "description": "Legacy environment variables added to q1timeline analyzer subprocesses."
         },
         "q1timeline.render.maxEventsBeforeSimplify": {
+          "scope": "resource",
           "type": "number",
           "default": 10000,
           "minimum": 1,
           "description": "Legacy event count threshold for q1timeline simplification warnings."
         },
         "q1lens.q1timeline.executionMode": {
+          "scope": "resource",
           "type": "string",
           "enum": [
             "project",
@@ -542,12 +579,14 @@
           "description": "Execution mode for Q1ASM previews. Project uses q1timeline.yml. Analysis provides compact previews; concrete executes bounded loops with analytical timing; simulation models RT queues, input events and configured signals. Refresh the preview after changing this setting."
         },
         "q1lens.q1timeline.maxSteps": {
+          "scope": "resource",
           "type": "integer",
           "minimum": 1,
           "default": 10000,
           "description": "Maximum instructions per sequencer when executionMode overrides the project. Project mode uses analysis.max_steps from q1timeline.yml."
         },
         "q1lens.q1timeline.hardwareReadiness": {
+          "scope": "resource",
           "type": "boolean",
           "default": false,
           "description": "Run conservative hardware-readiness checks during Q1ASM timeline analysis."

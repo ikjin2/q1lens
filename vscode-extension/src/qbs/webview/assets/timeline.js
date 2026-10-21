@@ -7,6 +7,7 @@ const instructionColors = window.q1asmInstructionColors;
 
 let currentIr = null;
 let currentSourceContext = null;
+let currentRenderId;
 let selectedId = null;
 let activeInspectorTab = "summary";
 let currentModel = null;
@@ -46,6 +47,10 @@ function button(className, text, onClick) {
   node.type = "button";
   node.addEventListener("click", onClick);
   return node;
+}
+
+function postRenderAction(message) {
+  vscode.postMessage({ ...message, ...(currentRenderId !== undefined ? { renderId: currentRenderId } : {}) });
 }
 
 function selectBlock(id) {
@@ -259,7 +264,11 @@ function handleBlockKeydown(event, selectionId) {
     return;
   }
   event.preventDefault();
+  const blockId = event.currentTarget.dataset.blockId;
   selectBlock(selectionId);
+  const selectedNode = Array.from(root.querySelectorAll("[data-block-id]"))
+    .find((node) => node.dataset.blockId === blockId);
+  selectedNode?.focus({ preventScroll: true });
 }
 
 function postSourceJumpMessage(block, event) {
@@ -269,7 +278,7 @@ function postSourceJumpMessage(block, event) {
   }
   event.preventDefault();
   event.stopPropagation();
-  vscode.postMessage(message);
+  postRenderAction(message);
 }
 
 function renderInlineQ1LaneToggle(lane) {
@@ -285,6 +294,7 @@ function renderInlineQ1LaneToggle(lane) {
     event.stopPropagation();
   });
   toggle.setAttribute("aria-expanded", expanded ? "true" : "false");
+  toggle.dataset.laneToggleId = lane.inlineQ1PreviewLaneId;
   toggle.setAttribute("aria-label", expanded ? `Hide ${label}` : `Show ${label}`);
   toggle.title = expanded ? `Hide ${label}` : `Show ${label}`;
   return toggle;
@@ -374,6 +384,7 @@ function renderLane(lane, selectedInspectorId) {
   const label = element("div", "lane-label");
   if (lane.expandable) {
     const toggle = button("lane-toggle", lane.expanded ? "▾" : "▸", () => toggleLaneGroup(lane.groupId));
+    toggle.dataset.laneToggleId = lane.groupId;
     toggle.setAttribute("aria-expanded", lane.expanded ? "true" : "false");
     toggle.title = lane.expanded ? "Collapse target lanes" : "Expand target lanes";
     const labelText = element("span", "lane-label-text", lane.label);
@@ -465,11 +476,12 @@ function renderInspectorTabs(inspector) {
   for (const tab of inspector.tabs || []) {
     const tabButton = button("inspector-tab", tab.label, () => {
       if (tab.message) {
-        vscode.postMessage(tab.message);
+        postRenderAction(tab.message);
         return;
       }
       activeInspectorTab = tab.id;
       render(currentIr);
+      root.querySelector('.inspector-tab[aria-selected="true"]')?.focus({ preventScroll: true });
     });
     tabButton.setAttribute("aria-selected", activeInspectorTab === tab.id ? "true" : "false");
     tabs.appendChild(tabButton);
@@ -569,9 +581,9 @@ function renderInspector(model) {
 
   const actions = element("div", "inspector-actions");
   for (const action of model.inspector.actions) {
-    actions.appendChild(button("action-button", action.label, () => vscode.postMessage(action.message)));
+    actions.appendChild(button("action-button", action.label, () => postRenderAction(action.message)));
   }
-  actions.appendChild(button("action-button secondary", "Open QBS IR", () => vscode.postMessage({ type: "openIr" })));
+  actions.appendChild(button("action-button secondary", "Open QBS IR", () => postRenderAction({ type: "openIr" })));
   inspector.appendChild(actions);
   return inspector;
 }
@@ -631,7 +643,7 @@ function renderSummary(model) {
     files.appendChild(element("span", "", model.source.outputLabel));
     const actions = element("div", "source-actions");
     for (const action of model.source.actions) {
-      actions.appendChild(button("source-button", action.label, () => vscode.postMessage(action.message)));
+      actions.appendChild(button("source-button", action.label, () => postRenderAction(action.message)));
     }
     source.appendChild(title);
     source.appendChild(files);
@@ -658,12 +670,15 @@ function renderSummary(model) {
   return summary;
 }
 
-function render(ir, explicitSelectedId, sourceContext) {
+function render(ir, explicitSelectedId, resetScroll = false) {
   currentIr = ir;
-  currentSourceContext = sourceContext || currentSourceContext;
   if (!currentIr) {
     return;
   }
+  const focusedZoomControl = !resetScroll && document.activeElement?.closest(".zoom-controls > button");
+  const focusedZoomIndex = focusedZoomControl ? Array.from(focusedZoomControl.parentElement.children).indexOf(focusedZoomControl) : -1;
+  const focusedLaneToggleId = !resetScroll && document.activeElement?.closest("[data-lane-toggle-id]")?.dataset.laneToggleId;
+  const scrollTop = resetScroll ? 0 : root.firstElementChild?.scrollTop || 0;
   const title = currentIr.schedule?.name || "Q1Lens";
   document.querySelector(".topbar h1").textContent = title;
   document.title = title;
@@ -673,17 +688,42 @@ function render(ir, explicitSelectedId, sourceContext) {
   const model = timelineModel.buildTimelineModel(currentIr, selectedId, currentSourceContext, {
     viewport,
     selectionRange,
+    exactSelection: !explicitSelectedId,
     expandedGroups: [...expandedGroups],
     expandedInlineQ1Lanes: [...expandedInlineQ1Lanes],
   });
+  if (explicitSelectedId && model.inspector.selectedId) selectedId = model.inspector.selectedId;
   currentModel = model;
-  root.replaceChildren(renderTimeline(model), renderInspector(model), renderSummary(model));
+  const timeline = renderTimeline(model);
+  root.replaceChildren(timeline, renderInspector(model), renderSummary(model));
+  if (scrollTop) timeline.scrollTop = scrollTop;
+  if (focusedZoomIndex >= 0) timeline.querySelectorAll(".zoom-controls > button")[focusedZoomIndex]?.focus({ preventScroll: true });
+  if (focusedLaneToggleId) {
+    Array.from(root.querySelectorAll("[data-lane-toggle-id]"))
+      .find((node) => node.dataset.laneToggleId === focusedLaneToggleId)?.focus({ preventScroll: true });
+  }
 }
 
 window.addEventListener("message", (event) => {
   const message = event.data;
   if (message.type === "render") {
-    render(message.ir, message.selectedOperationId, message.sourceContext);
+    currentRenderId = message.renderId;
+    const sourceContext = message.sourceContext || null;
+    const sourceChanged = currentSourceContext?.projectFile !== sourceContext?.projectFile ||
+        currentSourceContext?.scheduleFile !== sourceContext?.scheduleFile ||
+        currentSourceContext?.sourceNotebook !== sourceContext?.sourceNotebook;
+    if (sourceChanged) {
+      selectedId = null;
+      viewport = null;
+      selectionRange = null;
+      dragSelection = null;
+      dragPan = null;
+      expandedGroups.clear();
+      expandedInlineQ1Lanes.clear();
+      activeInspectorTab = "summary";
+    }
+    currentSourceContext = sourceContext;
+    render(message.ir, message.selectedOperationId, sourceChanged);
   }
 });
 

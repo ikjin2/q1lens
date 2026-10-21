@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import sys
 from collections import UserDict
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from qbstimeline import annotate, sym
 from qbstimeline import compile_worker
@@ -1622,10 +1625,158 @@ def build_compiler():
     assert result.ir["schedule"]["name"] == "sibling-import"
 
 
-def test_analyze_project_emits_source_map_for_literal_schedule_add_labels(
-    tmp_path: Path,
+@pytest.mark.parametrize("phase", ["schedule_factory", "compiler_factory", "compile"])
+def test_analyze_project_keeps_sibling_imports_available_during_analysis(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str,
 ) -> None:
-    schedule_file = tmp_path / "schedule.py"
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    helper_name = f"lazy_{phase}_helper"
+    (source_dir / f"{helper_name}.py").write_text("VALUE = 'lazy import'\n", encoding="utf-8")
+    phase_imports = {phase: f"from {helper_name} import VALUE"}
+    schedule_file = source_dir / "schedule.py"
+    schedule_file.write_text(
+        f"""
+class FakeCompiler:
+    def compile(self, schedule):
+        {phase_imports.get('compile', 'pass')}
+        return {{
+            "name": schedule["name"],
+            "schedulables": {{"idle": {{"operation_id": "idle_op", "abs_time": 0.0}}}},
+            "operations": {{"idle_op": {{"name": "Idle", "duration": 4e-9}}}},
+            "compiled_instructions": {{}},
+        }}
+
+def build_schedule():
+    {phase_imports.get('schedule_factory', 'pass')}
+    return {{"name": "lazy import"}}
+
+def build_compiler():
+    {phase_imports.get('compiler_factory', 'pass')}
+    return FakeCompiler()
+""".lstrip(),
+        encoding="utf-8",
+    )
+    config = ProjectConfig(
+        root=tmp_path,
+        project_file=tmp_path / "qbstimeline.yml",
+        schedule_file=schedule_file,
+        schedule_entrypoint="build_schedule",
+        compiler_entrypoint="build_compiler",
+        output_dir=tmp_path / ".qbs_timeline",
+        low_level_q1timeline=False,
+        artifacts_circuit_diagram=False,
+        artifacts_analog_pulse_diagram=False,
+    )
+    monkeypatch.chdir(tmp_path)
+    original_path = sys.path.copy()
+    try:
+        result = analyze_project(config)
+        assert result.ir["schedule"]["name"] == "lazy import"
+        assert helper_name in sys.modules
+    finally:
+        sys.modules.pop(helper_name, None)
+        assert sys.path == original_path
+        assert Path.cwd() == tmp_path
+
+
+@pytest.mark.parametrize("preexisting_path", [False, True])
+def test_analyze_project_restores_sibling_import_path_after_factory_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, preexisting_path: bool,
+) -> None:
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    schedule_file = source_dir / "schedule.py"
+    schedule_file.write_text(
+        "def build_schedule():\n    raise RuntimeError('factory failed')\n"
+        "def build_compiler():\n    raise AssertionError('must not compile')\n",
+        encoding="utf-8",
+    )
+    config = ProjectConfig(
+        root=tmp_path,
+        project_file=tmp_path / "qbstimeline.yml",
+        schedule_file=schedule_file,
+        schedule_entrypoint="build_schedule",
+        compiler_entrypoint="build_compiler",
+        output_dir=tmp_path / ".qbs_timeline",
+        low_level_q1timeline=False,
+        artifacts_circuit_diagram=False,
+        artifacts_analog_pulse_diagram=False,
+    )
+    if preexisting_path:
+        monkeypatch.syspath_prepend(str(source_dir))
+    original_path = sys.path.copy()
+
+    with pytest.raises(RuntimeError, match="factory failed"):
+        analyze_project(config)
+
+    assert sys.path == original_path
+
+
+@pytest.mark.parametrize("preexisting_path", [False, True])
+def test_analyze_project_keeps_notebook_sibling_imports_through_compilation_and_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, preexisting_path: bool,
+) -> None:
+    notebook_dir = tmp_path / "notebooks"
+    notebook_dir.mkdir()
+    helpers = [f"notebook_lazy_{phase}_{preexisting_path}" for phase in ("compile", "artifact")]
+    for helper in helpers:
+        (notebook_dir / f"{helper}.py").write_text("VALUE = 'notebook lazy import'\n", encoding="utf-8")
+    source = f"""
+class CompiledSchedule(dict):
+    def plot_pulse_diagram(self):
+        from {helpers[1]} import VALUE
+        return '<svg>' + VALUE + '</svg>'
+
+class Compiler:
+    def compile(self, schedule):
+        from {helpers[0]} import VALUE
+        return CompiledSchedule(
+            name=VALUE, schedulables={{}}, operations={{}},
+            compiled_instructions=dict(sequencers=dict(seq0=dict(sequence=dict(program="stop\\n")))),
+        )
+
+schedule = {{"name": "notebook"}}
+compiler = Compiler()
+""".lstrip()
+    notebook = notebook_dir / "experiment.ipynb"
+    notebook.write_text(json.dumps({"cells": [{
+        "cell_type": "code", "source": source,
+        "metadata": {"tags": ["qbstimeline-schedule"]},
+    }]}), encoding="utf-8")
+    project_file = tmp_path / "qbstimeline.yml"
+    project_file.write_text(
+        "schedule:\n  notebook: notebooks/experiment.ipynb\n"
+        "artifacts:\n  circuit_diagram: false\n  analog_pulse_diagram: true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    if preexisting_path:
+        monkeypatch.syspath_prepend(str(notebook_dir))
+    original_path = sys.path.copy()
+    try:
+        result = analyze_project(load_project_config(project_file))
+
+        assert result.ir["schedule"]["name"] == "notebook lazy import"
+        assert [program.program for program in result.q1asm_programs] == ["stop\n"]
+        assert result.ir["artifacts"]["analog_pulse_diagram"]["status"] == "ok"
+        assert result.ir.get("warnings", []) == []
+        assert all(helper in sys.modules for helper in helpers)
+    finally:
+        for helper in helpers:
+            sys.modules.pop(helper, None)
+        assert sys.path == original_path
+        assert Path.cwd() == tmp_path
+
+
+@pytest.mark.parametrize("relative_schedule", ["schedule.py", "nested/schedule.py", "../shared/schedule.py"])
+def test_analyze_project_emits_source_map_for_literal_schedule_add_labels(
+    tmp_path: Path, relative_schedule: str,
+) -> None:
+    project_root = tmp_path / "config"
+    project_root.mkdir()
+    schedule_file = (project_root / relative_schedule).resolve()
+    schedule_file.parent.mkdir(parents=True, exist_ok=True)
     schedule_text = """
 class Schedule:
     name = "demo"
@@ -1663,12 +1814,12 @@ def build_compiler():
         '    schedule.add(object(), label="measure", abs_time=60e-9)'
     ) + 1
     config = ProjectConfig(
-        root=tmp_path,
-        project_file=tmp_path / "qbstimeline.yml",
+        root=project_root,
+        project_file=project_root / "qbstimeline.yml",
         schedule_file=schedule_file,
         schedule_entrypoint="build_schedule",
         compiler_entrypoint="build_compiler",
-        output_dir=tmp_path / ".qbs_timeline",
+        output_dir=project_root / ".qbs_timeline",
         low_level_q1timeline=False,
         artifacts_circuit_diagram=False,
         artifacts_analog_pulse_diagram=False,
@@ -1677,7 +1828,7 @@ def build_compiler():
     result = analyze_project(config)
 
     assert result.ir["source_map"]["schedulables"]["measure"] == {
-        "file": "schedule.py",
+        "file": str(schedule_file) if relative_schedule == "../shared/schedule.py" else relative_schedule,
         "line": expected_line,
         "column": 4,
         "label": "measure",
@@ -2648,7 +2799,8 @@ low_level:
     assert result.ir["source_map"]["primary"]["kind"] == "notebook"
 
 
-def test_analyze_project_maps_direct_notebook_adds_to_cells(tmp_path: Path) -> None:
+@pytest.mark.parametrize("managed_snapshot", [False, True])
+def test_analyze_project_maps_direct_notebook_adds_to_cells(tmp_path: Path, managed_snapshot: bool) -> None:
     notebook = tmp_path / "experiment.ipynb"
     notebook.write_text(
         json.dumps(
@@ -2689,11 +2841,20 @@ def test_analyze_project_maps_direct_notebook_adds_to_cells(tmp_path: Path) -> N
         ),
         encoding="utf-8",
     )
-    project = tmp_path / "qbstimeline.yml"
+    project_dir = tmp_path
+    notebook_name = "experiment.ipynb"
+    if managed_snapshot:
+        project_dir = tmp_path / ".qbs_timeline" / "notebook"
+        project_dir.mkdir(parents=True)
+        snapshot = json.loads(notebook.read_text(encoding="utf-8"))
+        snapshot["cells"].insert(0, {"cell_type": "markdown", "source": ["Unsaved inserted cell"], "metadata": {}})
+        notebook_name = "selected.ipynb"
+        (project_dir / notebook_name).write_text(json.dumps(snapshot), encoding="utf-8")
+    project = project_dir / "qbstimeline.yml"
     project.write_text(
-        """
+        f"""
 schedule:
-  notebook: experiment.ipynb
+  notebook: {notebook_name}
   schedule_tag: qbstimeline-schedule
   schedule_variable: sched
   compiler_variable: hw_agent
@@ -2702,12 +2863,14 @@ outputs:
 """.lstrip(),
         encoding="utf-8",
     )
+    if managed_snapshot:
+        project.write_text(project.read_text(encoding="utf-8") + f"source:\n  notebook: {json.dumps(notebook.as_posix())}\n", encoding="utf-8")
 
     result = analyze_project(load_project_config(project))
     location = result.ir["source_map"]["schedulables"]["measure"]
 
     assert location["kind"] == "notebook"
-    assert location["notebook"]["cell_index"] == 1
+    assert location["notebook"]["cell_index"] == (2 if managed_snapshot else 1)
     assert location["notebook"]["cell_id"] == "schedule-cell"
     assert location["notebook"]["cell_line"] == 14
 

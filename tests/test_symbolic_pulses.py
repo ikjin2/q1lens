@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from qbstimeline import SymbolicValue, annotate, sym
+from qbstimeline.compile_worker import _extract_schedule_structure
 from qbstimeline.extract.symbolic_pulses import extract_symbolic_pulse_layer
 
 
@@ -194,6 +197,34 @@ def test_source_order_timing_advances_by_delayed_pulse_extent() -> None:
     layer = extract_symbolic_pulse_layer(compiled_schedule)
 
     assert [pulse["abs_time"] for pulse in layer["symbolic_pulses"]] == [10e-9, 30e-9]
+
+
+@pytest.mark.parametrize("duration_location", ["attribute", "mapping"])
+def test_source_order_pulses_follow_the_full_loop_duration(duration_location: str) -> None:
+    pulse = {
+        "name": "SquarePulse", "duration": 20e-9,
+        "pulse_info": [{"duration": 20e-9, "port": "q0:mw", "clock": "q0.01"}],
+    }
+    body = SimpleNamespace(
+        schedulables={"body0": {"operation_id": "pulse"}},
+        operations={"pulse": pulse},
+    )
+    data = {"name": "LoopOperation", "control_flow_info": {"body": body, "repetitions": 3}}
+    if duration_location == "attribute":
+        loop = SimpleNamespace(duration=60e-9, data=data)
+    else:
+        loop = {**data, "duration": 60e-9}
+    schedule = SimpleNamespace(
+        schedulables={"loop": {"operation_id": "loop_op"}, "after": {"operation_id": "pulse"}},
+        operations={"loop_op": loop, "pulse": pulse},
+    )
+
+    structure = _extract_schedule_structure(schedule)
+    pulses = extract_symbolic_pulse_layer(schedule)["symbolic_pulses"]
+
+    assert [pulse["schedulable_id"] for pulse in pulses] == ["loop/body0", "after"]
+    assert [pulse["abs_time"] for pulse in pulses] == [0.0, 60e-9]
+    assert next(row for row in structure.operations if row["id"] == "after")["abs_time"] == 60e-9
 
 
 def test_generated_uuid_schedulable_paths_get_human_display_labels() -> None:

@@ -10,6 +10,7 @@ from typing import Any
 import yaml
 
 from q1timeline.diagnostics import Diagnostic
+from q1timeline.external_inputs import validate_external_inputs
 from q1timeline.q1asm.ast import SourceLocation
 from q1timeline.simulation.config import validate_simulation
 
@@ -66,6 +67,7 @@ class ProjectConfig:
     display: dict[str, Any] = field(default_factory=dict)
     diagnostics: list[Diagnostic] = field(default_factory=list)
     simulation: dict[str, Any] = field(default_factory=dict)
+    external_inputs: dict[str, Any] = field(default_factory=dict)
 
 
 class ConfigLoadError(Exception):
@@ -247,6 +249,15 @@ def load_project_config(project_file: str | Path) -> ProjectConfig:
             source=_source_for_yaml_key(project_path, "simulation"),
         ))
 
+    external_inputs: dict[str, Any] = {}
+    try:
+        external_inputs = validate_external_inputs(data.get("external_inputs"), (seq.id for seq in sequencers))
+    except ValueError as exc:
+        errors.append(Diagnostic(
+            severity="error", category="invalid_external_inputs", message=str(exc),
+            source=_source_for_yaml_key(project_path, "external_inputs"),
+        ))
+
     if errors:
         raise ConfigLoadError("Project configuration contains errors", errors)
 
@@ -263,6 +274,7 @@ def load_project_config(project_file: str | Path) -> ProjectConfig:
         display=display,
         diagnostics=diagnostics,
         simulation=simulation,
+        external_inputs=external_inputs,
     )
 
 

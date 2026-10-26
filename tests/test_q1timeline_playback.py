@@ -276,7 +276,6 @@ def test_zero_loop_counter_wraps_and_partial_count_is_not_claimed_complete() -> 
     ("wait R0\nstop", "duration"),
     ("jmp R0\nstop", "destination"),
     ("fb_pull_data R0,R1\nstop", "external timing"),
-    ("wait_trigger 1,4\nstop", "external timing"),
 ])
 def test_unknown_timing_and_external_boundaries_do_not_execute(source: str, reason: str) -> None:
     playback = session(source)

@@ -2,6 +2,17 @@ import assert from "node:assert/strict";
 import { parseWebviewMessage } from "../src/q1timeline/webviewMessageValidation";
 
 describe("q1timeline webview message validation", () => {
+  it("accepts optional focus preservation for event selection and rejects invalid flags", () => {
+    for (const preserveFocus of [undefined, true, false]) {
+      const message = { type: "eventClick", eventId: "seq:e3", ...(preserveFocus === undefined ? {} : { preserveFocus }) };
+      assert.deepEqual(parseWebviewMessage(message), { valid: true, ...message });
+    }
+    for (const preserveFocus of [null, "true", 1, {}]) {
+      assert.equal(parseWebviewMessage({ type: "eventClick", eventId: "seq:e3", preserveFocus }).valid, false);
+    }
+    assert.equal(parseWebviewMessage({ type: "eventClick", eventId: "seq:e3", preserveFocus: true, extra: true }).valid, false);
+  });
+
   it("accepts feedback flow source jumps with an optional endpoint role", () => {
     for (const role of [undefined, "source", "target"]) {
       const message = { type: "feedbackFlowClick", flowId: "flow", ...(role === undefined ? {} : { role }) };

@@ -9,9 +9,9 @@ from q1timeline.q1asm.ast import Arg, Instr, Program, SourceLocation
 
 _LABEL_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*:")
 _NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SYMBOL_RE = re.compile(r"^\$?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
 _REGISTER_RE = re.compile(r"^R(?:0[xX][0-9A-Fa-f]+|0|[1-9]\d*)$", re.IGNORECASE)
 _INTEGER_RE = re.compile(r"^-?(?:0[xX][0-9A-Fa-f]+|0|[1-9]\d*)$")
-_PLACEHOLDER_RE = re.compile(r"^\{(?P<expression>.+)\}$")
 
 
 def parse_q1asm(text: str, *, file: str = "<string>") -> Program:
@@ -19,6 +19,9 @@ def parse_q1asm(text: str, *, file: str = "<string>") -> Program:
     labels: dict[str, int] = {}
     instructions: list[Instr] = []
     diagnostics: list[Diagnostic] = []
+    def_sources: dict[str, SourceLocation] = {}
+    forward_aliases: list[tuple[str, SourceLocation]] = []
+    def_label_references: list[tuple[str, SourceLocation]] = []
 
     for line_number, raw_line in enumerate(text.splitlines(), start=1):
         raw = raw_line.rstrip("\r\n")
@@ -68,10 +71,17 @@ def parse_q1asm(text: str, *, file: str = "<string>") -> Program:
                         message=".DEF directives may not appear after a label on the same line.",
                     )
                 )
+                if label_was_added:
+                    labels.pop(label, None)
                 continue
 
         if code.startswith(".DEF"):
-            _parse_def_line(code, defs, file, line_number, column, raw, diagnostics)
+            value = _parse_def_line(code, defs, file, line_number, column, raw, diagnostics)
+            if value is not None:
+                source = SourceLocation(file, line_number, column, raw)
+                def_sources[code.split(None, 2)[1]] = source
+                if value.kind == "label":
+                    def_label_references.append((str(value.value), source))
             continue
 
         instruction = _parse_instruction_line(
@@ -85,9 +95,33 @@ def parse_q1asm(text: str, *, file: str = "<string>") -> Program:
             diagnostics=diagnostics,
         )
         if instruction is not None:
+            for arg in instruction.args:
+                if arg.kind == "symbol" and str(arg.value).startswith("$"):
+                    name = str(arg.value)[1:]
+                    if name not in defs:
+                        forward_aliases.append((name, instruction.source))
             instructions.append(instruction)
         elif label_was_added:
             labels.pop(label, None)
+
+    for name, source in dict.fromkeys(forward_aliases):
+        if name in defs:
+            diagnostics.append(Diagnostic(
+                severity="error",
+                category="syntax_error",
+                message=f".DEF alias ${name} must be defined before use.",
+                source=source,
+                details={"name": name},
+            ))
+    for name, source in def_label_references:
+        if name not in labels:
+            diagnostics.append(Diagnostic(
+                severity="error",
+                category="undefined_label",
+                message=f"Undefined label: @{name}",
+                source=source,
+                details={"label": name},
+            ))
 
     return Program(
         file=file,
@@ -95,6 +129,7 @@ def parse_q1asm(text: str, *, file: str = "<string>") -> Program:
         labels=labels,
         instructions=instructions,
         diagnostics=diagnostics,
+        def_sources=def_sources,
     )
 
 
@@ -104,7 +139,8 @@ def parse_q1asm_file(path: str | Path) -> Program:
 
 
 def _strip_inline_comment(raw: str) -> str:
-    hash_comment = raw.split("#", 1)[0]
+    comment_index = _find_outside_templates(raw, "#")
+    hash_comment = raw[:comment_index] if comment_index != -1 else raw
     stripped = hash_comment.lstrip()
     if stripped.startswith("//"):
         leading_spaces = len(hash_comment) - len(stripped)
@@ -150,7 +186,7 @@ def _parse_def_line(
     column: int,
     raw: str,
     diagnostics: list[Diagnostic],
-) -> None:
+) -> Arg | None:
     parts = code.split(None, 2)
     if len(parts) != 3 or parts[0] != ".DEF" or not _NAME_RE.match(parts[1]):
         diagnostics.append(
@@ -225,6 +261,7 @@ def _parse_def_line(
         )
         return
     defs[parts[1]] = parsed_value
+    return parsed_value
 
 
 def _parse_instruction_line(
@@ -250,7 +287,7 @@ def _parse_instruction_line(
         )
         return None
 
-    semicolon_index = code.find(";")
+    semicolon_index = _find_outside_templates(code, ";")
     if semicolon_index != -1:
         diagnostics.append(
             _syntax_error(
@@ -265,6 +302,20 @@ def _parse_instruction_line(
 
     parts = ["stop", ""] if code.startswith("stop,") else code.split(None, 1)
     op = parts[0]
+    if len(parts) == 1:
+        op = op.rstrip(",")
+    if not _NAME_RE.fullmatch(op):
+        diagnostics.append(
+            _syntax_error(
+                file=file,
+                line=line,
+                column=column,
+                raw=raw,
+                message=f"Malformed instruction name or unsupported directive: {op}.",
+                details={"op": op},
+            )
+        )
+        return None
     if op != op.lower():
         diagnostics.append(
             _syntax_error(
@@ -379,7 +430,10 @@ def _parse_arg(
         )
         return None
     if _INTEGER_RE.match(raw):
-        return Arg(kind="imm", value=_parse_int(raw), raw=raw)
+        try:
+            return Arg(kind="imm", value=_parse_int(raw), raw=raw)
+        except ValueError:
+            pass
     if _looks_like_malformed_integer(raw):
         diagnostics.append(
             _syntax_error(
@@ -405,7 +459,10 @@ def _parse_arg(
         )
         return None
     if _REGISTER_RE.match(raw):
-        return Arg(kind="reg", value=f"R{_parse_register_index(raw)}", raw=raw)
+        try:
+            return Arg(kind="reg", value=f"R{_parse_register_index(raw)}", raw=raw)
+        except ValueError:
+            pass
     if _looks_like_malformed_register(raw):
         diagnostics.append(
             _syntax_error(
@@ -423,23 +480,76 @@ def _parse_arg(
     placeholder = _placeholder_expression(raw)
     if placeholder is not None:
         return Arg(kind="placeholder", value=placeholder, raw=raw)
+    if not _SYMBOL_RE.fullmatch(raw):
+        diagnostics.append(
+            _syntax_error(
+                file=file,
+                line=line,
+                column=column,
+                raw=raw_source,
+                message=f"Malformed reference, symbol, or template operand: {raw}.",
+                details={"operand": raw},
+            )
+        )
+        return None
     return Arg(kind="symbol", value=raw, raw=raw)
 
 
 def _split_argument_text(arg_text: str) -> list[str]:
     args: list[str] = []
     start = 0
-    brace_depth = 0
-    for index, char in enumerate(arg_text):
-        if char == "{":
-            brace_depth += 1
-        elif char == "}" and brace_depth:
-            brace_depth -= 1
-        elif char == "," and brace_depth == 0:
-            args.append(arg_text[start:index])
-            start = index + 1
+    while (index := _find_outside_templates(arg_text, ",", start)) != -1:
+        args.append(arg_text[start:index])
+        start = index + 1
     args.append(arg_text[start:])
     return args
+
+
+def _find_outside_templates(text: str, character: str, start: int = 0) -> int:
+    index = start
+    while index < len(text):
+        if text[index] == "{":
+            end = _template_end(text, index)
+            if end is not None:
+                index = end
+                continue
+        if text[index] == character:
+            return index
+        index += 1
+    return -1
+
+
+def _template_end(text: str, start: int) -> int | None:
+    closing = {"{": "}", "(": ")", "[": "]"}
+    stack = ["}"]
+    quote: str | None = None
+    index = start + 1
+    while index < len(text):
+        char = text[index]
+        if quote is not None:
+            if char == "\\":
+                index += 2
+            elif text.startswith(quote, index):
+                index += len(quote)
+                quote = None
+            else:
+                index += 1
+            continue
+        if char in "'\"":
+            quote = char * 3 if text.startswith(char * 3, index) else char
+            index += len(quote)
+            continue
+        if char in closing:
+            stack.append(closing[char])
+        elif char in "})]":
+            if char != stack.pop():
+                return None
+            if not stack:
+                return index + 1
+        elif char in "#;":
+            return None
+        index += 1
+    return None
 
 
 def _has_invalid_operand_whitespace(raw: str) -> bool:
@@ -450,17 +560,19 @@ def _has_invalid_operand_whitespace(raw: str) -> bool:
 
 
 def _placeholder_expression(raw: str) -> str | None:
-    match = _PLACEHOLDER_RE.match(raw)
-    if match is None:
+    if not raw.startswith("{") or _template_end(raw, 0) != len(raw):
         return None
-    expression = match.group("expression").strip()
+    expression = raw[1:-1].strip()
     return expression or None
 
 
 def _parse_int(raw: str) -> int:
     lowered = raw.lower()
     if lowered.startswith(("0x", "-0x")):
-        return int(raw, 0)
+        value = int(raw, 0)
+        # Diagnostics and JSON must also be able to render hexadecimal values in decimal.
+        str(value)
+        return value
     return int(raw, 10)
 
 

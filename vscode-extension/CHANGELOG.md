@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.5
+
+- Validate Q1ASM syntax, operand signatures, ranges, labels, and aliases across the full source before execution, with conservative lint diagnostics.
+- Add project-scoped feedback and trigger input scenarios, including shared starts and live playback reconfiguration.
+- Inspect register reads and applied latched settings on RT blocks, with clearer Q1/RT navigation and branch comparison rows.
+- Make initial RT queue reserve assumptions explicit and account for scheduled trigger arrivals in playback timing.
+- Improve analysis lifecycle reliability and simplify duplicate test work while preserving independent assembler contracts.
+- Pair with Python package 0.2.5.
+
 ## 0.2.4
 
 - Allow native shell installation-command checks enough time for both PowerShell launches on Windows CI.

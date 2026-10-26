@@ -11,6 +11,26 @@ class _SafeFormatDict(UserDict):
 
 
 DIAGNOSTIC_PRESENTATIONS: dict[str, dict[str, str]] = {
+    "template_expression_syntax": {
+        "group": "Q1ASM Lint", "title": "Template expression may be malformed", "summary": "{message}",
+        "fix": "Check expression operators and separators, or provide this exact parameter name if it is intentional.",
+    },
+    "unused_definition": {
+        "group": "Q1ASM Lint", "title": "Alias is never used", "summary": "{message}",
+        "fix": "Remove the unused .DEF alias or reference it with $NAME.",
+    },
+    "unreachable_code": {
+        "group": "Q1ASM Lint", "title": "Code is unreachable", "summary": "{message}",
+        "fix": "Check the preceding stop or jump and the intended entry to this region.",
+    },
+    "missing_stop": {
+        "group": "Q1ASM Lint", "title": "Execution can pass the end of the program", "summary": "{message}",
+        "fix": "End this path with stop or an intentional jump.",
+    },
+    "overwritten_register": {
+        "group": "Q1ASM Lint", "title": "Register value is overwritten before use", "summary": "{message}",
+        "fix": "Check the destination register or remove the unneeded write if it is intentional.",
+    },
     "acquisition_bin_reuse": {
         "group": "Hardware Readiness",
         "title": "Concrete acquisition bin is reused",
@@ -34,6 +54,12 @@ DIAGNOSTIC_PRESENTATIONS: dict[str, dict[str, str]] = {
         "title": "Definite RT underflow",
         "summary": "The RT queue slack is {slack_ns} ns, so this packet is scheduled too early.",
         "fix": "Increase the wait gap, reduce the preceding Q1 work, or move this RT packet later.",
+    },
+    "initial_rt_buffer_estimate": {
+        "group": "Timing",
+        "title": "Up to 2 ms initial buffer may cover Q1 work",
+        "summary": "{message}",
+        "fix": "1 ms is assumed; up to 2 ms is tentative and has not been measured.",
     },
     "duplicate_sequencer_id": {
         "group": "Project Config",

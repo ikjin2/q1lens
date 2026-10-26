@@ -2318,6 +2318,225 @@ describe("q1timeline controller", () => {
     return { controller, client, calls, posted, published, disposed: () => disposed };
   }
 
+  it("applies shared external inputs before rerunning, resets them and retains overrides across source refresh", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const trigger = { id: "shot", address: 1, targets: ["drive", "readout"], times_ns: [1000] };
+      let inputs = { triggers: [] }, overridden = false;
+      const state = () => ({ status: "completed", can_resume: false, steps: 8,
+        external_inputs: { ...inputs, overridden } });
+      const setup = playbackController(TimelineController, vscode, async (message) => {
+        if (message.command === "set_external_inputs") {
+          inputs = message.external_inputs || { triggers: [] };
+          overridden = message.external_inputs !== null;
+        }
+        return message.command === "run" ? { playback: state() } : { ir: { events: [], playback: state() } };
+      });
+      await setup.controller.handleWebviewMessage({ type: "setExternalInputs", triggers: [trigger] });
+      assert.deepEqual(setup.calls.map((call) => call.command), ["set_external_inputs", "run", "snapshot"]);
+      assert.deepEqual(setup.controller.webviewInitialState().externalInputs, { triggers: [trigger], overridden: true, canSave: true });
+      setup.controller.resetPlayback();
+      assert.equal(setup.controller.externalInputsState().canSave, false, "An analysis/parameter refresh must require revalidation even before sourceRevision changes");
+      setup.controller.invalidateSourceAnalysis();
+      await setup.controller.runPlayback();
+      assert.equal(setup.controller.externalInputsState().canSave, true);
+      assert.deepEqual(setup.calls.slice(3).map((call) => call.command), ["set_external_inputs", "run", "snapshot"]);
+      await setup.controller.handleWebviewMessage({ type: "resetExternalInputs" });
+      assert.deepEqual(setup.calls[6], { command: "set_external_inputs", external_inputs: null });
+      assert.equal(setup.controller.externalInputsState().overridden, false);
+      setup.controller.setProjectUri(vscode.Uri.file("C:\\other\\q1timeline.yml"));
+      assert.equal(setup.controller.externalInputsOverride, undefined);
+      setup.controller.dispose();
+    });
+  });
+
+  it("keeps the previous trace and worker after an invalid external input edit", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const setup = playbackController(TimelineController, vscode, async () => { throw new Error("Unknown target: missing"); });
+      const previous = { events: [], playback: { status: "completed", can_resume: false } };
+      setup.controller.timelineIr = previous;
+      setup.controller.executionState = previous.playback;
+      setup.controller.playbackClient = setup.client;
+      await setup.controller.handleWebviewMessage({ type: "setExternalInputs", triggers: [
+        { id: "shot", address: 1, targets: ["missing"], times_ns: [1000] },
+      ] });
+      assert.equal(setup.controller.timelineIr, previous);
+      assert.equal(setup.controller.playbackClient, setup.client);
+      assert.equal(setup.controller.executionState.status, "completed");
+      assert.equal(setup.controller.externalInputsOverride, undefined);
+      assert.equal(setup.disposed(), 0);
+      assert.match(setup.posted.at(-1).state.error, /Unknown target/);
+      assert.equal(setup.calls.length, 1);
+      setup.controller.dispose();
+    });
+  });
+
+  it("saves only applied external inputs without invalidating the equivalent trace", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const trigger = { id: "shot", address: "TRIGGER_INDEX", targets: ["drive"], times_ns: [2000] };
+      const state = { status: "completed", can_resume: false, external_inputs: { triggers: [trigger], overridden: false } };
+      const setup = playbackController(TimelineController, vscode, async () => ({ ir: { events: [], playback: state } }));
+      const project = join(mkdtempSync(join(tmpdir(), "q1-external-inputs-")), "q1timeline.yml");
+      writeFileSync(project, "# project\nversion: 1 # preserve\nsequencers: []\n");
+      setup.controller.projectUri = vscode.Uri.file(project);
+      await setup.controller.refreshProjectRelatedPaths();
+      setup.controller.externalInputsOverride = { triggers: [trigger] };
+      setup.controller.externalInputsOverrideBaseline = setup.controller.externalInputsBaseline;
+      setup.controller.externalInputsValidatedRevision = setup.controller.sourceRevision;
+      setup.controller.externalInputsValidatedProjectText = setup.controller.externalInputsProjectText;
+      setup.controller.playbackClient = setup.client;
+      const revision = setup.controller.sourceRevision;
+      await setup.controller.handleWebviewMessage({ type: "saveExternalInputs" });
+      assert.match(readFileSync(project, "utf8"), /version: 1 # preserve/);
+      assert.match(readFileSync(project, "utf8"), /times_ns:\n\s+- 2000/);
+      assert.deepEqual(setup.calls, [{ command: "accept_external_inputs" }]);
+      assert.equal(setup.controller.externalInputsState().overridden, false);
+      await setup.controller.onWatchedFile(vscode.Uri.file(project));
+      assert.equal(setup.controller.sourceRevision, revision);
+      assert.equal(setup.controller.playbackClient, setup.client);
+      setup.controller.dispose();
+    });
+  });
+
+  it("refuses to overwrite external inputs edited on disk or save a standalone preview", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const setup = playbackController(TimelineController, vscode, async () => ({}));
+      const project = join(mkdtempSync(join(tmpdir(), "q1-external-conflict-")), "q1timeline.yml");
+      writeFileSync(project, "sequencers: []\n");
+      setup.controller.projectUri = vscode.Uri.file(project);
+      await setup.controller.refreshProjectRelatedPaths();
+      setup.controller.externalInputsOverride = { triggers: [] };
+      setup.controller.externalInputsOverrideBaseline = setup.controller.externalInputsBaseline;
+      setup.controller.externalInputsValidatedRevision = setup.controller.sourceRevision;
+      setup.controller.externalInputsValidatedProjectText = setup.controller.externalInputsProjectText;
+      const changed = "sequencers: []\nexternal_inputs: {triggers: []}\n";
+      writeFileSync(project, changed);
+      await setup.controller.refreshProjectRelatedPaths();
+      await setup.controller.saveExternalInputs();
+      assert.equal(readFileSync(project, "utf8"), changed);
+      assert.match(setup.controller.externalInputsState().error, /changed on disk/);
+      assert.equal(setup.controller.externalInputsState().overridden, true);
+      setup.controller.singleFileMode = true;
+      await setup.controller.saveExternalInputs();
+      assert.match(setup.controller.externalInputsState().error, /standalone Q1ASM/);
+      assert.equal(setup.calls.length, 0);
+      setup.controller.dispose();
+    });
+  });
+
+  it("requires retained external inputs to be revalidated after project targets change", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const project = join(mkdtempSync(join(tmpdir(), "q1-external-target-rename-")), "q1timeline.yml");
+      let inputs = { triggers: [] }, target = "a";
+      writeFileSync(project, "sequencers:\n  - id: a\n    file: main.q1asm\n");
+      const state = () => ({ status: "completed", can_resume: false, external_inputs: { ...inputs, overridden: true } });
+      const setup = playbackController(TimelineController, vscode, async (message) => {
+        if (message.command === "set_external_inputs") {
+          if (message.external_inputs.triggers.some((trigger) => trigger.targets.includes(target === "a" ? "b" : "a"))) {
+            throw new Error("Unknown target");
+          }
+          inputs = message.external_inputs;
+        }
+        return message.command === "run" ? { playback: state() } : { ir: { events: [], playback: state() } };
+      });
+      const controller = setup.controller;
+      controller.projectUri = vscode.Uri.file(project);
+      controller.updateMode = () => "manual";
+      await controller.refreshProjectRelatedPaths();
+      const trigger = { id: "shot", address: 1, targets: ["a"], times_ns: [1000] };
+      await controller.setExternalInputs({ triggers: [trigger] });
+      assert.equal(controller.externalInputsState().canSave, true);
+      target = "b";
+      const renamed = "sequencers:\n  - id: b\n    file: main.q1asm\n";
+      writeFileSync(project, renamed);
+      await controller.onWatchedFile(vscode.Uri.file(project));
+      assert.equal(controller.externalInputsState().canSave, false);
+      await controller.saveExternalInputs();
+      assert.match(controller.externalInputsState().error, /Apply & rerun/);
+      assert.equal(readFileSync(project, "utf8"), renamed);
+      await controller.setExternalInputs({ triggers: [trigger] });
+      assert.equal(controller.externalInputsState().canSave, false);
+      assert.deepEqual(controller.externalInputsOverride.triggers[0].targets, ["a"]);
+      await controller.setExternalInputs({ triggers: [{ ...trigger, targets: ["b"] }] });
+      assert.equal(controller.externalInputsState().canSave, true);
+      await controller.saveExternalInputs();
+      assert.match(readFileSync(project, "utf8"), /targets:\n\s+- b/);
+      assert.equal(controller.externalInputsState().overridden, false);
+      controller.dispose();
+    });
+  });
+
+  it("refuses to save over a project edit whose watcher has not arrived yet", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const project = join(mkdtempSync(join(tmpdir(), "q1-external-save-race-")), "q1timeline.yml");
+      const source = "sequencers:\n  - id: a\n    file: main.q1asm\n";
+      writeFileSync(project, source);
+      const trigger = { id: "shot", address: 1, targets: ["a"], times_ns: [1000] };
+      const playback = { status: "completed", can_resume: false, external_inputs: { triggers: [trigger], overridden: true } };
+      const setup = playbackController(TimelineController, vscode, async (message) =>
+        message.command === "run" ? { playback } : { ir: { events: [], playback } });
+      const controller = setup.controller;
+      controller.projectUri = vscode.Uri.file(project);
+      await controller.refreshProjectRelatedPaths();
+      await controller.setExternalInputs({ triggers: [trigger] });
+      const renamed = source.replace("id: a", "id: b");
+      writeFileSync(project, renamed);
+      const previousSnapshots = Array.from(controller.sourceFileSnapshots.entries());
+      await controller.saveExternalInputs();
+      assert.equal(readFileSync(project, "utf8"), renamed);
+      assert.match(controller.externalInputsState().error, /Refresh, then Apply & rerun/);
+      assert.deepEqual(Array.from(controller.sourceFileSnapshots.entries()), previousSnapshots);
+      assert.equal(controller.externalInputsState().overridden, true);
+      assert.equal(setup.calls.some((call) => call.command === "accept_external_inputs"), false);
+      controller.dispose();
+    });
+  });
+
+  it("does not mark unchanged external inputs unsaved after applying and rerunning", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const trigger = { id: "shot", address: 1, targets: ["a"], times_ns: [1000] };
+      const playback = { status: "completed", can_resume: false, external_inputs: { triggers: [trigger], overridden: false } };
+      const setup = playbackController(TimelineController, vscode, async (message) =>
+        message.command === "run" ? { playback } : { ir: { events: [], playback } });
+      setup.controller.externalInputsProject = { triggers: [trigger] };
+      await setup.controller.setExternalInputs({ triggers: [trigger] });
+      assert.equal(setup.controller.externalInputsState().overridden, false);
+      assert.equal(setup.controller.externalInputsOverride, undefined);
+      assert.deepEqual(setup.calls.map((call) => call.command), ["set_external_inputs", "run", "snapshot"]);
+      setup.controller.dispose();
+    });
+  });
+
+  it("clears unsaved input state when restored session inputs now match the project", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const trigger = { id: "shot", address: 1, targets: ["a"], times_ns: [1000] };
+      let overridden = true;
+      const playback = () => ({ status: "completed", can_resume: false, external_inputs: { triggers: [trigger], overridden } });
+      const setup = playbackController(TimelineController, vscode, async (message) =>
+        message.command === "run" ? { playback: playback() } : { ir: { events: [], playback: playback() } });
+      await setup.controller.setExternalInputs({ triggers: [trigger] });
+      assert.equal(setup.controller.externalInputsState().overridden, true);
+      setup.controller.invalidateSourceAnalysis();
+      overridden = false;
+      await setup.controller.runPlayback();
+      assert.equal(setup.controller.externalInputsState().overridden, false);
+      assert.deepEqual(setup.controller.externalInputsProject, { triggers: [trigger] });
+      assert.equal(setup.controller.externalInputsOverride, undefined);
+      assert.equal(setup.controller.externalInputsOverrideBaseline, undefined);
+      assert.equal(setup.controller.externalInputsValidatedRevision, undefined);
+      assert.equal(setup.controller.externalInputsValidatedProjectText, undefined);
+      assert.deepEqual(setup.calls.slice(3).map((call) => call.command), ["set_external_inputs", "run", "snapshot"]);
+      setup.controller.dispose();
+    });
+  });
+
   for (const stage of ["environment setup", "snapshot rendering"]) {
     for (const outcome of ["success", "failure"]) {
       it(`runs a new project during old playback ${stage} and preserves it after a late ${outcome}`, async () => {
@@ -4298,6 +4517,67 @@ describe("q1timeline controller", () => {
       assert.equal(openedDocument, false);
       assert.equal(shownDocument, existingDocument);
       assert.deepEqual(shownOptions, { viewColumn: 1, preview: false });
+      controller.dispose();
+    });
+  });
+
+  for (const [timelineColumn, sourceColumn] of [[1, 1], [1, 2], [1, undefined], [3, 2], [3, 3], [3, undefined]]) {
+    it(`keeps RT detail selection focused in timeline group ${timelineColumn} when the source group is ${sourceColumn ?? "missing"}`, async () => {
+      const vscode = createMockVscode();
+      const sourcePath = "C:\\repo\\q1asm\\seq0.q1asm";
+      const document = { uri: vscode.Uri.file(sourcePath) };
+      const shown: any[] = [];
+      const commands: string[] = [];
+      const editor = { document, viewColumn: 2, setDecorations() {}, revealRange() {} };
+      vscode.workspace.textDocuments = sourceColumn === undefined ? [] : [document];
+      vscode.workspace.openTextDocument = async () => document;
+      vscode.window.tabGroups.all = sourceColumn === undefined ? [] : [
+        { viewColumn: sourceColumn, tabs: [{ input: { uri: document.uri } }] },
+      ];
+      vscode.commands.executeCommand = async (command) => { commands.push(command); };
+      vscode.window.showTextDocument = async (target, options) => { shown.push({ target, options }); return editor; };
+
+      await withMockedVscode(vscode, async ({ TimelineController }) => {
+        const controller = new TimelineController(createContext());
+        controller.projectUri = vscode.Uri.file("C:\\repo\\q1timeline.yml");
+        controller.panel = { viewColumn: timelineColumn, dispose() {} };
+        controller.timelineIr = {
+          project: { root: "C:\\repo" },
+          events: [{ id: "seq:e3", source: { file: sourcePath, line: 3, column: 4 } }],
+        };
+
+        await controller.handleWebviewMessage({ type: "eventClick", eventId: "seq:e3", preserveFocus: true });
+
+        assert.equal(shown.length, 1);
+        assert.equal(shown[0].target, document);
+        assert.deepEqual(shown[0].options, { viewColumn: sourceColumn !== undefined && sourceColumn !== timelineColumn ? sourceColumn : vscode.ViewColumn.Beside, preview: false, preserveFocus: true });
+        assert.equal(editor.selection.active.line, 2);
+        assert.equal(editor.selection.active.character, 3);
+        assert.deepEqual(commands, [], "RT detail inspection must not activate a new editor group");
+
+        if (sourceColumn !== undefined) {
+          await controller.handleWebviewMessage({ type: "eventClick", eventId: "seq:e3" });
+          assert.deepEqual(shown[1].options, { viewColumn: sourceColumn, preview: false }, "Explicit navigation must retain its existing source focus behavior");
+        }
+        controller.dispose();
+      });
+    });
+  }
+
+  it("finds a later source group when its first matching tab shares the timeline group", async () => {
+    const vscode = createMockVscode();
+    const sourcePath = "C:\\repo\\q1asm\\seq0.q1asm";
+    vscode.window.tabGroups.all = [
+      { viewColumn: 1, tabs: [{ input: { uri: vscode.Uri.file(sourcePath) } }] },
+      { viewColumn: 2, tabs: [{ input: { uri: vscode.Uri.file("C:\\repo\\notes.txt") } }] },
+      { viewColumn: 3, tabs: [{ input: { uri: vscode.Uri.file(sourcePath) } }] },
+    ];
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const controller = new TimelineController(createContext());
+      controller.panel = { viewColumn: 1, dispose() {} };
+      controller.lastSourceViewColumn = 1;
+      assert.deepEqual(await controller.sourceShowTextDocumentOptions(sourcePath, true, true),
+        { viewColumn: 3, preview: false, preserveFocus: true });
       controller.dispose();
     });
   });

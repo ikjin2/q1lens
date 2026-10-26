@@ -71,6 +71,13 @@ sequencers:
 params:
   file: params.json
 
+external_inputs:
+  triggers:
+    - id: shot_start
+      address: TRIGGER_INDEX
+      targets: [drive_q0, drive_q1, drive_q2, drive_q3, readout_q0, readout_q1, readout_q2, readout_q3, tracker_q0, tracker_q1, tracker_q2, tracker_q3, audit_scope_a, audit_scope_b, arbiter, telemetry, fault_probe]
+      times_ns: [1000]
+
 alignment:
   mode: first_wait_trigger
 

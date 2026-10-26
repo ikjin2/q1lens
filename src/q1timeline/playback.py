@@ -10,6 +10,7 @@ import json
 import sys
 import time
 from dataclasses import dataclass, field, replace
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,7 @@ from q1timeline.analysis.playback_loops import ExecutedStep, observed_loops
 from q1timeline.analysis.playback_timing import annotate_playback_queue_timing
 from q1timeline.analysis.values import Concrete, Unknown, add_values, resolve_arg_value, value_to_json
 from q1timeline.ir.serialize import timeline_ir_from_states
+from q1timeline.external_inputs import resolve_trigger_sources, validate_external_inputs
 from q1timeline.project import ConfigLoadError, load_project_config, load_single_file_config
 from q1timeline.q1asm.ast import Instr
 from q1timeline.q1asm.instruction_table import get_instruction_spec, rt_duration_arg_for_instruction
@@ -28,7 +30,7 @@ from q1timeline.sequence import load_sequence_names
 
 MAX_TRACE_EVENTS = 20_000
 MAX_ASSUMPTION_REFERENCES = 100_000
-_EXTERNAL_TIMING = {"fb_pull_data", "wait_trigger"}
+_EXTERNAL_TIMING = {"fb_pull_data"}
 
 
 @dataclass
@@ -37,14 +39,19 @@ class _Runner:
     symbols: dict
     trace: list[ExecutedStep] = field(default_factory=list)
     feedback_assumptions: list[str] = field(default_factory=list)
+    trigger_assumptions: list[str] = field(default_factory=list)
+    waiting: dict | None = None
 
 
 class PlaybackSession:
     def __init__(self, documents: dict[str, tuple[str, str]], *, params: dict | None = None,
                  alignment_mode: str = "none", alignment_anchor_kinds: tuple[str, ...] = (),
-                 project: dict | None = None):
+                 project: dict | None = None, external_inputs: dict | None = None):
         self.documents = dict(documents)
         self.params = dict(params or {})
+        self.external_inputs = validate_external_inputs(external_inputs, documents)
+        self.base_external_inputs = deepcopy(self.external_inputs)
+        self.trigger_sources = resolve_trigger_sources(self.external_inputs, self.params)
         self.alignment_mode = alignment_mode
         self.alignment_anchor_kinds = alignment_anchor_kinds
         self.project = project or {}
@@ -67,6 +74,7 @@ class PlaybackSession:
             {seq.id: (str(seq.file), seq.file.read_text(encoding="utf-8-sig")) for seq in config.sequencers},
             params={**config.params, **(params or {})}, alignment_mode=config.alignment_mode,
             alignment_anchor_kinds=config.alignment_anchor_kinds,
+            external_inputs=config.external_inputs,
             project={"root": str(config.root), "alignment_mode": config.alignment_mode,
                      "alignment_anchor_kinds": list(config.alignment_anchor_kinds),
                      "display": config.display, "display_file": str(config.display_file) if config.display_file else None},
@@ -85,6 +93,7 @@ class PlaybackSession:
         self.runners = []
         self.branches: list[dict] = []
         self.feedback: list[dict] = []
+        self.triggers: list[dict] = []
         self.steps = 0
         self.assumption_references = 0
         self.next_runner = 0
@@ -98,9 +107,10 @@ class PlaybackSession:
             state.diagnostics.extend(program.diagnostics)
             symbols = core.symbol_table_from_params(self.params)
             defs = {name: arg for name, arg in program.defs.items() if arg.kind != "reg"}
-            resolved = core.resolve_def_values(defs, symbols, state.diagnostics)
+            resolved = core.resolve_def_values(defs, symbols, state.diagnostics, labels=program.labels)
             state.symbol_origins = core._symbol_origins(self.params, symbols, defs, resolved)
             symbols.update(resolved)
+            core._diagnose_program(state, symbols, program)
             state.has_expanded_instructions = any(
                 item.op in {"loop", "jlt"} or (item.op == "jge" and len(item.args) == 3)
                 for item in program.instructions
@@ -108,7 +118,8 @@ class PlaybackSession:
             state.metadata["execution"] = {
                 "mode": "playback", "status": "paused", "steps": 0,
                 "timing_model": "analytical", "address_model": "source_instruction_index",
-                "assumptions": ["One executed path; feedback receipts are assumed and queue backpressure is not simulated."],
+                "assumptions": ["One executed path; feedback receipts are assumed and queue backpressure is not simulated.",
+                                "External trigger times are assumed receiver arrivals on the unaligned analytical RT clock; hardware transport latency is not modeled."],
             }
             self.runners.append(_Runner(state, symbols))
             errors = [item for item in state.diagnostics if item.severity == "error"]
@@ -129,15 +140,21 @@ class PlaybackSession:
             if all(runner.state.stopped for runner in self.runners):
                 self.status = "completed"
                 break
+            if all(runner.state.stopped or runner.waiting is not None for runner in self.runners):
+                self.status = "waiting"
+                waiters = [r for r in self.runners if r.waiting is not None]
+                reasons = dict.fromkeys(r.waiting["reason"] for r in waiters)
+                self.reason = f"{len(waiters)} sequencer(s) waiting. " + "; ".join(reasons)
+                break
             if (sum(len(runner.state.events) for runner in self.runners) >= MAX_TRACE_EVENTS
                     or self.assumption_references >= MAX_ASSUMPTION_REFERENCES):
                 self.status, self.reason = "limit", "Recorded event limit reached; the trace is a partial execution."
                 break
             runner = self.runners[self.next_runner]
             self.next_runner = (self.next_runner + 1) % len(self.runners)
-            if runner.state.stopped:
+            if runner.state.stopped or runner.waiting is not None:
                 continue
-            if not self._step(runner):
+            if not self._step(runner) and runner.waiting is None:
                 break
         if self.status == "running":
             self.status = "completed" if all(r.state.stopped for r in self.runners) else "paused"
@@ -153,6 +170,17 @@ class PlaybackSession:
         self.choices[branch_id] = path
         self._reset()
         # Replaying is done by the same bounded run requests as normal execution.
+        return self.snapshot()
+
+    def set_external_inputs(self, config: dict | None) -> dict:
+        candidate = validate_external_inputs(self.base_external_inputs if config is None else config, self.documents)
+        sources = resolve_trigger_sources(candidate, self.params)
+        self.external_inputs, self.trigger_sources = candidate, sources
+        self._reset()
+        return self.snapshot()
+
+    def accept_external_inputs(self) -> dict:
+        self.base_external_inputs = deepcopy(self.external_inputs)
         return self.snapshot()
 
     def set_feedback(self, feedback_id: str, value: int | None, delay_ns: int) -> dict:
@@ -220,7 +248,7 @@ class PlaybackSession:
             return self._block(runner, instruction, f"{instruction.op} requires unavailable execution or external timing semantics.")
         scope = core._scope(runner.symbols, state)
         duration_index = rt_duration_arg_for_instruction(spec, instruction)
-        if duration_index is not None and duration_index < len(instruction.args):
+        if instruction.op != "wait_trigger" and duration_index is not None and duration_index < len(instruction.args):
             if not isinstance(resolve_arg_value(instruction.args[duration_index], scope), Concrete):
                 return self._block(runner, instruction, f"{instruction.op} duration is unknown.")
         if state.has_expanded_instructions:
@@ -240,7 +268,10 @@ class PlaybackSession:
         diagnostic_start = len(state.diagnostics)
         flags_before = dict(state.alu_flags) if state.alu_flags is not None else None
         try:
-            if instruction.op == "fb_pop_data":
+            if instruction.op == "wait_trigger":
+                if not self._receive_trigger(runner, instruction):
+                    return False
+            elif instruction.op == "fb_pop_data":
                 self._receive_feedback(runner, instruction)
             elif spec.category == "branch":
                 if not self._branch(runner, instruction):
@@ -267,7 +298,10 @@ class PlaybackSession:
             if runner.feedback_assumptions:
                 event.meta["feedback_assumptions"] = list(runner.feedback_assumptions)
                 self.assumption_references += len(runner.feedback_assumptions)
-            if (state.metadata.get("branches", {}).get("assumptions") or runner.feedback_assumptions) and event.confidence == "exact":
+            if runner.trigger_assumptions:
+                event.meta["trigger_assumptions"] = list(runner.trigger_assumptions)
+                self.assumption_references += len(runner.trigger_assumptions)
+            if (state.metadata.get("branches", {}).get("assumptions") or runner.feedback_assumptions or runner.trigger_assumptions) and event.confidence == "exact":
                 state.events[index] = replace(event, confidence="assumed")
         # Unknown values may propagate; invalid instructions never become executed steps.
         if any(item.severity == "error" for item in state.diagnostics[diagnostic_start:]):
@@ -298,6 +332,66 @@ class PlaybackSession:
                 self.assumption_references += len(runner.feedback_assumptions)
         self.assumption_references += sum(len(write.meta.get("branch_assumptions", []))
                                          for write in state.register_history[history_start:])
+        return True
+
+    def _receive_trigger(self, runner: _Runner, instruction: Instr) -> bool:
+        state = runner.state
+        spec, invalid, diagnostic_start = core._validate_instruction(state, instruction, runner.symbols)
+        if not core._concrete_instruction_ready(
+            state, instruction, runner.symbols, spec, invalid, diagnostic_start,
+            supported_ops=core._CONCRETE_OPS | {"wait_trigger"}, allow_symbolic_operands=True,
+        ):
+            execution = state.metadata["execution"]
+            return self._block(runner, instruction, execution["reason"], error=execution["status"] == "error")
+        address, duration = [resolve_arg_value(arg, core._scope(runner.symbols, state)) for arg in instruction.args]
+        if not all(isinstance(value, Concrete) for value in (address, duration, state.rt_time_ns)):
+            return self._block(runner, instruction, "wait_trigger address, duration or RT start is unknown.")
+        if not 0 <= address.value <= 15:
+            return self._block(runner, instruction, f"wait_trigger resolved address {address.value} is outside the supported range 0..15.")
+        armed = state.rt_time_ns.value
+        candidates = []
+        connected = [source for source in self.trigger_sources if state.sequencer_id in source["targets"]]
+        matching = [source for source in connected if source["resolved_address"] == address.value]
+        for source in matching:
+            for index, arrival in enumerate(source["times_ns"]):
+                event_id = f"external:{source['id']}:{index}"
+                if arrival >= armed and event_id not in runner.trigger_assumptions:
+                    candidates.append((arrival, event_id, source["id"]))
+        assumption = {"source_id": None, "event_id": None, "address": address.value,
+                      "armed_at_ns": armed, "arrival_ns": None, "resume_ns": None,
+                      "duration_ns": duration.value, "status": "waiting"}
+        if not candidates:
+            reason = ("No unused trigger at or after the wait start" if any(s["times_ns"] for s in matching)
+                      else "No scheduled trigger" if matching else "No connected trigger source")
+            assumption["reason"] = f"{reason} for address {address.value} at {armed} ns. Configure external inputs."
+            assumption["source_id"] = matching[0]["id"] if len(matching) == 1 else None
+            runner.waiting = assumption
+            state.metadata["execution"].update(status="waiting", reason=assumption["reason"], pc=instruction.pc)
+            core._emit_event(state, lane="rt.sync", kind="wait_trigger", t0=state.rt_time_ns,
+                             t1=None, duration=Unknown(assumption["reason"]), label="Waiting for external trigger",
+                             confidence="unknown", source=instruction.source,
+                             meta={"playback": True, "trigger_assumption": assumption})
+            return False
+        arrival, event_id, source_id = min(candidates)
+        assumption.update(source_id=source_id, event_id=event_id, arrival_ns=arrival,
+                          resume_ns=arrival + duration.value, status="received")
+        event_start = len(state.events)
+        core._execute_instruction(state, instruction, runner.symbols, {}, {}, allow_symbolic_operands=True)
+        if state.metadata["execution"].get("status") in {"error", "blocked"}:
+            execution = state.metadata["execution"]
+            return self._block(runner, instruction, execution["reason"], error=execution["status"] == "error")
+        end, elapsed = Concrete(assumption["resume_ns"]), Concrete(assumption["resume_ns"] - armed)
+        state.rt_time_ns = end
+        packet = state.rt_packets[-1]
+        state.rt_packets[-1] = replace(packet, rt_t1=end, duration=elapsed,
+                                       meta={**packet.meta, "trigger_assumption": assumption})
+        for index in range(event_start, len(state.events)):
+            event = state.events[index]
+            event.meta["trigger_assumption"] = assumption
+            if event.kind == "wait_trigger":
+                state.events[index] = replace(event, t1=end, duration=elapsed, confidence="assumed")
+        runner.trigger_assumptions.append(event_id)
+        self.triggers.append({**assumption, "sequencer_id": state.sequencer_id})
         return True
 
     def _receive_feedback(self, runner: _Runner, instruction: Instr) -> None:
@@ -388,7 +482,10 @@ class PlaybackSession:
         t0 = state.q1_time_ns
         t1 = add_values(t0, Concrete(duration))
         state.q1_time_ns = t1
-        issue = core._emit_q1_issue(state, instruction, t0, t1, None)
+        issue = core._emit_q1_issue(
+            state, instruction, t0, t1, None,
+            register_metadata=core._register_issue_metadata(state, instruction, scope),
+        )
         if natural is not None and target_pc is not None:
             # Keep arithmetic, status flags and loop counter writes identical to concrete execution.
             core._execute_concrete_branch(state, instruction, issue, runner.symbols, defer_register_write=True)
@@ -487,7 +584,12 @@ class PlaybackSession:
             sequencer.update(self.sequencer_metadata.get(sequencer["id"], {}))
         if self.parameters:
             ir["analysis"]["parameters"] = self.parameters
-        ir["playback"] = {**self.summary(), "branches": list(self.branches), "feedback": list(self.feedback), "loops": loops}
+        ir["playback"] = {**self.summary(), "branches": list(self.branches), "feedback": list(self.feedback), "loops": loops,
+                          "triggers": deepcopy(self.triggers), "external_inputs": {
+                              "triggers": deepcopy(self.trigger_sources),
+                              "overridden": self.external_inputs != self.base_external_inputs,
+                              "timing_model": "receiver arrivals on the shared unaligned analytical RT clock; wait_trigger resumes after arrival plus duration",
+                          }}
         if self.status != "completed" or self.feedback:
             ir["diagnostics"] = [item for item in ir["diagnostics"] if item["category"] != "feedback_fifo_imbalance"]
             ir["feedback_balance"] = {"status": "incomplete" if self.status != "completed" else "assumed", "channels": {}}
@@ -523,6 +625,10 @@ def main(argv: list[str] | None = None) -> int:
                 result = {"ir": session.choose(request.get("branch_id"), request.get("path"))}
             elif command == "set_feedback":
                 result = {"ir": session.set_feedback(request.get("feedback_id"), request.get("value"), request.get("delay_ns"))}
+            elif command == "set_external_inputs":
+                result = {"ir": session.set_external_inputs(request.get("external_inputs"))}
+            elif command == "accept_external_inputs":
+                result = {"ir": session.accept_external_inputs()}
             else:
                 raise ValueError(f"Unknown playback command: {command}")
             result["id"] = request.get("id")

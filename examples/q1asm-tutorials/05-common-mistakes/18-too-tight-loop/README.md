@@ -1,8 +1,10 @@
 # Too-Tight Loop
 
 This common-mistake example puts a real-time `play` packet in a compact loop
-without enough Q1 issue slack. The program is intentionally tiny so the timeline
-focuses on the missing wait budget rather than on experiment logic.
+without enough Q1 issue slack. Its 8192 iterations each include 64 Q1 `nop`
+instructions after a 4 ns `play`. The sustained supply shortage exceeds both the
+assumed 1 ms initial buffer and the tentative 2 ms scenario, so an underflow warning
+remains visible. These buffer values are model assumptions, not measurements.
 
 Inspect:
 

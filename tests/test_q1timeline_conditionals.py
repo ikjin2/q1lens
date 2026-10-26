@@ -111,12 +111,12 @@ def test_queue_analysis_stops_at_conditional_rt_boundary() -> None:
 
 
 def test_conditional_boundary_does_not_hide_a_proven_earlier_queue_failure() -> None:
-    state = analyze("wait_sync 4\n" + "nop\nnop\nwait 4\n" * 100
-                    + "set_cond 1,1,0,20\nplay 0,1,40\nstop")
+    prefix = "wait_sync 4\nmove 8192,R0\nbody: wait 4\n" + "nop\n" * 64 + "loop R0,@body\n"
+    state = analyze(prefix + "set_cond 1,1,0,20\nplay 0,1,40\nstop")
 
     assert analyze_underflow(state).status == "definite_underflow"
     warning, = [event for event in state.events if event.kind == "underflow_warning"]
-    assert warning.source.line < 302
+    assert warning.source.line < len(prefix.splitlines()) + 1
 
 
 def test_enabled_condition_stays_an_explicit_concrete_execution_boundary() -> None:

@@ -26,6 +26,26 @@ function fixture() {
 }
 
 describe("q1timeline diagnostic underlines", () => {
+  it("publishes source validation and lint messages before a program runs", () => {
+    const { manager, published } = fixture();
+    const cases = [
+      ["syntax_error", "error", 0], ["invalid_argument_type", "error", 0],
+      ["unused_definition", "hint", 3], ["unreachable_code", "warning", 1],
+      ["missing_stop", "warning", 1], ["overwritten_register", "warning", 1],
+      ["template_expression_syntax", "warning", 1],
+    ] as const;
+    manager.apply(cases.map(([category, severity], index) => ({
+      category, severity, message: category,
+      source: { file: "/project/seq.q1asm", line: index + 1, column: 1 },
+    })));
+    assert.equal(published[0].length, cases.length);
+    for (const [index, diagnostic] of published[0].entries()) {
+      assert.equal(diagnostic.code, cases[index][0]);
+      assert.equal(diagnostic.severity, cases[index][2]);
+      assert.deepEqual(diagnostic.range, new Range(index, 0, index, Number.MAX_SAFE_INTEGER));
+    }
+  });
+
   it("highlights the complete instruction line for every severity", () => {
     const { manager, published } = fixture();
     manager.apply(["error", "warning", "information", "hint"].map((severity) => ({

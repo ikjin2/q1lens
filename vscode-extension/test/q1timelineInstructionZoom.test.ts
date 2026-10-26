@@ -51,6 +51,7 @@ function loadInstructionRuntime(options: { count?: number; clientWidth?: number;
     let stage = createStage(count);
     let instructionView = { cellWidth: 112, leftOrdinal: 0 };
     let timelineLayout = "instruction", timelineTimeBasis = "local", sharedTimelineActive = false;
+    let activeTimelineControlChip, rtDetailsByEvent = new Map();
     let selectedTimelineEventId = "rt-4";
     const selectedSourceEventIds = new Set(["rt-4", "q1-9"]);
     const expandedQ1IssueSequencers = new Set();
@@ -62,7 +63,7 @@ function loadInstructionRuntime(options: { count?: number; clientWidth?: number;
     })).concat(Array.from({ length: Math.ceil(count / 2) }, (_, index) => ({
       id: "q1-" + index, kind: "q1_issue", sequencer_id: "Control", t0: index * 4, t1: (index + 1) * 4,
     }))) };
-    const root = { querySelector: selector => selector === ".shared-timeline-stage" ? stage : undefined };
+    const root = { querySelector: selector => selector === ".shared-timeline-stage" ? stage : undefined, querySelectorAll: () => [] };
     const document = { getElementById: id => id === "timeline-root" ? root : undefined };
     const window = { q1timelineTimelineAdapter: adapter, q1lensSharedTimeline: {
       renderTimeline(_root, model) {

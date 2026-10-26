@@ -40,3 +40,4 @@ class Program:
     labels: dict[str, int] = field(default_factory=dict)
     instructions: list[Instr] = field(default_factory=list)
     diagnostics: list[Diagnostic] = field(default_factory=list)
+    def_sources: dict[str, SourceLocation] = field(default_factory=dict)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -75,6 +76,19 @@ def _analyze_project(project_file: Path, tmp_path: Path) -> dict:
     return json.loads(out_file.read_text(encoding="utf-8"))
 
 
+@pytest.fixture(scope="module")
+def analyze_tutorial(tmp_path_factory: pytest.TempPathFactory) -> Callable[[Path], dict]:
+    out_dir = tmp_path_factory.mktemp("q1asm-tutorials")
+    results: dict[Path, dict] = {}
+
+    def analyze(project_file: Path) -> dict:
+        if project_file not in results:
+            results[project_file] = _analyze_project(project_file, out_dir)
+        return results[project_file]
+
+    return analyze
+
+
 def test_q1asm_tutorial_corpus_has_expected_first_batch() -> None:
     projects = _tutorial_projects()
 
@@ -100,17 +114,17 @@ def test_q1asm_tutorial_corpus_has_expected_first_batch() -> None:
 
 
 @pytest.mark.parametrize("project_file", _tutorial_projects(), ids=lambda path: str(path.parent.relative_to(ROOT)))
-def test_q1asm_tutorial_projects_analyze(project_file: Path, tmp_path: Path) -> None:
-    ir = _analyze_project(project_file, tmp_path)
+def test_q1asm_tutorial_projects_analyze(project_file: Path, analyze_tutorial: Callable[[Path], dict]) -> None:
+    ir = analyze_tutorial(project_file)
 
     assert ir["events"]
     assert ir["sequencers"]
 
 
-def test_q1asm_tutorials_include_expected_teaching_signals(tmp_path: Path) -> None:
+def test_q1asm_tutorials_include_expected_teaching_signals(analyze_tutorial: Callable[[Path], dict]) -> None:
     signals: dict[str, set[str]] = {}
     for project_file in _tutorial_projects():
-        ir = _analyze_project(project_file, tmp_path)
+        ir = analyze_tutorial(project_file)
         key = str(project_file.parent.relative_to(ROOT)).replace("\\", "/")
         signals[key] = {
             *(event.get("kind", "") for event in ir.get("events", [])),
@@ -205,8 +219,8 @@ def test_q1asm_tutorial_readme_commands_work_from_workspace_root(tmp_path: Path)
         os.chdir(old_cwd)
 
 
-def test_linq_throughput_simulator_exposes_feedback_pressure(tmp_path: Path) -> None:
-    ir = _analyze_project(ROOT / "12-feedback-patterns/39-linq-throughput-simulator/q1timeline.yml", tmp_path)
+def test_linq_throughput_simulator_exposes_feedback_pressure(analyze_tutorial: Callable[[Path], dict]) -> None:
+    ir = analyze_tutorial(ROOT / "12-feedback-patterns/39-linq-throughput-simulator/q1timeline.yml")
 
     channels = ir["feedback_balance"]["channels"]
     diagnostics = {diagnostic["category"] for diagnostic in ir["diagnostics"]}
@@ -222,8 +236,8 @@ def test_linq_throughput_simulator_exposes_feedback_pressure(tmp_path: Path) -> 
     assert "feedback_latency_violation" in diagnostics
 
 
-def test_threshold_pull_router_uses_fb_pull_data_for_threshold_result(tmp_path: Path) -> None:
-    ir = _analyze_project(ROOT / "13-hardware-patterns/47-qcm-qrm-threshold-pull-router/q1timeline.yml", tmp_path)
+def test_threshold_pull_router_uses_fb_pull_data_for_threshold_result(analyze_tutorial: Callable[[Path], dict]) -> None:
+    ir = analyze_tutorial(ROOT / "13-hardware-patterns/47-qcm-qrm-threshold-pull-router/q1timeline.yml")
 
     flows = ir["feedback_flows"]
     diagnostics = {diagnostic["category"] for diagnostic in ir["diagnostics"]}
@@ -246,8 +260,8 @@ def test_threshold_pull_router_uses_fb_pull_data_for_threshold_result(tmp_path: 
     assert "feedback_latency_violation" not in diagnostics
 
 
-def test_iq_pull_router_uses_fb_pull_data_for_iq_values(tmp_path: Path) -> None:
-    ir = _analyze_project(ROOT / "13-hardware-patterns/48-qcm-qrm-iq-pull-router/q1timeline.yml", tmp_path)
+def test_iq_pull_router_uses_fb_pull_data_for_iq_values(analyze_tutorial: Callable[[Path], dict]) -> None:
+    ir = analyze_tutorial(ROOT / "13-hardware-patterns/48-qcm-qrm-iq-pull-router/q1timeline.yml")
 
     flows = ir["feedback_flows"]
     diagnostics = {diagnostic["category"] for diagnostic in ir["diagnostics"]}
@@ -276,9 +290,9 @@ def test_feedback_channel_imbalance_reports_warning_diagnostic(
     project: str,
     channel: str,
     status: str,
-    tmp_path: Path,
+    analyze_tutorial: Callable[[Path], dict],
 ) -> None:
-    ir = _analyze_project(ROOT / project / "q1timeline.yml", tmp_path)
+    ir = analyze_tutorial(ROOT / project / "q1timeline.yml")
 
     diagnostics = ir["diagnostics"]
     fifo_diagnostic = next(

@@ -30,6 +30,7 @@ from q1timeline.q1asm.instruction_table import (
     get_instruction_spec,
     rt_duration_arg_for_instruction,
 )
+from q1timeline.q1asm.lint import analyze_program_lints
 
 
 Confidence = Literal["exact", "symbolic", "assumed", "unknown", "runtime_dependent"]
@@ -161,6 +162,7 @@ class AnalysisState:
     strict_q1asm: bool = False
     execution_mode: Literal["analysis", "concrete"] = "analysis"
     has_expanded_instructions: bool = False
+    static_diagnostics: list[Diagnostic] = field(default_factory=list)
 
 
 def interpret_program(
@@ -200,9 +202,10 @@ def interpret_program(
     raw_params = params or {}
     symbols = symbol_table_from_params(raw_params)
     value_defs = {name: arg for name, arg in program.defs.items() if arg.kind != "reg"}
-    resolved_defs = resolve_def_values(value_defs, symbols, state.diagnostics)
+    resolved_defs = resolve_def_values(value_defs, symbols, state.diagnostics, labels=program.labels)
     state.symbol_origins = _symbol_origins(raw_params, symbols, value_defs, resolved_defs)
     symbols.update(resolved_defs)
+    _diagnose_program(state, symbols, program)
 
     state.pc = 0
     if execution_mode == "concrete":
@@ -250,9 +253,10 @@ def _run_concrete_program(
         instruction.op in {"loop", "jlt"} or (instruction.op == "jge" and len(instruction.args) == 3)
         for instruction in state.instructions_by_pc.values()
     )
-    errors = [diagnostic for diagnostic in state.diagnostics if diagnostic.severity == "error" and diagnostic.category != "unresolved_symbol"]
+    errors = [diagnostic for diagnostic in state.diagnostics if diagnostic.severity == "error"]
     if errors:
-        _end_concrete_execution(state, "error", errors[0].message)
+        status = "error" if any(item.category != "unresolved_symbol" for item in errors) else "blocked"
+        _end_concrete_execution(state, status, errors[0].message)
         return
     while not state.stopped:
         _apply_ready_register_writes(state)
@@ -265,10 +269,6 @@ def _run_concrete_program(
             break
         state.next_pc = state.pc + 1
         scope = _scope(symbols, state)
-        reads = {
-            register: value_to_json(resolve_arg_value(Arg("reg", register, register), scope))
-            for _, register in _register_read_operands(instruction, state)
-        }
         flags_before = dict(state.alu_flags) if state.alu_flags is not None else None
         event_start = len(state.events)
         state.current_resolved_args = _resolved_args_for_instruction(instruction, scope, state)
@@ -281,7 +281,7 @@ def _run_concrete_program(
         for event in state.events[event_start:]:
             if event.kind == "q1_issue":
                 event.meta.update(
-                    source_pc=instruction.pc, execution_index=execution["steps"], register_reads=reads,
+                    source_pc=instruction.pc, execution_index=execution["steps"],
                     flags_before=flags_before,
                     flags_after=dict(state.alu_flags) if state.alu_flags is not None else None,
                 )
@@ -309,8 +309,8 @@ def _concrete_instruction_ready(
         return False
     target_index = (1 if instruction.op == "loop" else 2 if len(instruction.args) == 3 else 0) if spec.category == "branch" else None
     if state.has_expanded_instructions:
-        uses_numeric_target = target_index is not None and instruction.args[target_index].kind != "label"
-        uses_label_value = any(arg.kind == "label" and index != target_index for index, arg in enumerate(instruction.args))
+        uses_numeric_target = target_index is not None and _branch_target_arg(instruction.args[target_index], state, symbols).kind != "label"
+        uses_label_value = any(_branch_target_arg(arg, state, symbols).kind == "label" and index != target_index for index, arg in enumerate(instruction.args))
         if uses_numeric_target or uses_label_value:
             _end_concrete_execution(
                 state, "blocked",
@@ -482,6 +482,31 @@ def _arg_symbol_lookup_names(arg: Arg) -> list[str]:
     return [name]
 
 
+def _diagnose_program(state: AnalysisState, symbols: SymbolTable, program: Program) -> None:
+    # Reuse operand rules without inventing runtime register values or readiness.
+    probe = AnalysisState(
+        sequencer_id=state.sequencer_id,
+        labels=state.labels,
+        instructions_by_pc=state.instructions_by_pc,
+        register_aliases=state.register_aliases,
+        symbol_origins=state.symbol_origins,
+        strict_q1asm=state.strict_q1asm,
+        execution_mode="concrete",
+    )
+    for instruction in state.instructions_by_pc.values():
+        _validate_instruction(probe, instruction, symbols)
+    state.static_diagnostics = [item for item in probe.diagnostics if item.severity == "error"]
+    if not state.strict_q1asm:
+        scope = _scope(symbols, probe)
+        for instruction in program.instructions:
+            for arg in instruction.args:
+                if (arg.kind == "symbol" and not str(arg.value).startswith("$")
+                        and not _is_bare_defined_symbol(arg, probe)):
+                    resolve_arg_value(arg, scope, state.static_diagnostics, required=True, source=instruction.source)
+    state.diagnostics.extend(state.static_diagnostics)
+    state.diagnostics.extend(analyze_program_lints(program, known_parameters=symbols))
+
+
 def _validate_instruction(
     state: AnalysisState,
     instruction: Instr,
@@ -499,6 +524,7 @@ def _validate_instruction(
     has_invalid_bare_def_operands = _diagnose_bare_def_symbol_operands(state, instruction)
     has_unresolved_dollar_symbols = _diagnose_unresolved_dollar_symbol_operands(state, instruction)
     has_unresolved_strict_symbols = _diagnose_strict_q1asm_unresolved_operands(state, instruction, symbols)
+    has_undefined_labels = _diagnose_undefined_label_operands(state, instruction, symbols)
     if not has_raw_invalid_arguments:
         _diagnose_resolved_argument_types(state, instruction, spec, symbols)
     _diagnose_unresolved_register_operands(state, instruction, spec)
@@ -507,6 +533,8 @@ def _validate_instruction(
         diagnostic.category in {"invalid_argument_count", "invalid_argument_type"}
         for diagnostic in state.diagnostics[diagnostic_start:]
     ) or has_invalid_register_operands or has_invalid_bare_def_operands or has_unresolved_dollar_symbols or has_unresolved_strict_symbols
+    if has_undefined_labels and (state.execution_mode != "analysis" or spec.category != "branch"):
+        has_invalid_arguments = True
     has_invalid_arguments = _diagnose_negative_rt_duration_operand(
         state,
         instruction,
@@ -530,7 +558,37 @@ def _validate_instruction(
         symbols,
     ) or has_invalid_arguments
 
+    if state.static_diagnostics:
+        state.diagnostics[diagnostic_start:] = [
+            item for item in state.diagnostics[diagnostic_start:]
+            if item not in state.static_diagnostics
+        ]
     return spec, has_invalid_arguments, diagnostic_start
+
+
+def _diagnose_undefined_label_operands(
+    state: AnalysisState, instruction: Instr, symbols: SymbolTable,
+) -> bool:
+    missing_labels: set[str] = set()
+    target_index = None
+    if get_instruction_spec(instruction.op).category == "branch":
+        target_index = 1 if instruction.op == "loop" else 2 if len(instruction.args) == 3 else 0
+    for index, arg in enumerate(instruction.args):
+        if _register_name(arg, state) is not None:
+            continue
+        resolved = _branch_target_arg(arg, state, symbols)
+        if resolved.kind == "label" and str(resolved.value) not in state.labels:
+            missing_labels.add(str(resolved.value))
+        elif (resolved.kind == "label" and index == target_index
+              and state.labels[str(resolved.value)] not in state.instructions_by_pc):
+            state.diagnostics.append(Diagnostic(
+                severity="error", category="invalid_argument_value",
+                message=f"Branch label @{resolved.value} does not point to an instruction.",
+                source=instruction.source, details={"op": instruction.op, "label": str(resolved.value)},
+            ))
+    for label in sorted(missing_labels):
+        _emit_undefined_label(state, instruction, label)
+    return bool(missing_labels)
 
 
 def _execute_instruction(
@@ -542,6 +600,7 @@ def _execute_instruction(
     *,
     allow_symbolic_operands: bool = False,
 ) -> None:
+    register_metadata = _register_issue_metadata(state, instruction, _scope(symbols, state))
     spec, has_invalid_arguments, diagnostic_start = _validate_instruction(state, instruction, symbols)
 
     if state.execution_mode == "concrete" and not _concrete_instruction_ready(
@@ -558,23 +617,23 @@ def _execute_instruction(
 
     rt_packet_id: str | None = None
     if has_invalid_arguments:
-        _emit_q1_issue(state, instruction, q1_t0, q1_t1, rt_packet_id)
+        _emit_q1_issue(state, instruction, q1_t0, q1_t1, rt_packet_id, register_metadata=register_metadata)
         return
 
     _diagnose_analysis_incomplete_timing_effect(state, instruction, spec, symbols)
 
     if spec.category == "unknown":
-        _emit_q1_issue(state, instruction, q1_t0, q1_t1, rt_packet_id)
+        _emit_q1_issue(state, instruction, q1_t0, q1_t1, rt_packet_id, register_metadata=register_metadata)
         return
 
     if spec.category == "classical":
         _execute_classical(state, instruction, symbols)
-        _emit_q1_issue(state, instruction, q1_t0, q1_t1, rt_packet_id)
+        _emit_q1_issue(state, instruction, q1_t0, q1_t1, rt_packet_id, register_metadata=register_metadata)
         return
 
     if spec.category == "latched":
         pending_event = _execute_latched(state, instruction, symbols)
-        q1_issue_event = _emit_q1_issue(state, instruction, q1_t0, q1_t1, rt_packet_id)
+        q1_issue_event = _emit_q1_issue(state, instruction, q1_t0, q1_t1, rt_packet_id, register_metadata=register_metadata)
         if pending_event is not None:
             pending_event.meta["q1_issue_event_id"] = q1_issue_event.id
             if instruction.op == "set_cond":
@@ -583,12 +642,12 @@ def _execute_instruction(
 
     if spec.category == "feedback":
         _execute_feedback_register_write(state, instruction, symbols)
-        q1_issue_event = _emit_q1_issue(state, instruction, q1_t0, q1_t1, rt_packet_id)
+        q1_issue_event = _emit_q1_issue(state, instruction, q1_t0, q1_t1, rt_packet_id, register_metadata=register_metadata)
         _emit_feedback_annotation(state, instruction, q1_issue_event, symbols)
         return
 
     if instruction.op in {"stop", "illegal"}:
-        _emit_q1_issue(state, instruction, q1_t0, q1_t1, rt_packet_id)
+        _emit_q1_issue(state, instruction, q1_t0, q1_t1, rt_packet_id, register_metadata=register_metadata)
         if instruction.op == "illegal":
             state.diagnostics.append(
                 Diagnostic(
@@ -616,7 +675,7 @@ def _execute_instruction(
 
     if spec.emits_rt_packet:
         rt_packet_id = f"{state.sequencer_id}:p{len(state.rt_packets)}"
-    q1_issue_event = _emit_q1_issue(state, instruction, q1_t0, q1_t1, rt_packet_id)
+    q1_issue_event = _emit_q1_issue(state, instruction, q1_t0, q1_t1, rt_packet_id, register_metadata=register_metadata)
 
     if spec.category == "branch":
         if state.execution_mode == "concrete":
@@ -1076,6 +1135,18 @@ def _register_read_operands(instruction: Instr, state: AnalysisState) -> list[tu
     return reads
 
 
+def _register_issue_metadata(state: AnalysisState, instruction: Instr, scope: SymbolTable) -> dict[str, Any]:
+    reads = {
+        register: value_to_json(resolve_arg_value(Arg("reg", register, register), scope))
+        for _, register in _register_read_operands(instruction, state)
+    }
+    # Keep values that the preceding RT command did not itself read, so first
+    # displaying a register does not falsely imply that its value just changed.
+    snapshot = {register: value_to_json(value) for register, value in state.registers.items()}
+    snapshot.update(reads)
+    return {"register_reads": reads, "register_snapshot": snapshot}
+
+
 def _register_write_operands(instruction: Instr, state: AnalysisState) -> set[str]:
     writes: set[str] = set()
     for index in _register_destination_argument_indexes(instruction.op):
@@ -1391,7 +1462,7 @@ def _diagnose_official_operand_ranges(
     instruction: Instr,
     symbols: SymbolTable,
 ) -> bool:
-    if _is_packed_feedback_register_form(instruction):
+    if _is_packed_feedback_register_form(instruction, state):
         return False
     emitted = False
     scope = _scope(symbols, state)
@@ -1410,8 +1481,6 @@ def _diagnose_official_operand_ranges(
         else:
             value = resolve_arg_value(arg, scope)
         if not isinstance(value, Concrete):
-            continue
-        if value.value < lower and _range_lower_bound_is_validated_elsewhere(instruction.op, operand_role):
             continue
         if lower <= value.value <= upper:
             continue
@@ -1440,21 +1509,12 @@ def _diagnose_official_operand_ranges(
     return emitted
 
 
-def _is_packed_feedback_register_form(instruction: Instr) -> bool:
+def _is_packed_feedback_register_form(instruction: Instr, state: AnalysisState) -> bool:
     return (
         instruction.op in {"fb_com_cfg", "fb_acq_tb_cfg", "fb_com_extra", "fb_acq_tb_extra", "fb_acq_tb_mock"}
         and len(instruction.args) == 2
-        and instruction.args[0].kind == "reg"
+        and _register_name(instruction.args[0], state) is not None
     )
-
-
-def _range_lower_bound_is_validated_elsewhere(op: str, operand_role: str) -> bool:
-    return (op, operand_role) in {
-        ("fb_com_cfg", "bit_position"),
-        ("fb_com_cfg", "payload_length"),
-        ("fb_acq_tb_cfg", "bit_position"),
-        ("fb_acq_tb_cfg", "payload_length"),
-    }
 
 
 def _official_operand_ranges(op: str, argument_count: int = 1) -> list[tuple[int, str, int, int]]:
@@ -1466,6 +1526,12 @@ def _official_operand_ranges(op: str, argument_count: int = 1) -> list[tuple[int
     feedback_idx = (0, 255)
     if op == "stop":
         return [(0, "stop_status", *signed_32)]
+    if op == "sw_req":
+        return [(0, "software_request", *signed_32)]
+    if op == "play_pulse":
+        return [(0, "fine_output_delay", 0, 2047)]
+    if op == "play_netzero":
+        return [(0, "maximum_compensation_length", 0, 0xFFFFFFFF)]
     if op == "set_mrk":
         return [(0, "marker", 0, 15)]
     if op == "set_awg_gain":
@@ -1520,11 +1586,13 @@ def _official_operand_ranges(op: str, argument_count: int = 1) -> list[tuple[int
             (3, "tag_index", 0, 2047),
         ]
     if op == "fb_pop_data":
-        return [(0, "feedback_pop_tag", 0, 255)]
-    if op in {"fb_com_data", "fb_cmd"}:
-        return [(0, "feedback_channel", *feedback_idx)]
+        return [(0, "feedback_pop_tag", 0, 65535)]
+    if op == "fb_cmd":
+        return [(0, "feedback_channel", 0, 511), (1, "feedback_source", 0, 0xFFFFFFFF)]
+    if op == "fb_com_data":
+        return [(0, "feedback_channel", *feedback_idx), (1, "feedback_source", 0, 0xFFFFFFFF)]
     if op in {"fb_com_cfg", "fb_acq_tb_cfg"}:
-        return [(0, "write_combine_flag", 0, 1), (1, "bit_position", 0, 511), (2, "payload_length", 0, 63)]
+        return [(0, "write_combine_flag", 0, 3), (1, "bit_position", 0, 1023), (2, "payload_length", 0, 127)]
     if op in {"fb_com_extra", "fb_acq_tb_extra"}:
         return [(0, "enable_flag", 0, 1), (1, "extra_payload_bytes", 0, 65535)]
     if op in {"fb_acq_iq_id", "fb_acq_tb_id"}:
@@ -1568,7 +1636,7 @@ def _official_operand_ranges(op: str, argument_count: int = 1) -> list[tuple[int
         return [(0, "unsigned_16_immediate", 0, 0xFFFF), (1, "unsigned_16_immediate", 0, 0xFFFF)]
     if op == "muls16":
         return [(0, "signed_16_immediate", -32768, 32767), (1, "signed_16_immediate", -32768, 32767)]
-    if op in {"mulu32l", "mulu32h"}:
+    if op in {"mulu32", "mulu32l", "mulu32h"}:
         return [(0, "unsigned_32_immediate", 0, 0xFFFFFFFF), (1, "unsigned_32_immediate", 0, 0xFFFFFFFF)]
     if op in {"muls32", "muls32l", "muls32h"}:
         return [
@@ -1718,6 +1786,11 @@ def _resolved_branch_target_arg(arg: Arg, value: Value) -> Arg | None:
 def _branch_target_arg(arg: Arg, state: AnalysisState, symbols: SymbolTable) -> Arg:
     if arg.kind in {"label", "imm"}:
         return arg
+    if arg.kind == "symbol" and str(arg.value).startswith("$"):
+        origin = state.symbol_origins.get("defs", {}).get(str(arg.value)[1:], {})
+        raw = origin.get("raw", "")
+        if raw.startswith("@"):
+            return Arg(kind="label", value=raw[1:], raw=arg.raw)
     scope = _scope(symbols, state)
     if arg.kind == "reg":
         return _resolved_branch_target_arg(arg, resolve_arg_value(arg, scope)) or arg
@@ -3204,15 +3277,15 @@ def _record_branch_assumption(
 
 
 def _emit_undefined_label(state: AnalysisState, instruction: Instr, target_label: str) -> None:
-    state.diagnostics.append(
-        Diagnostic(
-            severity="error",
-            category="undefined_label",
-            message=f"Undefined label: @{target_label}",
-            source=instruction.source,
-            details={"label": target_label, "op": instruction.op},
-        )
+    diagnostic = Diagnostic(
+        severity="error",
+        category="undefined_label",
+        message=f"Undefined label: @{target_label}",
+        source=instruction.source,
+        details={"label": target_label, "op": instruction.op},
     )
+    if diagnostic not in state.static_diagnostics:
+        state.diagnostics.append(diagnostic)
 
 
 def _emit_compact_loop(
@@ -3271,6 +3344,21 @@ def _emit_compact_loop(
                 body_counter = _register_name(body_instruction.args[0], state)
                 if body_counter is not None:
                     written_registers.add(body_counter)
+    preview_by_id = {event.id: event for event in preview_events}
+    uncertain_setters = {
+        event.id for event in preview_events
+        if event.kind == "latched_state_pending"
+        and written_registers.intersection(
+            preview_by_id.get(event.meta.get("q1_issue_event_id"), event).meta.get("register_reads", {})
+        )
+    }
+    last_applied_setters = {
+        field: setter_id for event in preview_events
+        for field, setter_id in event.meta.get("applied_setter_event_ids", {}).items()
+    }
+    uncertain_latched_fields = sorted(
+        field for field, setter_id in last_applied_setters.items() if setter_id in uncertain_setters
+    )
     condition_setters = [item for item in body_instructions if item.op == "set_cond" and item.args]
     condition_varies = bool(condition_setters and _register_name(condition_setters[-1].args[0], state) in written_registers)
     conditional_loop_timing_unknown = False
@@ -3346,6 +3434,8 @@ def _emit_compact_loop(
             "loop_q1_jump_runtime_ns": loop_q1_jump_runtime_ns,
             "loop_q1_continue_runtime_ns": loop_q1_continue_runtime_ns,
             "loop_q1_first_edge_runtime_ns": first_loop_edge_runtime_ns,
+            "uncertain_registers": sorted(written_registers),
+            "uncertain_latched_fields": uncertain_latched_fields,
             "source_start": _source_to_json(start_instruction.source),
             "source_end": _source_to_json(instruction.source),
             "first_iteration_event_ids": preview_ids,
@@ -3393,6 +3483,7 @@ def _emit_compact_loop(
             q1_period=q1_period,
             preview_policy=preview_policy,
             shown_iterations=shown_iterations,
+            written_registers=written_registers,
         )
         shifted_ids = [event.id for event in shifted_events]
         preview_iteration_event_ids[str(iteration_index)] = shifted_ids
@@ -3440,6 +3531,13 @@ def _emit_compact_loop(
         for register in written_registers:
             state.registers[register] = Unknown(reason)
             state.register_provenance.pop(register, None)
+        last_setters = {event.meta["field"]: event.id for event in preview_events if event.kind == "latched_state_pending"}
+        for field, setter_id in last_setters.items():
+            if setter_id not in uncertain_setters or not hasattr(state.latched_state, field):
+                continue
+            value = getattr(state.latched_state, field)
+            unknown = Unknown(f"{field} in compact loop {loop_id} is not evaluated")
+            setattr(state.latched_state, field, tuple(unknown for _ in value) if isinstance(value, tuple) else unknown)
         if condition_varies:
             state.conditional_enable = Unknown(reason)
     if not forever:
@@ -3527,12 +3625,22 @@ def _materialize_loop_iteration_preview(
     q1_period: Value,
     preview_policy: str,
     shown_iterations: list[int],
+    written_registers: set[str],
 ) -> list[TimelineEvent]:
     shifted_events: list[TimelineEvent] = []
     event_ids = {event.id: f"{event.id}:loop-{loop_id}-iter-{iteration_index}" for event in preview_events}
     for event in preview_events:
         period = q1_period if event.kind == "q1_issue" else rt_period
         meta = dict(event.meta)
+        # Later static previews copy timing without executing register writes.
+        # Stable operands remain useful; changing operands have no known value.
+        for key in ("register_reads", "register_snapshot"):
+            if key in meta:
+                meta[key] = {
+                    register: value_to_json(Unknown(f"{register} in compact loop {loop_id} iteration {iteration_index} is not evaluated"))
+                    if register in written_registers else value
+                    for register, value in meta[key].items()
+                }
         _remap_latched_event_ids(meta, event_ids)
         meta["loop_id"] = loop_id
         meta["loop_preview"] = loop_id
@@ -4125,8 +4233,7 @@ def _emit_play_events(
         waveform_index = _arg_int(arg, scope)
         if waveform_index is None:
             _diagnose_unresolved_index_operand(state, instruction, arg, arg_index, "waveform_index")
-            continue
-        if waveform_index < 0:
+        if waveform_index is not None and waveform_index < 0:
             continue
         meta = {"waveform_index": waveform_index, "path": path, "rt_packet_id": packet_id}
         if applied_state:
@@ -4138,7 +4245,7 @@ def _emit_play_events(
             t0=t0,
             t1=t1,
             duration=duration,
-            label=waveform_names.get(waveform_index, f"wf#{waveform_index}"),
+            label=waveform_names.get(waveform_index, f"wf#{waveform_index}") if waveform_index is not None else "wf#?",
             confidence=_confidence_for_timing(duration, t0, t1),
             source=instruction.source,
             meta=meta,
@@ -4219,21 +4326,26 @@ def _diagnose_unresolved_index_operand(
     if arg.kind not in {"symbol", "placeholder"}:
         return False
     symbol = _arg_symbol_lookup_names(arg)[0]
-    state.diagnostics.append(
-        Diagnostic(
-            severity="warning",
-            category="unresolved_symbol",
-            message=f"{operand_role.replace('_', ' ')} must resolve to a concrete integer: {arg.raw}",
-            source=instruction.source,
-            details={
-                "symbol": symbol,
-                "operand": arg.raw,
-                "operand_index": operand_index,
-                "operand_role": operand_role,
-                "op": instruction.op,
-            },
-        )
+    diagnostic = Diagnostic(
+        severity="warning",
+        category="unresolved_symbol",
+        message=f"{operand_role.replace('_', ' ')} must resolve to a concrete integer: {arg.raw}",
+        source=instruction.source,
+        details={
+            "symbol": symbol,
+            "operand": arg.raw,
+            "operand_index": operand_index,
+            "operand_role": operand_role,
+            "op": instruction.op,
+        },
     )
+    for index, existing in enumerate(state.diagnostics):
+        if (existing.category == "unresolved_symbol" and existing.severity == "warning"
+                and existing.source == instruction.source and existing.details == {"symbol": symbol}):
+            state.diagnostics[index] = diagnostic
+            return True
+    if diagnostic not in state.diagnostics:
+        state.diagnostics.append(diagnostic)
     return True
 
 
@@ -4345,11 +4457,14 @@ def _emit_q1_issue(
     q1_t0: Value,
     q1_t1: Value,
     rt_packet_id: str | None,
+    *,
+    register_metadata: dict[str, Any] | None = None,
 ) -> TimelineEvent:
     meta: dict[str, Any] = {
         "op": instruction.op,
         "emits_rt_packet": rt_packet_id is not None,
         "display_modes": ["debug"],
+        **(register_metadata or {}),
     }
     if rt_packet_id is not None:
         meta["rt_packet_id"] = rt_packet_id
@@ -4573,12 +4688,18 @@ def _consume_applied_state(state: AnalysisState) -> dict[str, Any]:
 def _scope(symbols: SymbolTable, state: AnalysisState) -> SymbolTable:
     label_symbols = {f"@{label}": Concrete(pc) for label, pc in state.labels.items()}
     scope = {**symbols, **label_symbols, **state.registers}
+    for name, value in symbols.items():
+        if not name.startswith("$"):
+            scope.setdefault(f"${name}", value)
     if state.execution_mode == "concrete":
         for name in symbols:
             if _is_valid_register_arg(Arg("reg", name, name)):
                 scope[name] = state.registers.get(name, Unknown(name))
     for alias, register in state.register_aliases.items():
-        scope[alias] = state.registers.get(register, Unknown(register))
+        value = state.registers.get(register, Unknown(register))
+        scope[f"${alias}"] = value
+        if not _is_valid_register_arg(Arg("reg", alias, alias)):
+            scope[alias] = value
     return scope
 
 

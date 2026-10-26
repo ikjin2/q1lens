@@ -10,6 +10,11 @@ Severity = Literal["error", "warning", "info", "hint"]
 SEVERITIES: tuple[Severity, ...] = ("error", "warning", "info", "hint")
 DIAGNOSTICS_SCHEMA_VERSION = "0.1.0"
 REQUIRED_DIAGNOSTIC_CATEGORIES = {
+    "unused_definition",
+    "unreachable_code",
+    "missing_stop",
+    "overwritten_register",
+    "template_expression_syntax",
     "syntax_error",
     "unknown_instruction",
     "unsupported_instruction",

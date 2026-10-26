@@ -75,7 +75,7 @@
 
     .stats {
       display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
+      grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 12px;
       margin: 30px 0 0;
     }
@@ -390,14 +390,11 @@
         not claim a real LINQ throughput number.
       </p>
       <p class="subtitle">
-        The analyzed shape contains 17 sequencers, 874 timeline events, and
-        27 feedback flows.
+        The demo connects 17 sequencers through 27 feedback flows.
       </p>
       <div class="stats" aria-label="Demo size">
         <div class="stat"><strong>17</strong><span>sequencers</span></div>
-        <div class="stat"><strong>874</strong><span>timeline events</span></div>
         <div class="stat"><strong>27</strong><span>feedback flows</span></div>
-        <div class="stat"><strong>18</strong><span>intentional warnings</span></div>
       </div>
     </div>
   </header>

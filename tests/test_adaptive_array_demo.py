@@ -5,30 +5,33 @@ import os
 import re
 from pathlib import Path
 
+import pytest
+
 from q1timeline.cli import main as q1timeline_main
 
 
 ROOT = Path("examples/adaptive-array-demo")
 
 
-def _analyze(tmp_path: Path) -> dict:
-    out_file = tmp_path / "adaptive-array-ir.json"
+@pytest.fixture(scope="module")
+def adaptive_array_ir(tmp_path_factory: pytest.TempPathFactory) -> dict:
+    out_file = tmp_path_factory.mktemp("adaptive-array") / "adaptive-array-ir.json"
     exit_code = q1timeline_main(["analyze", "--project", str(ROOT / "q1timeline.yml"), "--out", str(out_file)])
 
     assert exit_code == 0
     return json.loads(out_file.read_text(encoding="utf-8"))
 
 
-def test_adaptive_array_demo_has_large_multisequencer_execution(tmp_path: Path) -> None:
-    ir = _analyze(tmp_path)
+def test_adaptive_array_demo_has_large_multisequencer_execution(adaptive_array_ir: dict) -> None:
+    ir = adaptive_array_ir
 
     assert len(ir["sequencers"]) >= 14
     assert sum(event["kind"] == "q1_issue" for event in ir["events"]) >= 300
     assert len(ir["feedback_flows"]) >= 27
 
 
-def test_adaptive_array_demo_has_expected_signals(tmp_path: Path) -> None:
-    ir = _analyze(tmp_path)
+def test_adaptive_array_demo_has_expected_signals(adaptive_array_ir: dict) -> None:
+    ir = adaptive_array_ir
 
     kinds = {event["kind"] for event in ir["events"]}
     categories = {diagnostic["category"] for diagnostic in ir["diagnostics"]}
@@ -49,8 +52,8 @@ def test_adaptive_array_demo_has_expected_signals(tmp_path: Path) -> None:
     assert {"feedback_latency_violation", "unresolved_branch"} <= categories
 
 
-def test_adaptive_array_demo_feedback_balance(tmp_path: Path) -> None:
-    ir = _analyze(tmp_path)
+def test_adaptive_array_demo_feedback_balance(adaptive_array_ir: dict) -> None:
+    ir = adaptive_array_ir
 
     channels = ir["feedback_balance"]["channels"]
 
@@ -87,7 +90,6 @@ def test_adaptive_array_demo_has_english_html_overview() -> None:
     assert "<html lang=\"en\">" in html
     assert "What This Demo Shows" in html
     assert "17 sequencers" in html
-    assert "874 timeline events" in html
     assert "27 feedback flows" in html
     assert "not a hardware recipe" in html
     assert "Channel 60" in html

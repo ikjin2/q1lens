@@ -118,17 +118,23 @@ def test_assumed_runtime_branch_marks_the_concrete_path_partial() -> None:
     ]
 
 
-def test_queue_prefill_uncertainty_does_not_change_concrete_dependency_path() -> None:
-    ir = analyze_text("wait_sync 4\nupd_param 4\nnop\nnop\nupd_param 4\nstop\n")
+@pytest.mark.parametrize(
+    "source,duration_ns",
+    [
+        ("wait_sync 4\nupd_param 4\nnop\nnop\nupd_param 4\nstop\n", 12),
+        ("wait 4\n" * 32 + "wait_sync 4\n" + "nop\n" * 64 + "upd_param 4\nstop\n", 136),
+    ],
+)
+def test_assumed_initial_buffer_does_not_change_concrete_dependency_path(
+    source: str, duration_ns: int,
+) -> None:
+    ir = analyze_text(source)
     incomplete = [item for item in ir["diagnostics"] if item["category"] == "analysis_incomplete"]
     incomplete_events = [event for event in ir["events"] if event["kind"] == "analysis_incomplete"]
 
-    assert incomplete and incomplete_events
-    assert all(item["details"]["reason"] == "sync_start_uncertain" for item in incomplete)
-    assert all(item["details"]["analysis_scope"] == "rt_queue" for item in incomplete)
-    assert all(event["meta"]["analysis_scope"] == "rt_queue" for event in incomplete_events)
+    assert not incomplete and not incomplete_events
     assert ir["critical_path"]["status"] == "exact"
-    assert ir["critical_path"]["duration_ns"] == 12
+    assert ir["critical_path"]["duration_ns"] == duration_ns
     assert ir["critical_path"]["reasons"] == []
 
 

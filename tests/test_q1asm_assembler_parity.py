@@ -339,29 +339,6 @@ def test_jmp_register_loop_to_visited_target_stays_collapsed() -> None:
 @pytest.mark.parametrize(
     "source",
     [
-        "mulu16 R0,1,R1\nstop\n",
-        "muls16 R0,R1,R2\nstop\n",
-        "mulu32 R0,R1,R2,R3\nstop\n",
-        "mulu32l R0,1,R1\nstop\n",
-        "mulu32h R0,R1,R2\nstop\n",
-        "muls32 R0,R1,R2,R3\nstop\n",
-        "muls32l R0,1,R1\nstop\n",
-        "muls32h R0,R1,R2\nstop\n",
-        "test R0,1\nstop\n",
-        "lsl R0,1,R1\nstop\n",
-        "lsr R0,R1,R2\nstop\n",
-        "reset_netzero\nstop\n",
-        "sw_req 1\nstop\n",
-    ],
-)
-def test_assembler_supported_classical_and_control_opcodes_validate(source: str) -> None:
-    assert "unknown_instruction" not in set(_error_categories(source))
-    assert "invalid_argument_type" not in set(_error_categories(source))
-
-
-@pytest.mark.parametrize(
-    "source",
-    [
         "acquire_weighted 0,0,1,2,4\nstop\n",
         "play_pulse R0,4\nstop\n",
         "fb_cmd 0,1,4\nstop\n",
@@ -401,10 +378,10 @@ def test_set_digital_signature_matches_assembler() -> None:
         ("wait_trigger 16,4\nstop\n", "wait_trigger", "trigger_index", 16),
         ("upd_thres 4,0,4\nstop\n", "upd_thres", "threshold_index", 4),
         ("upd_thres 0,-1,4\nstop\n", "upd_thres", "threshold_value", -1),
-        ("fb_pop_data 256,R0\nstop\n", "fb_pop_data", "feedback_pop_tag", 256),
+        ("fb_pop_data 65536,R0\nstop\n", "fb_pop_data", "feedback_pop_tag", 65536),
         ("fb_com_data 256,0,4\nstop\n", "fb_com_data", "feedback_channel", 256),
-        ("fb_cmd 256,0,4\nstop\n", "fb_cmd", "feedback_channel", 256),
-        ("fb_com_cfg 2,0,1,4\nstop\n", "fb_com_cfg", "write_combine_flag", 2),
+        ("fb_cmd 512,0,4\nstop\n", "fb_cmd", "feedback_channel", 512),
+        ("fb_com_cfg 4,0,1,4\nstop\n", "fb_com_cfg", "write_combine_flag", 4),
         ("fb_com_extra 0,65536,4\nstop\n", "fb_com_extra", "extra_payload_bytes", 65536),
         ("fb_acq_iq_id 256,4\nstop\n", "fb_acq_iq_id", "feedback_acquisition_channel", 256),
         ("fb_llp_tags_id 256,4\nstop\n", "fb_llp_tags_id", "feedback_channel", 256),

@@ -470,7 +470,7 @@ describe("timeline webview assets", () => {
         },
       ],
     }, { mode: "normal", expandedQ1IssueSequencers: ["seq0"] });
-    assert.equal(expandedModel.lanes.find((lane: any) => lane.kind === "q1-issue").hidden, false);
+    assert.equal(expandedModel.lanes.find((lane: any) => lane.kind === "q1-issue").hidden, true);
   });
 
   it("keeps q1 issue lanes on the actual shared timescale", () => {
@@ -1133,7 +1133,7 @@ describe("timeline webview assets", () => {
     const savedState: Record<string, unknown> = {};
     const filter = { value: "", addEventListener(_type: string, listener: () => void) { onInput = listener; } };
     const stage = { scrollLeft: 0, dataset: {}, querySelectorAll: () => [] };
-    const root = { querySelector: (selector: string) => selector === ".shared-timeline-stage" ? stage : undefined };
+    const root = { querySelector: (selector: string) => selector === ".shared-timeline-stage" ? stage : undefined, querySelectorAll: () => [] };
     const noopNames = [
       "renderTimelineLayoutToggle", "renderTimelineWindowStatus", "renderTimeBasisToggle", "installSharedQ1IssueControls",
       "syncSharedSequencerFoldControls", "installTimelineControlChips", "installTimelineMouseInteractions", "applySharedSelection",
@@ -1141,6 +1141,7 @@ describe("timeline webview assets", () => {
     ];
     const runtime = Function("window", "document", "state", "writePersistedWebviewState", `
       let timelineLayout = "time", timelineTimeBasis = "local", sharedTimelineActive = false;
+      let activeTimelineControlChip, rtDetailsByEvent = new Map();
       let instructionView = { cellWidth: 112, leftOrdinal: 0 }, selectedTimelineEventId = "play";
       const selectedSourceEventIds = new Set(), expandedQ1IssueSequencers = new Set(), expandedPlaybackLoops = new Set();
       const timelineIr = { sequencers: [{ id: "seq" }], events: [
@@ -1296,7 +1297,7 @@ describe("timeline webview assets", () => {
     assert.match(script, /function sharedTimelinePointerAnchorRatio\(event\)/);
     assert.match(script, /installTimelineMouseInteractions\(\)/);
     assert.match(script, /window\.dispatchEvent\(new CustomEvent\("q1timeline:eventClick"/);
-    assert.match(script, /vscode\.postMessage\(\{ type: "eventClick", eventId \}\)/);
+    assert.match(script, /vscode\.postMessage\(\{ type: "eventClick", eventId, \.\.\.\(event\.detail\.preserveFocus \? \{ preserveFocus: true \} : \{\}\) \}\)/);
     assert.match(script, /function eventNodeMatchesId\(node, eventId\)/);
     assert.match(script, /node\.dataset\.eventIds/);
     assert.match(sharedRenderer, /node\.dataset\.eventId = String\(annotation\.eventId/);
@@ -2576,7 +2577,7 @@ describe("timeline webview assets", () => {
     const adapter = require(join(__dirname, "..", "src", "q1timeline", "media", "timelineAdapter.js"));
     let rendered: any;
     const stage = { scrollLeft: 88, dataset: {}, style: { setProperty() {} }, querySelectorAll: () => [] };
-    const root = { querySelector: (selector: string) => selector === ".shared-timeline-stage" ? stage : undefined };
+    const root = { querySelector: (selector: string) => selector === ".shared-timeline-stage" ? stage : undefined, querySelectorAll: () => [] };
     const noopNames = [
       "renderTimelineLayoutToggle", "renderTimelineWindowStatus", "renderTimeBasisToggle", "installSharedQ1IssueControls",
       "syncSharedSequencerFoldControls", "installTimelineControlChips", "installTimelineMouseInteractions", "applySharedSelection",
@@ -2585,6 +2586,7 @@ describe("timeline webview assets", () => {
     ];
     const runtime = Function("window", "document", `
       let timelineLayout = "time", timelineTimeBasis = "local", sharedTimelineActive = false;
+      let activeTimelineControlChip, rtDetailsByEvent = new Map();
       let instructionView = { cellWidth: 112, leftOrdinal: 0 };
       let selectedTimelineEventId;
       const selectedSourceEventIds = new Set(["play-path1"]);
@@ -2611,7 +2613,7 @@ describe("timeline webview assets", () => {
     assert.equal(runtime.render("instruction"), true);
     assert.deepEqual(rendered.viewport, { start: 0, end: 1 });
     assert.equal(rendered.selectionRange, undefined);
-    assert.equal(rendered.lanes.find((lane: any) => lane.kind === "q1-issue").hidden, false);
+    assert.equal(rendered.lanes.find((lane: any) => lane.kind === "q1-issue").hidden, true);
     assert.equal(rendered.lanes.flatMap((lane: any) => lane.blocks).find((block: any) => block.eventIds.includes("play-path1")).selected, true);
     assert.deepEqual(runtime.q1Preference(), []);
     assert.equal(runtime.render("time"), true);

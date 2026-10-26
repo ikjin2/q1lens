@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 from q1timeline.analysis.interpreter import AnalysisState
-from q1timeline.analysis.queue_timing import replay_queues
+from q1timeline.analysis.queue_timing import ASSUMED_INITIAL_BUFFER_NS, POSSIBLE_INITIAL_BUFFER_NS, replay_queues
 from q1timeline.analysis.values import Concrete, Unknown, subtract_values
 from q1timeline.diagnostics import Diagnostic
 
@@ -14,6 +14,7 @@ UnderflowStatus = Literal[
     "possible_underflow",
     "not_detected_under_current_assumptions",
     "analysis_incomplete",
+    "possibly_safe_with_initial_buffer",
 ]
 
 
@@ -36,10 +37,10 @@ def analyze_underflows(
     *,
     queue_depth_limit: int = 32,
 ) -> list[UnderflowResult]:
-    """Compare earliest SYNQ release with maximum finite-FIFO prefetch.
+    """Check assumed 1 ms and tentative 2 ms initial timing reserves.
 
-    A failure in only the earliest case depends on unknown SYNQ dwell, not a
-    proven empty queue. Original Q1/RT coordinates remain presentation data.
+    The reserve is consumed by Q1 supply gaps, not added as RT startup idle.
+    SYNQ dwell remains uncertain; original Q1/RT coordinates stay unchanged.
     """
     prepared = {state.sequencer_id: _queue_packets(state) for state in states}
     streams = {}
@@ -50,12 +51,17 @@ def analyze_underflows(
         boundary = boundary_packet or (packets[-1] if packets else None)
         if reason and boundary is not None:
             streams[name].append(replace(boundary, duration=Unknown(reason)))
-    earliest = replay_queues(streams, queue_depth_limit=queue_depth_limit)
-    prefetched = replay_queues(streams, queue_depth_limit=queue_depth_limit, prefill_sync=True)
+    earliest = replay_queues(streams, queue_depth_limit=queue_depth_limit, initial_buffer_ns=ASSUMED_INITIAL_BUFFER_NS)
+    prefetched = replay_queues(streams, queue_depth_limit=queue_depth_limit, prefill_sync=True,
+                              initial_buffer_ns=POSSIBLE_INITIAL_BUFFER_NS)
     results = []
     assumptions = {
         "queue_depth_limit": queue_depth_limit,
-        "startup": "first_packet_enqueue",
+        "startup": "first_packet_enqueue; no_added_idle",
+        "initial_buffer_assumed_ns": ASSUMED_INITIAL_BUFFER_NS,
+        "initial_buffer_possible_ns": POSSIBLE_INITIAL_BUFFER_NS,
+        "initial_buffer_basis": "user_assumption; not_measured",
+        "buffer_duration": "one_time_cumulative_q1_supply_gap_credit; never_replenished",
         "same_time_order": "enqueue_before_dequeue",
         "sync": "all_supplied_sequencers; earliest_release_to_maximum_prefetch",
         "unknown_branches": "incomplete",
@@ -67,19 +73,27 @@ def analyze_underflows(
         low, high = earliest[name], prefetched[name]
         _packets, reason, boundary_packet = prepared[name]
         failure = high.failure if low.failure and high.failure else None
-        replay = high if failure else low
+        replay = high if low.failure else low
         if failure:
             status = "definite_underflow"
-        elif low.failure:
-            status = "analysis_incomplete"
-            reason = reason or high.incomplete_reason or "sync_start_uncertain"
-            boundary_packet = boundary_packet or low.failure.packet
         elif reason or low.incomplete_reason or high.incomplete_reason:
             status = "analysis_incomplete"
             reason = reason or low.incomplete_reason or high.incomplete_reason
+        elif low.failure and not high.failure:
+            status = "possibly_safe_with_initial_buffer"
+        elif high.failure:
+            status = "analysis_incomplete"
+            reason = "startup_prefill_uncertain"
+            boundary_packet = boundary_packet or high.failure.packet
         else:
             status = "not_detected_under_current_assumptions"
-        state.metadata["underflow"] = {"assumptions": assumptions, "status": status}
+        initial_buffer = {
+            "assumed_ns": ASSUMED_INITIAL_BUFFER_NS, "possible_ns": POSSIBLE_INITIAL_BUFFER_NS,
+            "required_ns": replay.required_buffer_ns,
+            "status": "exhausted" if failure else "tentative" if status == "possibly_safe_with_initial_buffer"
+                      else "incomplete" if status == "analysis_incomplete" else "assumed",
+        }
+        state.metadata["underflow"] = {"assumptions": assumptions, "status": status, "initial_buffer": initial_buffer}
         for record in replay.records:
             packet = record.packet
             _emit_queue_depth(state, packet_id=packet.id, t0=packet.rt_t0,
@@ -93,6 +107,13 @@ def analyze_underflows(
             _emit_slack(state, packet_id=packet.id, slack_ns=failure.slack_ns, t0=packet.rt_t0, source=packet.source)
             _emit_underflow_warning(state, packet_id=packet.id, slack_ns=failure.slack_ns,
                                     t0=packet.rt_t0, source=packet.source, assumptions=assumptions, status=status)
+        elif status == "possibly_safe_with_initial_buffer":
+            state.diagnostics.append(Diagnostic(
+                severity="info", category="initial_rt_buffer_estimate",
+                message="Q1 supply gaps exceed the assumed 1 ms buffer, but may be covered by an initial buffer up to 2 ms.",
+                source=low.failure.packet.source,
+                details={"analysis_scope": "rt_queue", **initial_buffer},
+            ))
         elif status == "analysis_incomplete":
             _emit_analysis_incomplete(state, assumptions, packet=boundary_packet, reason=reason)
         _attach_loop_queue_slack_summaries(state)
@@ -261,7 +282,7 @@ def _emit_analysis_incomplete(state: AnalysisState, assumptions: dict[str, objec
         "assumptions": assumptions,
     }
     details: dict[str, Any] = {"assumptions": assumptions, "reason": reason}
-    if reason in {"sync_start_uncertain", "feedback_arrival_unknown", "runtime_branch_unknown", "compact_loop_timing_unexpanded"}:
+    if reason in {"startup_prefill_uncertain", "feedback_arrival_unknown", "runtime_branch_unknown", "compact_loop_timing_unexpanded"}:
         # Queue replay may stop where the event dependency graph remains usable.
         # Unknown RT timing, triggers, and unmatched barriers remain execution uncertainty.
         meta["analysis_scope"] = details["analysis_scope"] = "rt_queue"
@@ -283,8 +304,8 @@ def _emit_analysis_incomplete(state: AnalysisState, assumptions: dict[str, objec
         Diagnostic(
             severity="warning",
             category="analysis_incomplete",
-            message=("Underflow depends on the unknown synchronization/startup delay; the earliest-release queue can starve, but a prefetched queue does not."
-                     if reason == "sync_start_uncertain" else f"Underflow analysis incomplete: {reason.replace('_', ' ')}."),
+            message=("Underflow depends on the unknown initial RT queue prefill or synchronization dwell; the startup scenarios disagree."
+                     if reason == "startup_prefill_uncertain" else f"Underflow analysis incomplete: {reason.replace('_', ' ')}."),
             source=source,
             related_events=[event.id],
             details=details,

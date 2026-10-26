@@ -41,6 +41,212 @@ async function mount(page, status = "completed", actualIr, initialState = {}, ho
   await page.addScriptTag({path: path.join(assets, "q1timeline/media/timeline.js")});
 }
 
+test("initial RT buffer summary appears only with declared timing assumptions", async ({page}) => {
+  await mount(page);
+  await expect(page.locator("#q1timeline-initial-buffer-summary")).toHaveCount(0);
+  const ir = {sequencers: [{id: "seq"}], events: [event("wait", "wait", 0, 100)], assumptions: {
+    underflow: {initial_buffer_assumed_ns: 1000000, initial_buffer_possible_ns: 2000000}}};
+  await mount(page, "completed", ir);
+  const summary = page.locator("#q1timeline-initial-buffer-summary");
+  await expect(summary).toBeVisible();
+  await expect(summary).toHaveText("Initial buffer ≈ 1 ms · up to 2 ms probably OK");
+  await expect(summary).toHaveAttribute("title", /user-provided assumptions, not measured hardware values/);
+  await expect(summary).toHaveAttribute("title", /covers cumulative Q1 supply gaps during RT execution; no RT startup delay is added/);
+  const firstRt = page.locator('.timeline-block[data-event-id="wait"]').first();
+  await expect(firstRt).toBeVisible();
+  await expect(firstRt).toHaveAttribute("title", /^wait \| 0 ns -> 100 ns\n/);
+  await expect(firstRt).toHaveCSS("left", "0px");
+});
+
+test("initial RT buffer summary describes tentative playback consumption", async ({page}) => {
+  const ir = {sequencers: [{id: "seq"}], events: [event("wait", "wait", 0, 100)],
+    assumptions: {underflow: {initial_buffer_assumed_ns: 1000000, initial_buffer_possible_ns: 2000000}},
+    playback: {status: "completed", steps: 7},
+    execution: {seq: {queue_timing: {initial_buffer: {
+      assumed_ns: 1000000, possible_ns: 2000000, required_ns: 1500000, status: "tentative"}}}}};
+  await mount(page, "completed", ir);
+  const summary = page.locator("#q1timeline-initial-buffer-summary");
+  await expect(summary).toHaveText("Initial buffer ≈ 1 ms · up to 2 ms probably OK");
+  await expect(summary).toHaveAttribute("title", /seq: 1.5 ms of initial buffer required \(tentative\)/);
+  await expect(summary).toHaveAttribute("title", /Up to 2 ms may be sufficient, but is unconfirmed/);
+});
+
+test("external input editor keeps confirmed settings until rerun succeeds and recovers from errors", async ({page}) => {
+  const trigger = {id: "shot_start", address: "TRIGGER_INDEX", targets: ["seq"], times_ns: [1000]};
+  const ir = {sequencers: [{id: "seq"}, {id: "other"}], events: [event("wait", "wait_trigger", 0, 0)],
+    playback: {status: "waiting", can_resume: false, reason: "No matching external input", external_inputs: {
+      triggers: [{...trigger, resolved_address: 1}], overridden: false}}};
+  const base = {triggers: [trigger], overridden: false, canSave: true};
+  await mount(page, "waiting", ir, {}, {externalInputs: base});
+  await expect(page.getByRole("button", {name: "Waiting for external input", exact: true})).toBeDisabled();
+  const summary = page.locator("#q1timeline-external-inputs-summary");
+  await expect(summary).toContainText("≈ Scenario input · shot_start · address 1 · 1 sequencers · 1000 ns");
+  await expect(summary).toHaveAttribute("title", /TRIGGER_INDEX → 1/);
+  await page.getByRole("button", {name: "Configure external inputs"}).click();
+  const form = page.getByRole("form", {name: "External trigger configuration"});
+  await form.getByLabel("Trigger 1 times (ns)").fill("-1");
+  await form.getByRole("button", {name: "Apply & rerun"}).click();
+  await expect(form.getByRole("status")).toHaveText("Event times must be nonnegative integers in ns.");
+  expect(await page.evaluate(() => window.messages.filter((message) => message.type === "setExternalInputs"))).toEqual([]);
+  await form.getByLabel("Trigger 1 times (ns)").fill("2000, 4000");
+  await form.locator("summary").click();
+  await form.getByRole("checkbox", {name: "other", exact: true}).check();
+  await expect(form.locator("summary")).toHaveText("Targets (2)");
+  await form.getByRole("button", {name: "Apply & rerun"}).click();
+  await expect(form.getByLabel("Trigger 1 times (ns)")).toBeDisabled();
+  await expect(summary).toContainText("1000 ns");
+  const request = await page.evaluate(() => window.messages.find((message) => message.type === "setExternalInputs"));
+  expect(request).toEqual({type: "setExternalInputs", triggers: [{...trigger, targets: ["seq", "other"], times_ns: [2000, 4000]}]});
+  await page.evaluate((state) => window.dispatchEvent(new MessageEvent("message", {data: {type: "externalInputsState", state}})), {...base, error: "Parameter TRIGGER_INDEX is unavailable"});
+  await expect(form.getByLabel("Trigger 1 times (ns)")).toBeEnabled();
+  await expect(form.getByLabel("Trigger 1 times (ns)")).toHaveValue("2000, 4000");
+  await expect(form.getByRole("status")).toHaveText("Parameter TRIGGER_INDEX is unavailable");
+  await expect(form.getByRole("button", {name: "Save to project"})).toBeDisabled();
+  await form.getByRole("button", {name: "Apply & rerun"}).click();
+  const applied = {triggers: request.triggers, overridden: true, canSave: true};
+  await page.evaluate((state) => window.dispatchEvent(new MessageEvent("message", {data: {type: "externalInputsState", state}})), applied);
+  await expect(summary).toContainText("2000, 4000 ns · Unsaved changes");
+  await form.getByRole("button", {name: "Save to project"}).click();
+  expect(await page.evaluate(() => window.messages.at(-1))).toEqual({type: "saveExternalInputs"});
+  await page.evaluate((state) => window.dispatchEvent(new MessageEvent("message", {data: {type: "externalInputsState", state}})), {...applied, overridden: false});
+  await expect(summary).not.toContainText("Unsaved changes");
+  await form.getByLabel("Trigger 1 times (ns)").fill("7000");
+  await form.getByRole("button", {name: "Reset changes"}).click();
+  await expect(form.getByLabel("Trigger 1 times (ns)")).toHaveValue("2000, 4000");
+  await page.screenshot({path: test.info().outputPath("shared-trigger-configuration.png"), fullPage: true});
+});
+
+test("unconfigured projects can add and remove shared inputs without saving unapplied drafts", async ({page}) => {
+  await mount(page, "idle", undefined, {}, {externalInputs: {triggers: [], overridden: false, canSave: false}});
+  await expect(page.locator("#q1timeline-external-inputs-summary")).toHaveText("External inputs · not configured");
+  await page.getByRole("button", {name: "Configure external inputs"}).click();
+  const form = page.getByRole("form", {name: "External trigger configuration"});
+  await form.getByRole("button", {name: "Add trigger"}).click();
+  await form.getByLabel("Trigger 1 name").fill("shared_start");
+  await form.getByLabel("Trigger 1 times (ns)").fill("");
+  await form.getByRole("button", {name: "Apply & rerun"}).click();
+  expect(await page.evaluate(() => window.messages.at(-1))).toEqual({type: "setExternalInputs", triggers: [{id: "shared_start", address: 1, targets: ["seq"], times_ns: []}]});
+  await page.evaluate(() => window.dispatchEvent(new MessageEvent("message", {data: {type: "externalInputsState", state: {
+    triggers: [{id: "shared_start", address: 1, targets: ["seq"], times_ns: []}], overridden: true, canSave: false}}})));
+  await expect(form.getByRole("button", {name: "Save to project"})).toBeDisabled();
+  await expect(page.locator("#q1timeline-external-inputs-summary")).toContainText("no events");
+  await form.getByRole("button", {name: "Remove trigger 1"}).click();
+  await form.getByRole("button", {name: "Apply & rerun"}).click();
+  expect(await page.evaluate(() => window.messages.at(-1))).toEqual({type: "setExternalInputs", triggers: []});
+});
+
+test("external input drafts survive unsolicited host updates and initial errors remain visible", async ({page}) => {
+  const trigger = {id: "shot_start", address: 1, targets: ["seq"], times_ns: [1000]};
+  const base = {triggers: [trigger], overridden: false, canSave: true};
+  await mount(page, "idle", undefined, {}, {externalInputs: {...base, error: "External input calculation failed"}});
+  await page.getByRole("button", {name: "Configure external inputs"}).click();
+  const form = page.getByRole("form", {name: "External trigger configuration"});
+  await expect(form.getByRole("status")).toHaveText("External input calculation failed");
+  const times = form.getByLabel("Trigger 1 times (ns)");
+  const summary = page.locator("#q1timeline-external-inputs-summary");
+  const update = (state) => page.evaluate((state) => window.dispatchEvent(new MessageEvent("message", {
+    data: {type: "externalInputsState", state},
+  })), state);
+  await times.fill("2500");
+  await update({...base, triggers: [{...trigger, times_ns: [1200]}], overridden: true});
+  await expect(summary).toContainText("1200 ns · Unsaved changes");
+  await expect(times).toHaveValue("2500");
+  await expect(times).toBeFocused();
+  await expect(form.getByRole("status")).toHaveText("Unapplied changes");
+  await expect(form.getByRole("button", {name: "Save to project"})).toBeDisabled();
+  await form.getByRole("button", {name: "Apply & rerun"}).click();
+  const applied = {...base, triggers: [{...trigger, times_ns: [2500]}], overridden: true};
+  await update(applied);
+  await expect(form.getByRole("status")).toHaveText("Unsaved changes");
+  await times.fill("3000");
+  await update(applied);
+  await expect(times).toHaveValue("3000");
+  await expect(summary).toContainText("2500 ns");
+  await form.getByRole("button", {name: "Reset changes"}).click();
+  await update(base);
+  await expect(times).toHaveValue("1000");
+  await expect(form.getByRole("status")).toHaveText("");
+});
+
+test("adaptive array plays one shared trigger and reruns changed arrival, address, and reset", async ({page}) => {
+  test.setTimeout(60000);
+  const repo = path.resolve(__dirname, "../../..");
+  const projectFile = path.join(repo, "examples/adaptive-array-demo/q1timeline.yml");
+  function analyze(inputs = null, run = true) {
+    return JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+      "import json,sys", "from q1timeline.playback import PlaybackSession", "from q1timeline.render.html import render_html",
+      "s=PlaybackSession.from_project(sys.argv[1])", "inputs=json.loads(sys.argv[2])",
+      "if inputs is not None: s.set_external_inputs(inputs)",
+      "if sys.argv[3]=='run':",
+      "  for _ in range(20):",
+      "    s.run(budget_ms=1000,max_steps=10000)",
+      "    if s.status not in {'idle','paused'}: break",
+      "ir=s.snapshot()", "print(json.dumps({'ir':ir,'inputs':s.external_inputs,'html':render_html(ir,default_mode='debug')}))",
+    ].join("\n"), projectFile, JSON.stringify(inputs), run ? "run" : "idle"], {
+      cwd: repo, encoding: "utf8", timeout: 15000, maxBuffer: 30 * 1024 * 1024,
+      env: {...process.env, PYTHONPATH: path.join(repo, "src")},
+    }));
+  }
+  async function show(data, saved = {}) {
+    const shell = data.html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+      /type=["']application\/json["']/i.test(attributes) ? tag : "");
+    await mount(page, data.ir.playback.status, data.ir, saved, {parameterProjectFile: projectFile,
+      externalInputs: {...data.inputs, overridden: data.ir.playback.external_inputs.overridden, canSave: true}}, shell);
+  }
+  await show(analyze(null, false));
+  await page.getByRole("button", {name: "Run execution", exact: true}).click();
+  expect(await page.evaluate(() => window.messages.at(-1))).toEqual({type: "executionControl", action: "play"});
+  const first = analyze();
+  expect(first.ir.playback.status).toBe("completed");
+  const waits = first.ir.events.filter((item) => item.kind === "wait_trigger");
+  expect(waits).toHaveLength(17);
+  expect(new Set(waits.map((item) => item.meta.trigger_assumption.event_id)).size).toBe(1);
+  expect(waits.every((item) => item.meta.trigger_assumption.arrival_ns === 1000)).toBe(true);
+  await show(first);
+  await expect(page.getByRole("button", {name: "Execution complete", exact: true})).toBeDisabled();
+  const summary = page.locator("#q1timeline-external-inputs-summary");
+  await expect(summary).toContainText("17 sequencers · 1000 ns");
+  await page.evaluate((eventId) => window.dispatchEvent(new MessageEvent("message", {
+    data: {type: "highlightEventIds", highlightEventIds: [eventId]},
+  })), waits[0].id);
+  await expect(page.locator("#event-inspector-fields")).toContainText("≈ Scenario input");
+  await expect(page.locator("#event-inspector-fields")).toContainText(waits[0].meta.trigger_assumption.event_id);
+  await page.getByRole("button", {name: "Configure external inputs"}).click();
+  const form = page.getByRole("form", {name: "External trigger configuration"});
+  await form.getByLabel("Trigger 1 times (ns)").fill("1500");
+  await form.getByRole("button", {name: "Apply & rerun"}).click();
+  const edit = await page.evaluate(() => window.messages.findLast((message) => message.type === "setExternalInputs"));
+  const changed = analyze({triggers: edit.triggers});
+  expect(changed.ir.playback.status).toBe("completed");
+  const ends = (ir) => Object.fromEntries(ir.events.filter((item) => item.kind === "stop").map((item) => [item.sequencer_id, item.t0.value]));
+  const before = ends(first.ir), after = ends(changed.ir);
+  expect(Object.keys(after)).toHaveLength(17);
+  for (const [sequencer, end] of Object.entries(before)) expect(after[sequencer]).toBe(end + 500);
+  await show(changed, await page.evaluate(() => window.getSavedTimelineState()));
+  await expect(form).toBeVisible();
+  await expect(summary).toContainText("1500 ns · Unsaved changes");
+  await expect(form.getByRole("button", {name: "Save to project"})).toBeEnabled();
+  await form.getByLabel("Trigger 1 address").fill("2");
+  await form.getByRole("button", {name: "Apply & rerun"}).click();
+  const mismatch = await page.evaluate(() => window.messages.findLast((message) => message.type === "setExternalInputs"));
+  const waiting = analyze({triggers: mismatch.triggers});
+  expect(waiting.ir.playback.status).toBe("waiting");
+  expect(waiting.ir.events.filter((item) => item.kind === "stop")).toHaveLength(0);
+  await show(waiting, await page.evaluate(() => window.getSavedTimelineState()));
+  await expect(page.getByRole("button", {name: "Waiting for external input", exact: true})).toBeDisabled();
+  await expect(page.getByRole("button", {name: "Configure external inputs"})).toBeEnabled();
+  await expect(summary).toContainText("address 2");
+  await form.getByRole("button", {name: "Reset changes"}).click();
+  expect(await page.evaluate(() => window.messages.at(-1))).toEqual({type: "resetExternalInputs"});
+  const reset = analyze();
+  expect(ends(reset.ir)).toEqual(before);
+  await show(reset, await page.evaluate(() => window.getSavedTimelineState()));
+  await expect(summary).toContainText("1000 ns");
+  await expect(summary).not.toContainText("Unsaved changes");
+  await expect(form.getByLabel("Trigger 1 address")).toHaveValue("TRIGGER_INDEX");
+  await page.screenshot({path: test.info().outputPath("adaptive-array-shared-trigger-rerun.png"), fullPage: true});
+});
+
 test("restores Q1ASM view state only for the same project", async ({page}) => {
   const ir = {sequencers: [{id: "seq", module: "QCM0"}], events: [
     event("play", "play", 0, 1000), event("stop", "stop", 1000, 1000),
@@ -444,7 +650,7 @@ test("diagnostic event links reveal an offscreen target and notify its source on
   const repo = path.resolve(__dirname, "../../..");
   const {ir, html} = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
     "import json", "from q1timeline.analysis.api import analyze_text", "from q1timeline.render.html import render_html",
-    'ir=analyze_text("wait 4\\nnop\\nnop\\nnop\\nplay 0,0,4\\nwait 1000\\nstop\\n",file="diagnostic.q1asm",sequencer_id="seq")',
+    'ir=analyze_text("wait 4\\nmove 100000,R0\\nwork: nop\\nloop R0,@work\\nplay 0,0,4\\nwait 1000\\nstop\\n",file="diagnostic.q1asm",sequencer_id="seq")',
     "print(json.dumps({'ir':ir,'html':render_html(ir,default_mode='debug')}))",
   ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
   const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
@@ -689,6 +895,7 @@ for (const execution of ["analysis", "playback"]) {
     expect(await time.inputValue()).toBe(before);
     await page.screenshot({path: test.info().outputPath(`source-range-${execution}.png`), fullPage: true});
     await page.getByRole("button", {name: "Normal view", exact: true}).click();
+    await expect(core).toBeHidden();
     await expect(rt.locator('.time-selection')).toHaveAttribute("data-time-end", "4");
     await expect(core.locator('.time-selection')).toHaveAttribute("data-time-end", "24");
     await rt.locator('.timeline-block-wait').click();
@@ -704,6 +911,8 @@ for (const execution of ["analysis", "playback"]) {
     await page.mouse.move(ruler.x + ruler.width * 3 / 4, ruler.y + 2, {steps: 4});
     await page.mouse.up();
     await page.keyboard.up("Shift");
+    await expect(core).toBeHidden();
+    await page.getByRole("button", {name: "Debug view", exact: true}).click();
     expect((await core.locator('.time-selection').boundingBox()).width).toBeCloseTo((await rt.locator('.time-selection').boundingBox()).width, 0);
     expect(await page.evaluate(() => window.getSavedTimelineState().expandedPlaybackLoops)).toEqual([]);
     expect(await page.evaluate(() => JSON.parse(document.getElementById("timeline-ir").textContent))).toEqual(ir);
@@ -1084,7 +1293,7 @@ test("loop options stay local for clicks and keyboard activation while ordinary 
     expect(await page.evaluate(() => window.messages.filter((message) => ["eventClick", "sourceClick", "setLoopPreview"].includes(message.type)))).toEqual([]);
     await page.locator(`.timeline-block[data-event-id="${firstWait.id}"]`).click();
     expect(await page.evaluate(() => window.messages.filter((message) => message.type === "eventClick")))
-      .toEqual([{type: "eventClick", eventId: firstWait.id}]);
+      .toEqual([{type: "eventClick", eventId: firstWait.id, preserveFocus: true}]);
   }
 });
 
@@ -1632,7 +1841,7 @@ test("feedback connector crossings preserve block clicks and empty overlay space
   await page.evaluate(() => {window.messages = [];});
   await page.mouse.click(crossing.x, crossing.y);
   expect(await page.evaluate(() => window.messages.filter((message) => ["eventClick", "feedbackFlowClick"].includes(message.type))))
-    .toEqual([{type: "eventClick", eventId: "crossed-block"}]);
+    .toEqual([{type: "eventClick", eventId: "crossed-block", preserveFocus: true}]);
   const track = page.locator('.timeline-row[data-lane="sequencer:sender"] .lane-track');
   const bounds = await track.boundingBox();
   const empty = {x: bounds.x + bounds.width * .7, y: bounds.y + 2};
@@ -1670,7 +1879,8 @@ test("blocks take precedence over feedback marker overlap while exposed marker e
     await page.evaluate(() => {window.messages = [];});
     await page.mouse.click(point.x, point.y);
     expect(await page.evaluate(() => window.messages.filter((message) => ["eventClick", "feedbackFlowClick"].includes(message.type))))
-      .toEqual([{type: "eventClick", eventId}]);
+      .toEqual([{type: "eventClick", eventId, preserveFocus: true}]);
+    await page.keyboard.press("Escape");
     const flowId = await marker.getAttribute("data-flow-id");
     const edge = await marker.boundingBox();
     await page.evaluate(() => {window.messages = [];});

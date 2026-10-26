@@ -35,6 +35,7 @@ const {
 const updatePolicy = require("./updatePolicy");
 const { parseWebviewMessage } = require("./webviewMessageValidation");
 const { PlaybackClient } = require("./playbackClient");
+const { rawExternalInputs, readProjectExternalInputs, writeProjectExternalInputs } = require("./externalInputs");
 const { q1timelineProjectOutputDir } = require("./register");
 
 const COMPARISON_BASELINE_FILENAME = "comparison-baseline.json";
@@ -758,6 +759,15 @@ export class TimelineController {
     this.playbackInFlight = false;
     this.playbackRunning = false;
     this.playbackSnapshotId = undefined;
+    this.externalInputsProject = { triggers: [] };
+    this.externalInputsProjectText = undefined;
+    this.externalInputsBaseline = undefined;
+    this.externalInputsOverride = undefined;
+    this.externalInputsOverrideBaseline = undefined;
+    this.externalInputsValidatedRevision = undefined;
+    this.externalInputsValidatedProjectText = undefined;
+    this.externalInputsError = undefined;
+    this.externalInputsSaving = false;
     this.executionState = { status: "idle", can_resume: true, steps: 0 };
     this.parameterOverrides = new Map();
     this.pendingTarget = undefined;
@@ -866,6 +876,14 @@ export class TimelineController {
   }
 
   clearAnalyzerOverrides() {
+    this.externalInputsProject = { triggers: [] };
+    this.externalInputsProjectText = undefined;
+    this.externalInputsBaseline = undefined;
+    this.externalInputsOverride = undefined;
+    this.externalInputsOverrideBaseline = undefined;
+    this.externalInputsValidatedRevision = undefined;
+    this.externalInputsValidatedProjectText = undefined;
+    this.externalInputsError = undefined;
     this.executionReplayOverride = undefined;
     if (this.branchAssumptionOverrides) {
       this.branchAssumptionOverrides.clear();
@@ -1475,6 +1493,9 @@ export class TimelineController {
     this.playbackRunning = false;
     this.playbackSnapshotId = undefined;
     client?.dispose();
+    this.externalInputsValidatedRevision = undefined;
+    this.externalInputsValidatedProjectText = undefined;
+    if (this.externalInputsOverride && this.webviewReady) this.postExternalInputsState();
     this.executionState = { status: "idle", can_resume: true, steps: 0 };
     if (wasActive) this.setExecutionState(this.executionState);
   }
@@ -1510,10 +1531,93 @@ export class TimelineController {
     await this.runPlayback({ command: "set_feedback", feedback_id: feedbackId, value, delay_ns: delayNs });
   }
 
+  externalInputsState() {
+    const resolved = this.timelineIr?.playback?.external_inputs;
+    const inputs = this.externalInputsOverride || this.externalInputsProject;
+    const triggers = inputs.triggers.map((trigger) => {
+      const match = resolved?.triggers?.find((item) => item.id === trigger.id && item.address === trigger.address);
+      const parameter = typeof trigger.address === "string" && this.timelineIr?.analysis?.parameters?.find((item) => item.name === trigger.address);
+      const address = match?.resolved_address ?? Number(parameter?.value_json);
+      return { ...trigger, ...(Number.isInteger(address) && address >= 1 && address <= 15 ? { resolved_address: address } : {}) };
+    });
+    return { triggers, overridden: Boolean(this.externalInputsOverride), canSave: !this.singleFileMode &&
+      (!this.externalInputsOverride || this.externalInputsValidatedRevision === this.sourceRevision),
+      ...(this.externalInputsError ? { error: this.externalInputsError } : {}) };
+  }
+
+  postExternalInputsState(error) {
+    this.externalInputsError = error;
+    this.postWebviewMessage({ type: "externalInputsState", state: this.externalInputsState() });
+  }
+
+  async setExternalInputs(inputs) {
+    if (this.playbackInFlight || this.analysisInFlight || this.externalInputsSaving) {
+      this.postExternalInputsState("Wait for the current calculation to finish before changing external inputs.");
+      return;
+    }
+    await this.runPlayback({ command: "set_external_inputs", external_inputs: inputs });
+  }
+
+  async saveExternalInputs() {
+    if (!this.projectUri || this.singleFileMode) {
+      this.postExternalInputsState("Save to project requires a project YAML file, not a standalone Q1ASM preview.");
+      return;
+    }
+    if (this.playbackInFlight || this.analysisInFlight || this.externalInputsSaving || this.hasUnsavedProjectChanges()) {
+      this.postExternalInputsState("Save source changes and finish the current calculation before saving external inputs.");
+      return;
+    }
+    if (!this.externalInputsOverride) { this.postExternalInputsState(); return; }
+    if (this.externalInputsValidatedRevision !== this.sourceRevision) {
+      this.postExternalInputsState("Source changed. Apply & rerun external inputs to validate current targets and parameters before saving.");
+      return;
+    }
+    const projectUri = this.projectUri, session = this.projectSessionId, revision = this.sourceRevision;
+    const inputs = rawExternalInputs(this.externalInputsOverride);
+    const isCurrent = () => this.projectUri === projectUri && this.projectSessionId === session && this.sourceRevision === revision;
+    this.externalInputsSaving = true;
+    try {
+      const text = await fsPromises.readFile(projectUri.fsPath, "utf8");
+      const output = writeProjectExternalInputs(text, inputs, this.externalInputsOverrideBaseline);
+      if (text !== this.externalInputsValidatedProjectText) {
+        throw new Error("Project changed on disk. Refresh, then Apply & rerun external inputs before saving.");
+      }
+      if (!isCurrent()) return;
+      // Remember our exact write so the file watcher does not discard an equivalent execution.
+      const key = normalizedFsPath(projectUri.fsPath);
+      const previousSnapshot = this.sourceFileSnapshots.get(key);
+      this.sourceFileSnapshots.set(key, { content: Buffer.from(output), edited: false, mode: this.updateMode() });
+      try { await fsPromises.writeFile(projectUri.fsPath, output, "utf8"); }
+      catch (error) { this.sourceFileSnapshots.set(key, previousSnapshot || {}); throw error; }
+      if (!isCurrent()) return;
+      this.externalInputsProject = inputs;
+      this.externalInputsProjectText = output;
+      this.externalInputsBaseline = readProjectExternalInputs(output).baseline;
+      this.externalInputsOverride = undefined;
+      this.externalInputsOverrideBaseline = undefined;
+      this.externalInputsValidatedRevision = undefined;
+      this.externalInputsValidatedProjectText = undefined;
+      const client = this.playbackClient;
+      if (client) {
+        const result = await client.request({ command: "accept_external_inputs" });
+        if (!isCurrent() || this.playbackClient !== client) return;
+        if (this.timelineIr?.playback && result.ir?.playback?.external_inputs) {
+          this.timelineIr.playback.external_inputs = result.ir.playback.external_inputs;
+        }
+      }
+      this.postExternalInputsState();
+    } catch (error) {
+      if (isCurrent()) this.postExternalInputsState(error.message);
+    } finally {
+      this.externalInputsSaving = false;
+    }
+  }
+
   async runPlayback(update) {
-    if (!this.panel || !this.projectUri || !this.outputDir || this.analysisInFlight || this.playbackInFlight) return;
+    if (!this.panel || !this.projectUri || !this.outputDir || this.analysisInFlight || this.playbackInFlight || this.externalInputsSaving) return;
     if (this.hasUnsavedProjectChanges()) {
       this.setExecutionState({ status: "blocked", can_resume: false, reason: "Save the source before calculating its execution." });
+      if (update?.command === "set_external_inputs") this.postExternalInputsState("Save the source before applying external inputs.");
       return;
     }
     if (this.changeTimer) {
@@ -1527,6 +1631,8 @@ export class TimelineController {
     const environmentCheck = new AbortController();
     this.playbackEnvironmentCheck = environmentCheck;
     let client;
+    const previousExecutionState = this.executionState;
+    let externalUpdatePending = update?.command === "set_external_inputs";
     this.playbackInFlight = true;
     this.playbackRunning = true;
     this.cancelSourceRangeZoom();
@@ -1542,12 +1648,43 @@ export class TimelineController {
         if (!isCurrent() || !this.panel || this.sourceRevision !== sourceRevision || !this.isCurrentAnalysis(analysisRequestId)) return;
         if (!environment) {
           this.setExecutionState({ status: "blocked", can_resume: true, reason: "Select a Python environment and complete setup before calculating execution." });
+          if (externalUpdatePending) this.postExternalInputsState("Select a Python environment before applying external inputs.");
           return;
         }
         this.pythonEnvironment = environment;
       }
+      const isNewClient = !this.playbackClient;
       client = this.playbackClient || (this.playbackClient = this.createPlaybackClient());
-      if (update) await client.request(update);
+      if (isNewClient && this.externalInputsOverride && !externalUpdatePending) {
+        const restored = await client.request({ command: "set_external_inputs", external_inputs: this.externalInputsOverride });
+        if (!isCurrent() || this.playbackClient !== client || this.sourceRevision !== sourceRevision) return;
+        const accepted = restored.ir?.playback?.external_inputs;
+        if (accepted?.overridden === false) {
+          this.externalInputsProject = rawExternalInputs(accepted);
+          this.externalInputsOverride = undefined;
+          this.externalInputsOverrideBaseline = undefined;
+        }
+        this.externalInputsValidatedRevision = this.externalInputsOverride ? sourceRevision : undefined;
+        this.externalInputsValidatedProjectText = this.externalInputsOverride ? this.externalInputsProjectText : undefined;
+      }
+      if (update) {
+        const updated = await client.request(update);
+        if (!isCurrent() || this.playbackClient !== client || this.sourceRevision !== sourceRevision) return;
+        if (externalUpdatePending) {
+          const baseline = this.externalInputsOverride ? this.externalInputsOverrideBaseline : this.externalInputsBaseline;
+          const accepted = updated.ir?.playback?.external_inputs;
+          this.externalInputsOverride = update.external_inputs === null || accepted?.overridden === false
+            ? undefined : rawExternalInputs(update.external_inputs);
+          this.externalInputsOverrideBaseline = this.externalInputsOverride ? baseline : undefined;
+          this.externalInputsValidatedRevision = this.externalInputsOverride ? sourceRevision : undefined;
+          this.externalInputsValidatedProjectText = this.externalInputsOverride ? this.externalInputsProjectText : undefined;
+          if (accepted && !this.externalInputsOverride) {
+            this.externalInputsProject = rawExternalInputs(accepted);
+          }
+          externalUpdatePending = false;
+          this.externalInputsError = undefined;
+        }
+      }
       const deadline = Date.now() + 5000;
       while (this.playbackClient === client && this.playbackRunning) {
         const result = await client.request({ command: "run", budget_ms: 100, max_steps: 1000 });
@@ -1563,13 +1700,22 @@ export class TimelineController {
       if (!isTimelineIr(result.ir) || !result.ir.playback) throw new Error("Invalid playback timeline response.");
       this.playbackSnapshotId = crypto.randomUUID();
       await this.publishPlaybackSnapshot(result.ir, client);
-      if (isCurrent() && this.playbackClient === client && this.sourceRevision === sourceRevision) this.setExecutionState(result.ir.playback);
+      if (isCurrent() && this.playbackClient === client && this.sourceRevision === sourceRevision) {
+        this.setExecutionState(result.ir.playback);
+        this.postExternalInputsState();
+      }
     } catch (error) {
       if (!isCurrent() || client && this.playbackClient !== client) return;
+      if (externalUpdatePending && client && !client.failure) {
+        this.setExecutionState(previousExecutionState);
+        this.postExternalInputsState(error.message);
+        return;
+      }
       this.output.appendLine(`Playback failed: ${error.message}`);
       this.playbackClient?.dispose();
       this.playbackClient = undefined;
       this.setExecutionState({ status: "error", can_resume: true, reason: error.message });
+      if (update?.command === "set_external_inputs") this.postExternalInputsState(error.message);
     } finally {
       if (this.playbackEnvironmentCheck === environmentCheck) this.playbackEnvironmentCheck = undefined;
       if (isCurrent()) {
@@ -2372,6 +2518,7 @@ export class TimelineController {
     const projectUri = this.projectUri;
     const singleFileUri = this.singleFileUri;
     const related = new Set();
+    let externalInputs, externalInputsError;
     if (projectUri) {
       try {
         const projectText = await fsPromises.readFile(projectUri.fsPath, "utf-8").catch((error) => {
@@ -2382,6 +2529,10 @@ export class TimelineController {
         });
         for (const relatedPath of collectProjectRelatedPaths(projectUri.fsPath, projectText)) {
           related.add(relatedPath);
+        }
+        if (projectText) {
+          try { externalInputs = { ...readProjectExternalInputs(projectText), projectText }; }
+          catch (error) { externalInputsError = error.message; }
         }
       } catch (error) {
         related.add(path.resolve(projectUri.fsPath));
@@ -2394,6 +2545,13 @@ export class TimelineController {
     if (this.disposed || requestId !== this.projectRelatedPathsRequestId ||
         this.projectUri?.fsPath !== projectUri?.fsPath || this.singleFileUri?.fsPath !== singleFileUri?.fsPath) return;
     this.projectRelatedPaths = related;
+    if (externalInputs) {
+      this.externalInputsProject = externalInputs.inputs;
+      this.externalInputsProjectText = externalInputs.projectText;
+      this.externalInputsBaseline = externalInputs.baseline;
+    }
+    this.externalInputsError = externalInputsError;
+    if (this.webviewReady) this.postExternalInputsState(externalInputsError);
     if (this.watcher) this.updateRelatedFileWatchers();
   }
 
@@ -2961,12 +3119,15 @@ export class TimelineController {
     const parsedMessage = parseWebviewMessage(message);
     if (!parsedMessage.valid) {
       this.logMalformedWebviewMessage(message);
+      if (message?.type === "setExternalInputs") {
+        this.postExternalInputsState("Check trigger IDs, addresses, targets and increasing nonnegative event times.");
+      }
       return;
     }
     if (parsedMessage.type === "eventClick" || parsedMessage.type === "diagnosticClick" ||
         parsedMessage.type === "sourceClick" || parsedMessage.type === "feedbackFlowClick") {
       try {
-        if (parsedMessage.type === "eventClick") await this.openSourceForEvent(parsedMessage.eventId);
+        if (parsedMessage.type === "eventClick") await this.openSourceForEvent(parsedMessage.eventId, { preserveFocus: parsedMessage.preserveFocus });
         else if (parsedMessage.type === "diagnosticClick") await this.openSourceForDiagnostic(parsedMessage.diagnosticIndex);
         else if (parsedMessage.type === "feedbackFlowClick") await this.openSourceForFeedbackFlow(parsedMessage.flowId, parsedMessage.role);
         else await this.openSourceLocation({
@@ -2996,6 +3157,14 @@ export class TimelineController {
     }
     if (parsedMessage.type === "setExecutionFeedback") {
       await this.setExecutionFeedback(parsedMessage.eventId, parsedMessage.feedbackId, parsedMessage.value, parsedMessage.delayNs);
+      return;
+    }
+    if (parsedMessage.type === "setExternalInputs" || parsedMessage.type === "resetExternalInputs") {
+      await this.setExternalInputs(parsedMessage.type === "resetExternalInputs" ? null : { triggers: parsedMessage.triggers });
+      return;
+    }
+    if (parsedMessage.type === "saveExternalInputs") {
+      await this.saveExternalInputs();
       return;
     }
     if (parsedMessage.type === "prepareExecutionReplay") {
@@ -3075,7 +3244,7 @@ export class TimelineController {
     this.panel.webview.postMessage(message);
   }
 
-  async openSourceForEvent(eventId) {
+  async openSourceForEvent(eventId, options = {}) {
     let source = lookupSourceForEvent(this.timelineIr, eventId);
     if (!source) {
       this.output.appendLine(`q1timeline eventClick source not found: ${eventId}`);
@@ -3109,7 +3278,7 @@ export class TimelineController {
       }
     }
     this.output.appendLine(`q1timeline eventClick: ${eventId} -> ${source.file}:${source.line || 1}`);
-    return this.openSourceLocation(source, { preserveHardwareCursor: true, ...(sourceRange ? { sourceRange } : {}) });
+    return this.openSourceLocation(source, { preserveHardwareCursor: true, ...options, ...(sourceRange ? { sourceRange } : {}) });
   }
 
   async openSourceForDiagnostic(diagnosticIndex) {
@@ -3178,7 +3347,7 @@ export class TimelineController {
       if (!isCurrent()) return;
       const showing = this.sourceNavigationQueue.then(async () => {
         if (!isCurrent()) return;
-        const showOptions = await this.sourceShowTextDocumentOptions(sourcePath, Boolean(existingDocument));
+        const showOptions = await this.sourceShowTextDocumentOptions(sourcePath, Boolean(existingDocument), options.preserveFocus);
         if (!isCurrent()) return;
         return vscode.window.showTextDocument(document, showOptions);
       });
@@ -3219,8 +3388,16 @@ export class TimelineController {
     }
   }
 
-  async sourceShowTextDocumentOptions(sourcePath, documentAlreadyOpen) {
+  async sourceShowTextDocumentOptions(sourcePath, documentAlreadyOpen, preserveFocus = false) {
     const visibleColumn = visibleSourceEditorColumn(sourcePath, vscode.window.visibleTextEditors);
+    if (preserveFocus) {
+      const sourceTabGroups = { all: vscode.window.tabGroups?.all?.filter((group) => group.viewColumn !== this.panel?.viewColumn) };
+      const sourceColumns = [visibleColumn, openTabGroupColumn(sourcePath, sourceTabGroups),
+        q1asmTabGroupColumn(sourceTabGroups), this.lastSourceViewColumn];
+      const viewColumn = sourceColumns.find((column) => column !== undefined && column !== this.panel?.viewColumn)
+        ?? vscode.ViewColumn.Beside;
+      return { viewColumn, preview: false, preserveFocus: true };
+    }
     if (visibleColumn !== undefined) {
       return { viewColumn: visibleColumn, preview: false };
     }
@@ -3455,6 +3632,7 @@ export class TimelineController {
       parameterOverrideNames: Array.from(this.parameterOverrides.keys()),
       comparison: this.comparison,
       executionState: this.executionState,
+      externalInputs: this.externalInputsState(),
       playbackSnapshotId: this.playbackSnapshotId,
     };
   }

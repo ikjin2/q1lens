@@ -296,7 +296,9 @@ def _has_ambiguous_execution(state: AnalysisState) -> bool:
         return True
     return any(
         diagnostic.severity == "error"
-        or diagnostic.category in {"analysis_incomplete", "loop_truncated", "unresolved_branch"}
+        or diagnostic.category in {"loop_truncated", "unresolved_branch"}
+        or (diagnostic.category == "analysis_incomplete"
+            and diagnostic.details.get("analysis_scope") != "rt_queue")
         for diagnostic in state.diagnostics
     )
 

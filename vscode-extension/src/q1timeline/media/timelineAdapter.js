@@ -141,7 +141,7 @@
         parentGroupId: parent,
         sequencer,
         ...branch,
-        hidden: !(options && (options.layout === "instruction" || options.expandedQ1IssueSequencers && options.expandedQ1IssueSequencers.has(sequencer))),
+        hidden: !(options && options.mode === "debug"),
       };
     }
     if (isPlayPathEvent(event) && !(options && options.mergedPlayEventIds && options.mergedPlayEventIds.has(String(event.id)))) {
@@ -180,6 +180,9 @@
       return false;
     }
     if (event.kind === "q1_issue") {
+      return true;
+    }
+    if (event.kind === "underflow_warning" || event.kind === "analysis_incomplete") {
       return true;
     }
     if (options.mode !== "debug" && lane.startsWith("debug.")) {
@@ -504,6 +507,11 @@
 
   function applyInstructionLayout(lanes, annotations, events) {
     const eventOrder = new Map(events.map((event, index) => [String(event.id), index]));
+    const eventById = new Map(events.map((event) => [String(event.id), event]));
+    const warning = (block) => block.kind === "underflow_warning" || block.kind === "analysis_incomplete";
+    const packetEffects = new Set(["marker_state", "latched_state_applied", "sync_wait", "trigger_wait",
+      "feedback_receive", "feedback_send", "trigger_receive", "acquisition_result"]);
+    const visibleLaneIds = new Set(lanes.filter((lane) => !lane.hidden).map((lane) => lane.id));
     const positions = new Map();
     const startsByLane = new Map();
     const offsetsByLane = new Map();
@@ -513,9 +521,10 @@
       if (lane.kind === "runtime") lane.label = `${lane.sequencer || lane.label} · RT`;
       const conditionalTimeUnknown = lane.blocks.some((block) => block.domain.meta.conditional_time_unknown);
       lane.blocks.sort((left, right) => (conditionalTimeUnknown ? 0 : left.start - right.start) || blockOrder(left) - blockOrder(right));
-      startsByLane.set(lane.id, lane.blocks.map((block) => block.start));
-      maxCount = Math.max(maxCount, lane.blocks.length);
-      lane.blocks.forEach((block, index) => {
+      const commands = lane.blocks.filter((block) => !warning(block));
+      startsByLane.set(lane.id, commands.map((block) => block.start));
+      if (!lane.hidden) maxCount = Math.max(maxCount, commands.length);
+      commands.forEach((block, index) => {
         block.start = index;
         block.duration = 1;
         for (const id of block.eventIds) {
@@ -531,6 +540,7 @@
       const offset = anchor ? (positions.get(String(anchor.id)) || {}).end || 0 : 0;
       offsetsByLane.set(lane.id, offset);
       for (const block of lane.blocks) {
+        if (warning(block)) continue;
         block.start += offset;
         for (const id of block.eventIds) {
           const position = positions.get(id);
@@ -538,16 +548,39 @@
           position.end += offset;
         }
       }
-      maxCount = Math.max(maxCount, offset + lane.blocks.length);
+      if (!lane.hidden) maxCount = Math.max(maxCount, offset + lane.blocks.filter((block) => !warning(block)).length);
     }
     function insertionPosition(laneId, time) {
       const starts = startsByLane.get(laneId) || [];
       const index = starts.findIndex((start) => start >= time);
       return (offsetsByLane.get(laneId) || 0) + (index < 0 ? starts.length : index);
     }
+    // Queue warnings flag an RT boundary rather than occupying another instruction.
+    for (const lane of lanes) {
+      for (const block of lane.blocks.filter(warning)) {
+        const event = eventById.get(block.eventId);
+        const meta = event.meta || {};
+        const candidates = meta.rt_packet_id === undefined ? [] : events.filter((candidate) => {
+          const other = candidate.meta || {};
+          return candidate.sequencer_id === event.sequencer_id && eventLaneName(candidate).startsWith("rt.") &&
+            candidate.kind !== "underflow_warning" && candidate.kind !== "analysis_incomplete" && !packetEffects.has(candidate.kind) &&
+            other.rt_packet_id === meta.rt_packet_id &&
+            other.branch_comparison_branch_id === meta.branch_comparison_branch_id &&
+            other.branch_comparison_path === meta.branch_comparison_path &&
+            other.loop_preview === meta.loop_preview && other.loop_iteration_index === meta.loop_iteration_index &&
+            (other.diff_status === "removed") === (meta.diff_status === "removed");
+        });
+        const anchors = candidates.map((candidate) => positions.get(String(candidate.id))).filter(Boolean);
+        const starts = new Set(anchors.map((anchor) => anchor.start));
+        block.start = starts.size === 1 ? anchors[0].start : insertionPosition(lane.id, block.start);
+        block.duration = 0;
+        for (const id of block.eventIds) positions.set(id, { laneId: lane.id, laneKind: lane.kind, start: block.start, end: block.start });
+        if (!lane.hidden) maxCount = Math.max(maxCount, block.start);
+      }
+    }
     for (const annotation of annotations) {
       if (annotation.type === "loop-range") {
-        const members = annotation.eventIds.map((id) => positions.get(id)).filter(Boolean);
+        const members = annotation.eventIds.map((id) => positions.get(id)).filter((position) => position && visibleLaneIds.has(position.laneId));
         const anchor = members.find((position) => position.laneId === annotation.laneId)
           || members.find((position) => position.laneKind !== "q1-issue") || members[0];
         if (anchor) {
@@ -749,6 +782,123 @@
     return changesById;
   }
 
+  function buildRtDetails(events, selectionIndex) {
+    const byId = new Map(events.map((event) => [String(event.id), event]));
+    const issuesByRt = new Map();
+    for (const event of events.filter((item) => item.kind === "q1_issue")) {
+      for (const id of selectionIndex.get(String(event.id))?.rtEventIds || []) issuesByRt.set(id, event);
+    }
+    const valueDisplay = (value) => {
+      if (value === undefined || value === null) return "?";
+      if (Array.isArray(value)) return value.map(valueDisplay).join(", ");
+      return typeof value === "object" ? String(value.display ?? value.value ?? value.expr ?? "?") : String(value);
+    };
+    const concreteValue = (value) => {
+      if (Array.isArray(value)) {
+        const values = value.map(concreteValue);
+        return values.every((item) => item !== undefined) ? values : undefined;
+      }
+      if (value && typeof value === "object") return !value.kind || value.kind === "concrete" ? concreteValue(value.value) : undefined;
+      return typeof value === "number" && Number.isFinite(value) || typeof value === "boolean" ? value : undefined;
+    };
+    const row = (name, value, previous) => {
+      const currentValue = concreteValue(value), previousValue = concreteValue(previous);
+      const changed = currentValue !== undefined && previousValue !== undefined && JSON.stringify(currentValue) !== JSON.stringify(previousValue);
+      return { name, valueDisplay: valueDisplay(value), changed, ...(changed ? { previousDisplay: valueDisplay(previous) } : {}) };
+    };
+    const scopeKey = (event, common = false) => {
+      const meta = event.meta || {};
+      return JSON.stringify([event.sequencer_id, common ? undefined : meta.branch_comparison_branch_id,
+        common ? undefined : meta.branch_comparison_path, meta.diff_status === "removed" ? "removed" : undefined]);
+    };
+    const excluded = new Set(["marker_state", "latched_state_applied", "rt_queue_enqueue", "rt_queue_dequeue", "q1_stall",
+      "sync_wait", "trigger_wait", "feedback_receive", "feedback_send", "trigger_receive", "acquisition_result",
+      "loop_block", "loop_iteration_preview", "branch_region", "control_flow_loop", "control_flow_branch"]);
+    const states = new Map(), packets = new Map(), details = new Map();
+    const ordered = events.map((event, index) => ({ event, index })).filter(({ event }) =>
+      eventLaneName(event).startsWith("rt.") && !excluded.has(event.kind));
+    const time = (event) => {
+      const value = event.t0 ?? event.t0_ns;
+      return typeof value === "number" ? value : value && (!value.kind || value.kind === "concrete") ? value.value ?? value.value_ns : undefined;
+    };
+    const eventOrder = new Map(events.map((event, index) => [String(event.id), index]));
+    for (const loop of events.filter((event) => event.kind === "loop_block" &&
+      (event.meta?.uncertain_latched_fields?.length || event.meta?.uncertain_registers?.length))) {
+      const meta = loop.meta;
+      const members = Object.values(meta.preview_iteration_event_ids || { 0: meta.first_iteration_event_ids || [] }).flat();
+      const memberIndexes = members.map((id) => eventOrder.get(String(id)) ?? -1);
+      const end = time(loop) + time({t0: loop.duration}) * Number(meta.count);
+      ordered.push({event: { ...loop, t0: Number.isFinite(end) ? end : undefined }, index: Math.max(eventOrder.get(String(loop.id)), ...memberIndexes) + 0.5});
+    }
+    ordered.sort((a, b) => a.index - b.index);
+    // IR order remains authoritative when a conditional execution makes timing unknown.
+    if (ordered.every(({ event }) => Number.isFinite(time(event)))) ordered.sort((a, b) => time(a.event) - time(b.event) || a.index - b.index);
+    for (const { event } of ordered) {
+      const meta = event.meta || {}, scope = scopeKey(event), issue = issuesByRt.get(String(event.id));
+      const key = JSON.stringify([scope, issue?.id ?? meta.rt_packet_id ?? event.id, meta.loop_preview, meta.loop_iteration_index]);
+      if (packets.has(key)) {
+        details.set(String(event.id), packets.get(key));
+        continue;
+      }
+      if (!states.has(scope)) {
+        const common = states.get(scopeKey(event, true));
+        states.set(scope, { parameters: { ...common?.parameters }, registers: common?.registers, unknown: Boolean(common?.unknown) });
+      }
+      const state = states.get(scope), issueMeta = issue?.meta || {};
+      if (event.kind === "loop_block") {
+        for (const field of meta.uncertain_latched_fields || []) {
+          if (field in state.parameters) state.parameters[field] = {kind: "unknown", display: "? (hidden loop iterations)"};
+        }
+        if (state.registers) state.registers = { ...state.registers, ...Object.fromEntries(
+          (meta.uncertain_registers || []).map((name) => [name, {kind: "unknown", display: "?"}])) };
+        continue;
+      }
+      const reads = issueMeta.register_reads;
+      const registers = Object.entries(reads || {}).sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true }))
+        .map(([name, value]) => row(name, value, state.registers?.[name]));
+      // A snapshot of every register prevents first use from being mistaken for a change.
+      if (meta.rt_packet_id != null || issueMeta.rt_packet_id != null) state.registers = issueMeta.register_snapshot;
+      const previous = { ...state.parameters };
+      const blocked = event.kind === "unknown_region" && meta.playback && meta.rt_packet_id == null && !meta.output_state_unknown;
+      const outputUnknown = meta.output_state_unknown || event.kind === "unknown_region" && !blocked && meta.output_state_unknown !== false;
+      if (outputUnknown) {
+        state.parameters = {};
+        state.unknown = true;
+      }
+      const skipped = event.kind === "conditional_skip" || meta.conditional_skipped;
+      const applies = !skipped && !["wait", "wait_sync", "wait_trigger"].includes(event.kind) && !outputUnknown;
+      const applied = applies ? { ...meta.applied_state } : {};
+      if (applies && meta.applied_state_mode === "snapshot") {
+        state.parameters = {};
+        state.unknown = false;
+      }
+      const updatedFields = meta.applied_updated_fields || Object.keys(applied);
+      // An increment describes this application; retaining it would imply another increment.
+      delete state.parameters.phase_delta;
+      if (!updatedFields.includes("phase_delta")) delete applied.phase_delta;
+      for (const [name, setterId] of Object.entries(meta.applied_setter_event_ids || {})) {
+        const setter = byId.get(String(setterId));
+        const setterIssue = byId.get(String(setter?.meta?.q1_issue_event_id));
+        if (meta.preview_source_event_id && setterIssue?.meta?.preview_source_event_id &&
+          Object.values(setterIssue.meta.register_reads || {}).some((value) => concreteValue(value) === undefined) && name in applied) {
+          applied[name] = { kind: "unknown", display: "? (loop iteration)" };
+        }
+      }
+      Object.assign(state.parameters, applied);
+      const parameters = Object.entries(state.parameters).filter(([name]) =>
+        name !== "scope_enable" || event.kind === "acquire" || event.kind === "upd_param" || event.kind === "upd_thres")
+        .filter(() => !["stop", "feedback_pop", "feedback_com", "set_latch_en", "latch_rst"].includes(event.kind) && !String(event.kind).startsWith("fb_"))
+        .map(([name, value]) => row(name, value, previous[name]));
+      const result = { registers, parameters,
+        ...(reads === undefined ? { registerNote: "Register operand values are unavailable." } : {}),
+        ...(blocked ? { parameterNote: "Execution is blocked here; shown parameters are the last known applied values." }
+          : state.unknown ? { parameterNote: "Some effective parameters are unknown after unresolved execution." } : {}) };
+      packets.set(key, result);
+      details.set(String(event.id), result);
+    }
+    return details;
+  }
+
   function buildQ1TimelineSharedModel(timelineIr, options = {}) {
     const mode = options.mode === "debug" ? "debug" : "normal";
     const allEvents = Array.isArray(timelineIr && timelineIr.events) ? timelineIr.events : [];
@@ -816,8 +966,9 @@
         continue;
       }
       const block = eventBlock(event, adapterOptions);
-      maxTime = Math.max(maxTime, block.start + Math.max(block.duration, 1));
-      ensureLane(eventLane(event, adapterOptions)).blocks.push(block);
+      const lane = ensureLane(eventLane(event, adapterOptions));
+      if (!lane.hidden) maxTime = Math.max(maxTime, block.start + Math.max(block.duration, 1));
+      lane.blocks.push(block);
     }
 
     for (const group of playGroups) {
@@ -831,8 +982,11 @@
 
     const selectionIndex = buildQ1TimelineSelectionIndex(timelineIr);
     const parameterChanges = buildParameterChanges(allEvents, selectionIndex, adapterOptions);
+    const rtDetails = buildRtDetails(allEvents, selectionIndex);
     for (const lane of lanes) {
       for (const block of lane.blocks) {
+        const detail = rtDetails.get(block.eventId);
+        if (detail) block.rtDetails = detail;
         const changes = new Set((block.eventIds || [block.eventId]).flatMap((id) => parameterChanges.get(id) || []));
         if (changes.size) block.parameterChanges = [...changes];
         const rtEventIds = selectionIndex.get(block.eventId)?.rtEventIds || [];
@@ -880,7 +1034,7 @@
     return {
       title: "Q1ASM Timeline",
       layout: instruction ? "instruction" : "time",
-      subtitle: instruction ? "Independent instruction order per lane; columns do not show simultaneous time" : `${lanes.length} lanes / ${events.length} events`,
+      subtitle: instruction ? "Independent instruction order per lane; columns do not show simultaneous time" : `${lanes.filter((lane) => !lane.hidden).length} lanes / ${events.length} events`,
       totalTime: maxTime,
       viewport,
       ticks: instruction ? [...new Set([0, 0.25, 0.5, 0.75, 1].map((ratio) => Math.round(maxTime * ratio)))].map((index) => ({

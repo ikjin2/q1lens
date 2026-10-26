@@ -2,6 +2,7 @@ import pytest
 
 from q1timeline.analysis.api import analyze_documents, analyze_text
 from q1timeline.analysis.interpreter import interpret_program
+from q1timeline.analysis.queue_timing import replay_queues
 from q1timeline.analysis.underflow import analyze_underflow
 from q1timeline.q1asm.parser import parse_q1asm
 
@@ -38,38 +39,38 @@ def test_first_rt_packet_without_sync_is_not_a_starvation_event(prefix: str) -> 
 
 @pytest.mark.parametrize("prefix", ["", "set_mrk 2\nwait_sync 4\n"])
 def test_same_time_enqueue_is_available_to_the_rt_consumer(prefix: str) -> None:
-    state, result = _analyze(f"{prefix}upd_param 4\nupd_param 4\nupd_param 4\nstop\n")
+    state = interpret_program(
+        parse_q1asm(f"{prefix}upd_param 4\nupd_param 4\nupd_param 4\nstop\n", file="program.q1asm"),
+        sequencer_id="seq0",
+    )
+    result = replay_queues({"seq0": state.rt_packets})["seq0"]
 
-    assert result.status == "not_detected_under_current_assumptions"
-    assert not [event for event in state.events if event.kind == "underflow_warning"]
-    assert any(event.kind == "slack" and event.meta["slack_ns"] == 0 for event in state.events)
+    assert result.failure is None
+    assert result.incomplete_reason is None
+    assert len(result.records) == len(state.rt_packets)
+    assert all(record.enqueue_ns == record.dequeue_ns for record in result.records)
 
 
 @pytest.mark.parametrize("prefix", ["", "wait_sync 4\n"])
 @pytest.mark.parametrize("operation", ["upd_param 4", "wait 4"])
-def test_short_housekeeping_starvation_depends_on_sync_prefill(prefix: str, operation: str) -> None:
-    text = f"{prefix}{operation}\nnop\nnop\n{operation}\nstop\n"
+@pytest.mark.parametrize("q1_instruction_count", [2, 1000])
+def test_q1_work_after_first_rt_packet_is_covered_by_assumed_initial_buffer(
+    prefix: str, operation: str, q1_instruction_count: int,
+) -> None:
+    text = f"{prefix}{operation}\n" + "nop\n" * q1_instruction_count + f"{operation}\nstop\n"
     state, result = _analyze(text)
-    warnings = [event for event in state.events if event.kind == "underflow_warning"]
-    starved_packet = state.rt_packets[-1]
 
-    if prefix:
-        assert result.status == "analysis_incomplete"
-        assert not warnings
-        incomplete = [event for event in state.events if event.kind == "analysis_incomplete"]
-        assert any(event.meta.get("reason") == "sync_start_uncertain" for event in incomplete)
-        return
-    assert result.status in UNDERFLOW_CATEGORIES
-    assert len(warnings) == 1
-    assert warnings[0].meta["rt_packet_id"] == starved_packet.id
-    assert warnings[0].source.line == len(prefix.splitlines()) + 4
-    assert warnings[0].meta["slack_ns"] < 0
-    assert warnings[0].t0 == starved_packet.rt_t0
+    assert result.status == "not_detected_under_current_assumptions"
+    assert not [event for event in state.events if event.kind == "underflow_warning"]
+    assert not [event for event in state.events if event.kind == "analysis_incomplete"]
+    assert result.assumptions["initial_buffer_assumed_ns"] == 1_000_000
+    assert result.assumptions["initial_buffer_possible_ns"] == 2_000_000
+    assert state.metadata["underflow"]["initial_buffer"]["status"] == "assumed"
 
 
 @pytest.mark.parametrize("operation", ["upd_param 4", "wait 4"])
-def test_sustained_post_sync_starvation_exhausts_even_a_full_prefilled_queue(operation: str) -> None:
-    text = "wait_sync 4\n" + ("nop\n" * 8 + f"{operation}\n") * 48 + "stop\n"
+def test_sustained_post_sync_starvation_exhausts_initial_buffer(operation: str) -> None:
+    text = "wait_sync 4\nmove 8192,R0\nbody: " + operation + "\n" + "nop\n" * 64 + "loop R0,@body\nstop\n"
     state, result = _analyze(text)
     warnings = [event for event in state.events if event.kind == "underflow_warning"]
 
@@ -77,9 +78,8 @@ def test_sustained_post_sync_starvation_exhausts_even_a_full_prefilled_queue(ope
     assert warnings
     assert all(event.source.line > 1 for event in warnings)
     assert all(event.meta["slack_ns"] < 0 for event in warnings)
-    assert all(event.meta["rt_packet_id"] in {packet.id for packet in state.rt_packets[1:]} for event in warnings)
-
-
+    assert all(event.meta["rt_packet_id"].startswith(state.rt_packets[1].id) for event in warnings)
+    assert state.metadata["underflow"]["initial_buffer"]["status"] == "exhausted"
 
 
 def test_unequal_q1_arrivals_share_the_first_sync_release() -> None:
@@ -119,36 +119,31 @@ def test_missing_sync_participant_is_incomplete_instead_of_safe(participant: str
     assert not [item for item in ir["diagnostics"] if item["category"] in UNDERFLOW_CATEGORIES]
 
 
-def test_tight_concrete_loop_starves_on_its_second_iteration_without_sync() -> None:
+@pytest.mark.parametrize("prefix", ["", "wait_sync 4\n"])
+def test_two_tight_concrete_loop_iterations_are_covered_by_initial_buffer(prefix: str) -> None:
     state = interpret_program(
-        parse_q1asm("move 2,R0\nbody: upd_param 4\nloop R0,@body\nstop\n", file="loop.q1asm"),
+        parse_q1asm(f"{prefix}move 2,R0\nbody: upd_param 4\nloop R0,@body\nstop\n", file="loop.q1asm"),
         sequencer_id="seq0", execution_mode="concrete",
     )
     result = analyze_underflow(state)
-    warnings = [event for event in state.events if event.kind == "underflow_warning"]
 
-    assert len(state.rt_packets) == 2
-    assert result.status in UNDERFLOW_CATEGORIES
-    assert len(warnings) == 1
-    assert warnings[0].meta["rt_packet_id"] == state.rt_packets[1].id
-    assert warnings[0].source.line == 2
-    assert warnings[0].meta["slack_ns"] < 0
+    assert len([packet for packet in state.rt_packets if packet.op == "upd_param"]) == 2
+    assert result.status == "not_detected_under_current_assumptions"
+    assert not [event for event in state.events if event.kind == "underflow_warning"]
+    assert not [event for event in state.events if event.kind == "analysis_incomplete"]
 
 
 def test_queue_capacity_backpressure_limits_q1_lookahead() -> None:
     text = "wait 1000\nwait 4\nwait 4\nwait 4\nnop\nnop\nnop\nnop\nupd_param 4\nstop\n"
-    roomy, roomy_result = _analyze(text, queue_depth_limit=32)
-    bounded, bounded_result = _analyze(text, queue_depth_limit=2)
+    state = interpret_program(parse_q1asm(text, file="program.q1asm"), sequencer_id="seq0")
+    roomy = replay_queues({"seq0": state.rt_packets}, queue_depth_limit=32)["seq0"]
+    bounded = replay_queues({"seq0": state.rt_packets}, queue_depth_limit=2)["seq0"]
 
-    assert roomy_result.status == "not_detected_under_current_assumptions"
-    assert not [event for event in roomy.events if event.kind == "underflow_warning"]
-    assert bounded_result.status in UNDERFLOW_CATEGORIES
-    warnings = [event for event in bounded.events if event.kind == "underflow_warning"]
-    assert len(warnings) == 1
-    assert warnings[0].source.line == 9
-    assert warnings[0].meta["rt_packet_id"] == bounded.rt_packets[-1].id
-    assert warnings[0].meta["slack_ns"] < 0
-    assert bounded_result.assumptions["queue_depth_limit"] == 2
+    assert roomy.failure is None
+    assert bounded.failure is not None
+    assert bounded.failure.packet.source.line == 9
+    assert bounded.failure.packet.id == state.rt_packets[-1].id
+    assert bounded.failure.slack_ns < 0
 
 
 @pytest.mark.parametrize("operation", ["wait_sync R0", "wait_trigger R0,R1"])

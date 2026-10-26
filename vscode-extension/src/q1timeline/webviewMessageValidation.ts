@@ -1,4 +1,5 @@
 // @ts-nocheck
+const { validExternalTriggers } = require("./externalInputs");
 function hasOnlyKeys(message, keys) {
   const allowed = new Set(keys);
   return Object.keys(message).every((key) => allowed.has(key));
@@ -15,9 +16,11 @@ function parseWebviewMessage(message) {
     message.type === "eventClick" &&
     typeof message.eventId === "string" &&
     message.eventId.length > 0 &&
-    hasOnlyKeys(message, ["type", "eventId"])
+    (message.preserveFocus === undefined || typeof message.preserveFocus === "boolean") &&
+    hasOnlyKeys(message, ["type", "eventId", "preserveFocus"])
   ) {
-    return { valid: true, type: "eventClick", eventId: message.eventId };
+    return { valid: true, type: "eventClick", eventId: message.eventId,
+      ...(typeof message.preserveFocus === "boolean" ? { preserveFocus: message.preserveFocus } : {}) };
   }
 
   if (message.type === "feedbackFlowClick" &&
@@ -35,6 +38,15 @@ function parseWebviewMessage(message) {
   if (message.type === "executionControl" && ["play", "pause"].includes(message.action) &&
       hasOnlyKeys(message, ["type", "action"])) {
     return { valid: true, type: message.type, action: message.action };
+  }
+
+  if (message.type === "setExternalInputs" && validExternalTriggers(message.triggers) &&
+      hasOnlyKeys(message, ["type", "triggers"])) {
+    return { valid: true, type: message.type, triggers: message.triggers };
+  }
+
+  if (["saveExternalInputs", "resetExternalInputs"].includes(message.type) && hasOnlyKeys(message, ["type"])) {
+    return { valid: true, type: message.type };
   }
 
   if (message.type === "setExecutionBranch" &&

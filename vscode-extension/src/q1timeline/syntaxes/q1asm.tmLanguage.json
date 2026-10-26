@@ -107,7 +107,7 @@
           }
         },
         {
-          "match": "(?i)^\\s*(?:([A-Za-z_][A-Za-z0-9_]*)\\s*:\\s*)?(acquire|acquire_digital|acquire_timetags|acquire_ttl|acquire_weighed|acquire_weighted|latch_rst|play|play_pulse|set_latch_en|upd_param|upd_thres|wait)\\b(?!\\s*:)",
+          "match": "(?i)^\\s*(?:([A-Za-z_][A-Za-z0-9_]*)\\s*:\\s*)?(acquire|acquire_digital|acquire_timetags|acquire_ttl|acquire_weighed|acquire_weighted|latch_rst|play|play_netzero|play_pulse|set_latch_en|upd_param|upd_thres|wait)\\b(?!\\s*:)",
           "captures": {
             "1": {
               "name": "entity.name.label.q1asm"

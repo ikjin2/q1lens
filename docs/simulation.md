@@ -12,6 +12,26 @@ Q1, and missing RT work produces an underflow. `stop` stops Q1 and drains the RT
 queue. All project sequencers participate in the modeled `wait_sync` barrier.
 The trace records flags, branches, iterations, reads, writes and their provenance.
 
+Analytical and path-playback queue checks model a finite 32-packet RT FIFO and
+assume 1 ms of initial RT buffer time. This is an unmeasured modeling assumption:
+the first packet still starts immediately, and the credit is consumed only when
+Q1 leaves a gap in RT supply. It is shared across the whole sequencer trace and
+does not renew at each packet or synchronization. Full queues still stall Q1;
+original Q1/RT display coordinates and shared trigger-arrival times stay unchanged.
+
+Supply gaps covered by the assumed 1 ms do not produce underflow warnings. If
+they need more than 1 ms but fit within the tentative 2 ms scenario, the timeline
+reports `possibly_safe_with_initial_buffer` and an informational estimate. The
+2 ms scenario also allows prefetch at `wait_sync`. A gap exceeding that scenario
+still produces an underflow warning. Unknown branches, inputs, or unfinished
+traces remain incomplete; neither buffer scenario verifies hardware behavior.
+
+The event-driven simulator instead uses its explicit `startup_delay_ns` scenario,
+which defaults to 200 ns. Its RT consumer starts at that time on the shared clock,
+measured from Q1 start. This scenario parameter is not a measured initial buffer
+duration. Physical simulations need sample periods and budgets that cover their
+full scenario window.
+
 ## Scenario configuration
 
 ```yaml

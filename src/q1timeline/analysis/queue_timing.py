@@ -10,6 +10,10 @@ from q1timeline.analysis.interpreter import RtPacket
 from q1timeline.analysis.values import Concrete
 
 
+ASSUMED_INITIAL_BUFFER_NS = 1_000_000
+POSSIBLE_INITIAL_BUFFER_NS = 2_000_000
+
+
 @dataclass(frozen=True)
 class QueueTimingRecord:
     packet: RtPacket
@@ -31,6 +35,7 @@ class QueueReplayResult:
     records: list[QueueTimingRecord] = field(default_factory=list)
     failure: QueueTimingFailure | None = None
     incomplete_reason: str | None = None
+    required_buffer_ns: int = 0
 
 
 @dataclass
@@ -45,6 +50,7 @@ class _Queue:
     rt_waiting: bool = False
     underflow_suspended: bool = False
     sync: RtPacket | None = None
+    trigger_missed: bool = False
 
 
 def replay_queues(
@@ -52,16 +58,31 @@ def replay_queues(
     *,
     queue_depth_limit: int = 32,
     prefill_sync: bool = False,
+    prefill_startup: bool = False,
+    initial_buffer_ns: int = 0,
 ) -> dict[str, QueueReplayResult]:
-    """Replay earliest startup, optionally holding sync for maximal prefetch.
+    """Replay buffered startup, optionally holding sync for maximal prefetch.
+
+    Startup scenarios either consume the first packet as soon as it arrives,
+    or let Q1 fill the finite FIFO (or complete a deterministic packet stream)
+    first. Prefill stores commands, not a fixed amount of time. Neither scenario
+    specifies a measured hardware startup interval.
+
+    An optional initial timing reserve covers cumulative guarded Q1 supply gaps.
+    It is spent only when the FIFO would starve, never added as startup idle,
+    and never replenished. This is an explicit timing assumption, not FIFO space.
 
     When any stream uses wait_sync, all supplied streams participate. Each
     barrier matches their next wait_sync; a missing round is incomplete. This bounded packet replay
     does not infer trigger arrivals, omitted loop iterations, or terminal stops.
+    Trigger arrivals keep their shared analytical receiver times; a missed
+    arrival makes that scenario incomplete rather than inventing a time shift.
     Callers must supply a complete, deterministic packet prefix.
     """
     if isinstance(queue_depth_limit, bool) or not isinstance(queue_depth_limit, int) or queue_depth_limit < 1:
         raise ValueError("queue_depth_limit must be a positive integer")
+    if type(initial_buffer_ns) is not int or initial_buffer_ns < 0:
+        raise ValueError("initial_buffer_ns must be a nonnegative integer")
     results = {name: QueueReplayResult() for name in streams}
     queues: dict[str, _Queue] = {}
     participants = set(streams) if any(packet.op == "wait_sync" for packets in streams.values() for packet in packets) else set()
@@ -77,7 +98,7 @@ def replay_queues(
             if end <= start or duration < 0 or (previous_end is not None and start < previous_end):
                 results[name].incomplete_reason = f"Invalid packet timing at {packet.id}."
                 break
-            if packet.op == "wait_trigger":
+            if packet.op == "wait_trigger" and _trigger_timing(packet) is None:
                 results[name].incomplete_reason = f"External trigger timing is unknown at {packet.id}."
                 break
             prefix.append(packet)
@@ -120,7 +141,7 @@ def replay_queues(
     while events:
         time, _, _, name, action = heapq.heappop(events)
         queue = queues[name]
-        if queue.result.failure is not None:
+        if queue.result.failure is not None or queue.trigger_missed:
             continue
         if action == "issue":
             if len(queue.pending) >= queue_depth_limit:
@@ -137,7 +158,10 @@ def replay_queues(
             if queue.index < len(queue.packets):
                 gap = queue.packets[queue.index].q1_issue_t0.value - packet.q1_issue_t1.value
                 issue_at(name, time + gap)
-            if not queue.rt_started or queue.rt_waiting:
+            startup_ready = not prefill_startup or len(queue.pending) >= queue_depth_limit or (
+                queue.index == len(queue.packets) and queue.result.incomplete_reason is None
+            )
+            if (not queue.rt_started and startup_ready) or queue.rt_waiting:
                 queue.rt_started = True
                 queue.rt_waiting = False
                 schedule(time, 1, name, "rt")
@@ -147,19 +171,31 @@ def replay_queues(
                     queue.rt_waiting = True
                 elif queue.index < len(queue.packets):
                     packet = queue.packets[queue.index]
-                    queue.result.failure = QueueTimingFailure(packet, queue.ready_ns, time, time - queue.ready_ns)
+                    queue.result.required_buffer_ns += queue.ready_ns - time
+                    if queue.result.required_buffer_ns <= initial_buffer_ns:
+                        queue.rt_waiting = True
+                    else:
+                        queue.result.failure = QueueTimingFailure(packet, queue.ready_ns, time, time - queue.ready_ns)
                 continue
             packet, enqueued = queue.pending.popleft()
             queue.result.records.append(QueueTimingRecord(packet, enqueued, time, len(queue.pending)))
+            trigger = _trigger_timing(packet) if packet.op == "wait_trigger" else None
+            duration = packet.duration.value if trigger is None else trigger[1]
+            if trigger is not None and time > trigger[0]:
+                queue.result.incomplete_reason = (
+                    f"Scenario trigger arrived at {trigger[0]} ns before {packet.id} dequeued at {time} ns."
+                )
+                queue.trigger_missed = True
+                continue
             # A zero duration suspends the guard, but the next pop is still
             # attempted after 4 ns. Any nonzero duration restores the guard.
-            queue.underflow_suspended = packet.duration.value == 0
+            queue.underflow_suspended = duration == 0
             if queue.blocked:
                 issue_at(name, time)
             if packet.op == "wait_sync":
                 queue.sync = packet
             else:
-                schedule(time + (packet.duration.value or 4), 1, name, "rt")
+                schedule((time if trigger is None else trigger[0]) + (duration or 4), 1, name, "rt")
         release_sync(time)
 
     for name, queue in queues.items():
@@ -169,3 +205,11 @@ def replay_queues(
                       else f"Maximal prefetch before wait_sync {queue.sync.id} is unknown.")
             queue.result.incomplete_reason = queue.result.incomplete_reason or reason
     return results
+
+
+def _trigger_timing(packet: RtPacket) -> tuple[int, int] | None:
+    assumption = packet.meta.get("trigger_assumption")
+    if not isinstance(assumption, dict) or assumption.get("status") != "received":
+        return None
+    values = (assumption.get("arrival_ns"), assumption.get("duration_ns"))
+    return values if all(type(value) is int and value >= 0 for value in values) else None

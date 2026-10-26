@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from q1timeline.analysis.interpreter import AnalysisState
-from q1timeline.analysis.queue_timing import QueueReplayResult, replay_queues
+from q1timeline.analysis.queue_timing import ASSUMED_INITIAL_BUFFER_NS, POSSIBLE_INITIAL_BUFFER_NS, QueueReplayResult, replay_queues
 from q1timeline.analysis.values import Concrete, Unknown
 from q1timeline.diagnostics import Diagnostic
 
@@ -24,14 +24,14 @@ def annotate_playback_queue_timing(states: list[AnalysisState]) -> None:
             streams[state.sequencer_id].append(replace(
                 streams[state.sequencer_id][-1], duration=Unknown("Playback trace is incomplete"),
             ))
-    earliest = replay_queues(streams)
-    prefetched = replay_queues(streams, prefill_sync=True)
+    earliest = replay_queues(streams, initial_buffer_ns=ASSUMED_INITIAL_BUFFER_NS)
+    prefetched = replay_queues(streams, prefill_sync=True, initial_buffer_ns=POSSIBLE_INITIAL_BUFFER_NS)
     for state in states:
         low, high = earliest[state.sequencer_id], prefetched[state.sequencer_id]
         failure = high.failure if low.failure and high.failure else None
         reasons = list(dict.fromkeys(reason for reason in (low.incomplete_reason, high.incomplete_reason) if reason))
-        if low.failure and not high.failure:
-            reasons.append("Underflow depends on the unknown synchronization/startup delay.")
+        if high.failure and not low.failure:
+            reasons.append("Underflow depends on the unknown initial RT queue prefill or synchronization dwell.")
         if not state.stopped:
             reasons.append("The recorded execution is incomplete.")
         last_packet_end = state.rt_packets[-1].q1_issue_t1 if state.rt_packets else Concrete(0)
@@ -41,20 +41,36 @@ def annotate_playback_queue_timing(states: list[AnalysisState]) -> None:
             for event in state.events
         ):
             reasons.append("Feedback waiting after the last recorded RT packet is not checked.")
-        status = "definite_underflow" if failure else "analysis_incomplete" if reasons else "not_detected_in_recorded_packets"
+        status = ("definite_underflow" if failure else "analysis_incomplete" if reasons else
+                  "possibly_safe_with_initial_buffer" if low.failure else "not_detected_in_recorded_packets")
+        replay = high if low.failure else low
+        initial_buffer = {
+            "assumed_ns": ASSUMED_INITIAL_BUFFER_NS, "possible_ns": POSSIBLE_INITIAL_BUFFER_NS,
+            "required_ns": replay.required_buffer_ns,
+            "status": "exhausted" if failure else "tentative" if status == "possibly_safe_with_initial_buffer"
+                      else "incomplete" if reasons else "assumed",
+        }
         timing = {
             "status": status,
             "scope": "between_recorded_rt_packets",
             "terminal_timing": "not_modeled",
             "assumptions": {
-                "queue_depth_limit": 32, "startup": "first_packet_enqueue",
+                "queue_depth_limit": 32,
+                "startup": "first_packet_enqueue; no_added_idle",
+                "initial_buffer_assumed_ns": ASSUMED_INITIAL_BUFFER_NS,
+                "initial_buffer_possible_ns": POSSIBLE_INITIAL_BUFFER_NS,
+                "initial_buffer_basis": "user_assumption; not_measured",
+                "buffer_duration": "one_time_cumulative_q1_supply_gap_credit; never_replenished",
                 "same_time_order": "enqueue_before_dequeue",
                 "sync": "all_supplied_sequencers; earliest_release_to_maximum_prefetch",
                 "feedback": "playback_receipt_assumptions",
+                "trigger": "scheduled_receiver_arrival; duration_after_arrival; missed_arrival_incomplete",
+                "trigger_clock": "shared_analytical_receiver_arrival; no_startup_offset",
                 "zero_duration": "4_ns_then_wait_for_next_packet",
                 "display_coordinates": "unchanged_analytical",
             },
             "reasons": reasons,
+            "initial_buffer": initial_buffer,
             "earliest_failure": _failure_json(low),
             "prefetched_failure": _failure_json(high),
             "zero_duration_waits": {"earliest": _zero_duration_waits(low), "prefetched": _zero_duration_waits(high)},
@@ -67,11 +83,17 @@ def annotate_playback_queue_timing(states: list[AnalysisState]) -> None:
                 source=failure.packet.source,
                 details={"scope": timing["scope"], "assumptions": timing["assumptions"], **_failure_json(high)},
             ))
-        elif low.failure:
+        elif status == "possibly_safe_with_initial_buffer":
+            state.diagnostics.append(Diagnostic(
+                severity="info", category="initial_rt_buffer_estimate",
+                message="Q1 supply gaps exceed the assumed 1 ms buffer, but may be covered by an initial buffer up to 2 ms.",
+                source=low.failure.packet.source, details={"scope": timing["scope"], **initial_buffer},
+            ))
+        elif low.failure or high.failure:
             state.diagnostics.append(Diagnostic(
                 severity="info", category="playback_queue_timing_uncertain",
-                message="RT queue underflow depends on the unknown synchronization/startup delay.",
-                source=low.failure.packet.source,
+                message="RT queue underflow depends on the unknown initial queue prefill or synchronization dwell.",
+                source=(low.failure or high.failure).packet.source,
                 details={"scope": timing["scope"], "assumptions": timing["assumptions"]},
             ))
 
@@ -85,10 +107,12 @@ def _failure_json(result: QueueReplayResult) -> dict | None:
 
 
 def _zero_duration_waits(result: QueueReplayResult) -> list[dict]:
-    return [
-        {"after_packet_id": previous.packet.id, "next_packet_id": current.packet.id,
-         "wait_ns": current.dequeue_ns - previous.dequeue_ns - 4}
-        for previous, current in zip(result.records, result.records[1:])
-        if previous.packet.duration.value == 0 and previous.packet.op != "wait_sync"
-        and current.dequeue_ns > previous.dequeue_ns + 4
-    ]
+    waits = []
+    for previous, current in zip(result.records, result.records[1:]):
+        trigger = previous.packet.meta.get("trigger_assumption", {}) if previous.packet.op == "wait_trigger" else {}
+        duration = trigger.get("duration_ns", previous.packet.duration.value)
+        start = trigger.get("arrival_ns", previous.dequeue_ns)
+        if duration == 0 and previous.packet.op != "wait_sync" and current.dequeue_ns > start + 4:
+            waits.append({"after_packet_id": previous.packet.id, "next_packet_id": current.packet.id,
+                          "wait_ns": current.dequeue_ns - start - 4})
+    return waits

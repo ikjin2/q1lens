@@ -51,14 +51,14 @@ describe("Q1 timeline branch comparison lanes", () => {
           assert.equal(lane.branchComparisonId, branchId);
           assert.equal(lane.parentGroupId, "sequencer:Control");
           assert.equal(lane.sequencer, "Control");
-          assert.equal(Boolean(lane.hidden), false);
+          assert.equal(Boolean(lane.hidden), lane.kind === "q1-issue" && mode !== "debug");
           assert.ok(lane.blocks.every((block: any) => block.domain.meta.branch_comparison_path === lane.branchComparisonPath));
         }
         const common = model.lanes.filter((lane: any) => !lane.branchComparisonPath).flatMap((lane: any) => lane.blocks);
         assert.deepEqual(common.map((block: any) => block.id).sort(), ["branch-q1", "branch-rt", "prefix-q1", "prefix-rt"]);
         assert.equal(new Set(blocks(model).flatMap((block: any) => block.eventIds)).size, comparison().events.length);
         const folded = buildModel(comparison(), { layout, mode, expandedQ1IssueSequencers: [] });
-        assert.ok(pathLanes(folded).filter((lane: any) => lane.kind === "q1-issue").every((lane: any) => lane.hidden === (layout !== "instruction")));
+        assert.ok(pathLanes(folded).filter((lane: any) => lane.kind === "q1-issue").every((lane: any) => lane.hidden === (mode !== "debug")));
       }
     }
   });

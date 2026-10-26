@@ -14,7 +14,7 @@ from typing import Any
 
 from q1timeline.analysis import interpreter as core
 from q1timeline.analysis.values import Concrete, Unknown, resolve_arg_value, resolve_def_values, symbol_table_from_params, value_to_json
-from q1timeline.q1asm.ast import Arg, Instr, Program, SourceLocation
+from q1timeline.q1asm.ast import Instr, Program, SourceLocation
 from q1timeline.q1asm.instruction_table import get_instruction_spec, rt_duration_arg_for_instruction
 
 
@@ -119,9 +119,10 @@ class _Runtime:
                 core._diagnose_strict_q1asm_placeholder_defs(state, program.defs)
             symbols = symbol_table_from_params(params)
             defs = {key: arg for key, arg in program.defs.items() if arg.kind != "reg"}
-            resolved = resolve_def_values(defs, symbols, state.diagnostics)
+            resolved = resolve_def_values(defs, symbols, state.diagnostics, labels=program.labels)
             state.symbol_origins = core._symbol_origins(params, symbols, defs, resolved)
             symbols.update(resolved)
+            core._diagnose_program(state, symbols, program)
             state.has_expanded_instructions = any(
                 instruction.op in {"loop", "jlt"} or (instruction.op == "jge" and len(instruction.args) == 3)
                 for instruction in program.instructions
@@ -139,9 +140,10 @@ class _Runtime:
                 ],
             }
             seq = self.sequencers[name] = _Sequencer(state, symbols)
-            errors = [item for item in state.diagnostics if item.severity == "error" and item.category != "unresolved_symbol"]
+            errors = [item for item in state.diagnostics if item.severity == "error"]
             if errors:
-                self.fail(seq, "error", errors[0].message)
+                status = "error" if any(item.category != "unresolved_symbol" for item in errors) else "blocked"
+                self.fail(seq, status, errors[0].message)
             else:
                 self.schedule(0, 3, name, "q1")
                 self.schedule(self.startup, 2, name, "rt")
@@ -299,11 +301,10 @@ class _Runtime:
                 seq.waiting, seq.waiting_since = "feedback_input", self.now
                 return
         state.next_pc = state.pc + 1
-        reads = {register: value_to_json(resolve_arg_value(Arg("reg", register, register), scope))
-                 for _, register in core._register_read_operands(instruction, state)}
+        register_metadata = core._register_issue_metadata(state, instruction, scope)
         if instruction.op == "fb_pull_data":
             register = core._register_name(instruction.args[0], state)
-            reads[register] = value_to_json(resolve_arg_value(instruction.args[0], scope))
+            register_metadata["register_reads"][register] = value_to_json(resolve_arg_value(instruction.args[0], scope))
         before = dict(state.alu_flags) if state.alu_flags is not None else None
         state.current_resolved_args = core._resolved_args_for_instruction(instruction, scope, state)
         event_start = len(state.events)
@@ -347,14 +348,17 @@ class _Runtime:
                 steps=[core._provenance_step(instruction, f"feedback id {feedback['id']}", value)])
             provenance["input_event_id"] = feedback["event_id"]
             core._schedule_register_write(state, instruction, register, value, provenance)
-        issue = core._emit_q1_issue(state, instruction, Concrete(self.now), state.q1_time_ns, packet_id)
+        issue = core._emit_q1_issue(
+            state, instruction, Concrete(self.now), state.q1_time_ns, packet_id,
+            register_metadata=register_metadata,
+        )
         for event in state.events[event_start:]:
             if event.kind == "latched_state_pending":
                 seq.setter_ids[event.meta["field"]] = event.id
                 event.meta["q1_issue_event_id"] = issue.id
         if spec.category == "branch":
             core._execute_concrete_branch(state, instruction, issue, seq.symbols, defer_register_write=True)
-        issue.meta.update(source_pc=instruction.pc, execution_index=state.q1_issue_index, register_reads=reads,
+        issue.meta.update(source_pc=instruction.pc, execution_index=state.q1_issue_index,
                           flags_before=before, flags_after=dict(state.alu_flags) if state.alu_flags is not None else None)
         if feedback is not None:
             issue.meta["input_event_ids"] = [feedback["event_id"]]
@@ -458,12 +462,13 @@ class _Runtime:
         end = started + duration
         packet = state.rt_packets[command.packet_index]
         meta = {**packet.meta, "rt_packet_id": packet.id, "applied_state": command.settings,
+                "applied_state_mode": "snapshot", "applied_updated_fields": command.updated_fields,
                 "applied_setter_event_ids": command.setter_ids}
         if input_event_id is not None:
             meta["input_event_ids"] = [input_event_id]
         if skipped:
             meta.update(condition=list(command.condition), conditional_skipped=True,
-                        captured_state=command.settings, applied_state={}, applied_setter_event_ids={})
+                        captured_state=command.settings, applied_state={}, applied_updated_fields=[], applied_setter_event_ids={})
         state.rt_packets[command.packet_index] = replace(packet, rt_t0=Concrete(started), rt_t1=Concrete(end), duration=Concrete(duration), meta=meta)
         state.rt_time_ns = Concrete(end)
         if not skipped and op == "play":

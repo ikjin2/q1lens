@@ -140,10 +140,13 @@ def resolve_def_values(
     defs: dict[str, Arg],
     symbols: SymbolTable,
     diagnostics: list[Diagnostic] | None = None,
+    *,
+    labels: dict[str, int] | None = None,
 ) -> SymbolTable:
     diagnostic_sink = diagnostics if diagnostics is not None else []
     resolved: SymbolTable = {}
     scope = dict(symbols)
+    scope.update({f"@{name}": Concrete(pc) for name, pc in (labels or {}).items()})
     for name, arg in defs.items():
         value = resolve_arg_value(arg, scope, diagnostic_sink, required=False)
         resolved[name] = value
@@ -178,22 +181,22 @@ def resolve_arg_value(
                     _diagnose_unresolved_symbolic_value(value, diagnostics, source)
                 return value
         if required:
-            diagnostics.append(
-                Diagnostic(
-                    severity="warning",
-                    category="unresolved_symbol",
-                    message=f"Unresolved symbol: {name}",
-                    source=source,
-                    details={"symbol": name},
-                )
+            diagnostic = Diagnostic(
+                severity="warning",
+                category="unresolved_symbol",
+                message=f"Unresolved symbol: {name}",
+                source=source,
+                details={"symbol": name},
             )
+            if diagnostic not in diagnostics:
+                diagnostics.append(diagnostic)
         return Symbolic(name, (name,))
     return Symbolic(arg.raw)
 
 
 def _symbol_lookup_names(name: str) -> tuple[str, ...]:
     if name.startswith("$") and len(name) > 1:
-        return (name[1:], name)
+        return (name, name[1:])
     return (name,)
 
 
@@ -263,15 +266,15 @@ def _diagnose_unresolved_symbolic_value(
     if not isinstance(value, Symbolic):
         return
     for symbol in value.unresolved_symbols:
-        diagnostics.append(
-            Diagnostic(
-                severity="warning",
-                category="unresolved_symbol",
-                message=f"Unresolved symbol: {symbol}",
-                source=source,
-                details={"symbol": symbol},
-            )
+        diagnostic = Diagnostic(
+            severity="warning",
+            category="unresolved_symbol",
+            message=f"Unresolved symbol: {symbol}",
+            source=source,
+            details={"symbol": symbol},
         )
+        if diagnostic not in diagnostics:
+            diagnostics.append(diagnostic)
 
 
 def _unresolved_symbols(*values: Value) -> tuple[str, ...]:

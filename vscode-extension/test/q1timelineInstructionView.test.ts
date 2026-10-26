@@ -30,7 +30,7 @@ describe("Q1 timeline instruction layout", () => {
       ["long-wait", 0, 1], ["pulse", 1, 1], ["stop", 2, 1],
     ]);
     const q1 = lane(model, "sequencer:Control:q1_issue");
-    assert.equal(q1.hidden, false);
+    assert.equal(q1.hidden, true);
     assert.equal(q1.parentGroupId, "sequencer:Control");
     assert.deepEqual(q1.blocks.map((block: any) => [block.id, block.start, block.duration]), [
       ["q1-first", 0, 1], ["q1-last", 1, 1],
@@ -94,7 +94,7 @@ describe("Q1 timeline instruction layout", () => {
     ] }, { layout: "instruction" });
     assert.deepEqual(lane(model, "sequencer:Control:rt.path0").blocks.map((block: any) => [block.start, block.duration]), [[0, 1], [1, 1]]);
     assert.equal(lane(model, "sequencer:OnlyQ1").label, "OnlyQ1 · RT");
-    assert.equal(lane(model, "sequencer:OnlyQ1:q1_issue").hidden, false);
+    assert.equal(lane(model, "sequencer:OnlyQ1:q1_issue").hidden, true);
     assert.deepEqual(model.viewport, { start: 0, end: 2 });
   });
 
@@ -144,7 +144,7 @@ describe("Q1 timeline instruction layout", () => {
     assert.deepEqual([loop.laneId, loop.start, loop.end], ["sequencer:Control", 1, 3]);
     assert.deepEqual(loop.eventIds, ["loop", "issue", "path0", "path1", "member"]);
     assert.equal(loop.label, "L0 x4");
-    assert.deepEqual([q1.laneId, q1.start, q1.end], ["sequencer:Control:q1_issue", 0, 1]);
+    assert.deepEqual([q1.laneId, q1.start, q1.end], ["sequencer:Control", 1, 1]);
     assert.deepEqual([omitted.laneId, omitted.start, omitted.end], ["sequencer:Control", 3, 3]);
     assert.ok(allBlocks(model).every((block) => !["loop_block", "loop_iteration_preview"].includes(block.kind)));
     assert.ok(model.annotations.every((annotation: any) => annotation.start >= 0 && annotation.end <= model.viewport.end));

@@ -184,6 +184,14 @@ stages, acquisitions, and feedback. Execution replay can prepare a bounded
 concrete or simulated trace. These views show the declared software model;
 they do not represent measurements from connected hardware.
 
+Normal view shows RT lanes with underflow flags; Debug view also shows Q1 lanes.
+Click an RT block to expand its latched parameters and the registers read by that
+command. Highlights mark known value changes: registers are compared with the
+previous RT command's issue snapshot, and parameters with the previous applied
+state. Unknown values and first appearances are not highlighted as changes.
+Loop controls and branch choices remain available; the sequencer's execution
+assumptions menu exposes branch and feedback choices when Q1 lanes are hidden.
+
 `q1lens.q1timeline.executionMode` defaults to `project`, which respects the
 project configuration. Choose `analysis`, `concrete`, or `simulation` to override
 it, and set `q1lens.q1timeline.maxSteps` to bound that override.

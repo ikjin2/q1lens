@@ -13,7 +13,7 @@
       color: "#6ec6d9", lightColor: "#176b7e", scope: "storage.modifier.latched.q1asm",
     },
     rt: {
-      ops: "acquire acquire_digital acquire_timetags acquire_ttl acquire_weighed acquire_weighted latch_rst play play_pulse set_latch_en upd_param upd_thres wait".split(" "),
+      ops: "acquire acquire_digital acquire_timetags acquire_ttl acquire_weighed acquire_weighted latch_rst play play_netzero play_pulse set_latch_en upd_param upd_thres wait".split(" "),
       color: "#8bcf9a", lightColor: "#27763c", scope: "entity.name.function.rt.q1asm",
     },
     sync: {

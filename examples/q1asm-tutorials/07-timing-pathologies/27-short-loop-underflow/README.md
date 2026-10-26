@@ -1,8 +1,10 @@
 # Short Loop Underflow
 
 This q1timeline project is a minimal timing-pathology example. The program enters
-a short loop whose first real-time `play` packet is issued too late for its RT
-start time, so underflow analysis should report `definite_underflow`.
+a loop body repeated 8192 times, with 64 Q1 `nop` instructions after each 4 ns
+`play`. The sustained supply shortage exceeds the assumed 1 ms initial buffer
+and the tentative 2 ms scenario. Underflow analysis should then report
+`definite_underflow`; the initial buffer values are not hardware measurements.
 
 Run:
 

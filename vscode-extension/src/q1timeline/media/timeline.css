@@ -312,6 +312,7 @@ body.instruction-view.mode-normal .event.normal-feedback-collapsed {
 }
 
 .q1timeline-execution-status[data-execution-status="paused"],
+.q1timeline-execution-status[data-execution-status="waiting"],
 .q1timeline-execution-status[data-execution-status="blocked"],
 .q1timeline-execution-status[data-execution-status="limit"] {
   background: var(--vscode-editorWarning-foreground, #cca700);
@@ -319,6 +320,104 @@ body.instruction-view.mode-normal .event.normal-feedback-collapsed {
 
 .q1timeline-execution-status[data-execution-status="error"] {
   background: var(--vscode-editorError-foreground, #f14c4c);
+}
+
+.q1timeline-initial-buffer-summary {
+  margin-left: 6px;
+  color: var(--vscode-descriptionForeground);
+  font-size: 11px;
+}
+
+.q1timeline-external-inputs-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: min(600px, 100%);
+}
+
+#q1timeline-external-inputs-summary {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.q1timeline-external-inputs-summary button,
+.q1timeline-external-inputs-form button {
+  padding: 3px 8px;
+  border: 1px solid var(--vscode-panel-border, #555);
+  border-radius: 3px;
+  background: var(--vscode-button-secondaryBackground, var(--vscode-editorWidget-background, #eef0f3));
+  color: var(--vscode-button-secondaryForeground, var(--vscode-foreground, #1f2937));
+  font: inherit;
+  cursor: pointer;
+}
+
+.q1timeline-external-inputs-form button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.q1timeline-external-inputs-form {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--vscode-panel-border, #555);
+  font: 12px var(--vscode-font-family, sans-serif);
+}
+
+.q1timeline-input-help {
+  margin: 0 0 8px;
+  color: var(--vscode-descriptionForeground);
+}
+
+.q1timeline-trigger-source {
+  margin: 0 0 8px;
+  border: 1px solid var(--vscode-panel-border, #555);
+}
+
+.q1timeline-trigger-fields,
+.q1timeline-input-actions {
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.q1timeline-trigger-fields label {
+  display: grid;
+  gap: 3px;
+}
+
+.q1timeline-trigger-fields input {
+  padding: 4px 6px;
+  border: 1px solid var(--vscode-input-border, #555);
+  background: var(--vscode-input-background, var(--vscode-editor-background, #fff));
+  color: var(--vscode-input-foreground, var(--vscode-foreground, #1f2937));
+  font: inherit;
+}
+
+.q1timeline-trigger-targets {
+  margin-top: 8px;
+}
+
+.q1timeline-trigger-targets > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  padding: 6px 0;
+}
+
+.q1timeline-trigger-targets label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.q1timeline-input-actions {
+  align-items: center;
+}
+
+.q1timeline-input-actions .has-error {
+  color: var(--vscode-errorForeground, #f48771);
 }
 
 .q1timeline-toolbar-button svg,
@@ -384,6 +483,140 @@ body.instruction-view.mode-normal .event.normal-feedback-collapsed {
 
 .shared-q1-issue-toggle:hover {
   background: var(--vscode-button-secondaryHoverBackground);
+}
+
+body.mode-normal [data-lane-role="q1-issue"],
+body.mode-normal .q1-issue-lane,
+body.mode-normal .shared-q1-issue-toggle {
+  display: none !important;
+}
+
+.q1timeline-control-popover.q1timeline-rt-details {
+  display: block;
+  width: min(360px, calc(100vw - 32px));
+  max-height: min(460px, calc(100vh - 32px));
+  overflow: auto;
+  padding: 12px;
+  font-size: 12px;
+}
+
+.q1timeline-rt-details-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.q1timeline-rt-details-close {
+  border: 0;
+  padding: 0 4px;
+  background: transparent;
+  color: var(--vscode-foreground);
+  cursor: pointer;
+  font-size: 16px;
+}
+
+.q1timeline-rt-details-note {
+  margin: 6px 0;
+  color: var(--vscode-descriptionForeground);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.q1timeline-rt-details details {
+  margin-top: 10px;
+}
+
+.q1timeline-rt-details summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.q1timeline-rt-values {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.q1timeline-rt-values th,
+.q1timeline-rt-values td {
+  padding: 4px 6px;
+  text-align: left;
+  font-weight: normal;
+  overflow-wrap: anywhere;
+}
+
+.q1timeline-rt-values td {
+  font-family: var(--vscode-editor-font-family, monospace);
+}
+
+.q1timeline-rt-values .is-changed {
+  background: color-mix(in srgb, var(--vscode-charts-yellow, #cca700) 14%, transparent);
+}
+
+.q1timeline-rt-values .is-changed td {
+  font-weight: 700;
+  color: var(--vscode-charts-yellow, #cca700);
+  border-left: 2px solid currentColor;
+}
+
+.q1timeline-rt-disclosure {
+  flex: 0 0 auto;
+  margin-right: 3px;
+}
+
+.timeline-block[aria-expanded="true"] .q1timeline-rt-disclosure {
+  transform: rotate(90deg);
+}
+
+.q1timeline-assumptions-toggle {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 2px 5px;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 3px;
+  background: var(--vscode-button-secondaryBackground);
+  color: var(--vscode-foreground);
+  cursor: pointer;
+}
+
+.q1timeline-assumptions-popover {
+  flex-direction: column;
+  max-width: min(420px, calc(100vw - 16px));
+  max-height: min(400px, calc(100vh - 32px));
+  overflow: auto;
+}
+
+.q1timeline-assumptions-popover .q1timeline-control-action {
+  width: 100%;
+  height: auto;
+  padding: 7px;
+  text-align: left;
+  justify-items: start;
+}
+
+.shared-timeline-stage .timeline-block.q1timeline-timing-warning {
+  top: 0;
+  z-index: 9;
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  min-width: 16px;
+  padding: 0;
+  border: 1px solid var(--vscode-errorForeground, #f48771);
+  border-radius: 3px;
+  background: var(--vscode-editor-background);
+  color: var(--vscode-errorForeground, #f48771);
+  font-weight: bold;
+}
+
+.shared-timeline-stage .q1timeline-timing-warning.is-incomplete {
+  border-color: var(--vscode-charts-yellow, #cca700);
+  color: var(--vscode-charts-yellow, #cca700);
 }
 
 .shared-timeline-stage .lane-track {

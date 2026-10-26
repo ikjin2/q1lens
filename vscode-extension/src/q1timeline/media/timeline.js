@@ -8,6 +8,7 @@
   let timelineSelectionEvents;
   let timelineSelectionIndex = new Map();
   let activeTimelineControlChip = undefined;
+  let rtDetailsByEvent = new Map();
   let hardwareView;
   let hardwarePersistTimer;
 
@@ -126,6 +127,20 @@
     }
   }
 
+  function appendTriggerInspectorFields(fields, meta) {
+    const trigger = meta.trigger_assumption;
+    if (!trigger) return;
+    addInspectorField(fields, "Trigger input", "≈ Scenario input");
+    addInspectorField(fields, "Trigger source", trigger.source_id || "No matching source");
+    addInspectorField(fields, "Trigger address", trigger.address);
+    addInspectorField(fields, "Shared event", trigger.event_id);
+    addInspectorField(fields, "Wait armed (project ns)", trigger.armed_at_ns);
+    addInspectorField(fields, "Trigger arrival (project ns)", trigger.arrival_ns);
+    addInspectorField(fields, "Resume (project ns)", trigger.resume_ns);
+    addInspectorField(fields, "Wait after trigger (ns)", trigger.duration_ns);
+    addInspectorField(fields, "Trigger status", trigger.reason || trigger.status);
+  }
+
   function currentTimelineMode() {
     const mode = document.body && document.body.dataset ? document.body.dataset.mode : undefined;
     if (mode === "debug" || mode === "normal") {
@@ -138,6 +153,8 @@
     if (!eventNode) {
       return false;
     }
+    if (eventNode.closest('[hidden], [data-timeline-hidden="true"]')) return false;
+    if (currentTimelineMode() === "normal" && eventNode.closest('[data-lane-role="q1-issue"], .q1-issue-lane')) return false;
     if (eventNode.closest(".debug-lane") && currentTimelineMode() === "normal") {
       return false;
     }
@@ -167,6 +184,7 @@
     const source = event.source || {};
     const fields = [];
     appendDiffInspectorFields(fields, event);
+    appendTriggerInspectorFields(fields, meta);
     addInspectorField(fields, "Label", event.label || event.kind);
     addInspectorField(fields, "Sequencer", event.sequencer_id);
     addInspectorField(fields, "Lane", event.lane);
@@ -217,7 +235,8 @@
     renderSharedEventInspector(eventId);
     syncTimelineZoomActionState();
     if (options.notify !== false) {
-      window.dispatchEvent(new CustomEvent("q1timeline:eventClick", { detail: { eventId } }));
+      window.dispatchEvent(new CustomEvent("q1timeline:eventClick", { detail: { eventId,
+        ...(options.preserveFocus ? { preserveFocus: true } : {}) } }));
     }
   }
 
@@ -317,6 +336,7 @@
   }
 
   function expandQ1IssueLanesForHighlight(eventIds) {
+    if (currentTimelineMode() !== "debug" || sharedTimelineActive) return false;
     if (timelineLayout === "instruction") return false;
     let changed = false;
     for (const eventId of Array.isArray(eventIds) ? eventIds : []) {
@@ -776,8 +796,9 @@
     const centerX = chipRect.left + chipRect.width / 2;
     let left = centerX - popoverRect.width / 2;
     left = Math.max(8, Math.min(left, viewportWidth - popoverRect.width - 8));
-    let top = chipRect.top - popoverRect.height - 8;
-    let placement = "top";
+    const below = popover.classList.contains("q1timeline-rt-details") && chipRect.bottom + popoverRect.height + 16 <= viewportHeight;
+    let top = below ? chipRect.bottom + 8 : chipRect.top - popoverRect.height - 8;
+    let placement = below ? "bottom" : "top";
     if (top < 8) {
       top = chipRect.bottom + 8;
       placement = "bottom";
@@ -788,6 +809,80 @@
     popover.style.left = `${left}px`;
     popover.style.top = `${top}px`;
     popover.style.visibility = "";
+  }
+
+  function renderRtBlockDetails(popover, event) {
+    const details = rtDetailsByEvent.get(String(event.id));
+    if (!details) return;
+    popover.classList.add("q1timeline-rt-details");
+    popover.setAttribute("role", "dialog");
+    popover.setAttribute("aria-label", "RT block values");
+    const heading = document.createElement("div");
+    heading.className = "q1timeline-rt-details-heading";
+    heading.textContent = event.source?.raw?.trim() || event.label || event.kind;
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "q1timeline-rt-details-close";
+    close.textContent = "×";
+    close.setAttribute("aria-label", "Close RT block values");
+    close.addEventListener("click", () => closeTimelineControlPopover(true));
+    heading.append(close);
+    popover.append(heading);
+    const context = document.createElement("p");
+    context.className = "q1timeline-rt-details-note";
+    const meta = event.meta || {};
+    const scope = [];
+    if (meta.loop_iteration_index !== undefined) scope.push(`Iteration ${Number(meta.loop_iteration_index) + 1}`);
+    if (meta.branch_comparison_path) scope.push(meta.branch_comparison_path === "taken" ? "Jump" : "Continue");
+    if (event.confidence === "assumed" || meta.assumed_branch_path || meta.feedback_assumptions?.length) scope.push("Assumed execution");
+    context.textContent = [...scope, "Changed values are highlighted; register values were read when this command was issued."].join(" · ");
+    popover.append(context);
+    for (const [key, title, empty] of [
+      ["parameters", "Latched parameters", "No latched parameters used."],
+      ["registers", "Registers used", "No registers read by this command."],
+    ]) {
+      const section = document.createElement("details");
+      section.open = true;
+      const summary = document.createElement("summary");
+      summary.textContent = title;
+      section.append(summary);
+      const items = details[key] || [];
+      if (items.length) {
+        const table = document.createElement("table");
+        table.className = "q1timeline-rt-values";
+        table.setAttribute("aria-label", title);
+        const body = document.createElement("tbody");
+        for (const item of items) {
+          const row = document.createElement("tr");
+          row.dataset.valueName = item.name;
+          row.classList.toggle("is-changed", Boolean(item.changed));
+          if (item.changed) row.title = `Changed${item.previousDisplay !== undefined ? ` from ${item.previousDisplay}` : ""}`;
+          const name = document.createElement("th");
+          name.scope = "row";
+          name.textContent = ({phase: "phase (last absolute set)", phase_delta: "phase increment (this command)"})[item.name]
+            || item.name.replaceAll("_", " ");
+          const value = document.createElement("td");
+          value.textContent = item.valueDisplay;
+          row.append(name, value);
+          body.append(row);
+        }
+        table.append(body);
+        section.append(table);
+      } else {
+        const note = document.createElement("p");
+        note.className = "q1timeline-rt-details-note";
+        note.textContent = details[key === "registers" ? "registerNote" : "parameterNote"] || empty;
+        section.append(note);
+      }
+      const sectionNote = details[key === "registers" ? "registerNote" : "parameterNote"];
+      if (items.length && sectionNote) {
+        const note = document.createElement("p");
+        note.className = "q1timeline-rt-details-note";
+        note.textContent = sectionNote;
+        section.append(note);
+      }
+      popover.append(section);
+    }
   }
 
   function repositionActiveTimelineControlPopover() {
@@ -859,6 +954,22 @@
       renderBranchControls(popover, event);
     } else if (actionKind === "feedback") {
       renderFeedbackControls(popover, event);
+    } else if (actionKind === "rt-details") {
+      renderRtBlockDetails(popover, event);
+    } else if (actionKind === "assumptions") {
+      popover.classList.add("q1timeline-assumptions-popover");
+      popover.setAttribute("role", "dialog");
+      popover.setAttribute("aria-label", "Execution assumptions");
+      for (const [index, id] of meta.assumption_event_ids.entries()) {
+        const item = timelineEventsById.get(id);
+        const feedback = eventHasFeedbackControl(item);
+        const state = feedback ? `Feedback ≈ ${item.meta.feedback_assumption.value ?? "?"}` :
+          branchAssumptionDisplay(branchControlMeta(item)) || "Choose path";
+        addTimelineControlAction(popover, "branch", `${index + 1}. ${branchSourceJumpLabel(item)} · ${state}`, () => {
+          closeTimelineControlPopover();
+          openTimelineControlPopover(chip, item, feedback ? "feedback" : "branch");
+        }, { text: true });
+      }
     } else if (actionKind === "loop" && meta.playback) {
       popover.classList.add("q1timeline-playback-loop-popover");
       const loopKey = String(meta.loop_preview_key || meta.loop_id || event.id);
@@ -892,7 +1003,7 @@
     }
     ensureTimelineControlOverlay().append(popover);
     positionTimelineControlPopover(popover, chip);
-    if (actionKind === "branch" || actionKind === "feedback" || actionKind === "loop") {
+    if (["branch", "feedback", "loop", "rt-details", "assumptions"].includes(actionKind)) {
       popover.addEventListener("keydown", (keyEvent) => {
         if (keyEvent.key === "Escape") {
           keyEvent.preventDefault();
@@ -1000,47 +1111,57 @@
     document.querySelectorAll(".q1timeline-control-chip").forEach((node) => node.remove());
     const branchNodes = Array.from(document.querySelectorAll(".shared-timeline-stage .timeline-block[data-event-id]"));
     const chipStackCounts = new Map();
+    const hiddenControls = new Map();
     for (const node of branchNodes) {
       const event = timelineEventsById.get(String(node.dataset.eventId));
       const actionKind = eventHasFeedbackControl(event) ? "feedback" : event && eventHasBranchControl(event) ? "branch" : undefined;
       if (actionKind) {
+        if (!isTimelineEventVisible(node)) {
+          if (event.kind === "q1_issue") {
+            const sequencer = String(event.sequencer_id);
+            if (!hiddenControls.has(sequencer)) hiddenControls.set(sequencer, []);
+            hiddenControls.get(sequencer).push(String(event.id));
+          }
+          continue;
+        }
         const stackKey = timelineControlChipStackKey(node);
         const stackIndex = chipStackCounts.get(stackKey) || 0;
         chipStackCounts.set(stackKey, stackIndex + 1);
         addTimelineControlChip(node, event, actionKind, stackIndex);
       }
     }
+    document.querySelectorAll(".q1timeline-assumptions-toggle").forEach((node) => node.remove());
+    for (const [sequencer, ids] of hiddenControls) {
+      const row = Array.from(document.querySelectorAll(".shared-timeline-stage .timeline-row")).find(
+        (node) => node.dataset.lane === `sequencer:${sequencer}`);
+      const label = row?.querySelector(".lane-label");
+      if (!label) continue;
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "q1timeline-assumptions-toggle";
+      button.textContent = "⑂";
+      button.dataset.controlChipId = `assumptions:${sequencer}`;
+      button.setAttribute("aria-label", `Execution assumptions for ${sequencer}`);
+      button.setAttribute("aria-haspopup", "dialog");
+      button.setAttribute("aria-expanded", "false");
+      button.title = `${ids.length} branch / feedback choices`;
+      button.addEventListener("pointerdown", (event) => event.stopPropagation());
+      button.addEventListener("click", (event) => {
+        event.stopPropagation();
+        openTimelineControlPopover(button, { id: sequencer, meta: { assumption_event_ids: ids } }, "assumptions");
+      });
+      label.append(button);
+    }
     installLoopLaneTimelineControls();
   }
 
   function installSharedQ1IssueControls() {
-    const q1IssueRows = Array.from(document.querySelectorAll('.shared-timeline-stage [data-lane-role="q1-issue"]'));
-    const sequencers = new Set(q1IssueRows.map(q1IssueLaneParent).filter(Boolean));
-    for (const sequencer of sequencers) {
-      const parentRow = Array.from(document.querySelectorAll(".shared-timeline-stage [data-lane]")).find(
-        (laneNode) => !isQ1IssueLaneNode(laneNode) && laneBelongsToSequencer(laneNode.dataset.lane, sequencer),
-      );
-      const labelNode = parentRow ? parentRow.querySelector(".lane-label") : undefined;
-      if (!labelNode || labelNode.querySelector(".shared-q1-issue-toggle")) {
-        continue;
-      }
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "shared-q1-issue-toggle";
-      button.dataset.sequencerControl = sequencer;
-      button.addEventListener("click", (event) => {
-        stopSequencerControlEvent(event);
-        toggleSequencerFoldControl(sequencer);
-      });
-      button.addEventListener("pointerdown", stopSequencerControlEvent);
-      labelNode.prepend(button);
-    }
+    document.querySelectorAll(".shared-q1-issue-toggle").forEach((node) => node.remove());
   }
 
   function syncSharedSequencerFoldControls() {
     for (const laneNode of document.querySelectorAll('.shared-timeline-stage [data-lane-role="q1-issue"]')) {
-      const sequencer = q1IssueLaneParent(laneNode);
-      setTimelineNodeHidden(laneNode, timelineLayout !== "instruction" && !sequencerQ1IssueExpanded(sequencer));
+      setTimelineNodeHidden(laneNode, currentTimelineMode() !== "debug");
     }
     for (const button of document.querySelectorAll(".shared-q1-issue-toggle")) {
       const sequencer = button.dataset.sequencerControl;
@@ -1274,6 +1395,7 @@
     // calculating folds so the first frame uses the same scale as later frames.
     root.querySelector(".timeline-svg")?.remove();
     const focusedEventId = document.activeElement?.closest?.(".timeline-block")?.dataset.eventId;
+    const expandedDetailsId = activeTimelineControlChip?.dataset.rtDetailEventId;
     const previousStage = root.querySelector(".shared-timeline-stage");
     if (timelineLayout === "instruction" && previousStage && previousStage.dataset.instructionCount) {
       instructionView.leftOrdinal = previousStage.scrollLeft / instructionView.cellWidth;
@@ -1286,6 +1408,8 @@
       expandedQ1IssueSequencers: Array.from(expandedQ1IssueSequencers || []),
       expandedPlaybackLoops: Array.from(expandedPlaybackLoops),
     });
+    rtDetailsByEvent = new Map(model.lanes.flatMap((lane) => lane.blocks.filter((block) => block.rtDetails)
+      .flatMap((block) => (block.eventIds || [block.eventId]).map((id) => [String(id), block.rtDetails]))));
     if (timelineLayout !== "instruction") {
       model.viewport = sharedTimelineViewport();
       model.ticks = sharedTimelineTicks();
@@ -1311,11 +1435,15 @@
       }
     }
     window.q1lensSharedTimeline.renderTimeline(root, model, {
-      onBlockClick: (_block, node, event) => {
+      onBlockClick: (block, node, event) => {
         if (event && typeof event.stopPropagation === "function") {
           event.stopPropagation();
         }
-        selectEventNode(node);
+        selectEventNode(node, { preserveFocus: Boolean(block.rtDetails) });
+        if (block.rtDetails) {
+          const target = findVisibleEventNodeByIds([String(block.eventId)]);
+          if (target) openTimelineControlPopover(target, timelineEventsById.get(String(block.eventId)), "rt-details");
+        } else closeTimelineControlPopover();
       },
       onAnnotationClick: (annotation, node, event) => {
         if (event && typeof event.stopPropagation === "function") {
@@ -1362,6 +1490,34 @@
     installSharedQ1IssueControls();
     syncSharedSequencerFoldControls();
     installTimelineControlChips();
+    for (const node of root.querySelectorAll(".timeline-block[data-event-id]")) {
+      const event = timelineEventsById.get(node.dataset.eventId);
+      if (["underflow_warning", "analysis_incomplete"].includes(event?.kind)) {
+        const underflow = event.kind === "underflow_warning";
+        node.classList.add("q1timeline-timing-warning");
+        node.classList.toggle("is-incomplete", !underflow);
+        node.textContent = underflow ? "!" : "?";
+        node.title = underflow ? `Underflow${event.meta?.slack_ns !== undefined ? ` · slack ${event.meta.slack_ns} ns` : ""}` :
+          `Underflow analysis incomplete · ${event.meta?.reason || "Timing unknown"}`;
+        node.setAttribute("aria-label", node.title);
+        node.style.width = "16px";
+      }
+      if (!rtDetailsByEvent.has(node.dataset.eventId)) continue;
+      node.dataset.rtDetailEventId = node.dataset.eventId;
+      node.dataset.controlChipId = `rt-details:${node.dataset.eventId}`;
+      node.setAttribute("aria-haspopup", "dialog");
+      node.setAttribute("aria-expanded", "false");
+      node.title = `${node.title || ""}\nClick or press Enter to expand latched parameters and registers used.`;
+      const disclosure = document.createElement("span");
+      disclosure.className = "q1timeline-rt-disclosure";
+      disclosure.textContent = "▸";
+      disclosure.setAttribute("aria-hidden", "true");
+      node.prepend(disclosure);
+    }
+    if (expandedDetailsId && rtDetailsByEvent.has(expandedDetailsId)) {
+      const node = findVisibleEventNodeByIds([expandedDetailsId]);
+      if (node) openTimelineControlPopover(node, timelineEventsById.get(expandedDetailsId), "rt-details");
+    }
     installTimelineMouseInteractions();
     applySharedSelection(options);
     if (focusedEventId) findVisibleEventNodeByIds([focusedEventId])?.focus({ preventScroll: true });
@@ -1498,6 +1654,7 @@
       const source = event.source || {};
       const fields = [];
       appendDiffInspectorFields(fields, event);
+      appendTriggerInspectorFields(fields, meta);
       addInspectorField(fields, "Label", event.label || event.kind);
       addInspectorField(fields, "Sequencer", event.sequencer_id);
       addInspectorField(fields, "Lane", event.lane);
@@ -1725,6 +1882,10 @@
     eventFilter.value = savedEventFilterQuery;
   }
   let timelineExecutionState = state.executionState || timelineIr.playback || { status: "idle" };
+  let externalInputsState = state.externalInputs || { ...timelineIr.playback?.external_inputs,
+    canSave: Boolean(state.parameterProjectFile) && !state.singleFileMode };
+  let externalInputsPending = false;
+  let externalInputsDirty = false;
   const savedFoldState = readPersistedWebviewState();
   const currentFoldState = savedFoldState.timelineFoldStateVersion === 2 && savedFoldState.timelineFoldSnapshotId === state.playbackSnapshotId;
   const expandedPlaybackLoops = new Set(currentFoldState && Array.isArray(savedFoldState.expandedPlaybackLoops) ? savedFoldState.expandedPlaybackLoops : []);
@@ -2106,17 +2267,17 @@
     if (!button || !indicator) return;
     const execution = timelineExecutionState || { status: "idle" };
     const running = execution.status === "running";
-    const labels = { idle: "Ready", running: "Running", paused: "Paused", blocked: "Blocked", completed: "Completed", limit: "Instruction limit reached", error: "Execution stopped" };
+    const labels = { idle: "Ready", running: "Running", paused: "Paused", waiting: "Waiting for external input", blocked: "Blocked", completed: "Completed", limit: "Instruction limit reached", error: "Execution stopped" };
     const details = [labels[execution.status] || "Ready"];
     if (Number.isFinite(execution.steps)) details.push(`${execution.steps} instructions`);
     if (execution.reason) details.push(execution.reason);
     const completed = execution.status === "completed";
-    const cannotResume = ["blocked", "limit"].includes(execution.status) && execution.can_resume === false;
+    const cannotResume = execution.status === "waiting" || ["blocked", "limit"].includes(execution.status) && execution.can_resume === false;
     const label = running ? "Pause execution" : completed ? "Execution complete" : cannotResume ? labels[execution.status] : "Run execution";
     setIconOnlyToolbarButton(button, running ? "pause" : "play", label);
     button.disabled = completed || cannotResume;
-    if (completed) button.title = "Execution complete. Change a branch or feedback assumption to recalculate.";
-    if (cannotResume) button.title = `${execution.reason || labels[execution.status]} Change a branch or feedback assumption to recalculate.`;
+    if (completed) button.title = "Execution complete. Change a branch, feedback, or external input assumption to recalculate.";
+    if (cannotResume) button.title = `${execution.reason || labels[execution.status]} Change a branch, feedback, or external input assumption to recalculate.`;
     button.setAttribute("aria-pressed", String(running));
     indicator.dataset.executionStatus = execution.status || "idle";
     indicator.title = details.join(" · ");
@@ -2124,9 +2285,150 @@
   }
 
   function requestExecutionControl() {
-    if (timelineExecutionState.status === "completed" ||
+    if (["completed", "waiting"].includes(timelineExecutionState.status) ||
         ["blocked", "limit"].includes(timelineExecutionState.status) && timelineExecutionState.can_resume === false) return;
     vscode.postMessage({ type: "executionControl", action: timelineExecutionState.status === "running" ? "pause" : "play" });
+  }
+
+  function renderInitialBufferSummary() {
+    const underflow = timelineIr.assumptions?.underflow;
+    const assumed = underflow?.initial_buffer_assumed_ns;
+    const possible = underflow?.initial_buffer_possible_ns;
+    if (!Number.isFinite(assumed) || !Number.isFinite(possible)) return;
+    const summary = document.createElement("span");
+    summary.id = "q1timeline-initial-buffer-summary";
+    summary.className = "q1timeline-initial-buffer-summary";
+    summary.textContent = `Initial buffer ≈ ${formatFoldDuration(assumed)} · up to ${formatFoldDuration(possible)} probably OK`;
+    const details = [
+      `${formatFoldDuration(assumed)} of initial RT buffer is assumed. Up to ${formatFoldDuration(possible)} may be sufficient, but is unconfirmed.`,
+      "These are user-provided assumptions, not measured hardware values. The buffer covers cumulative Q1 supply gaps during RT execution; no RT startup delay is added.",
+    ];
+    for (const [sequencer, execution] of Object.entries(timelineIr.execution || {})) {
+      const buffer = execution.queue_timing?.initial_buffer;
+      if (Number.isFinite(buffer?.required_ns)) {
+        details.push(`${sequencer}: ${formatFoldDuration(buffer.required_ns)} of initial buffer required (${buffer.status}).`);
+      }
+    }
+    summary.title = details.join("\n");
+    ensureToolbarNode().append(summary);
+  }
+
+  function renderExternalInputsSummary() {
+    const summary = document.getElementById("q1timeline-external-inputs-summary");
+    if (!summary) return;
+    const triggers = externalInputsState.triggers || [];
+    const parameters = [];
+    const descriptions = triggers.map((trigger) => {
+      const resolved = trigger.resolved_address ?? (timelineIr.playback?.external_inputs?.triggers || [])
+        .find((item) => item.id === trigger.id && item.address === trigger.address)?.resolved_address;
+      const address = resolved ?? trigger.address;
+      if (resolved !== undefined && resolved !== trigger.address) parameters.push(`${trigger.id}: ${trigger.address} → ${resolved}`);
+      return `${trigger.id} · address ${address} · ${trigger.targets.length} sequencers · ${trigger.times_ns.length ? `${trigger.times_ns.join(", ")} ns` : "no events"}`;
+    });
+    summary.textContent = triggers.length ? `≈ Scenario input · ${descriptions[0]}${triggers.length > 1 ? ` · +${triggers.length - 1} sources` : ""}` : "External inputs · not configured";
+    if (externalInputsState.overridden) summary.textContent += " · Unsaved changes";
+    summary.title = descriptions.length ? `${[...descriptions, ...parameters].join("\n")}\nEvent times use the project clock. Configured scenario inputs are assumptions.` : "Configure shared trigger events for this project.";
+  }
+
+  function syncExternalInputsActions(error = "") {
+    const form = document.getElementById("q1timeline-external-inputs-form");
+    if (!form) return;
+    for (const control of form.querySelectorAll("input, button")) control.disabled = externalInputsPending;
+    form.querySelector('[data-trigger-action="save"]').disabled = externalInputsPending || externalInputsDirty || !externalInputsState.overridden || !externalInputsState.canSave;
+    form.querySelector('[data-trigger-action="reset"]').disabled = externalInputsPending || !externalInputsDirty && !externalInputsState.overridden;
+    const status = form.querySelector('[role="status"]');
+    status.textContent = error || (externalInputsPending ? "Applying…" : externalInputsDirty ? "Unapplied changes" : externalInputsState.overridden ? "Unsaved changes" : "");
+    status.classList.toggle("has-error", Boolean(error));
+  }
+
+  function renderExternalInputsEditor() {
+    const form = document.getElementById("q1timeline-external-inputs-form");
+    if (!form) return;
+    const triggers = externalInputsState.triggers || [];
+    const sequencers = (timelineIr.sequencers || []).map((item) => String(item.id));
+    form.innerHTML = '<p class="q1timeline-input-help">Times are receiver arrivals on the shared project clock (ns), before display alignment. Each selected sequencer can receive the same scenario event. An empty times list supplies no events.</p><div class="q1timeline-trigger-sources"></div>';
+    const sources = form.querySelector(".q1timeline-trigger-sources");
+    let nextSourceIndex = 1;
+    const addSource = (trigger) => {
+      const index = nextSourceIndex++;
+      const card = document.createElement("fieldset");
+      card.className = "q1timeline-trigger-source";
+      const targets = [...new Set([...sequencers, ...trigger.targets])];
+      card.innerHTML = `<legend>Trigger ${index}</legend><div class="q1timeline-trigger-fields">
+        <label>Name<input data-trigger-field="id" aria-label="Trigger ${index} name" value="${escapeHtml(trigger.id)}" required></label>
+        <label>Address / parameter<input data-trigger-field="address" aria-label="Trigger ${index} address" value="${escapeHtml(trigger.address)}" required></label>
+        <label>Times (ns, comma separated)<input data-trigger-field="times" aria-label="Trigger ${index} times (ns)" value="${escapeHtml(trigger.times_ns.join(", "))}"></label>
+        <button type="button" data-trigger-action="remove" aria-label="Remove trigger ${index}">Remove</button></div>
+        <details class="q1timeline-trigger-targets"><summary>Targets (${trigger.targets.length})</summary><div>${targets.map((id) => `<label><input type="checkbox" data-trigger-target="${escapeHtml(id)}"${trigger.targets.includes(id) ? " checked" : ""}>${escapeHtml(id)}</label>`).join("")}</div></details>`;
+      card.querySelector('[data-trigger-action="remove"]').addEventListener("click", () => {
+        card.remove(); externalInputsDirty = true; syncExternalInputsActions();
+      });
+      sources.append(card);
+    };
+    triggers.forEach(addSource);
+    const actions = document.createElement("div");
+    actions.className = "q1timeline-input-actions";
+    actions.innerHTML = '<button type="button" data-trigger-action="add">Add trigger</button><button type="submit">Apply &amp; rerun</button><button type="button" data-trigger-action="save">Save to project</button><button type="button" data-trigger-action="reset">Reset changes</button><span role="status" aria-live="polite"></span>';
+    actions.querySelector('[data-trigger-action="add"]').addEventListener("click", () => {
+      addSource({id: `trigger_${nextSourceIndex}`, address: 1, targets: sequencers, times_ns: [1000]});
+      externalInputsDirty = true; syncExternalInputsActions();
+    });
+    for (const [action, type] of [["save", "saveExternalInputs"], ["reset", "resetExternalInputs"]]) {
+      actions.querySelector(`[data-trigger-action="${action}"]`).addEventListener("click", () => {
+        if (action === "reset" && !externalInputsState.overridden) {
+          externalInputsDirty = false; renderExternalInputsEditor(); return;
+        }
+        externalInputsPending = true; syncExternalInputsActions(); vscode.postMessage({type});
+      });
+    }
+    form.append(actions);
+    syncExternalInputsActions(externalInputsState.error);
+  }
+
+  function installExternalInputs() {
+    const toolbar = ensureToolbarNode();
+    const group = document.createElement("span");
+    group.className = "q1timeline-external-inputs-summary";
+    group.innerHTML = '<span id="q1timeline-external-inputs-summary"></span><button type="button" aria-label="Configure external inputs" aria-controls="q1timeline-external-inputs-form" aria-expanded="false">Configure</button>';
+    toolbar.insertBefore(group, document.getElementById("q1timeline-refresh-button"));
+    const form = document.createElement("form");
+    form.id = "q1timeline-external-inputs-form";
+    form.className = "q1timeline-external-inputs-form";
+    form.setAttribute("aria-label", "External trigger configuration");
+    form.hidden = !readPersistedWebviewState().externalInputsOpen;
+    toolbar.insertAdjacentElement("afterend", form);
+    const configure = group.querySelector("button");
+    configure.setAttribute("aria-expanded", String(!form.hidden));
+    configure.addEventListener("click", () => {
+      form.hidden = !form.hidden;
+      configure.setAttribute("aria-expanded", String(!form.hidden));
+      writePersistedWebviewState({externalInputsOpen: !form.hidden});
+    });
+    form.addEventListener("input", () => {
+      externalInputsDirty = true;
+      for (const card of form.querySelectorAll(".q1timeline-trigger-source")) {
+        card.querySelector("summary").textContent = `Targets (${card.querySelectorAll("input[type=checkbox]:checked").length})`;
+      }
+      syncExternalInputsActions();
+    });
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      if (externalInputsPending) return;
+      const triggers = [...form.querySelectorAll(".q1timeline-trigger-source")].map((card) => {
+        const value = (name) => card.querySelector(`[data-trigger-field="${name}"]`).value.trim();
+        const address = value("address");
+        return {id: value("id"), address: /^\d+$/.test(address) ? Number(address) : address,
+          targets: [...card.querySelectorAll("input[type=checkbox]:checked")].map((input) => input.dataset.triggerTarget),
+          times_ns: value("times") ? value("times").split(/[,\s]+/).map(Number) : []};
+      });
+      if (triggers.some((trigger) => trigger.times_ns.some((time) => !Number.isSafeInteger(time) || time < 0))) {
+        syncExternalInputsActions("Event times must be nonnegative integers in ns."); return;
+      }
+      externalInputsPending = true; syncExternalInputsActions();
+      vscode.postMessage({type: "setExternalInputs", triggers});
+    });
+    renderExternalInputsSummary();
+    renderExternalInputsEditor();
   }
 
   function ensureToolbarNode() {
@@ -2315,6 +2617,7 @@
   function requestViewMode(mode) {
     const currentMode = mode === "debug" ? "debug" : "normal";
     renderModeToggle(currentMode);
+    if (sharedTimelineActive) renderSharedTimelineIfAvailable(currentMode);
     vscode.postMessage({ type: "setViewMode", mode: currentMode });
   }
 
@@ -4313,6 +4616,8 @@
   }
 
   ensureToolbarNode();
+  renderInitialBufferSummary();
+  installExternalInputs();
   renderExecutionControls();
   renderComparisonStatus(state.comparison);
   renderAlignmentPolicy(initialAlignmentPolicy);
@@ -4337,12 +4642,12 @@
   window.addEventListener("q1timeline:eventClick", (event) => {
     const eventId = event.detail && event.detail.eventId;
     if (eventId) {
-      vscode.postMessage({ type: "eventClick", eventId });
+      vscode.postMessage({ type: "eventClick", eventId, ...(event.detail.preserveFocus ? { preserveFocus: true } : {}) });
     }
   });
 
   document.addEventListener("click", (event) => {
-    if (!event.target.closest(".q1timeline-control-chip, .q1timeline-control-popover")) {
+    if (!event.target.closest(".q1timeline-control-chip, .q1timeline-control-popover, .q1timeline-assumptions-toggle, [data-rt-detail-event-id]")) {
       closeTimelineControlPopover();
     }
   });
@@ -4357,6 +4662,21 @@
   });
 
   window.addEventListener("message", (event) => {
+    if (event.data && event.data.type === "externalInputsState") {
+      const wasPending = externalInputsPending;
+      externalInputsPending = false;
+      const next = event.data.state || {};
+      if (next.error) { syncExternalInputsActions(next.error); return; }
+      externalInputsState = next;
+      renderExternalInputsSummary();
+      if (wasPending || !externalInputsDirty) {
+        externalInputsDirty = false;
+        renderExternalInputsEditor();
+      } else {
+        syncExternalInputsActions();
+      }
+      return;
+    }
     if (event.data && event.data.type === "setAnalysisStatus") {
       if (["error", "idle"].includes(event.data.status)) hardwareView?.finishReplayPreparation();
       return;

@@ -1,6 +1,6 @@
 // @ts-nocheck
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -1739,7 +1739,8 @@ describe("q1timeline controller", () => {
         { cwd: repoRoot, env: { ...process.env, PYTHONPATH: join(repoRoot, "src") }, encoding: "utf8", windowsHide: true });
         const ir = JSON.parse(readFileSync(join(setup.root, "custom-ir.json"), "utf8"));
         assert.ok(ir.events.length > 0);
-        assert.ok(ir.events.some((event) => event.source?.file === setup.files.file));
+        assert.ok(ir.events.some((event) => event.source?.file &&
+          realpathSync.native(event.source.file) === realpathSync.native(setup.files.file)));
       } finally { setup.controller.dispose(); }
     });
   });

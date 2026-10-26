@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import Module = require("node:module");
 import { tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
@@ -59,7 +59,7 @@ describe("commands", () => {
       const target = resolveScheduleSourceTarget({ ir, projectDir, scheduleFile, selection: { blockId: ir.operations[0].id } });
 
       assert.equal(target.kind, "file");
-      assert.equal(target.file, scheduleFile);
+      assert.equal(realpathSync.native(target.file), realpathSync.native(scheduleFile));
       if (target.kind === "file") assert.equal(target.line, source.indexOf('    schedule.add(object(), label="measure")') + 1);
     } finally {
       if (originalPythonPath === undefined) delete process.env.PYTHONPATH;

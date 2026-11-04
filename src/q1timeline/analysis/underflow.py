@@ -7,6 +7,7 @@ from q1timeline.analysis.interpreter import AnalysisState
 from q1timeline.analysis.queue_timing import ASSUMED_INITIAL_BUFFER_NS, POSSIBLE_INITIAL_BUFFER_NS, replay_queues
 from q1timeline.analysis.values import Concrete, Unknown, subtract_values
 from q1timeline.diagnostics import Diagnostic
+from q1timeline.diagnostic_catalog import underflow_label
 
 
 UnderflowStatus = Literal[
@@ -257,15 +258,15 @@ def _emit_underflow_warning(
         kind="underflow_warning",
         t0=t0,
         source=source,
-        label=status,
+        label=underflow_label(meta),
         meta=meta,
     )
     state.events.append(event)
     state.diagnostics.append(
         Diagnostic(
-            severity="warning",
+            severity="error" if status == "definite_underflow" else "warning",
             category=status,
-            message=f"{status}: slack = {slack_ns} ns.",
+            message=f"{underflow_label(meta)}.",
             source=source,
             related_events=[event.id],
             details=details,

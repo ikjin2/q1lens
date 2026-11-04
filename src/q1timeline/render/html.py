@@ -8,7 +8,7 @@ from html import escape
 from pathlib import Path
 from typing import Any
 
-from q1timeline.diagnostic_catalog import describe_diagnostic
+from q1timeline.diagnostic_catalog import describe_diagnostic, underflow_label
 from q1timeline.q1asm.instruction_table import INSTRUCTION_TABLE, STATUS_BRANCH_OPS
 
 
@@ -720,7 +720,7 @@ def _tooltip(event: dict[str, Any]) -> str:
     source_display = f"{source.get('file')}:{source.get('line')}" if source.get("file") else "unavailable"
     raw_display = str(source.get("raw")) if source.get("raw") else "unavailable"
     lines = [
-        f"label: {event.get('label', event.get('kind'))}",
+        f"label: {underflow_label(meta) if event.get('kind') == 'underflow_warning' else event.get('label', event.get('kind'))}",
         f"kind: {event.get('kind')}",
         f"sequencer: {event.get('sequencer_id')}",
         f"lane: {event.get('_base_lane', event.get('lane'))}",
@@ -747,6 +747,8 @@ def _group_events(events: list[dict[str, Any]], *, mode: str) -> tuple[list[dict
     grouped_events: list[dict[str, Any]] = []
     lanes: list[str] = []
     for event in events:
+        if event.get("kind") == "slack":
+            continue
         sequencer = event.get("sequencer_id", "")
         lane = str(event.get("lane", ""))
         if mode == "normal":
@@ -759,7 +761,7 @@ def _group_events(events: list[dict[str, Any]], *, mode: str) -> tuple[list[dict
                     if base_lane not in lanes:
                         lanes.append(base_lane)
                     grouped = f"{base_lane} / {NORMAL_Q1_ISSUE_LANE}"
-                elif _is_debug_lane(lane):
+                elif _is_debug_lane(lane) and event.get("kind") != "underflow_warning":
                     continue
                 else:
                     grouped = f"sequencer:{sequencer}"
@@ -778,6 +780,8 @@ def _lane_display_label(lane: str) -> str:
     base_lane = _debug_lane_candidate(lane)
     if base_lane in {NORMAL_Q1_ISSUE_LANE, "debug.q1_issue"}:
         return "Q1 core"
+    if base_lane == "debug.underflow":
+        return "RT underflow"
     if base_lane.startswith("If "):
         return base_lane
     parsed = _branch_comparison_lane_parts(lane)
@@ -790,6 +794,8 @@ def _lane_display_label(lane: str) -> str:
 def _event_display_label(event: dict[str, Any]) -> str:
     label = str(event.get("label", event.get("kind", "event")))
     meta = event.get("meta", {}) if isinstance(event.get("meta"), dict) else {}
+    if event.get("kind") == "underflow_warning":
+        label = underflow_label(meta)
     path = meta.get("branch_comparison_path")
     if path == "taken":
         return f"[Taken] {label}"
@@ -805,6 +811,8 @@ def _event_inline_label(event: dict[str, Any], width: float) -> str:
 
 def _event_label_token(event: dict[str, Any]) -> str:
     kind = str(event.get("kind", ""))
+    if kind == "underflow_warning":
+        return _event_display_label(event)
     if kind == "q1_issue":
         return _q1_issue_command_token(event)
     if kind == "acquire":
@@ -2397,7 +2405,12 @@ function renderInspector(eventId) {
   const meta = event.meta || {};
   const source = event.source || {};
   const fields = [];
-  addInspectorField(fields, 'Label', event.label || event.kind);
+  let label = event.label || event.kind;
+  if (event.kind === 'underflow_warning') {
+    label = meta.status === 'possible_underflow' ? 'Possible RT underflow' : 'RT underflow';
+    if (meta.slack_ns < 0) label += ` · ${-meta.slack_ns} ns late`;
+  }
+  addInspectorField(fields, 'Label', label);
   addInspectorField(fields, 'Sequencer', event.sequencer_id);
   addInspectorField(fields, 'Lane', event.lane);
   addInspectorField(fields, 'Time range', `${displayInspectorValue(event.t0)} -> ${displayInspectorValue(event.t1)}`);
@@ -2406,7 +2419,7 @@ function renderInspector(eventId) {
   addInspectorField(fields, 'Q1 core', event.kind === 'q1_issue' ? `${displayInspectorValue(event.t0)} -> ${displayInspectorValue(event.t1)}` : meta.q1_issue_event_id);
   addInspectorField(fields, 'RT packet', meta.rt_packet_id);
   addInspectorField(fields, 'Queue depth', meta.estimated_depth);
-  addInspectorField(fields, 'Slack', meta.slack_ns !== undefined ? `${meta.slack_ns} ns` : '');
+  addInspectorField(fields, 'Late by', event.kind === 'underflow_warning' && meta.slack_ns < 0 ? `${-meta.slack_ns} ns` : '');
   addInspectorField(fields, 'Branch condition', meta.condition);
   addInspectorField(fields, 'Branch decision', meta.branch_decision);
   addInspectorField(fields, 'Runtime dependency', meta.runtime_dependency);

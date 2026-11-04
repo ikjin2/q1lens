@@ -125,7 +125,7 @@ def test_feedback_delay_queue_checks_preserve_raw_coordinates(first_wait, expect
         assert not snapshot.diagnostics
     else:
         assert snapshot.diagnostics[-1].category == "playback_queue_underflow"
-        assert snapshot.diagnostics[-1].severity == "warning"
+        assert snapshot.diagnostics[-1].severity == "error"
 
 
 def test_initial_buffer_covers_short_post_sync_housekeeping():

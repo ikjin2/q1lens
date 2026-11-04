@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.6
+
+- Show Q1ASM instruction signatures and operand types on hover, with comment toggling and bracket completion.
+- Underline instruction code without labels or trailing comments, while preserving validated Quick Fix edit ranges.
+- Report confirmed RT and playback queue underflows as errors, show positive lateness, and retain the timeline when underflow is the analysis error.
+- Replace separate slack displays with RT underflow labels in extension and standalone HTML timelines.
+- Correct initial framing of compact loops and simplify RT block details.
+- Add an initial RT buffer example and pair with Python package 0.2.6.
+
 ## 0.2.5
 
 - Validate Q1ASM syntax, operand signatures, ranges, labels, and aliases across the full source before execution, with conservative lint diagnostics.

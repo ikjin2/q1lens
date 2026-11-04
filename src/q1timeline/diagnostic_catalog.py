@@ -51,8 +51,8 @@ DIAGNOSTIC_PRESENTATIONS: dict[str, dict[str, str]] = {
     },
     "definite_underflow": {
         "group": "Timing",
-        "title": "Definite RT underflow",
-        "summary": "The RT queue slack is {slack_ns} ns, so this packet is scheduled too early.",
+        "title": "RT underflow",
+        "summary": "The RT command is {late_ns} ns late.",
         "fix": "Increase the wait gap, reduce the preceding Q1 work, or move this RT packet later.",
     },
     "initial_rt_buffer_estimate": {
@@ -214,7 +214,7 @@ DIAGNOSTIC_PRESENTATIONS: dict[str, dict[str, str]] = {
     "possible_underflow": {
         "group": "Timing",
         "title": "Possible RT underflow",
-        "summary": "The RT queue slack is {slack_ns} ns after a sync or trigger, so underflow depends on runtime alignment.",
+        "summary": "The RT command may be {late_ns} ns late, depending on runtime alignment.",
         "fix": "Increase the wait gap or inspect the sync/trigger relationship around this packet.",
     },
     "pending_hardware_state": {
@@ -304,6 +304,12 @@ DIAGNOSTIC_PRESENTATIONS: dict[str, dict[str, str]] = {
 }
 
 
+def underflow_label(meta: dict[str, Any]) -> str:
+    label = "Possible RT underflow" if meta.get("status") == "possible_underflow" else "RT underflow"
+    slack_ns = meta.get("slack_ns")
+    return f"{label} · {-slack_ns} ns late" if isinstance(slack_ns, (int, float)) and slack_ns < 0 else label
+
+
 def describe_diagnostic(diagnostic: Any) -> dict[str, str]:
     category = str(_get_diagnostic_field(diagnostic, "category", "diagnostic"))
     severity = str(_get_diagnostic_field(diagnostic, "severity", "info"))
@@ -328,6 +334,9 @@ def describe_diagnostic(diagnostic: Any) -> dict[str, str]:
             **{str(key): _format_value(value) for key, value in details.items()},
         }
     )
+    slack_ns = details.get("slack_ns")
+    if isinstance(slack_ns, (int, float)) and slack_ns < 0:
+        values["late_ns"] = str(-slack_ns)
     summary_template = spec.get("summary", "{message}")
     fix_template = spec.get("fix", "")
     summary = message if _has_missing_field(summary_template, values) else _format_template(summary_template, values)

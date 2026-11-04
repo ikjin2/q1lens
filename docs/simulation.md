@@ -23,7 +23,11 @@ Supply gaps covered by the assumed 1 ms do not produce underflow warnings. If
 they need more than 1 ms but fit within the tentative 2 ms scenario, the timeline
 reports `possibly_safe_with_initial_buffer` and an informational estimate. The
 2 ms scenario also allows prefetch at `wait_sync`. A gap exceeding that scenario
-still produces an underflow warning. Unknown branches, inputs, or unfinished
+still produces an underflow diagnostic. Confirmed RT underflows and recorded-path
+playback underflows are errors; possible underflows remain warnings. Analysis
+with an error returns exit code 2 while retaining its timeline and diagnostics.
+The timeline shows lateness as a positive duration, such as `24 ns late`.
+Unknown branches, inputs, or unfinished
 traces remain incomplete; neither buffer scenario verifies hardware behavior.
 
 The event-driven simulator instead uses its explicit `startup_delay_ns` scenario,

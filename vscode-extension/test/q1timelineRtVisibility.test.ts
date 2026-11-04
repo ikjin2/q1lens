@@ -49,8 +49,31 @@ describe("RT timeline visibility", () => {
       const debug = buildModel(ir, { layout, mode: "debug" });
       const warnings = debug.lanes.find((lane: any) => lane.id === "sequencer:Control:debug.underflow");
       assert.deepEqual(warnings.blocks.map((block: any) => block.eventId), ["underflow", "incomplete"]);
-      assert.ok(debug.lanes.some((lane: any) => lane.blocks.some((block: any) => block.eventId === "slack")));
+      assert.ok(debug.lanes.every((lane: any) => lane.blocks.every((block: any) => block.eventId !== "slack")));
+      assert.equal(warnings.label, "RT underflow");
     }
+  });
+
+  it("shows underflow lateness as a positive duration without exposing normal slack", () => {
+    const ir = { events: [
+      event("normal", "slack", 0, { slack_ns: 24 }, { lane: "debug.slack" }),
+      event("late", "slack", 4, { slack_ns: -24 }, { lane: "debug.slack" }),
+      event("underflow", "underflow_warning", 4, { status: "definite_underflow", slack_ns: -24 }),
+      event("possible", "underflow_warning", 8, { status: "possible_underflow", slack_ns: -8 }),
+      event("unknown", "underflow_warning", 12, { simulated: true }),
+    ] };
+    const before = JSON.stringify(ir);
+    for (const mode of ["normal", "debug"]) {
+      for (const layout of ["time", "instruction"]) {
+        const blocks = buildModel(ir, { mode, layout }).lanes.flatMap((lane: any) => lane.blocks);
+        assert.deepEqual(blocks.map((block: any) => block.eventId), ["underflow", "possible", "unknown"]);
+        assert.deepEqual(blocks.map((block: any) => block.label), [
+          "RT underflow · 24 ns late", "Possible RT underflow · 8 ns late", "RT underflow",
+        ]);
+        assert.ok(blocks.every((block: any) => !/slack|-[0-9]/.test(block.title)));
+      }
+    }
+    assert.equal(JSON.stringify(ir), before);
   });
 
   it("anchors warning markers within the matching Compare alternative", () => {

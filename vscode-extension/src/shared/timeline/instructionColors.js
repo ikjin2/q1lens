@@ -67,19 +67,22 @@
     return `var(--q1asm-arg-${kind}-color, ${argumentStyles[kind].color})`;
   }
 
-  function sourceTokens(raw) {
+  function sourceCodeEnd(raw) {
     const text = String(raw || "");
-    let codeEnd = text.length;
     let braceDepth = 0;
     for (let index = 0; index < text.length; index += 1) {
       if (text[index] === "#" || (braceDepth === 0 && text.startsWith("//", index))) {
-        codeEnd = index;
-        break;
+        return index;
       }
       if (text[index] === "{") braceDepth += 1;
       else if (text[index] === "}") braceDepth = Math.max(0, braceDepth - 1);
     }
-    const code = text.slice(0, codeEnd);
+    return text.length;
+  }
+
+  function sourceTokens(raw) {
+    const text = String(raw || "");
+    const code = text.slice(0, sourceCodeEnd(text));
     const tokens = [];
     const prefix = code.match(/^(\s*)(?:([A-Za-z_][A-Za-z0-9_]*)\s*:\s*)?/);
     if (prefix[2]) {
@@ -97,6 +100,7 @@
         tokens.push({ start: offset - definition[1].length, end: offset, kind: "symbol" });
       }
     }
+    let braceDepth = 0;
     while (offset < code.length) {
       if (/[,\s]/.test(code[offset])) {
         offset += 1;
@@ -121,7 +125,7 @@
     return tokens;
   }
 
-  const api = { families, argumentStyles, commandToken, commandFamily, commandAccentColor, eventCommandToken, argumentAccentColor, sourceTokens };
+  const api = { families, argumentStyles, commandToken, commandFamily, commandAccentColor, eventCommandToken, argumentAccentColor, sourceCodeEnd, sourceTokens };
   root.q1asmInstructionColors = api;
   if (typeof module !== "undefined" && module.exports) module.exports = api;
 })(typeof window !== "undefined" ? window : globalThis);

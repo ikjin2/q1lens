@@ -7,6 +7,20 @@ const { families } = require("../../src/shared/timeline/instructionColors.js");
 describe("Q1ASM colors in VS Code", function () {
   this.timeout(30000);
 
+  it("keeps comment toggling available without another Q1ASM extension", async () => {
+    const source = "play 0, 1, 4\n";
+    const document = await vscode.workspace.openTextDocument({ language: "q1asm", content: source });
+    await vscode.window.showTextDocument(document);
+    try {
+      await vscode.commands.executeCommand("editor.action.commentLine");
+      assert.equal(document.getText(), "# play 0, 1, 4\n");
+      await vscode.commands.executeCommand("editor.action.commentLine");
+      assert.equal(document.getText(), source);
+    } finally {
+      await vscode.commands.executeCommand("workbench.action.revertAndCloseActiveEditor");
+    }
+  });
+
   it("updates actual editor decorations when its language changes without a text edit", async () => {
     const document = await vscode.workspace.openTextDocument({ language: "plaintext", content: "play 0, 1, 4\n" });
     await vscode.window.showTextDocument(document);

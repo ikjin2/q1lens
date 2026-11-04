@@ -63,7 +63,7 @@ describe("package metadata", () => {
     assert.ok(commands.every((entry: { category: string }) => entry.category === "Q1Lens"));
   });
 
-  it("activates and exposes q1timeline preview actions for Q1ASM files", () => {
+  it("keeps Q1ASM preview actions in context menus without an editor title button", () => {
     const manifest = packageJson();
     const commands = manifest.contributes.commands.map((entry: { command: string }) => entry.command);
 
@@ -75,12 +75,7 @@ describe("package metadata", () => {
     assert.ok(commands.includes("q1timeline.selectQ1asmFilesInFolder"));
 
     const menus = manifest.contributes.menus;
-    assert.ok(
-      menus["editor/title"].some((entry: { command: string; when: string }) => (
-        entry.command === "q1timeline.openPreview" &&
-        entry.when.includes("resourceExtname == .q1asm")
-      )),
-    );
+    assert.ok(!(menus["editor/title"] ?? []).some((entry: { command: string }) => entry.command === "q1timeline.openPreview"));
     assert.ok(
       menus["editor/context"].some((entry: { command: string; when: string }) => (
         entry.command === "q1timeline.openPreview" &&
@@ -160,7 +155,7 @@ describe("package metadata", () => {
     assert.equal(scripts["verify:installed"], "node ./scripts/verify-installed-assets.js");
     assert.equal(
       scripts["reinstall:local"],
-      "npm run package && code --install-extension q1lens-0.2.5.vsix --force && npm run verify:installed",
+      "npm run package && code --install-extension q1lens-0.2.6.vsix --force && npm run verify:installed",
     );
   });
 

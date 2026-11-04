@@ -1,0 +1,12 @@
+{
+  "folders": [
+    {
+      "name": "Initial RT buffer demo",
+      "path": "."
+    }
+  ],
+  "settings": {
+    "q1lens.q1timeline.pythonPath": "python",
+    "q1lens.q1timeline.executionMode": "project"
+  }
+}

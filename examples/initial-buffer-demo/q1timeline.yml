@@ -1,0 +1,29 @@
+sequencers:
+  - id: assumed
+    name: 0.5 ms - covered by 1 ms assumption
+    file: 01-assumed-0_5ms.q1asm
+    module: QCM0
+  - id: tentative
+    name: 1.5 ms - probably OK up to 2 ms
+    file: 02-tentative-1_5ms.q1asm
+    module: QCM0
+  - id: exhausted
+    name: 2.5 ms - initial buffer exhausted
+    file: 03-underflow-2_5ms.q1asm
+    module: QCM0
+
+alignment:
+  mode: none
+
+view:
+  default_mode: debug
+  show_q1_issue: true
+  show_queue: true
+  show_slack: true
+  show_loop_preview: true
+
+analysis:
+  execution_mode: analysis
+  loop_policy: compact_first_iteration
+  branch_policy: assume_fallthrough
+  underflow_policy: confidence_levels

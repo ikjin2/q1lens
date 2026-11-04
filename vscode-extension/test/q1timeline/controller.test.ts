@@ -6839,7 +6839,7 @@ describe("q1timeline controller", () => {
     });
   });
 
-  it("renders a new partial simulation error trace while preserving failure handling for other modes", async () => {
+  it("renders simulation and underflow errors while preserving failure handling for other diagnostics", async () => {
     const vscode = createMockVscode();
     const outputDir = mkdtempSync(join(tmpdir(), "q1-simulation-error-"));
     await withMockedVscode(vscode, async ({ TimelineController }) => {
@@ -6847,6 +6847,7 @@ describe("q1timeline controller", () => {
       controller.projectUri = vscode.Uri.file(join(outputDir, "q1timeline.yml"));
       controller.outputDir = outputDir;
       let mode = "simulation";
+      const diagnostics: any[] = [];
       let rendered = 0;
       let refreshed = 0;
       let cleared = 0;
@@ -6854,6 +6855,7 @@ describe("q1timeline controller", () => {
         writeFileSync(join(outputDir, "timeline_ir.json"), JSON.stringify({
           events: [{ id: "underflow", kind: "underflow_warning" }],
           execution: { seq0: { mode, status: "error", reason: "RT queue empty" } },
+          diagnostics,
         }));
         writeFileSync(join(outputDir, "diagnostics.json"), "[]");
         throw Object.assign(new Error("simulation error"), { stage: "analyzer", exitCode: 1, elapsedMs: 1,
@@ -6872,6 +6874,16 @@ describe("q1timeline controller", () => {
       assert.equal(rendered, 1);
       assert.equal(refreshed, 1);
       assert.equal(cleared, 1);
+      diagnostics.push({ category: "definite_underflow", severity: "error" });
+      await controller.runAnalysis();
+      assert.equal(rendered, 2);
+      assert.equal(refreshed, 2);
+      assert.equal(cleared, 1);
+      diagnostics.push({ category: "syntax_error", severity: "error" });
+      await controller.runAnalysis();
+      assert.equal(rendered, 2);
+      assert.equal(refreshed, 2);
+      assert.equal(cleared, 2);
       controller.dispose();
     });
   });

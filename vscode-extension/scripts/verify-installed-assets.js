@@ -16,6 +16,7 @@ const assetFiles = [
   "out/src/q1timeline/media/hardwareView.js",
   "out/src/q1timeline/media/hardwareView.css",
   "out/src/q1timeline/syntaxes/q1asm.tmLanguage.json",
+  "out/src/q1timeline/syntaxes/q1asm.language-configuration.json",
   "out/src/shared/timeline/renderer.css",
   "out/src/shared/timeline/renderer.js",
   "out/src/shared/timeline/instructionColors.js",

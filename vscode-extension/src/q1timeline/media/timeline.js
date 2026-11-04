@@ -185,7 +185,7 @@
     const fields = [];
     appendDiffInspectorFields(fields, event);
     appendTriggerInspectorFields(fields, meta);
-    addInspectorField(fields, "Label", event.label || event.kind);
+    addInspectorField(fields, "Label", event.kind === "underflow_warning" ? window.q1timelineTimelineAdapter.underflowLabel(event) : event.label || event.kind);
     addInspectorField(fields, "Sequencer", event.sequencer_id);
     addInspectorField(fields, "Lane", event.lane);
     addInspectorField(fields, "Time range", `${displayInspectorValue(eventTime(event, "t0"))} -> ${displayInspectorValue(eventTime(event, "t1"))}`);
@@ -194,7 +194,7 @@
     addInspectorField(fields, "Q1 core", event.kind === "q1_issue" ? `${displayInspectorValue(event.t0)} -> ${displayInspectorValue(event.t1)}` : meta.q1_issue_event_id);
     addInspectorField(fields, "RT packet", meta.rt_packet_id);
     addInspectorField(fields, "Queue depth", meta.estimated_depth);
-      addInspectorField(fields, "Slack", meta.slack_ns !== undefined ? `${meta.slack_ns} ns` : "");
+      addInspectorField(fields, "Late by", event.kind === "underflow_warning" && meta.slack_ns < 0 ? `${-meta.slack_ns} ns` : "");
       addInspectorField(fields, "Branch condition", meta.condition);
       addInspectorField(fields, "Branch policy", meta.branch_policy);
       addInspectorField(fields, "Branch assumption", branchAssumptionDisplay(meta));
@@ -819,7 +819,8 @@
     popover.setAttribute("aria-label", "RT block values");
     const heading = document.createElement("div");
     heading.className = "q1timeline-rt-details-heading";
-    heading.textContent = event.source?.raw?.trim() || event.label || event.kind;
+    const raw = event.source?.raw || "";
+    heading.textContent = raw.slice(0, window.q1asmInstructionColors.sourceCodeEnd(raw)).trim() || event.label || event.kind;
     const close = document.createElement("button");
     close.type = "button";
     close.className = "q1timeline-rt-details-close";
@@ -828,15 +829,17 @@
     close.addEventListener("click", () => closeTimelineControlPopover(true));
     heading.append(close);
     popover.append(heading);
-    const context = document.createElement("p");
-    context.className = "q1timeline-rt-details-note";
     const meta = event.meta || {};
     const scope = [];
     if (meta.loop_iteration_index !== undefined) scope.push(`Iteration ${Number(meta.loop_iteration_index) + 1}`);
     if (meta.branch_comparison_path) scope.push(meta.branch_comparison_path === "taken" ? "Jump" : "Continue");
     if (event.confidence === "assumed" || meta.assumed_branch_path || meta.feedback_assumptions?.length) scope.push("Assumed execution");
-    context.textContent = [...scope, "Changed values are highlighted; register values were read when this command was issued."].join(" · ");
-    popover.append(context);
+    if (scope.length) {
+      const context = document.createElement("p");
+      context.className = "q1timeline-rt-details-note";
+      context.textContent = scope.join(" · ");
+      popover.append(context);
+    }
     for (const [key, title, empty] of [
       ["parameters", "Latched parameters", "No latched parameters used."],
       ["registers", "Registers used", "No registers read by this command."],
@@ -1497,7 +1500,7 @@
         node.classList.add("q1timeline-timing-warning");
         node.classList.toggle("is-incomplete", !underflow);
         node.textContent = underflow ? "!" : "?";
-        node.title = underflow ? `Underflow${event.meta?.slack_ns !== undefined ? ` · slack ${event.meta.slack_ns} ns` : ""}` :
+        node.title = underflow ? window.q1timelineTimelineAdapter.underflowLabel(event) :
           `Underflow analysis incomplete · ${event.meta?.reason || "Timing unknown"}`;
         node.setAttribute("aria-label", node.title);
         node.style.width = "16px";
@@ -1655,7 +1658,7 @@
       const fields = [];
       appendDiffInspectorFields(fields, event);
       appendTriggerInspectorFields(fields, meta);
-      addInspectorField(fields, "Label", event.label || event.kind);
+      addInspectorField(fields, "Label", event.kind === "underflow_warning" ? window.q1timelineTimelineAdapter.underflowLabel(event) : event.label || event.kind);
       addInspectorField(fields, "Sequencer", event.sequencer_id);
       addInspectorField(fields, "Lane", event.lane);
       addInspectorField(fields, "Time range", `${displayInspectorValue(eventTime(event, "t0"))} -> ${displayInspectorValue(eventTime(event, "t1"))}`);
@@ -1666,7 +1669,7 @@
       addInspectorField(fields, "Q1 core", event.kind === "q1_issue" ? `${displayInspectorValue(event.t0)} -> ${displayInspectorValue(event.t1)}` : meta.q1_issue_event_id);
       addInspectorField(fields, "RT packet", meta.rt_packet_id);
       addInspectorField(fields, "Queue depth", meta.estimated_depth);
-      addInspectorField(fields, "Slack", meta.slack_ns !== undefined ? `${meta.slack_ns} ns` : "");
+      addInspectorField(fields, "Late by", event.kind === "underflow_warning" && meta.slack_ns < 0 ? `${-meta.slack_ns} ns` : "");
       addInspectorField(fields, "Branch condition", meta.condition);
       addInspectorField(fields, "Branch policy", meta.branch_policy);
       addInspectorField(fields, "Branch assumption", branchAssumptionDisplay(meta));
@@ -3067,17 +3070,24 @@
   }
 
   function initialTimelineWindow(full) {
+    const compactLoops = Array.from(timelineEventsById.values()).filter((event) =>
+      event.kind === "loop_block" &&
+      ["first_iteration_only", "requested_iterations"].includes(event.meta?.preview_policy) &&
+      Number(event.meta.count) > (Number(event.meta.visible_iteration_count) || 1));
+    if (!compactLoops.length) return full;
+    const compactSequencers = new Set(compactLoops.map((event) => event.sequencer_id));
+    const previewIds = new Set(compactLoops.flatMap((event) => loopPreviewEventIds(event.meta)));
     let previewEnd = full.min;
-    let hasHiddenIterations = false;
     for (const event of timelineEventsById.values()) {
       const meta = event.meta || {};
-      if (
-        event.kind === "loop_block" &&
-        ["first_iteration_only", "requested_iterations"].includes(meta.preview_policy) &&
-        Number(meta.count) > (Number(meta.visible_iteration_count) || 1)
-      ) {
-        hasHiddenIterations = true;
+      // Q1 timestamps after omitted iterations include their cumulative cost.
+      // Frame the visible loop instructions and RT work instead of that hidden cost.
+      if (event.kind === "q1_issue" && compactSequencers.has(event.sequencer_id) &&
+          !previewIds.has(String(event.id)) && !compactLoops.some((loop) =>
+            loop.sequencer_id === event.sequencer_id && sameSourceLine(event.source, loop.meta.source_end))) {
+        continue;
       }
+      if (String(event.lane || "").startsWith("debug.") && event.kind !== "q1_issue") continue;
       // Stops retain the full execution time even when repeated iterations are omitted.
       if (event.kind === "stop" || (event.kind === "q1_issue" && meta.op === "stop")) {
         continue;
@@ -3087,7 +3097,7 @@
         previewEnd = Math.max(previewEnd, end);
       }
     }
-    return hasHiddenIterations && previewEnd > full.min
+    return previewEnd > full.min
       ? { min: full.min, max: Math.min(full.max, previewEnd) }
       : full;
   }

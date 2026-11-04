@@ -179,6 +179,30 @@ describe("Q1ASM diagnostic quick fixes", () => {
     assert.deepEqual(provider.provideCodeActions(documentFor(file, "wait 4"), range, { diagnostics: [transported] } as any), []);
   });
 
+  it("retains validated line-start insertions when the underline starts at the command", () => {
+    const vscode = mockVscode();
+    const file = join(tmpdir(), "q1lens-quick-fix", "seq0.q1asm");
+    const published: Diagnostic[][] = [];
+    const manager = new DiagnosticsManager(vscode,
+      { clear() {}, set: (_target: any, diagnostics: Diagnostic[]) => published.push(diagnostics) },
+      (sourceFile: string) => sourceFile);
+    const input = suggestedDiagnostic(file);
+    input.source.raw = "  stop # preserve this comment";
+    manager.apply([input]);
+    const diagnostic = published[0][0];
+    assert.deepEqual(diagnostic.range, new Range(0, 2, 0, 6));
+    const transported = Object.assign(new Diagnostic(diagnostic.range, diagnostic.message, diagnostic.severity), {
+      source: diagnostic.source, code: diagnostic.code,
+    });
+    for (const selected of [diagnostic, transported]) {
+      const actions = new Q1asmQuickFixProvider(vscode).provideCodeActions(
+        documentFor(file, input.source.raw), diagnostic.range as any, { diagnostics: [selected] } as any,
+      ) as any[];
+      assert.equal(actions.length, 1);
+      assert.deepEqual(actions[0].edit.replacements[0].range, new Range(0, 0, 0, 0));
+    }
+  });
+
   it("underlines the whole instruction line for every diagnostic severity", () => {
     const vscode = mockVscode();
     const file = join(tmpdir(), "q1lens-quick-fix", "seq0.q1asm");

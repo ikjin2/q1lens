@@ -1,6 +1,7 @@
 // @ts-nocheck
 const { mapAnalyzerDiagnostic } = require("./diagnosticMapper");
 const { clearSuggestedEdits, preserveSuggestedEdit } = require("./q1asmQuickFix");
+const { sourceCodeEnd, sourceTokens } = require("../shared/timeline/instructionColors.js");
 
 class DiagnosticsManager {
   constructor(vscodeApi, collection, resolveSourcePath) {
@@ -22,18 +23,30 @@ class DiagnosticsManager {
         continue;
       }
       const uri = this.vscode.Uri.file(mapped.file);
-      // Highlight the instruction line without widening the validated suggested edit.
+      let startColumn = 0;
+      let endColumn = Number.MAX_SAFE_INTEGER;
+      if (mapped.file.toLowerCase().endsWith(".q1asm")) {
+        const document = this.vscode.workspace?.textDocuments?.find((document) => document.uri.toString() === uri.toString());
+        const raw = document && mapped.range.startLine < document.lineCount
+          ? document.lineAt(mapped.range.startLine).text : item.source.raw;
+        if (typeof raw === "string") {
+          const code = raw.slice(0, sourceCodeEnd(raw)).trimEnd();
+          startColumn = sourceTokens(code).find((token) => token.kind === "command")?.start ?? code.search(/\S|$/);
+          endColumn = code.length;
+        }
+      }
+      // Keep the underline separate from the validated suggested edit.
       const range = new this.vscode.Range(
         mapped.range.startLine,
-        0,
+        startColumn,
         mapped.range.endLine,
-        Number.MAX_SAFE_INTEGER
+        endColumn
       );
       const diagnostic = new this.vscode.Diagnostic(range, mapped.message, this.toSeverity(mapped.severity));
       diagnostic.source = mapped.source;
       diagnostic.code = mapped.code;
       if (allowSuggestedEdits && mapped.suggestedEdit) {
-        preserveSuggestedEdit(mapped.file, diagnostic, mapped.suggestedEdit);
+        preserveSuggestedEdit(mapped.file, diagnostic, mapped.suggestedEdit, mapped.range);
       }
       const relatedInformation = this.toRelatedInformation(mapped);
       if (relatedInformation.length) {

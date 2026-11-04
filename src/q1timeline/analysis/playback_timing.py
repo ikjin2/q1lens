@@ -78,7 +78,7 @@ def annotate_playback_queue_timing(states: list[AnalysisState]) -> None:
         state.metadata["execution"] = {**state.metadata.get("execution", {}), "queue_timing": timing}
         if failure:
             state.diagnostics.append(Diagnostic(
-                severity="warning", category="playback_queue_underflow",
+                severity="error", category="playback_queue_underflow",
                 message="RT queue underflow in the recorded path under the current playback assumptions.",
                 source=failure.packet.source,
                 details={"scope": timing["scope"], "assumptions": timing["assumptions"], **_failure_json(high)},

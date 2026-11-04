@@ -6,11 +6,37 @@ import re
 import pytest
 
 from q1timeline.q1asm.instruction_table import INSTRUCTION_TABLE
+from q1timeline.diagnostic_catalog import describe_diagnostic
 from q1timeline.render.html import render_html
 
 
 def _ns(value: int) -> dict:
     return {"kind": "concrete", "value": value}
+
+
+@pytest.mark.parametrize("mode", ["normal", "debug"])
+def test_underflow_labels_hide_slack_and_show_positive_lateness(mode: str) -> None:
+    events = [
+        {"id": event_id, "kind": kind, "label": kind, "source": {}, "sequencer_id": "seq0", "lane": lane,
+         "t0": _ns(0), "t1": _ns(0), "duration": _ns(0), "confidence": "exact", "meta": meta}
+        for event_id, kind, lane, meta in [
+            ("normal", "slack", "debug.slack", {"slack_ns": 24}),
+            ("late", "slack", "debug.slack", {"slack_ns": -24}),
+            ("warning", "underflow_warning", "debug.underflow", {"status": "definite_underflow", "slack_ns": -24}),
+            ("possible", "underflow_warning", "debug.underflow", {"status": "possible_underflow", "slack_ns": -8}),
+        ]
+    ]
+    before = json.dumps(events)
+    html = render_html({"version": "0.1.0", "events": events}, default_mode=mode)
+    assert 'data-event-id="normal"' not in html
+    assert 'data-event-id="late"' not in html
+    assert 'aria-label="RT underflow · 24 ns late' in html
+    assert 'aria-label="Possible RT underflow · 8 ns late' in html
+    assert json.dumps(events) == before
+    presentation = describe_diagnostic({"category": "definite_underflow", "details": {"slack_ns": -24}})
+    assert presentation["title"] == "RT underflow"
+    assert "24 ns late" in presentation["summary"]
+    assert "slack" not in presentation["summary"]
 
 
 def test_svg_command_families_cover_all_supported_instructions() -> None:

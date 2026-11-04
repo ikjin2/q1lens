@@ -109,7 +109,7 @@ describe("Q1 timeline branch comparison lanes", () => {
 
   it("hides prefixed debug events in Normal and keeps them in the matching comparison in Debug", () => {
     const ir = comparison();
-    ir.events.push(pathEvent("jump-debug", "slack", "taken", 8, 4, {}, "debug.slack"));
+    ir.events.push(pathEvent("jump-debug", "queue_depth", "taken", 8, 4, {}, "debug.queue_depth"));
     for (const layout of ["time", "instruction"]) {
       assert.equal(blocks(buildModel(ir, { layout, mode: "normal" })).some((block: any) => block.id === "jump-debug"), false);
       const debug = buildModel(ir, { layout, mode: "debug" });

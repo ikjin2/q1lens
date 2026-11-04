@@ -180,7 +180,7 @@ type DiagnosticWithSuggestedEdit = vscodeTypes.Diagnostic & {
   [DIAGNOSTIC_SUGGESTED_EDIT_PROPERTY]?: unknown;
 };
 
-const suggestedEdits = new Map<string, SuggestedTextEdit>();
+const suggestedEdits = new Map<string, { edit: SuggestedTextEdit; range: TextRange }>();
 const diagnosticsWithEdits = new Set<DiagnosticWithSuggestedEdit>();
 
 function diagnosticKey(file: string, diagnostic: vscodeTypes.Diagnostic): string {
@@ -205,15 +205,16 @@ export function preserveSuggestedEdit(
   file: string,
   diagnostic: vscodeTypes.Diagnostic,
   edit: SuggestedTextEdit,
+  range: MappedDiagnosticRange,
 ): void {
   (diagnostic as DiagnosticWithSuggestedEdit)[DIAGNOSTIC_SUGGESTED_EDIT_PROPERTY] = edit;
   diagnosticsWithEdits.add(diagnostic);
-  suggestedEdits.set(diagnosticKey(file, diagnostic), edit);
+  suggestedEdits.set(diagnosticKey(file, diagnostic), { edit, range: mappedRange(range) });
 }
 
 function editForDiagnostic(file: string, diagnostic: vscodeTypes.Diagnostic): SuggestedTextEdit | undefined {
   const attached = (diagnostic as DiagnosticWithSuggestedEdit)[DIAGNOSTIC_SUGGESTED_EDIT_PROPERTY];
-  return validatedEdit(attached) || suggestedEdits.get(diagnosticKey(file, diagnostic));
+  return validatedEdit(attached) || suggestedEdits.get(diagnosticKey(file, diagnostic))?.edit;
 }
 
 export class Q1asmQuickFixProvider implements vscodeTypes.CodeActionProvider {
@@ -235,7 +236,7 @@ export class Q1asmQuickFixProvider implements vscodeTypes.CodeActionProvider {
 
     return context.diagnostics.flatMap((diagnostic) => {
       const edit = editForDiagnostic(document.uri.fsPath, diagnostic);
-      const sourceRange = diagnosticRange(diagnostic);
+      const sourceRange = suggestedEdits.get(diagnosticKey(document.uri.fsPath, diagnostic))?.range || diagnosticRange(diagnostic);
       if (
         diagnostic.source !== "q1timeline"
         || !edit

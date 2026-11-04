@@ -54,7 +54,9 @@ async function mount(page, ir = fixture(), mode = "normal") {
 }
 
 test("RT blocks expand captured values and highlight only known changes", async ({page}) => {
-  await mount(page);
+  const ir = fixture();
+  ir.events.find((event) => event.id === "play").source.raw = "play 0, 1, {DURATION // 2} # waveform";
+  await mount(page, ir);
   const q1 = page.locator('[data-lane-role="q1-issue"]');
   await expect(q1).toBeHidden();
   const block = page.locator('.timeline-block[data-event-id="play"]');
@@ -62,6 +64,8 @@ test("RT blocks expand captured values and highlight only known changes", async 
   await block.click();
   const panel = page.getByRole("dialog", {name: "RT block values", exact: true});
   await expect(panel).toBeVisible();
+  await expect(panel.locator(".q1timeline-rt-details-heading")).toContainText("play 0, 1, {DURATION // 2}");
+  await expect(panel.locator(".q1timeline-rt-details-heading")).not.toContainText("waveform");
   await expect(block).toHaveAttribute("aria-expanded", "true");
   await expect(q1).toBeHidden();
   const registers = panel.getByRole("table", {name: "Registers used", exact: true});
@@ -84,14 +88,19 @@ test("RT blocks expand captured values and highlight only known changes", async 
 });
 
 test("Q1 is visible in debug and timing warnings stay visible in normal instruction view", async ({page}) => {
-  await mount(page, fixture(), "debug");
+  const ir = fixture();
+  ir.events.push(event("slack", "slack", 4, 4, {slack_ns: 24}, {lane: "debug.slack"}),
+    event("possible", "underflow_warning", 108, 108, {status: "possible_underflow", slack_ns: -8}, {lane: "debug.underflow"}));
+  await mount(page, ir, "debug");
+  await expect(page.locator('.timeline-block[data-event-id="slack"]')).toHaveCount(0);
+  await expect(page.getByRole("button", {name: "Possible RT underflow · 8 ns late", exact: true})).toBeVisible();
   await expect(page.locator('[data-lane-role="q1-issue"]')).toBeVisible();
-  await mount(page);
+  await mount(page, ir);
   await page.getByRole("button", {name: "Debug view", exact: true}).click();
   await expect(page.locator('[data-lane-role="q1-issue"]')).toBeVisible();
   await page.getByRole("button", {name: "Normal view", exact: true}).click();
   await expect(page.locator('[data-lane-role="q1-issue"]')).toBeHidden();
-  const warning = page.getByRole("button", {name: "Underflow · slack -4 ns", exact: true});
+  const warning = page.getByRole("button", {name: "RT underflow · 4 ns late", exact: true});
   await expect(warning).toBeVisible();
   await page.getByRole("button", {name: "Instruction", exact: true}).click();
   await expect(warning).toBeVisible();

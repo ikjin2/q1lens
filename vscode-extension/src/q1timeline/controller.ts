@@ -2667,14 +2667,19 @@ export class TimelineController {
         return this.execFile(pythonPath, args, timeoutMs, cwd, extraEnv, "analyzer");
       })
       .catch(async (error) => {
-        // Runtime failures can still produce a valid partial simulation trace.
+        // Runtime failures and diagnosed underflows can still produce a valid trace.
         // Outputs were cleared above, so this cannot recover a stale trace.
         if (!this.isCurrentAnalysis(analysisRequestId) || this.isAnalyzerTimeoutError(error)) throw error;
         let partial;
         try { partial = JSON.parse(await fsPromises.readFile(timelineIrPath, "utf-8")); } catch { throw error; }
-        if (!Array.isArray(partial.events) || !partial.events.length || !Object.values(partial.execution || {}).some((entry) => entry.mode === "simulation" && entry.status === "error")) throw error;
+        const simulationFailure = Object.values(partial.execution || {}).some((entry) => entry.mode === "simulation" && entry.status === "error");
+        const diagnosticErrors = Array.isArray(partial.diagnostics) ? partial.diagnostics.filter((item) => item.severity === "error") : [];
+        const underflowFailure = diagnosticErrors.length > 0 && diagnosticErrors.every((item) =>
+          ["definite_underflow", "playback_queue_underflow"].includes(item.category));
+        if (!Array.isArray(partial.events) || !partial.events.length || (!simulationFailure && !underflowFailure)) throw error;
         try { parseAnalyzerResult(error.stdout); } catch { throw error; }
-        this.output.appendLine("Simulation stopped with an error; rendering the partial execution trace and its diagnostics.");
+        this.output.appendLine(simulationFailure ? "Simulation stopped with an error; rendering the partial execution trace and its diagnostics." :
+          "RT underflow detected; rendering the timeline and its error diagnostics.");
         return { stdout: error.stdout, stderr: error.stderr, elapsedMs: error.elapsedMs, exitCode: error.exitCode };
       })
       .then(async (result) => {

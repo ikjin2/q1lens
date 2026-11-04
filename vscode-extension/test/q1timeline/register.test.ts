@@ -26,6 +26,7 @@ function quickFixApi() {
     CodeActionKind: { QuickFix: "quickfix" },
     languages: {
       registerCodeActionsProvider: () => ({ dispose: () => undefined }),
+      registerHoverProvider: () => ({ dispose: () => undefined }),
     },
   };
 }

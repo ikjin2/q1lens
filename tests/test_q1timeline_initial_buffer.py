@@ -45,9 +45,9 @@ def test_initial_buffer_policy_boundaries(gap, expected, mode):
     assert timing["initial_buffer"]["required_ns"] == gap
     assert timing["assumptions"]["initial_buffer_assumed_ns"] == 1_000_000
     assert timing["assumptions"]["initial_buffer_possible_ns"] == 2_000_000
-    warnings = [item for item in state.diagnostics if item.severity == "warning"]
+    errors = [item for item in state.diagnostics if item.severity == "error"]
     estimates = [item for item in state.diagnostics if item.category == "initial_rt_buffer_estimate"]
-    assert bool(warnings) == (expected == "exhausted")
+    assert bool(errors) == (expected == "exhausted")
     assert bool(estimates) == (expected == "tentative")
     if estimates:
         assert estimates[0].severity == "info"

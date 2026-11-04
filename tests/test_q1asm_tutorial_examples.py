@@ -72,8 +72,11 @@ def _analyze_project(project_file: Path, tmp_path: Path) -> dict:
     out_file = tmp_path / project_file.parent.relative_to(ROOT) / "timeline_ir.json"
     exit_code = q1timeline_main(["analyze", "--project", str(project_file), "--out", str(out_file)])
 
-    assert exit_code == 0
-    return json.loads(out_file.read_text(encoding="utf-8"))
+    ir = json.loads(out_file.read_text(encoding="utf-8"))
+    errors = {item["category"] for item in ir["diagnostics"] if item["severity"] == "error"}
+    assert errors <= {"definite_underflow"}
+    assert exit_code == (2 if errors else 0)
+    return ir
 
 
 @pytest.fixture(scope="module")
@@ -214,7 +217,12 @@ def test_q1asm_tutorial_readme_commands_work_from_workspace_root(tmp_path: Path)
             project_arg = match.group(1)
 
             assert not project_arg.startswith("examples/q1asm-tutorials/")
-            assert q1timeline_main(["analyze", "--project", project_arg, "--out", str(tmp_path / f"{readme.parent.name}.json")]) == 0
+            out_file = tmp_path / f"{readme.parent.name}.json"
+            exit_code = q1timeline_main(["analyze", "--project", project_arg, "--out", str(out_file)])
+            ir = json.loads(out_file.read_text(encoding="utf-8"))
+            errors = {item["category"] for item in ir["diagnostics"] if item["severity"] == "error"}
+            assert errors <= {"definite_underflow"}
+            assert exit_code == (2 if errors else 0)
     finally:
         os.chdir(old_cwd)
 

@@ -233,7 +233,7 @@ function loadQ1TimelineZoomRuntime(script: string, events: any[], options: any =
   const full = options.full || { min: 0, max: 40_160_000 };
   let savedState = options.state || {};
   const sources = [
-    "concreteTime", "eventTime", "initialTimelineWindow", "fullTimelineWindow",
+    "concreteTime", "eventTime", "normalizedSource", "sameSourceLine", "loopPreviewEventIds", "initialTimelineWindow", "fullTimelineWindow",
     "currentTimelineWindow", "timelineExtentMatches", "persistedTimelineWindowFor",
     "readPersistedWebviewState", "writePersistedWebviewState", "writeTimelineWindowState",
     "snapTimelineNs", "clamp", "timelineWindowForRange", "setTimelineWindow",
@@ -2164,6 +2164,43 @@ describe("timeline webview assets", () => {
       loadQ1TimelineZoomRuntime(script, events, { full: { min: 200, max: 1600 } }).currentTimelineWindow(),
       { min: 200, max: 1600 },
     );
+  });
+
+  it("frames compact Q1-only loops without fitting cumulative post-loop Q1 times or debug tails", () => {
+    const script = readFileSync(join(__dirname, "..", "src", "q1timeline", "media", "timeline.js"), "utf-8");
+    const source = (line: number) => ({ file: "initial-buffer.q1asm", line });
+    const event = (id: string, kind: string, start: number, end: number, line: number, meta: any = {}) => ({
+      id, kind, sequencer_id: "seq0", source: source(line),
+      lane: kind === "q1_issue" ? "debug.q1_issue" : kind === "queue_depth" ? "debug.queue_depth" : "rt.control",
+      t0: { kind: "concrete", value: start }, t1: { kind: "concrete", value: end },
+      meta: { aligned_t0: start + 100, aligned_t1: end + 100, ...meta },
+    });
+    const events = [
+      event("update", "upd_param", 0, 4, 1),
+      event("body", "q1_issue", 12, 16, 3, { op: "nop" }),
+      event("edge", "q1_issue", 16, 40, 4, { op: "loop" }),
+      event("loop", "loop_block", 4, 4, 3, {
+        count: 17857, visible_iteration_count: 1, preview_policy: "first_iteration_only",
+        first_iteration_event_ids: ["body"], source_end: source(4),
+      }),
+      event("setter", "q1_issue", 499988, 499992, 5, { op: "set_mrk" }),
+      event("update-issue", "q1_issue", 499992, 499996, 6, { op: "upd_param" }),
+      event("after", "upd_param", 4, 1004, 6),
+      event("stop", "stop", 1004, 1004, 7),
+      event("stop-issue", "q1_issue", 499996, 500000, 7, { op: "stop" }),
+      event("queue", "queue_depth", 0, 500000, 7),
+    ];
+    for (const basis of ["local", "aligned"]) {
+      const runtime = loadQ1TimelineZoomRuntime(script, events, { basis });
+      const expected = { min: 0, max: basis === "local" ? 1004 : 1104 };
+      assert.deepEqual(runtime.currentTimelineWindow(), expected);
+      runtime.restoreTimelineZoom();
+      assert.deepEqual(runtime.currentTimelineWindow(), expected);
+      runtime.fitTimelineToWindow();
+      assert.deepEqual(runtime.currentTimelineWindow(), { min: 0, max: 40_160_000 });
+    }
+    const q1Only = events.filter((event) => !["after", "queue", "stop"].includes(event.id));
+    assert.deepEqual(loadQ1TimelineZoomRuntime(script, q1Only).currentTimelineWindow(), { min: 0, max: 40 });
   });
 
   it("preserves saved zoom and keeps full-range defaults, Fit, and Reset available", () => {

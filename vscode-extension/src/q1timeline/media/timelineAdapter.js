@@ -85,10 +85,18 @@
     return String(value);
   }
 
+  function underflowLabel(event) {
+    const meta = event.meta || {};
+    const label = meta.status === "possible_underflow" ? "Possible RT underflow" : "RT underflow";
+    return typeof meta.slack_ns === "number" && Number.isFinite(meta.slack_ns) && meta.slack_ns < 0
+      ? `${label} · ${-meta.slack_ns} ns late` : label;
+  }
+
   function eventLabelToken(event, options = {}) {
     if (!event) {
       return "";
     }
+    if (event.kind === "underflow_warning") return underflowLabel(event);
     if (event.kind === "wait" && options.mode !== "debug") {
       return "wait";
     }
@@ -158,7 +166,7 @@
     if (options.mode === "debug" && lane.startsWith("debug.")) {
       return {
         id: `${base}:${lane}`,
-        label: `${comparison ? `${prefix} · ` : ""}${lane.replace(/^debug\./, "debug / ")}`,
+        label: `${comparison ? `${prefix} · ` : ""}${lane === "debug.underflow" ? "RT underflow" : lane.replace(/^debug\./, "debug / ")}`,
         kind: "debug",
         parentGroupId: parent,
         sequencer,
@@ -176,7 +184,7 @@
 
   function shouldIncludeEvent(event, options) {
     const lane = eventLaneName(event);
-    if (["latched_state_pending", "control_flow_loop", "control_flow_branch"].includes(event.kind)) {
+    if (["slack", "latched_state_pending", "control_flow_loop", "control_flow_branch"].includes(event.kind)) {
       return false;
     }
     if (event.kind === "q1_issue") {
@@ -237,6 +245,7 @@
   }
 
   function eventTitle(event, start, end) {
+    if (event.kind === "underflow_warning") return underflowLabel(event);
     if (event && event.kind === "branch_region") {
       return `Branch effect (${branchPathLabel(event)}) | ${displayValue(event.t0, start)} -> ${displayValue(event.t1, end)}`;
     }
@@ -1391,6 +1400,7 @@
     buildWaitTimeScale,
     eventLabelToken,
     eventTimeValue,
+    underflowLabel,
   };
 
   root.q1timelineTimelineAdapter = api;

@@ -3,11 +3,21 @@ import pytest
 from q1timeline.analysis.api import analyze_documents, analyze_text
 from q1timeline.analysis.interpreter import interpret_program
 from q1timeline.analysis.queue_timing import replay_queues
-from q1timeline.analysis.underflow import analyze_underflow
+from q1timeline.analysis.underflow import analyze_underflow, _emit_underflow_warning
 from q1timeline.q1asm.parser import parse_q1asm
 
 
 UNDERFLOW_CATEGORIES = {"definite_underflow", "possible_underflow"}
+
+
+@pytest.mark.parametrize("status,severity", [("definite_underflow", "error"), ("possible_underflow", "warning")])
+def test_underflow_severity_distinguishes_confirmed_and_possible_failures(status, severity) -> None:
+    state = interpret_program(parse_q1asm("wait 4\nstop", file="program.q1asm"), sequencer_id="seq0")
+    packet = state.rt_packets[0]
+    _emit_underflow_warning(state, packet_id=packet.id, slack_ns=-24, t0=packet.rt_t0,
+                            source=packet.source, assumptions={}, status=status)
+    assert state.diagnostics[-1].category == status
+    assert state.diagnostics[-1].severity == severity
 
 
 def _analyze(text: str, *, queue_depth_limit: int = 32):
@@ -75,6 +85,7 @@ def test_sustained_post_sync_starvation_exhausts_initial_buffer(operation: str) 
     warnings = [event for event in state.events if event.kind == "underflow_warning"]
 
     assert result.status in UNDERFLOW_CATEGORIES
+    assert all(item.severity == "error" for item in state.diagnostics if item.category == "definite_underflow")
     assert warnings
     assert all(event.source.line > 1 for event in warnings)
     assert all(event.meta["slack_ns"] < 0 for event in warnings)

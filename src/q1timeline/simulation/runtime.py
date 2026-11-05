@@ -65,13 +65,21 @@ class _Sequencer:
     tb_valid: int = 1
     iq_shift: int = 0
     setter_ids: dict[str, str] = field(default_factory=dict)
+    branch_occurrences: dict[int, int] = field(default_factory=dict)
 
 
 def simulate_programs(
     programs: dict[str, Program], *, params: dict | None = None, max_steps: int = 10000,
     simulation: dict | None = None, sequences: dict[str, dict] | None = None,
     strict_q1asm: bool = False,
+    branch_choices: Mapping[tuple[str, int, int], bool] | None = None,
 ) -> list[core.AnalysisState]:
+    """Run a scenario, optionally selecting a conditional branch occurrence.
+
+    Choice keys are (sequencer_id, source_pc, 1-based occurrence). A choice
+    changes only the selected path; natural operands, flags and loop writes
+    are retained. Choices that execution never reaches raise ValueError.
+    """
     from q1timeline.simulation.config import validate_simulation
     from q1timeline.simulation.signals import SignalModel
     from q1timeline.project import validate_params_json_mapping
@@ -87,16 +95,34 @@ def simulate_programs(
     validate_params_json_mapping(dict(params or {}))
     if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps < 1:
         raise ValueError("max_steps must be a positive integer")
+    if branch_choices is not None and not isinstance(branch_choices, Mapping):
+        raise ValueError("branch_choices must map (sequencer, pc, occurrence) tuples to booleans")
+    choices = dict(branch_choices or {})
+    for key, taken in choices.items():
+        if (not isinstance(key, tuple) or len(key) != 3 or not isinstance(key[0], str)
+                or type(key[1]) is not int or type(key[2]) is not int or key[2] < 1 or type(taken) is not bool):
+            raise ValueError("branch_choices keys require a sequencer, integer PC and positive occurrence; values must be booleans")
+        name, pc, _occurrence = key
+        instruction = next((item for item in programs[name].instructions if item.pc == pc), None) if name in programs else None
+        if instruction is None or instruction.op == "jmp" or get_instruction_spec(instruction.op).category != "branch":
+            raise ValueError(f"Branch choice {key!r} does not identify a conditional branch")
     config = validate_simulation(simulation, sequencer_ids=set(programs))
     memories = {name: (sequences or {}).get(name, {}) for name in programs}
     signals = SignalModel(config["physical"], memories) if config["physical"] else None
-    engine = _Runtime(programs, params or {}, max_steps, config, signals, strict_q1asm)
-    return engine.run()
+    engine = _Runtime(programs, params or {}, max_steps, config, signals, strict_q1asm, choices)
+    states = engine.run()
+    unused = set(choices) - engine.applied_branch_choices
+    if unused:
+        raise ValueError(f"Branch choices were not reached: {sorted(unused)!r}")
+    return states
 
 
 class _Runtime:
-    def __init__(self, programs: dict[str, Program], params: dict, max_steps: int, config: dict, signals: Any, strict_q1asm: bool):
+    def __init__(self, programs: dict[str, Program], params: dict, max_steps: int, config: dict, signals: Any, strict_q1asm: bool,
+                 branch_choices: dict[tuple[str, int, int], bool]):
         self.config, self.signals, self.max_steps = config, signals, max_steps
+        self.branch_choices = branch_choices
+        self.applied_branch_choices: set[tuple[str, int, int]] = set()
         self.capacity = config["queue_capacity"]
         self.feedback_capacity = config["feedback_queue_capacity"]
         self.startup = config["startup_delay_ns"]
@@ -357,7 +383,19 @@ class _Runtime:
                 seq.setter_ids[event.meta["field"]] = event.id
                 event.meta["q1_issue_event_id"] = issue.id
         if spec.category == "branch":
-            core._execute_concrete_branch(state, instruction, issue, seq.symbols, defer_register_write=True)
+            occurrence = seq.branch_occurrences.get(instruction.pc, 0) + 1
+            seq.branch_occurrences[instruction.pc] = occurrence
+            key = (state.sequencer_id, instruction.pc, occurrence)
+            choice = self.branch_choices.get(key)
+            if choice is not None:
+                self.applied_branch_choices.add(key)
+                state.metadata.setdefault("branches", {}).setdefault("assumptions", []).append({
+                    "branch_id": f"{state.sequencer_id}:simulation:{instruction.pc}:{occurrence}",
+                    "assumed_branch_path": "taken" if choice else "fallthrough", "assumption_source": "user",
+                })
+            core._execute_concrete_branch(state, instruction, issue, seq.symbols,
+                                          defer_register_write=True, forced_decision=choice)
+            issue.meta["branch_occurrence"] = occurrence
         issue.meta.update(source_pc=instruction.pc, execution_index=state.q1_issue_index,
                           flags_before=before, flags_after=dict(state.alu_flags) if state.alu_flags is not None else None)
         if feedback is not None:

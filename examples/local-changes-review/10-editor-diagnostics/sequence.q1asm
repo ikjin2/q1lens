@@ -1,0 +1,3 @@
+# Even unreachable source is validated. Repair move to move 1,R0, then save.
+stop
+move 1

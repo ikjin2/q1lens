@@ -559,6 +559,32 @@ describe("timeline webview assets", () => {
     assert.equal(JSON.stringify(ir), before);
   });
 
+  it("hides queue samples while retaining underflow warnings and source data in both views", () => {
+    const adapter = require(join(__dirname, "..", "src", "q1timeline", "media", "timelineAdapter.js"));
+    const event = (id: string, kind: string, lane: string, meta: any = {}) => ({
+      id, kind, sequencer_id: "seq0", lane, t0: { value: 4 }, t1: { value: 4 },
+      confidence: "exact", meta,
+    });
+    const ir = { events: [
+      event("queue", "queue_depth", "debug.queue_depth", { estimated_depth: 0 }),
+      event("warning", "underflow_warning", "debug.underflow", { estimated_depth: 0, slack_ns: -24 }),
+      event("comparison-queue", "queue_depth", "branch_compare.taken.debug.queue_depth", {
+        estimated_depth: 0, branch_comparison_path: "taken", branch_comparison_branch_id: "branch",
+      }),
+    ] };
+    const before = JSON.stringify(ir);
+    for (const mode of ["normal", "debug"]) {
+      for (const layout of ["time", "instruction"]) {
+        const model = adapter.buildQ1TimelineSharedModel(ir, { mode, layout });
+        const blocks = model.lanes.flatMap((lane: any) => lane.blocks);
+        assert.deepEqual(blocks.map((block: any) => block.id), ["warning"]);
+        assert.equal(blocks[0].label, "RT underflow · 24 ns late");
+        assert.equal(model.lanes.some((lane: any) => lane.id.includes("queue_depth")), false);
+      }
+    }
+    assert.equal(JSON.stringify(ir), before);
+  });
+
   it("keeps merged play state aliases within their packet preview occurrence", () => {
     const adapter = require(join(__dirname, "..", "src", "q1timeline", "media", "timelineAdapter.js"));
     const event = (id: string, kind: string, iteration: number, path?: number) => ({
@@ -1524,7 +1550,7 @@ describe("timeline webview assets", () => {
       const timelineIr = { events: [{ id: "q1", meta: { aligned_t0: 100, aligned_t1: 104 } }] };
       const timelineEventsById = new Map(timelineIr.events.map(event => [event.id, event]));
       let hardwareView, hardwarePersistTimer;
-      function ensureAnalysisDetailsBody() {}
+      function ensureAnalysisDetailsBody() { return { append: (root) => document.getElementById().after(root) }; }
       function renderHardwareCursor() {}
       function renderTimeBasisToggle() {}
       function resetTimelineZoom() {}

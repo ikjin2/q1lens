@@ -1,0 +1,6 @@
+# The RT update applies both settings; there is no pending-state warning.
+wait 100
+set_freq 10000000
+set_awg_gain 8192,8192
+upd_param 4
+stop

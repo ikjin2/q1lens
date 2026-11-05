@@ -1,0 +1,5 @@
+# These settings remain pending at stop. Try the Quick Fix on stop, then save.
+wait 100
+set_freq 10000000
+set_awg_gain 8192,8192
+stop

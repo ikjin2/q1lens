@@ -13,6 +13,11 @@ const test = base.extend({
   }, { auto: true }],
 });
 
+async function analysisDetails(page) {
+  const details = page.locator("#q1timeline-analysis-details");
+  if (await details.getAttribute("open") === null) await details.locator(":scope > summary").click();
+}
+
 async function open(page, scenario, module, sequencer) {
   await page.goto(`/?case=${scenario}`);
   await page.getByRole("button", { name: `Open ${module}: 1 sequencer`, exact: true }).click();
@@ -26,4 +31,4 @@ const value = (page, name) => page.locator(`[data-value="${name}"]`);
 const register = (page, name) => page.locator(`[data-register="${name}"] strong`);
 const tab = (page, name) => page.getByRole("tab", { name, exact: true }).click();
 
-module.exports = { test, expect, open, at, value, register, tab };
+module.exports = { test, expect, open, at, value, register, tab, analysisDetails };

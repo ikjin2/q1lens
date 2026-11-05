@@ -1,0 +1,5 @@
+# One acquisition every 120 ns forever cannot sustain a 300 ns service period.
+wait_sync 4
+shot: acquire 0,0,40
+wait 80
+jmp @shot

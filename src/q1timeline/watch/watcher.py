@@ -9,6 +9,7 @@ from typing import Any
 import yaml
 
 from q1timeline.analysis.alignment import align_timelines
+from q1timeline.analysis.hardware_readiness import analyze_project_hardware_readiness
 from q1timeline.analysis.interpreter import AnalysisState, interpret_program
 from q1timeline.analysis.underflow import analyze_underflows
 from q1timeline.diagnostics import Diagnostic, has_fatal_diagnostics
@@ -173,6 +174,7 @@ def run_watch_once(project_file: str | Path, out_dir: str | Path) -> WatchRunRes
     try:
         config = load_project_config(project_path)
         states = _analyze_config(config)
+        analyze_project_hardware_readiness(states, config.sequencers)
         align_timelines(
             states,
             mode=config.alignment_mode,

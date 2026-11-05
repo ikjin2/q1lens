@@ -1,0 +1,11 @@
+# Nine requests exceed the documented allowance. Exact FIFO overflow is unknown.
+acquire 0,0,4
+acquire 0,1,4
+acquire 0,2,4
+acquire 0,3,4
+acquire 0,4,4
+acquire 0,5,4
+acquire 0,6,4
+acquire 0,7,4
+acquire 0,8,4
+stop

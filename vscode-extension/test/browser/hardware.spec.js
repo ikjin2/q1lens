@@ -1,4 +1,4 @@
-const { test, expect, open, at, value, register, tab } = require("./helpers");
+const { test, expect, open, at, value, register, tab, analysisDetails } = require("./helpers");
 const { createHash } = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -32,6 +32,7 @@ test("replay generation can retry after an analysis failure or completion withou
     "q1timeline/media/hardwareState.js", "q1timeline/media/hardwareView.js", "q1timeline/media/timeline.js"]) {
     await page.addScriptTag({ path: path.join(assets, file) });
   }
+  await analysisDetails(page);
   const prepare = page.locator('[data-action="replay-prepare"]');
   await expect(prepare).toBeVisible();
   for (const terminalStatus of ["error", "idle"]) {

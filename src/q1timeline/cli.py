@@ -14,7 +14,7 @@ import yaml
 
 from q1timeline import __version__
 from q1timeline.analysis.alignment import align_timelines
-from q1timeline.analysis.hardware_readiness import analyze_hardware_readiness
+from q1timeline.analysis.hardware_readiness import analyze_project_hardware_readiness
 from q1timeline.analysis.interpreter import LOOP_PREVIEW_MAX_VISIBLE_ITERATIONS, interpret_program
 from q1timeline.analysis.underflow import analyze_underflows
 from q1timeline.diagnostics import (
@@ -674,9 +674,7 @@ def _analyze_command(args: argparse.Namespace) -> int:
             return 2
     if execution_mode != "simulation":
         analyze_underflows(states)
-    if args.hardware_readiness:
-        for state in states:
-            analyze_hardware_readiness(state)
+    analyze_project_hardware_readiness(states, config.sequencers, include_optional_checks=args.hardware_readiness)
     align_timelines(states, mode=alignment_mode, anchor_kinds=alignment_anchor_kinds)
     diagnostics.extend(diagnostic for state in states for diagnostic in state.diagnostics)
     ir = timeline_ir_from_states(
@@ -789,7 +787,7 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument(
         "--hardware-readiness",
         action="store_true",
-        help="run conservative hardware-readiness checks and include their summary",
+        help="include additional scope and bin-reuse hints; buffers and pending settings are always checked",
     )
     analyze.add_argument("--align", help="override alignment mode")
     analyze.add_argument(

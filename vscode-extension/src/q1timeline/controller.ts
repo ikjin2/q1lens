@@ -773,6 +773,7 @@ export class TimelineController {
     this.pendingTarget = undefined;
     this.pendingBranchSelection = undefined;
     this.projectRelatedPaths = new Set();
+    this.sourcePathAliases = new Map();
     this.projectRelatedPathsRequestId = 0;
     this.relatedFileWatchers = [];
     this.sourceFileSnapshots = new Map();
@@ -859,6 +860,7 @@ export class TimelineController {
         this.changeTimer = undefined;
       }
       this.sourceFileSnapshots = new Map();
+      this.sourcePathAliases = new Map();
       this.analysisQueued = false;
       this.analysisQueuedRefreshPolicy = undefined;
       this.analysisRequestId += 1;
@@ -2545,6 +2547,14 @@ export class TimelineController {
     if (this.disposed || requestId !== this.projectRelatedPathsRequestId ||
         this.projectUri?.fsPath !== projectUri?.fsPath || this.singleFileUri?.fsPath !== singleFileUri?.fsPath) return;
     this.projectRelatedPaths = related;
+    const aliases = new Map();
+    for (const relatedPath of related) {
+      try {
+        const realPath = normalizedFsPath(fs.realpathSync(relatedPath));
+        if (realPath !== normalizedFsPath(relatedPath)) aliases.set(realPath, relatedPath);
+      } catch { /* Missing dependencies retain their declared path. */ }
+    }
+    this.sourcePathAliases = aliases;
     if (externalInputs) {
       this.externalInputsProject = externalInputs.inputs;
       this.externalInputsProjectText = externalInputs.projectText;
@@ -2667,19 +2677,19 @@ export class TimelineController {
         return this.execFile(pythonPath, args, timeoutMs, cwd, extraEnv, "analyzer");
       })
       .catch(async (error) => {
-        // Runtime failures and diagnosed underflows can still produce a valid trace.
+        // Runtime failures and diagnosed timing/buffer limits can still produce a valid trace.
         // Outputs were cleared above, so this cannot recover a stale trace.
         if (!this.isCurrentAnalysis(analysisRequestId) || this.isAnalyzerTimeoutError(error)) throw error;
         let partial;
         try { partial = JSON.parse(await fsPromises.readFile(timelineIrPath, "utf-8")); } catch { throw error; }
         const simulationFailure = Object.values(partial.execution || {}).some((entry) => entry.mode === "simulation" && entry.status === "error");
         const diagnosticErrors = Array.isArray(partial.diagnostics) ? partial.diagnostics.filter((item) => item.severity === "error") : [];
-        const underflowFailure = diagnosticErrors.length > 0 && diagnosticErrors.every((item) =>
-          ["definite_underflow", "playback_queue_underflow"].includes(item.category));
-        if (!Array.isArray(partial.events) || !partial.events.length || (!simulationFailure && !underflowFailure)) throw error;
+        const timelineDiagnosticFailure = diagnosticErrors.length > 0 && diagnosticErrors.every((item) =>
+          ["definite_underflow", "playback_queue_underflow", "acquisition_buffer_sustained_overload"].includes(item.category));
+        if (!Array.isArray(partial.events) || !partial.events.length || (!simulationFailure && !timelineDiagnosticFailure)) throw error;
         try { parseAnalyzerResult(error.stdout); } catch { throw error; }
         this.output.appendLine(simulationFailure ? "Simulation stopped with an error; rendering the partial execution trace and its diagnostics." :
-          "RT underflow detected; rendering the timeline and its error diagnostics.");
+          "Timing or buffer limit detected; rendering the timeline and its error diagnostics.");
         return { stdout: error.stdout, stderr: error.stderr, elapsedMs: error.elapsedMs, exitCode: error.exitCode };
       })
       .then(async (result) => {
@@ -3615,12 +3625,14 @@ export class TimelineController {
 
   resolveSourcePath(sourceFile) {
     if (path.isAbsolute(sourceFile)) {
-      return sourceFile;
+      return this.sourcePathAliases.get(normalizedFsPath(sourceFile)) || sourceFile;
     }
     const root = this.timelineIr && this.timelineIr.project && this.timelineIr.project.root
       ? this.timelineIr.project.root
       : path.dirname(this.projectUri.fsPath);
-    return path.resolve(root, sourceFile);
+    const resolved = path.resolve(root, sourceFile);
+    // The analyzer resolves filesystem links; diagnostics and navigation must use the project's editor paths.
+    return this.sourcePathAliases.get(normalizedFsPath(resolved)) || resolved;
   }
 
   webviewInitialState() {

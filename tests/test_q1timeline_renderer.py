@@ -14,12 +14,40 @@ def _ns(value: int) -> dict:
     return {"kind": "concrete", "value": value}
 
 
+def test_diagnostics_are_outside_details_with_compact_paths_and_no_repeated_codes_or_fixes() -> None:
+    html = render_html({"version": "0.1.0", "events": [], "diagnostics": [{
+        "severity": "warning", "category": "analysis_incomplete",
+        "message": "Underflow analysis incomplete: runtime input is missing.",
+        "source": {"file": r"C:\project\readout.q1asm", "line": 12},
+    }]})
+    assert html.index('class="diagnostics"') < html.index('id="q1timeline-analysis-details"') < html.index('id="event-inspector"')
+    assert re.search(r'<details id="q1timeline-analysis-details"[\s\S]*<aside id="event-inspector"[\s\S]*</aside>[\s\S]*</details>', html)
+    row = re.search(r'<li class="diagnostic severity-warning"[\s\S]*?</li>', html).group()
+    visible = re.sub(r"<[^>]+>", "", row)
+    assert "Analysis is incomplete" in visible
+    assert "analysis_incomplete" not in visible
+    assert "C:\\project" not in visible
+    assert "readout.q1asm:12" in visible
+    assert "runtime input is missing." in visible
+    assert "Fix:" not in visible
+    assert "<code>" not in row
+
+
+def test_diagnostic_summary_does_not_repeat_its_title() -> None:
+    html = render_html({"version": "0.1.0", "events": [], "diagnostics": [{
+        "severity": "warning", "category": "analysis_incomplete", "message": "Analysis is incomplete.",
+    }]})
+    row = re.search(r'<li class="diagnostic severity-warning"[\s\S]*?</li>', html).group()
+    assert "diagnostic-message" not in row
+
+
 @pytest.mark.parametrize("mode", ["normal", "debug"])
-def test_underflow_labels_hide_slack_and_show_positive_lateness(mode: str) -> None:
+def test_underflow_labels_hide_queue_samples_and_slack_and_show_positive_lateness(mode: str) -> None:
     events = [
         {"id": event_id, "kind": kind, "label": kind, "source": {}, "sequencer_id": "seq0", "lane": lane,
          "t0": _ns(0), "t1": _ns(0), "duration": _ns(0), "confidence": "exact", "meta": meta}
         for event_id, kind, lane, meta in [
+            ("queue", "queue_depth", "debug.queue_depth", {"estimated_depth": 0}),
             ("normal", "slack", "debug.slack", {"slack_ns": 24}),
             ("late", "slack", "debug.slack", {"slack_ns": -24}),
             ("warning", "underflow_warning", "debug.underflow", {"status": "definite_underflow", "slack_ns": -24}),
@@ -28,6 +56,8 @@ def test_underflow_labels_hide_slack_and_show_positive_lateness(mode: str) -> No
     ]
     before = json.dumps(events)
     html = render_html({"version": "0.1.0", "events": events}, default_mode=mode)
+    assert 'data-event-id="queue"' not in html
+    assert ' / debug.queue_depth' not in html
     assert 'data-event-id="normal"' not in html
     assert 'data-event-id="late"' not in html
     assert 'aria-label="RT underflow · 24 ns late' in html

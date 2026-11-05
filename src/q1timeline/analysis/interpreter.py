@@ -1804,8 +1804,10 @@ def _branch_target_arg(arg: Arg, state: AnalysisState, symbols: SymbolTable) -> 
 
 def _execute_concrete_branch(
     state: AnalysisState, instruction: Instr, q1_issue_event: TimelineEvent, symbols: SymbolTable,
-    *, defer_register_write: bool = False,
+    *, defer_register_write: bool = False, forced_decision: bool | None = None,
 ) -> None:
+    if forced_decision is not None and (type(forced_decision) is not bool or instruction.op == "jmp"):
+        raise ValueError("A forced branch decision must be a boolean for a conditional branch")
     scope = _scope(symbols, state)
     target_index = 1 if instruction.op == "loop" else 2 if len(instruction.args) == 3 else 0
     target_pc = resolve_arg_value(instruction.args[target_index], scope).value
@@ -1831,12 +1833,18 @@ def _execute_concrete_branch(
         _set_alu_flags(state, instruction, _sub_flags(left, right))
     else:
         decision = True if instruction.op == "jmp" else _status_branch_decision(instruction.op, state.alu_flags)
+    if forced_decision is not None:
+        q1_issue_event.meta.update(natural_branch_taken=decision, branch_overridden=True,
+                                  assumption_source="user", assumed_branch_path="taken" if forced_decision else "fallthrough")
+        decision = forced_decision
     duration = 24 if instruction.op in {"loop", "jlt", "jge"} else 16
     duration = duration if decision else 4
     q1_t1 = add_values(q1_issue_event.t0, Concrete(duration))
-    state.events[-1] = replace(q1_issue_event, t1=q1_t1, duration=Concrete(duration))
+    state.events[-1] = replace(q1_issue_event, t1=q1_t1, duration=Concrete(duration),
+                              confidence="assumed" if forced_decision is not None else q1_issue_event.confidence)
     state.q1_time_ns = q1_t1
-    q1_issue_event.meta.update(branch_decision="concrete", branch_taken=decision, target_pc=target_pc)
+    q1_issue_event.meta.update(branch_decision="assumed" if forced_decision is not None else "concrete",
+                               branch_taken=decision, target_pc=target_pc)
     if counter_write is not None:
         if defer_register_write:
             state.pending_register_writes.append(counter_write)
@@ -1844,6 +1852,8 @@ def _execute_concrete_branch(
             _apply_register_write(state, counter_write)
     if decision:
         state.next_pc = target_pc
+    elif forced_decision is not None:
+        state.next_pc = instruction.pc + 1
 
 
 def _execute_branch(

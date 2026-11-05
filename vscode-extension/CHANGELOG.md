@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.7
+
+- Check acquisition burst pressure and sustained overload, with module-aware uncertainty.
+- Report unapplied end-state settings without enabling optional hardware hints.
+- Keep diagnostics visible and open execution details when following an event.
+- Correct saved-file diagnostics and navigation through filesystem aliases.
+- Preserve natural operands and flags when exploring a chosen simulated branch.
+- Add the Q1ASM/LINQ demo and concise installation instructions.
+- Pair with Python package 0.2.7.
+
 ## 0.2.6
 
 - Show Q1ASM instruction signatures and operand types on hover, with comment toggling and bracket completion.

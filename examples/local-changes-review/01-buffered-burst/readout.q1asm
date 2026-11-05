@@ -1,0 +1,9 @@
+# Seven back-to-back acquisitions fit the documented burst allowance.
+acquire 0,0,4
+acquire 0,1,4
+acquire 0,2,4
+acquire 0,3,4
+acquire 0,4,4
+acquire 0,5,4
+acquire 0,6,4
+stop

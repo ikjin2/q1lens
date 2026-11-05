@@ -1,0 +1,10 @@
+analysis:
+  execution_mode: analysis
+alignment:
+  mode: none
+sequencers:
+  - id: seq0
+    file: sequence.q1asm
+    module: control_module
+view:
+  default_mode: debug

@@ -189,11 +189,11 @@
     addInspectorField(fields, "Sequencer", event.sequencer_id);
     addInspectorField(fields, "Lane", event.lane);
     addInspectorField(fields, "Time range", `${displayInspectorValue(eventTime(event, "t0"))} -> ${displayInspectorValue(eventTime(event, "t1"))}`);
-    addInspectorField(fields, "Source", source.file ? `${source.file}:${source.line || 1}` : "unavailable");
+    addInspectorField(fields, "Source", source.file ? `${source.file.replace(/\\/g, "/").split("/").pop()}:${source.line || 1}` : "unavailable");
     addInspectorField(fields, "Confidence", event.confidence);
     addInspectorField(fields, "Q1 core", event.kind === "q1_issue" ? `${displayInspectorValue(event.t0)} -> ${displayInspectorValue(event.t1)}` : meta.q1_issue_event_id);
     addInspectorField(fields, "RT packet", meta.rt_packet_id);
-    addInspectorField(fields, "Queue depth", meta.estimated_depth);
+    addInspectorField(fields, "Queue depth", meta.estimated_depth ?? meta.depth);
       addInspectorField(fields, "Late by", event.kind === "underflow_warning" && meta.slack_ns < 0 ? `${-meta.slack_ns} ns` : "");
       addInspectorField(fields, "Branch condition", meta.condition);
       addInspectorField(fields, "Branch policy", meta.branch_policy);
@@ -235,6 +235,7 @@
     renderSharedEventInspector(eventId);
     syncTimelineZoomActionState();
     if (options.notify !== false) {
+      openAnalysisDetails();
       window.dispatchEvent(new CustomEvent("q1timeline:eventClick", { detail: { eventId,
         ...(options.preserveFocus ? { preserveFocus: true } : {}) } }));
     }
@@ -251,6 +252,7 @@
   function revealTimelineLinkedEvent(eventId) {
     const event = timelineEventsById.get(String(eventId));
     if (!event) return;
+    openAnalysisDetails();
     const visibleEvent = visiblePlaybackEvent(event);
     expandQ1IssueLanesForHighlight([String(visibleEvent.id)]);
     zoomTimelineToHighlightedEvent(visibleEvent);
@@ -1668,7 +1670,7 @@
       addInspectorField(fields, "Confidence", event.confidence);
       addInspectorField(fields, "Q1 core", event.kind === "q1_issue" ? `${displayInspectorValue(event.t0)} -> ${displayInspectorValue(event.t1)}` : meta.q1_issue_event_id);
       addInspectorField(fields, "RT packet", meta.rt_packet_id);
-      addInspectorField(fields, "Queue depth", meta.estimated_depth);
+      addInspectorField(fields, "Queue depth", meta.estimated_depth ?? meta.depth);
       addInspectorField(fields, "Late by", event.kind === "underflow_warning" && meta.slack_ns < 0 ? `${-meta.slack_ns} ns` : "");
       addInspectorField(fields, "Branch condition", meta.condition);
       addInspectorField(fields, "Branch policy", meta.branch_policy);
@@ -1736,6 +1738,7 @@
       renderInspector(eventId);
       syncTimelineZoomActionState();
       if (options.notify !== false) {
+        openAnalysisDetails();
         window.dispatchEvent(new CustomEvent("q1timeline:eventClick", { detail: { eventId } }));
       }
     }
@@ -1949,6 +1952,11 @@
 
   function analysisDetailsBody() {
     return ensureAnalysisDetailsBody();
+  }
+
+  function openAnalysisDetails() {
+    const details = document.getElementById("q1timeline-analysis-details");
+    if (details) details.open = true;
   }
 
   function installAnalysisDetailsPersistence() {
@@ -2294,6 +2302,11 @@
   }
 
   function renderInitialBufferSummary() {
+    const bufferCategories = new Set(["definite_underflow", "possible_underflow", "rt_queue_underflow", "playback_queue_underflow", "initial_rt_buffer_estimate"]);
+    const hasBufferFinding = (timelineIr.diagnostics || []).some((diagnostic) =>
+      ["warning", "error"].includes(diagnostic.severity) &&
+      bufferCategories.has(diagnostic.category));
+    if (!hasBufferFinding) return;
     const underflow = timelineIr.assumptions?.underflow;
     const assumed = underflow?.initial_buffer_assumed_ns;
     const possible = underflow?.initial_buffer_possible_ns;
@@ -4566,8 +4579,7 @@
     const root = document.createElement("section");
     root.id = "q1timeline-hardware";
     root.setAttribute("aria-label", "Sequencer hardware state");
-    ensureAnalysisDetailsBody();
-    document.getElementById("q1timeline-analysis-details").after(root);
+    ensureAnalysisDetailsBody().append(root);
     hardwareView = window.q1lensHardwareView.mount(root, timelineIr, {
       initialState: { ...readPersistedWebviewState().hardwareState, basis: timelineTimeBasis },
       onStateChange(state) {

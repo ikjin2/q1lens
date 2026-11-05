@@ -2,18 +2,40 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from q1timeline.analysis.acquisition_buffer import READOUT_OPS, analyze_acquisition_buffer
 from q1timeline.analysis.interpreter import AnalysisState, TimelineEvent
 from q1timeline.diagnostics import Diagnostic
 from q1timeline.q1asm.ast import SourceLocation
 
+if TYPE_CHECKING:
+    from q1timeline.project import SequencerConfig
 
-_STATUS_PRIORITY = {"ready": 0, "incomplete": 1, "info": 2, "warning": 3}
+
+_STATUS_PRIORITY = {"ready": 0, "incomplete": 1, "info": 2, "warning": 3, "error": 4}
 
 
-def analyze_hardware_readiness(state: AnalysisState) -> dict[str, Any]:
-    """Run conservative, opt-in checks over one completed interpreter state."""
+def analyze_project_hardware_readiness(
+    states: list[AnalysisState], sequencers: list[SequencerConfig], *, include_optional_checks: bool = False,
+) -> None:
+    peers: dict[str, int] = {}
+    for state, sequencer in zip(states, sequencers):
+        if sequencer.module and any(i.op in READOUT_OPS for i in state.instructions_by_pc.values()):
+            peers[sequencer.module] = peers.get(sequencer.module, 0) + 1
+    for state, sequencer in zip(states, sequencers):
+        analyze_hardware_readiness(
+            state, module_type=sequencer.module_type,
+            acquisition_sequencers=peers.get(sequencer.module) if sequencer.module else None,
+            include_optional_checks=include_optional_checks,
+        )
+
+
+def analyze_hardware_readiness(
+    state: AnalysisState, *, module_type: str | None = None, acquisition_sequencers: int | None = None,
+    include_optional_checks: bool = True,
+) -> dict[str, Any]:
+    """Check buffers and pending settings, optionally including scope/bin hints."""
 
     ambiguous = _has_ambiguous_execution(state)
     findings: list[Diagnostic] = []
@@ -24,8 +46,6 @@ def analyze_hardware_readiness(state: AnalysisState) -> dict[str, Any]:
 
     if ambiguous:
         terminal_status = "skipped"
-        scope_status = "skipped"
-        bins_status = "skipped"
     else:
         terminal_status = "pass"
         if pending_fields:
@@ -34,6 +54,10 @@ def analyze_hardware_readiness(state: AnalysisState) -> dict[str, Any]:
             findings.append(diagnostic)
             terminal_status = "warning"
 
+    if ambiguous or not include_optional_checks:
+        scope_status = "skipped"
+        bins_status = "skipped"
+    else:
         scope_event = _enabled_scope_without_acquisition(state)
         scope_status = "pass"
         if scope_event is not None:
@@ -57,6 +81,13 @@ def analyze_hardware_readiness(state: AnalysisState) -> dict[str, Any]:
             findings.extend(reuse_diagnostics)
             bins_status = "info"
 
+    buffer_summary, buffer_findings = analyze_acquisition_buffer(
+        state, module_type=module_type, acquisition_sequencers=acquisition_sequencers,
+    )
+    if buffer_summary is None and not include_optional_checks and not findings:
+        return {}
+    state.diagnostics.extend(buffer_findings)
+    findings.extend(buffer_findings)
     counts = _diagnostic_counts(findings)
     status = _summary_status(counts, incomplete=ambiguous)
     summary: dict[str, Any] = {
@@ -77,7 +108,12 @@ def analyze_hardware_readiness(state: AnalysisState) -> dict[str, Any]:
             },
         },
     }
-    if ambiguous:
+    if not include_optional_checks:
+        summary["checks"].pop("scope_acquisition")
+        summary["checks"].pop("acquisition_bins")
+    if buffer_summary is not None:
+        summary["checks"]["acquisition_buffer"] = buffer_summary
+    if ambiguous and include_optional_checks:
         summary["skipped_reason"] = "invalid input or runtime-dependent or incomplete control flow"
     state.metadata["hardware_readiness"] = summary
     return summary
@@ -311,7 +347,9 @@ def _diagnostic_counts(diagnostics: list[Diagnostic]) -> dict[str, int]:
 
 
 def _summary_status(counts: dict[str, int], *, incomplete: bool) -> str:
-    if counts["error"] or counts["warning"]:
+    if counts["error"]:
+        return "error"
+    if counts["warning"]:
         return "warning"
     if counts["info"] or counts["hint"]:
         return "info"

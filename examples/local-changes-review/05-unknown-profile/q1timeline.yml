@@ -1,0 +1,10 @@
+analysis:
+  execution_mode: analysis
+alignment:
+  mode: none
+sequencers:
+  - id: readout
+    file: readout.q1asm
+    module: readout_module
+view:
+  default_mode: debug

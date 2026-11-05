@@ -37,6 +37,16 @@ DIAGNOSTIC_PRESENTATIONS: dict[str, dict[str, str]] = {
         "summary": "{message}",
         "fix": "Confirm that repeated writes or accumulation into this acquisition bin are intentional.",
     },
+    "acquisition_buffer_sustained_overload": {
+        "group": "Hardware Readiness", "title": "Acquisition buffer cannot sustain this loop",
+        "summary": "{message}",
+        "fix": "Reduce acquisitions per loop or increase its period, preserving the intended experiment timing.",
+    },
+    "acquisition_buffer_pressure": {
+        "group": "Hardware Readiness", "title": "Acquisition buffer margin is uncertain",
+        "summary": "{message}",
+        "fix": "Check module type, acquisition sequencer count, burst size and idle recovery time.",
+    },
     "alignment_missing": {
         "group": "Alignment",
         "title": "Alignment anchor was not found",

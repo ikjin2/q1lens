@@ -16,6 +16,8 @@ def test_underflow_severity_distinguishes_confirmed_and_possible_failures(status
     packet = state.rt_packets[0]
     _emit_underflow_warning(state, packet_id=packet.id, slack_ns=-24, t0=packet.rt_t0,
                             source=packet.source, assumptions={}, status=status)
+    assert state.events[-1].meta["estimated_depth"] == 0
+    assert state.events[-1].meta["slack_ns"] == -24
     assert state.diagnostics[-1].category == status
     assert state.diagnostics[-1].severity == severity
 

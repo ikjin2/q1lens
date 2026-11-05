@@ -251,7 +251,6 @@ def render_html(
         for panel in (
             _confidence_legend(_visible_confidences(events, default_mode=default_mode)),
             _feedback_balance_panel(ir.get("feedback_balance", {})),
-            _diagnostics_panel(diagnostics, event_dom_ids),
             _semantic_panel(ir.get("semantic", {}), event_dom_ids),
         )
         if panel
@@ -270,6 +269,7 @@ def render_html(
       {''.join(svg_parts)}
     </section>
     {_parameters_panel(ir.get("analysis", {}))}
+    {_diagnostics_panel(diagnostics, event_dom_ids)}
     <details id="q1timeline-analysis-details" class="analysis-details">
       <summary>Analysis details</summary>
       <div id="q1timeline-analysis-details-body">
@@ -283,13 +283,13 @@ def render_html(
             </div>
           </div>
         </header>
+        <aside id="event-inspector" class="event-inspector" aria-live="polite">
+          <h2>Selected event</h2>
+          <dl id="event-inspector-fields"></dl>
+        </aside>
         {analysis_panels}
       </div>
     </details>
-    <aside id="event-inspector" class="event-inspector" aria-live="polite">
-      <h2>Selected event</h2>
-      <dl id="event-inspector-fields"></dl>
-    </aside>
   </main>
   <script id="timeline-ir" type="application/json">{embedded_ir}</script>
   <script>{_js()}</script>
@@ -747,7 +747,7 @@ def _group_events(events: list[dict[str, Any]], *, mode: str) -> tuple[list[dict
     grouped_events: list[dict[str, Any]] = []
     lanes: list[str] = []
     for event in events:
-        if event.get("kind") == "slack":
+        if event.get("kind") in {"queue_depth", "slack"}:
             continue
         sequencer = event.get("sequencer_id", "")
         lane = str(event.get("lane", ""))
@@ -1131,15 +1131,16 @@ def _diagnostics_panel(diagnostics: list[dict[str, Any]], event_dom_ids: dict[st
     for diagnostic in diagnostics:
         severity = str(diagnostic.get("severity", "info"))
         counts[severity] = counts.get(severity, 0) + 1
-    summary = " ".join(f"{severity}={counts.get(severity, 0)}" for severity in ("error", "warning", "info", "hint"))
-    error_items = "".join(_diagnostic_item(diagnostic, event_dom_ids) for diagnostic in diagnostics if diagnostic.get("severity") == "error")
-    secondary_diagnostics = [diagnostic for diagnostic in diagnostics if diagnostic.get("severity") != "error"]
+    summary = " · ".join(f"{counts[severity]} {severity}" + ("s" if counts[severity] != 1 else "")
+                         for severity in ("error", "warning", "info", "hint") if counts[severity]) or "No issues"
+    error_items = "".join(_diagnostic_item(diagnostic, event_dom_ids) for diagnostic in diagnostics if diagnostic.get("severity") in {"error", "warning"})
+    secondary_diagnostics = [diagnostic for diagnostic in diagnostics if diagnostic.get("severity") not in {"error", "warning"}]
     secondary_items = "".join(_diagnostic_item(diagnostic, event_dom_ids) for diagnostic in secondary_diagnostics[:25])
     critical_html = f'<ol class="diagnostics-critical">{error_items}</ol>' if error_items else ""
     secondary_html = ""
     if secondary_items:
         secondary_count = len(secondary_diagnostics)
-        secondary_label = f"{secondary_count} non-error diagnostic" + ("" if secondary_count == 1 else "s")
+        secondary_label = f"{secondary_count} note" + ("" if secondary_count == 1 else "s")
         secondary_html = (
             '<details class="diagnostics-secondary" data-default-open="false">'
             f"<summary>{escape(secondary_label)}</summary>"
@@ -1223,23 +1224,33 @@ def _feedback_balance_item(channel: dict[str, Any]) -> str:
 def _diagnostic_item(diagnostic: dict[str, Any], event_dom_ids: dict[str, str]) -> str:
     severity = escape(str(diagnostic.get("severity", "info")))
     presentation = describe_diagnostic(diagnostic)
-    category = escape(presentation["category"])
     title = escape(presentation["title"])
-    summary = escape(presentation["summary"])
-    fix = escape(presentation["fix"])
-    fix_html = f'<p class="diagnostic-fix">Fix: {fix}</p>' if fix else ""
     source = diagnostic.get("source") if isinstance(diagnostic.get("source"), dict) else {}
-    location = ""
-    if source:
-        location = f" {escape(str(source.get('file')))}:{escape(str(source.get('line')))}"
-    related = "".join(_related_event_link(event_id, event_dom_ids) for event_id in diagnostic.get("related_events", []))
+    source_file = str(source.get("file") or "")
+    filename = source_file.replace("\\", "/").rsplit("/", 1)[-1]
+    location = f'{filename}:{source.get("line") or 1}' if filename else ""
+    summary = presentation["summary"].strip()
+    details = diagnostic.get("details") or {}
+    if presentation["category"] == "pending_hardware_state" and isinstance(details, dict) and isinstance(details.get("pending_fields"), list):
+        summary = "Not applied: " + ", ".join(str(field) for field in details["pending_fields"])
+    if source_file:
+        summary = summary.replace(source_file, filename)
+    if presentation["category"] == "analysis_incomplete":
+        summary = re.sub(r"^(?:Underflow )?analysis incomplete:\s*", "", summary, flags=re.IGNORECASE)
+    if summary.casefold().startswith(presentation["title"].casefold() + ":"):
+        summary = summary[len(presentation["title"]) + 1:].strip()
+    if (re.sub(r"\W+", "", summary).casefold() == re.sub(r"\W+", "", presentation["title"]).casefold()
+            or summary == presentation["category"]):
+        summary = ""
+    message = f'<p class="diagnostic-message">{escape(summary)}</p>' if summary else ""
+    related_events = diagnostic.get("related_events", [])
+    related = _related_event_link(related_events[0], event_dom_ids, label="Show event") if related_events else ""
     return (
-        f'<li class="diagnostic severity-{severity}">'
-        f"<strong>{severity}</strong> <span class=\"diagnostic-title\">{title}</span> "
-        f"<code>{category}</code>{location}"
-        f'<p class="diagnostic-message">{summary}</p>'
-        f"{fix_html}"
-        f'<span class="related-events">{related}</span>'
+        f'<li class="diagnostic severity-{severity}" data-diagnostic-category="{escape(presentation["category"], quote=True)}">'
+        '<div class="diagnostic-heading">'
+        f"<strong>{severity}</strong> <span class=\"diagnostic-title\">{title}</span>"
+        f'<span class="diagnostic-source">{escape(location)}</span>'
+        f'<span class="related-events">{related}</span></div>{message}'
         "</li>"
     )
 
@@ -1317,11 +1328,11 @@ def _semantic_event_link(event_id: Any, event_dom_ids: dict[str, str]) -> str:
     )
 
 
-def _related_event_link(event_id: Any, event_dom_ids: dict[str, str]) -> str:
+def _related_event_link(event_id: Any, event_dom_ids: dict[str, str], *, label: str | None = None) -> str:
     raw_id = str(event_id)
     return (
         f' <a href="#{escape(_event_dom_id(raw_id, event_dom_ids), quote=True)}" '
-        f'data-related-event-id="{escape(raw_id, quote=True)}">{escape(raw_id)}</a>'
+        f'data-related-event-id="{escape(raw_id, quote=True)}">{escape(label or raw_id)}</a>'
     )
 
 
@@ -2029,6 +2040,7 @@ body.vscode-dark button { background: var(--vscode-button-secondaryBackground, #
 button[aria-pressed="true"] { background: #17202a; color: #fff; }
 .analysis-details { margin: 0 16px 16px; }
 .analysis-details > summary { cursor: pointer; padding: 8px 0; font-weight: 700; }
+.analysis-details .event-inspector, .analysis-details .q1-hardware { margin: 12px 0; }
 .analysis-parameters { margin: 0 16px 8px; font-size: 12px; container-type: inline-size; }
 .analysis-parameters > summary { cursor: pointer; padding: 8px 0; font-size: 14px; font-weight: 700; }
 .analysis-parameters .parameters-search-toggle { float: right; display: inline-flex; align-items: center; gap: 4px; font-size: 12px; font-weight: normal; }
@@ -2060,7 +2072,7 @@ button[aria-pressed="true"] { background: #17202a; color: #fff; }
 .parameter-error { flex-basis: 100%; color: var(--vscode-errorForeground, #c72c2c); }
 .parameter-status { display: block; color: var(--vscode-descriptionForeground, #4b5563); }
 .diagnostics { margin: 16px 16px 0; padding: 10px 12px; border: 1px solid var(--vscode-panel-border, #d8dee6); }
-.diagnostics ol { margin: 8px 0 0; padding-left: 20px; }
+.diagnostics ol { margin: 8px 0 0; padding: 0; list-style: none; }
 .diagnostics-secondary { margin-top: 8px; }
 .diagnostics-secondary > summary,
 .confidence-legend > summary,
@@ -2070,8 +2082,9 @@ button[aria-pressed="true"] { background: #17202a; color: #fff; }
 .diagnostic { margin: 4px 0; font-size: 12px; }
 .diagnostic-summary { margin: 0; color: var(--vscode-descriptionForeground, #4b5563); font-size: 12px; }
 .diagnostic-title { font-weight: 700; }
-.diagnostic-message, .diagnostic-fix { margin: 3px 0 0; }
-.diagnostic-fix { color: var(--vscode-descriptionForeground, #4b5563); }
+.diagnostic-heading { display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px; }
+.diagnostic-source { margin-left: auto; color: var(--vscode-descriptionForeground, #4b5563); }
+.diagnostic-message { margin: 3px 0 0; }
 .severity-error strong { color: #c72c2c; }
 .severity-warning strong { color: #a45516; }
 .related-events { margin-left: 6px; }
@@ -2414,11 +2427,11 @@ function renderInspector(eventId) {
   addInspectorField(fields, 'Sequencer', event.sequencer_id);
   addInspectorField(fields, 'Lane', event.lane);
   addInspectorField(fields, 'Time range', `${displayInspectorValue(event.t0)} -> ${displayInspectorValue(event.t1)}`);
-  addInspectorField(fields, 'Source', source.file ? `${source.file}:${source.line || 1}` : 'unavailable');
+  addInspectorField(fields, 'Source', source.file ? `${source.file.replace(/\\\\/g, '/').split('/').pop()}:${source.line || 1}` : 'unavailable');
   addInspectorField(fields, 'Confidence', event.confidence);
   addInspectorField(fields, 'Q1 core', event.kind === 'q1_issue' ? `${displayInspectorValue(event.t0)} -> ${displayInspectorValue(event.t1)}` : meta.q1_issue_event_id);
   addInspectorField(fields, 'RT packet', meta.rt_packet_id);
-  addInspectorField(fields, 'Queue depth', meta.estimated_depth);
+  addInspectorField(fields, 'Queue depth', meta.estimated_depth ?? meta.depth);
   addInspectorField(fields, 'Late by', event.kind === 'underflow_warning' && meta.slack_ns < 0 ? `${-meta.slack_ns} ns` : '');
   addInspectorField(fields, 'Branch condition', meta.condition);
   addInspectorField(fields, 'Branch decision', meta.branch_decision);
@@ -2610,6 +2623,8 @@ function selectEventNode(eventNode) {
   highlightRelatedControlFlow(eventNode);
   const eventId = eventNode.dataset.eventId;
   renderInspector(eventId);
+  const details = document.getElementById('q1timeline-analysis-details');
+  if (details) details.open = true;
   window.dispatchEvent(new CustomEvent('q1timeline:eventClick', { detail: { eventId } }));
 }
 function setMode(mode) {

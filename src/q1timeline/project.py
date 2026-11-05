@@ -33,6 +33,7 @@ class SequencerConfig:
     file: Path
     module: str | None = None
     sequence_json: Path | None = None
+    module_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -398,6 +399,14 @@ def _load_sequencers(
         if item.get("sequence_json"):
             sequence_json = _resolve_path(root, item["sequence_json"])
 
+        module_type = item.get("module_type")
+        if module_type is not None and (not isinstance(module_type, str) or not module_type.strip()):
+            errors.append(Diagnostic(
+                severity="error", category="invalid_argument_value",
+                message=f"Sequencer {sequencer_id} module_type must be a nonempty string.",
+                source=_source_for_yaml_key(project_path, "module_type"),
+            ))
+            module_type = None
         sequencers.append(
             SequencerConfig(
                 id=sequencer_id,
@@ -405,6 +414,7 @@ def _load_sequencers(
                 file=q1asm_file,
                 module=item.get("module"),
                 sequence_json=sequence_json,
+                module_type=module_type.strip().upper() if module_type is not None else None,
             )
         )
 

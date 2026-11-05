@@ -51,8 +51,7 @@ def analyze_text(
     )
     if execution_mode != "simulation":
         analyze_underflows([state])
-    if hardware_readiness:
-        analyze_hardware_readiness(state)
+    analyze_hardware_readiness(state, include_optional_checks=hardware_readiness)
     align_timelines([state], mode=alignment_mode, anchor_kinds=anchor_kinds)
     return timeline_ir_from_states(
         [state],
@@ -108,9 +107,8 @@ def analyze_documents(
             for file, text in validated_documents.items()
         ]
         analyze_underflows(states)
-    if hardware_readiness:
-        for state in states:
-            analyze_hardware_readiness(state)
+    for state in states:
+        analyze_hardware_readiness(state, include_optional_checks=hardware_readiness)
     align_timelines(states, mode=alignment_mode, anchor_kinds=anchor_kinds)
     return timeline_ir_from_states(
         states,

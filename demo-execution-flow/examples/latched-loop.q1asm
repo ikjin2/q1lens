@@ -1,0 +1,18 @@
+# Synthetic setting sweep, executed by the regular Q1Lens engine.
+.DEF GAIN R0
+.DEF N R1
+.DEF ZERO R2
+
+move 1000,$GAIN
+move 5,$N
+move 0,$ZERO
+set_freq 40000000
+nop
+
+sweep:
+set_awg_gain $GAIN,$ZERO
+upd_param 4
+wait 64
+add $GAIN,1000,$GAIN
+loop $N,@sweep
+stop

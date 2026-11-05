@@ -241,6 +241,7 @@ def _emit_underflow_warning(
     meta: dict[str, Any] = {
         "status": status,
         "rt_packet_id": packet_id,
+        "estimated_depth": 0,
         "slack_ns": slack_ns,
         "assumptions": assumptions,
     }

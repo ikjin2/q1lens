@@ -150,12 +150,13 @@ describe("package metadata", () => {
   });
 
   it("exposes local reinstall and installed asset verification scripts", () => {
-    const scripts = packageJson().scripts;
+    const manifest = packageJson();
+    const scripts = manifest.scripts;
 
     assert.equal(scripts["verify:installed"], "node ./scripts/verify-installed-assets.js");
     assert.equal(
       scripts["reinstall:local"],
-      "npm run package && code --install-extension q1lens-0.2.6.vsix --force && npm run verify:installed",
+      `npm run package && code --install-extension q1lens-${manifest.version}.vsix --force && npm run verify:installed`,
     );
   });
 

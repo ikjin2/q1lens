@@ -24,7 +24,7 @@ def _readiness_diagnostics(ir: dict) -> list[dict]:
     ]
 
 
-def test_hardware_readiness_is_opt_in_and_preserves_default_schema() -> None:
+def test_pending_settings_are_checked_even_when_optional_hardware_hints_are_disabled() -> None:
     source = "set_freq 100\nstop\n"
 
     default_ir = analyze_text(source, file="seq0.q1asm")
@@ -35,8 +35,13 @@ def test_hardware_readiness_is_opt_in_and_preserves_default_schema() -> None:
     )
 
     assert default_ir == explicitly_disabled_ir
-    assert "hardware_readiness" not in default_ir
-    assert _readiness_diagnostics(default_ir) == []
+    assert [d["category"] for d in _readiness_diagnostics(default_ir)] == ["pending_hardware_state"]
+    assert set(default_ir["hardware_readiness"]["sequencers"][0]["checks"]) == {"terminal_latched_state"}
+
+
+def test_optional_scope_hints_remain_disabled_by_default() -> None:
+    ir = analyze_text("set_scope_en 1\nplay 0,0,4\nstop\n")
+    assert _readiness_diagnostics(ir) == []
 
 
 def test_pending_terminal_state_has_deterministic_summary_and_safe_stop_edit() -> None:
@@ -246,7 +251,7 @@ def test_readiness_preserves_execution_and_critical_path_metadata(
 
 
 @pytest.mark.parametrize("execution_mode", ["analysis", "concrete", "simulation"])
-def test_cli_flag_serializes_readiness_and_controls_strict_failure(tmp_path: Path, execution_mode: str) -> None:
+def test_cli_checks_pending_settings_with_or_without_the_optional_flag(tmp_path: Path, execution_mode: str) -> None:
     source_file = tmp_path / "seq0.q1asm"
     disabled_out = tmp_path / "disabled.json"
     enabled_out = tmp_path / "enabled.json"
@@ -254,7 +259,7 @@ def test_cli_flag_serializes_readiness_and_controls_strict_failure(tmp_path: Pat
 
     assert main(
         ["analyze", str(source_file), "--out", str(disabled_out), "--align", "none", "--strict", "--execution-mode", execution_mode]
-    ) == 0
+    ) == 2
     assert main(
         [
             "analyze",
@@ -272,7 +277,7 @@ def test_cli_flag_serializes_readiness_and_controls_strict_failure(tmp_path: Pat
 
     disabled_ir = json.loads(disabled_out.read_text(encoding="utf-8"))
     enabled_ir = json.loads(enabled_out.read_text(encoding="utf-8"))
-    assert "hardware_readiness" not in disabled_ir
+    assert disabled_ir["hardware_readiness"]["status"] == "warning"
     assert enabled_ir["hardware_readiness"]["enabled"] is True
     diagnostic = next(
         item for item in enabled_ir["diagnostics"]

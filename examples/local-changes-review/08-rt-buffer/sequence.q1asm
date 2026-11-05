@@ -1,0 +1,7 @@
+# Q1 work exhausts both assumed initial RT reserves. Expect an RT error + label.
+upd_param 4
+move 89286,R0
+work: nop
+loop R0,@work
+upd_param 1000
+stop

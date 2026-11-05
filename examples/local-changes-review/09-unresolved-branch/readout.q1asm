@@ -1,0 +1,5 @@
+# Neither the wait duration nor this conditional loop's count is established.
+shot: acquire 0,0,4
+wait R1
+jg @shot
+stop

@@ -1,0 +1,7 @@
+# Starts: 100, 900, 1100, 1900, ... ns. The 200 ns wrap gap is buffered.
+wait 100
+shot: acquire 0,0,40
+wait 760
+acquire 0,1,40
+wait 160
+jmp @shot

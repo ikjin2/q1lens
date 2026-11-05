@@ -1,6 +1,6 @@
 const path = require("node:path");
 const { execFileSync } = require("node:child_process");
-const { test, expect } = require("./helpers");
+const { test, expect, analysisDetails } = require("./helpers");
 
 const assets = path.resolve(__dirname, "../../src");
 const source = { file: "playback.q1asm", line: 2, raw: "jl @done" };
@@ -39,19 +39,61 @@ async function mount(page, status = "completed", actualIr, initialState = {}, ho
   await page.addScriptTag({path: path.join(assets, "q1timeline/media/hardwareState.js")});
   await page.addScriptTag({path: path.join(assets, "q1timeline/media/hardwareView.js")});
   await page.addScriptTag({path: path.join(assets, "q1timeline/media/timeline.js")});
+  if (initialState.analysisDetailsOpen !== false) await analysisDetails(page);
 }
 
-test("initial RT buffer summary appears only with declared timing assumptions", async ({page}) => {
+test("analysis details contain selection and hardware while compact diagnostics remain visible", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const {ir, html} = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json", "from q1timeline.analysis.api import analyze_text", "from q1timeline.render.html import render_html",
+    'ir=analyze_text("wait 100\\nstop\\n",file="C:/project/readout.q1asm",sequencer_id="seq")',
+    'ir["diagnostics"]=[{"severity":"warning","category":"analysis_incomplete","message":"Underflow analysis incomplete: runtime input is missing.","source":{"file":"C:/project/readout.q1asm","line":1},"related_events":[next(e["id"] for e in ir["events"] if e["kind"]=="wait")]}]',
+    "print(json.dumps({'ir':ir,'html':render_html(ir)}))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+    /type=["']application\/json["']/i.test(attributes) ? tag : "");
+  await mount(page, "idle", ir, {analysisDetailsOpen: false}, {}, shell);
+  const details = page.locator("#q1timeline-analysis-details");
+  const diagnostic = page.locator(".diagnostics .diagnostic");
+  await expect(details.locator("#event-inspector")).toBeHidden();
+  await expect(details.locator("#q1timeline-hardware")).toBeHidden();
+  await expect(diagnostic).toBeVisible();
+  await expect(details.locator(".diagnostics")).toHaveCount(0);
+  await expect(diagnostic).toContainText("Analysis is incomplete");
+  await expect(diagnostic).toContainText("readout.q1asm:1");
+  await expect(diagnostic).not.toContainText("analysis_incomplete");
+  await expect(diagnostic).not.toContainText("C:/project");
+  await expect(diagnostic).not.toContainText("Fix:");
+  await expect(diagnostic.locator(".diagnostic-message")).toHaveText("runtime input is missing.");
+  await diagnostic.getByRole("link", {name: "Show event"}).click();
+  await expect(details).toHaveAttribute("open", "");
+  await expect(details.locator("#event-inspector-fields")).toContainText("readout.q1asm:1");
+  await expect(details.locator("#q1timeline-hardware")).toBeVisible();
+  await details.locator(":scope > summary").click();
+  await expect(diagnostic).toBeVisible();
+  await expect(details.locator("#q1timeline-hardware")).toBeHidden();
+  const saved = await page.evaluate(() => window.getSavedTimelineState());
+  await mount(page, "idle", ir, saved, {}, shell);
+  await expect(page.locator("#q1timeline-analysis-details")).not.toHaveAttribute("open", "");
+  await expect(page.locator(".diagnostics")).toBeVisible();
+});
+
+test("initial RT buffer summary stays hidden without a related warning or error", async ({page}) => {
   await mount(page);
   await expect(page.locator("#q1timeline-initial-buffer-summary")).toHaveCount(0);
   const ir = {sequencers: [{id: "seq"}], events: [event("wait", "wait", 0, 100)], assumptions: {
     underflow: {initial_buffer_assumed_ns: 1000000, initial_buffer_possible_ns: 2000000}}};
   await mount(page, "completed", ir);
-  const summary = page.locator("#q1timeline-initial-buffer-summary");
-  await expect(summary).toBeVisible();
-  await expect(summary).toHaveText("Initial buffer ≈ 1 ms · up to 2 ms probably OK");
-  await expect(summary).toHaveAttribute("title", /user-provided assumptions, not measured hardware values/);
-  await expect(summary).toHaveAttribute("title", /covers cumulative Q1 supply gaps during RT execution; no RT startup delay is added/);
+  await expect(page.locator("#q1timeline-initial-buffer-summary")).toHaveCount(0);
+  for (const diagnostic of [
+    {severity: "info", category: "initial_rt_buffer_estimate"},
+    {severity: "warning", category: "register_not_ready"},
+    {severity: "warning", category: "analysis_incomplete", details: {analysis_scope: "rt_queue"}},
+    {severity: "error", category: "acquisition_buffer_sustained_overload"},
+  ]) {
+    await mount(page, "completed", {...ir, diagnostics: [diagnostic]});
+    await expect(page.locator("#q1timeline-initial-buffer-summary")).toHaveCount(0);
+  }
   const firstRt = page.locator('.timeline-block[data-event-id="wait"]').first();
   await expect(firstRt).toBeVisible();
   await expect(firstRt).toHaveAttribute("title", /^wait \| 0 ns -> 100 ns\n/);
@@ -61,6 +103,7 @@ test("initial RT buffer summary appears only with declared timing assumptions", 
 test("initial RT buffer summary describes tentative playback consumption", async ({page}) => {
   const ir = {sequencers: [{id: "seq"}], events: [event("wait", "wait", 0, 100)],
     assumptions: {underflow: {initial_buffer_assumed_ns: 1000000, initial_buffer_possible_ns: 2000000}},
+    diagnostics: [{severity: "warning", category: "possible_underflow", message: "Buffer may be exhausted"}],
     playback: {status: "completed", steps: 7},
     execution: {seq: {queue_timing: {initial_buffer: {
       assumed_ns: 1000000, possible_ns: 2000000, required_ns: 1500000, status: "tentative"}}}}};
@@ -69,6 +112,10 @@ test("initial RT buffer summary describes tentative playback consumption", async
   await expect(summary).toHaveText("Initial buffer ≈ 1 ms · up to 2 ms probably OK");
   await expect(summary).toHaveAttribute("title", /seq: 1.5 ms of initial buffer required \(tentative\)/);
   await expect(summary).toHaveAttribute("title", /Up to 2 ms may be sufficient, but is unconfirmed/);
+  for (const category of ["definite_underflow", "playback_queue_underflow", "rt_queue_underflow"]) {
+    await mount(page, "completed", {...ir, diagnostics: [{severity: "error", category, message: "Buffer exhausted"}]});
+    await expect(page.locator("#q1timeline-initial-buffer-summary")).toBeVisible();
+  }
 });
 
 test("external input editor keeps confirmed settings until rerun succeeds and recovers from errors", async ({page}) => {
@@ -417,7 +464,7 @@ test("successful parameter reanalysis keeps the source filter only for the same 
   await page.getByRole("button", {name: "Search parameters", exact: true}).click();
   const parameterSearch = page.getByRole("searchbox", {name: "Search parameters by name", exact: true});
   await parameterSearch.fill("WAIT");
-  await page.locator("#q1timeline-analysis-details > summary").click();
+  await analysisDetails(page);
   const filter = page.getByRole("searchbox", {name: "Filter source or kind", exact: true});
   await filter.fill("wait");
   await expect(stop()).toBeHidden();
@@ -443,7 +490,7 @@ test("successful parameter reanalysis keeps the source filter only for the same 
   await filter.fill("wait");
   const projectB = project("project-b");
   await show(analyze(projectB), await page.evaluate(() => window.getSavedTimelineState()), projectB);
-  await page.locator("#q1timeline-analysis-details > summary").click();
+  await analysisDetails(page);
   await expect(filter).toHaveValue(""); await expect(stop()).toBeVisible();
   await page.screenshot({path: test.info().outputPath("parameter-success-filter-project-scope.png"), fullPage: true});
 });
@@ -522,7 +569,7 @@ test("keeps a source filter active across layout switches and wait folding", asy
   const wait = ir.events.find((item) => item.kind === "wait");
   const waitBlock = page.locator(`.timeline-block[data-event-id="${wait.id}"]`);
   await expect(waitBlock).toBeVisible();
-  await page.locator("#q1timeline-analysis-details > summary").click();
+  await analysisDetails(page);
   const filter = page.getByRole("searchbox", {name: "Filter source or kind"});
   await filter.fill("upd_param");
   for (const layout of ["Instruction", "Time scale"]) {
@@ -620,7 +667,7 @@ test("a source highlight hidden by the filter updates the inspector and selectio
   };
   await playBlock.click();
   await expect(playBlock).toHaveAttribute("aria-selected", "true");
-  await page.locator("#q1timeline-analysis-details > summary").click();
+  await analysisDetails(page);
   const filter = page.getByRole("searchbox", {name: "Filter source or kind"});
   await filter.fill("play");
   await expect(waitBlock).toBeHidden();
@@ -661,8 +708,7 @@ test("diagnostic event links reveal an offscreen target and notify its source on
   const target = page.locator(`.timeline-block[data-event-id="${eventId}"]`);
   const link = page.locator(`[data-related-event-id="${eventId}"]`).first();
   const time = page.getByRole("spinbutton", {name: "Selected time in nanoseconds"});
-  await page.locator("#q1timeline-analysis-details > summary").click();
-  await page.locator(".diagnostics-secondary > summary").click();
+  await analysisDetails(page);
   await expect(target).toBeVisible();
   await link.click();
   await expect(target).toHaveClass(/is-selected/);
@@ -700,8 +746,7 @@ test("diagnostic event links select pending setters without adding a separate ti
   const eventId = diagnostic.related_events[0];
   const target = page.locator(`.timeline-block[data-event-id="${eventId}"]`);
   await expect(target).toHaveCount(0);
-  await page.locator("#q1timeline-analysis-details > summary").click();
-  await page.locator(".diagnostics-secondary > summary").click();
+  await analysisDetails(page);
   await page.locator(`[data-related-event-id="${eventId}"]`).first().click();
   await expect(page.locator("#event-inspector-fields")).toContainText("pending.q1asm:3");
   await expect(page.getByRole("spinbutton", {name: "Selected time in nanoseconds"})).toHaveValue("1004");

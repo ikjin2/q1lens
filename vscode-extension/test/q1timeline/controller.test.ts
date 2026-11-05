@@ -2927,7 +2927,7 @@ describe("q1timeline controller", () => {
     });
   });
 
-  it("declares hardware readiness as an opt-in Q1Lens setting", () => {
+  it("keeps additional hardware hints opt-in without gating acquisition buffers", () => {
     const manifest = JSON.parse(readFileSync(join(__dirname, "../../../package.json"), "utf8"));
     const setting = manifest.contributes.configuration.properties["q1lens.q1timeline.hardwareReadiness"];
 
@@ -2935,6 +2935,7 @@ describe("q1timeline controller", () => {
       { type: setting.type, default: setting.default },
       { type: "boolean", default: false },
     );
+    assert.match(setting.description, /Acquisition buffers are always checked/);
   });
 
   it("cache-busts q1timeline webview assets when injecting them", async () => {
@@ -6839,7 +6840,7 @@ describe("q1timeline controller", () => {
     });
   });
 
-  it("renders simulation and underflow errors while preserving failure handling for other diagnostics", async () => {
+  it("renders simulation, underflow and acquisition buffer errors while preserving failure handling for other diagnostics", async () => {
     const vscode = createMockVscode();
     const outputDir = mkdtempSync(join(tmpdir(), "q1-simulation-error-"));
     await withMockedVscode(vscode, async ({ TimelineController }) => {
@@ -6879,10 +6880,20 @@ describe("q1timeline controller", () => {
       assert.equal(rendered, 2);
       assert.equal(refreshed, 2);
       assert.equal(cleared, 1);
+      diagnostics.push({ category: "acquisition_buffer_sustained_overload", severity: "error" });
+      await controller.runAnalysis();
+      assert.equal(rendered, 3);
+      assert.equal(refreshed, 3);
+      assert.equal(cleared, 1);
+      diagnostics.splice(0, 1);
+      await controller.runAnalysis();
+      assert.equal(rendered, 4);
+      assert.equal(refreshed, 4);
+      assert.equal(cleared, 1);
       diagnostics.push({ category: "syntax_error", severity: "error" });
       await controller.runAnalysis();
-      assert.equal(rendered, 2);
-      assert.equal(refreshed, 2);
+      assert.equal(rendered, 4);
+      assert.equal(refreshed, 4);
       assert.equal(cleared, 2);
       controller.dispose();
     });

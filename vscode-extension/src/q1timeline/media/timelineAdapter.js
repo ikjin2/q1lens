@@ -184,7 +184,7 @@
 
   function shouldIncludeEvent(event, options) {
     const lane = eventLaneName(event);
-    if (["slack", "latched_state_pending", "control_flow_loop", "control_flow_branch"].includes(event.kind)) {
+    if (["queue_depth", "slack", "latched_state_pending", "control_flow_loop", "control_flow_branch"].includes(event.kind)) {
       return false;
     }
     if (event.kind === "q1_issue") {

@@ -1,0 +1,5 @@
+# Same workload as 04, but no confirmed module type: warn instead of error.
+wait_sync 4
+shot: acquire 0,0,40
+wait 80
+jmp @shot

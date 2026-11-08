@@ -2677,19 +2677,25 @@ export class TimelineController {
         return this.execFile(pythonPath, args, timeoutMs, cwd, extraEnv, "analyzer");
       })
       .catch(async (error) => {
-        // Runtime failures and diagnosed timing/buffer limits can still produce a valid trace.
+        // Diagnosed failures can still produce a valid trace with a selectable instruction.
         // Outputs were cleared above, so this cannot recover a stale trace.
         if (!this.isCurrentAnalysis(analysisRequestId) || this.isAnalyzerTimeoutError(error)) throw error;
         let partial;
         try { partial = JSON.parse(await fsPromises.readFile(timelineIrPath, "utf-8")); } catch { throw error; }
         const simulationFailure = Object.values(partial.execution || {}).some((entry) => entry.mode === "simulation" && entry.status === "error");
         const diagnosticErrors = Array.isArray(partial.diagnostics) ? partial.diagnostics.filter((item) => item.severity === "error") : [];
+        const q1Events = Array.isArray(partial.events) ? partial.events.filter((event) => event.kind === "q1_issue") : [];
         const timelineDiagnosticFailure = diagnosticErrors.length > 0 && diagnosticErrors.every((item) =>
-          ["definite_underflow", "playback_queue_underflow", "acquisition_buffer_sustained_overload"].includes(item.category));
-        if (!Array.isArray(partial.events) || !partial.events.length || (!simulationFailure && !timelineDiagnosticFailure)) throw error;
+          item.details?.source_line_skipped === true ||
+          ["definite_underflow", "playback_queue_underflow", "acquisition_buffer_sustained_overload"].includes(item.category) ||
+          q1Events.some((event) => item.related_events?.includes(event.id) ||
+            (!item.related_events?.length && item.source?.file && event.source?.file === item.source.file && event.source.line === item.source.line)));
+        const sourceRecovery = diagnosticErrors.some((item) => item.details?.source_line_skipped === true);
+        if (!Array.isArray(partial.events) || (!partial.events.length && !sourceRecovery) || (!simulationFailure && !timelineDiagnosticFailure)) throw error;
         try { parseAnalyzerResult(error.stdout); } catch { throw error; }
-        this.output.appendLine(simulationFailure ? "Simulation stopped with an error; rendering the partial execution trace and its diagnostics." :
-          "Timing or buffer limit detected; rendering the timeline and its error diagnostics.");
+        this.output.appendLine(sourceRecovery ? "Invalid source lines excluded; rendering the remaining instructions and error diagnostics." :
+          simulationFailure ? "Simulation stopped with an error; rendering the partial execution trace and its diagnostics." :
+          "Analysis produced a timeline with error diagnostics; rendering the timeline.");
         return { stdout: error.stdout, stderr: error.stderr, elapsedMs: error.elapsedMs, exitCode: error.exitCode };
       })
       .then(async (result) => {

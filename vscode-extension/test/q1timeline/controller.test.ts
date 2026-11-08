@@ -6840,7 +6840,7 @@ describe("q1timeline controller", () => {
     });
   });
 
-  it("renders simulation, underflow and acquisition buffer errors while preserving failure handling for other diagnostics", async () => {
+  it("renders simulation, timing, buffer and linked Q1 errors while preserving failure handling for other diagnostics", async () => {
     const vscode = createMockVscode();
     const outputDir = mkdtempSync(join(tmpdir(), "q1-simulation-error-"));
     await withMockedVscode(vscode, async ({ TimelineController }) => {
@@ -6852,9 +6852,10 @@ describe("q1timeline controller", () => {
       let rendered = 0;
       let refreshed = 0;
       let cleared = 0;
+      const source = { file: join(outputDir, "seq0.q1asm"), line: 5 };
       controller.execFile = async () => {
         writeFileSync(join(outputDir, "timeline_ir.json"), JSON.stringify({
-          events: [{ id: "underflow", kind: "underflow_warning" }],
+          events: [{ id: "underflow", kind: "underflow_warning" }, { id: "loop", kind: "q1_issue", source }],
           execution: { seq0: { mode, status: "error", reason: "RT queue empty" } },
           diagnostics,
         }));
@@ -6895,9 +6896,46 @@ describe("q1timeline controller", () => {
       assert.equal(rendered, 4);
       assert.equal(refreshed, 4);
       assert.equal(cleared, 2);
+      diagnostics.pop();
+      diagnostics.push({ category: "invalid_argument_value", severity: "error", source });
+      await controller.runAnalysis();
+      assert.equal(rendered, 5);
+      assert.equal(refreshed, 5);
+      assert.equal(cleared, 2);
       controller.dispose();
     });
   });
+
+  for (const events of [[], [{ id: "remaining-wait", kind: "wait" }]]) {
+    it(`renders recovered source diagnostics with ${events.length} remaining events`, async () => {
+      const vscode = createMockVscode();
+      const outputDir = mkdtempSync(join(tmpdir(), "q1-source-recovery-"));
+      await withMockedVscode(vscode, async ({ TimelineController }) => {
+        const controller = new TimelineController(createContext());
+        controller.projectUri = vscode.Uri.file(join(outputDir, "q1timeline.yml"));
+        controller.outputDir = outputDir;
+        let rendered = 0;
+        let refreshed = 0;
+        let cleared = 0;
+        controller.execFile = async () => {
+          writeFileSync(join(outputDir, "timeline_ir.json"), JSON.stringify({ events, diagnostics: [{
+            category: "syntax_error", severity: "error", details: { source_line_skipped: true },
+          }] }));
+          writeFileSync(join(outputDir, "diagnostics.json"), "[]");
+          throw Object.assign(new Error("invalid source"), { stage: "analyzer", exitCode: 2,
+            stdout: JSON.stringify({ schema_version: "0.2.0", status: "error" }), stderr: "" });
+        };
+        controller.runRender = async () => { rendered++; return { stdout: "", stderr: "", exitCode: 0 }; };
+        controller.refreshWebview = async () => { refreshed++; };
+        controller.clearPreviewAfterAnalyzerFailure = () => { cleared++; };
+        await controller.runAnalysis();
+        assert.equal(rendered, 1);
+        assert.equal(refreshed, 1);
+        assert.equal(cleared, 0);
+        controller.dispose();
+      });
+    });
+  }
 
   it("adds branch and loop timeline chip overrides to analyzer args", async () => {
     const vscode = createMockVscode();

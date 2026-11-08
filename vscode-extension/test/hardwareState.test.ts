@@ -684,6 +684,44 @@ describe("hardware state cursor model", () => {
     assert.deepEqual(state.warnings, []);
   });
 
+  it("restores only proved active settings at the end of uncertain branch outputs", () => {
+    const ir = fixture();
+    const sources = {taken: source(11), fallthrough: source(13)};
+    ir.events.push(event("branch", "unknown_region", 124, 140, 10, {
+      output_state_unknown: true, branch_timing_known: true,
+      latched_state_at_join: {frequency: 200, marker: 1, awg_gain: [2, 3]},
+      latched_sources_at_join: {frequency: sources, marker: sources, awg_gain: sources},
+      pending_fields_at_join: ["frequency"],
+    }));
+    const index = hardware.createIndex(ir);
+    const during = hardware.snapshot(index, "seq0", 130);
+    assert.equal(during.parameters.find((item: any) => item.field === "marker").applied.known, false);
+    const after = hardware.snapshot(index, "seq0", 140);
+    assert.equal(after.parameters.find((item: any) => item.field === "frequency").applied.known, false);
+    const marker = after.parameters.find((item: any) => item.field === "marker").applied;
+    assert.equal(marker.value, 1);
+    assert.deepEqual(marker.branchJoinSources, sources);
+    assert.deepEqual(after.parameters.find((item: any) => item.field === "awg_gain").applied.value, [2, 3]);
+  });
+
+  it("keeps known NCO settings while hiding uncertain physical phase until an applied reset", () => {
+    const ir = fixture();
+    ir.events.push(
+      event("uncertain", "play", 124, 128, 10, {rt_packet_id: "uncertain", output_state_unknown: true,
+        nco_phase_uncertain: true, applied_state: {frequency: 200, phase: 0}}),
+      event("set-phase", "play", 128, 132, 11, {rt_packet_id: "set-phase", output_state_unknown: true,
+        nco_phase_uncertain: true, applied_state: {phase: 50}}),
+      event("reset", "play", 132, 136, 12, {rt_packet_id: "reset", phase_reset: true, applied_state: {phase: 0}}),
+    );
+    const index = hardware.createIndex(ir);
+    for (const time of [124, 128]) {
+      const parameters = hardware.snapshot(index, "seq0", time).parameters;
+      assert.equal(parameters.find((item: any) => item.field === "frequency").applied.value, 200);
+      assert.equal(parameters.find((item: any) => item.field === "phase").applied.known, false);
+    }
+    assert.equal(hardware.snapshot(index, "seq0", 132).parameters.find((item: any) => item.field === "phase").applied.value, 0);
+  });
+
   it("invalidates pre-branch applied parameters when comparing both branch paths", () => {
     const ir = fixture();
     ir.events.push(event("q9", "q1_issue", 124, 128, 9, { op: "jlt" }));

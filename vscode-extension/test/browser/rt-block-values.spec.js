@@ -60,8 +60,10 @@ test("RT blocks expand captured values and highlight only known changes", async 
   const q1 = page.locator('[data-lane-role="q1-issue"]');
   await expect(q1).toBeHidden();
   const block = page.locator('.timeline-block[data-event-id="play"]');
+  await expect(block).toHaveCSS("border-top-color", "rgba(0, 0, 0, 0)");
   const width = (await block.boundingBox()).width;
   await block.click();
+  await expect(block).toHaveCSS("outline-style", "solid");
   const panel = page.getByRole("dialog", {name: "RT block values", exact: true});
   await expect(panel).toBeVisible();
   await expect(panel.locator(".q1timeline-rt-details-heading")).toContainText("play 0, 1, {DURATION // 2}");
@@ -87,28 +89,46 @@ test("RT blocks expand captured values and highlight only known changes", async 
   await page.screenshot({path: path.resolve(__dirname, "../../../output/playwright/rt-block-values.png")});
 });
 
-test("Q1 is visible in debug and timing warnings stay visible in normal instruction view", async ({page}) => {
+test("command errors remain visible across view and layout changes", async ({page}) => {
   const ir = fixture();
   ir.events.push(event("slack", "slack", 4, 4, {slack_ns: 24}, {lane: "debug.slack"}),
-    event("possible", "underflow_warning", 108, 108, {status: "possible_underflow", slack_ns: -8}, {lane: "debug.underflow"}));
-  await mount(page, ir, "debug");
-  await expect(page.locator('.timeline-block[data-event-id="slack"]')).toHaveCount(0);
-  await expect(page.getByRole("button", {name: "Possible RT underflow · 8 ns late", exact: true})).toBeVisible();
-  await expect(page.locator('[data-lane-role="q1-issue"]')).toBeVisible();
+    event("possible", "underflow_warning", 108, 108, {status: "possible_underflow", slack_ns: -8}, {lane: "debug.underflow"}),
+    event("unattached", "underflow_warning", 65, 65, {slack_ns: -6}, {lane: "debug.underflow"}),
+    event("loop", "q1_issue", 16, 24, {op: "loop"}));
+  ir.diagnostics = [{severity: "error", message: "Loop count must be positive.", related_events: ["loop"]}];
   await mount(page, ir);
-  await page.getByRole("button", {name: "Debug view", exact: true}).click();
-  await expect(page.locator('[data-lane-role="q1-issue"]')).toBeVisible();
-  await page.getByRole("button", {name: "Normal view", exact: true}).click();
-  await expect(page.locator('[data-lane-role="q1-issue"]')).toBeHidden();
-  const warning = page.getByRole("button", {name: "RT underflow · 4 ns late", exact: true});
-  await expect(warning).toBeVisible();
-  await page.getByRole("button", {name: "Instruction", exact: true}).click();
-  await expect(warning).toBeVisible();
-  await expect(page.locator('[data-lane-role="q1-issue"]')).toBeHidden();
-  const pulse = await page.locator('.timeline-block[data-event-id="play"]').boundingBox();
-  const flag = await warning.boundingBox();
-  expect(Math.abs(pulse.x - flag.x)).toBeLessThan(1);
-  expect(flag.width).toBe(16);
+  await page.evaluate(() => document.body.insertAdjacentHTML("beforeend", '<dl id="event-inspector-fields"></dl>'));
+  const q1Marker = page.getByRole("button", {name: "seq · 1 Q1 error", exact: true});
+  const q1 = page.locator('.timeline-block[data-event-id="loop"]');
+  const rt = page.locator('.timeline-block[data-event-id="play"]');
+  const underflowMarker = page.locator('.diagnostic-point[data-event-id="unattached"] .timeline-error-mark');
+  await expect(q1Marker).toBeVisible();
+  await expect(q1Marker).toHaveText("!");
+  const errorColor = await q1Marker.evaluate((node) => getComputedStyle(node).color);
+  await q1Marker.press("Enter");
+  const reason = page.locator("#event-inspector-fields .diagnostic-error-message");
+  await expect(reason).toHaveText("Loop count must be positive.");
+  await expect(reason).toHaveCSS("color", errorColor);
+  expect(await page.evaluate(() => window.messages)).toContainEqual({type: "eventClick", eventId: "loop", preserveFocus: true});
+  await expect(q1).toBeHidden();
+  await expect(rt).toHaveCSS("background-color", "rgb(87, 43, 50)");
+  await expect(rt).toHaveAttribute("data-event-ids", /warning/);
+  await expect(rt.locator(".block-label")).toContainText("play");
+  await expect(rt.locator(".timeline-error-mark:first-child")).toHaveText("!");
+  await expect(rt.locator(".timeline-error-mark")).toHaveCSS("color", errorColor);
+  await expect(underflowMarker).toHaveText("!");
+  await expect(underflowMarker).toHaveCSS("color", errorColor);
+  await page.getByRole("button", {name: "Debug view", exact: true}).press("Enter");
+  await expect(q1Marker).toHaveCount(0);
+  await expect(q1).toBeVisible();
+  await expect(q1).toHaveCSS("background-color", "rgb(87, 43, 50)");
+  await expect(q1.locator(".timeline-error-mark:first-child")).toHaveText("!");
+  await expect(page.locator('.timeline-block[data-event-id="slack"], .timeline-block[data-event-id="possible"]')).toHaveCount(0);
+  await page.getByRole("button", {name: "Normal view", exact: true}).press("Enter");
+  await page.getByRole("button", {name: "Instruction", exact: true}).press("Enter");
+  await expect(rt).toHaveCSS("background-color", "rgb(87, 43, 50)");
+  await expect(q1Marker).toBeVisible();
+  await expect(underflowMarker).toBeVisible();
 });
 
 test("hidden Q1 branches and feedback retain their assumption choices", async ({page}) => {

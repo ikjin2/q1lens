@@ -124,12 +124,13 @@ function environmentHarness() {
     failedPython: undefined as string | undefined,
     rejectedPython: undefined as string | undefined,
     deferredPython: undefined as string | undefined,
+    trusted: true,
     report: {
       executable: "selected-python", version: "3.12.10", supported: true,
       packagePath: "/site-packages/q1lens/__init__.py", q1asmPath: "/site-packages/q1timeline/cli.py",
     } as PythonEnvironmentReport,
   };
-  const source = { fsPath: "/project/sequence.q1asm" };
+  const source: { fsPath: string; scheme?: string } = { fsPath: "/project/sequence.q1asm", scheme: "file" };
   const notification = (message: string, ...actions: string[]) => {
     messages.push({ message, actions });
     return state.informationReply ?? (state.informationAction
@@ -139,6 +140,7 @@ function environmentHarness() {
   const fakeVscode = {
     ConfigurationTarget: { WorkspaceFolder: 3, Workspace: 2, Global: 1 },
     workspace: {
+      get isTrusted() { return state.trusted; },
       workspaceFolders: [{ name: "project", uri: { fsPath: repoRoot } }],
       getWorkspaceFolder: (_resource: unknown) => undefined as { name: string; uri: { fsPath: string } } | undefined,
       openNotebookDocument: async (resource: unknown) => resource,
@@ -211,9 +213,10 @@ function environmentHarness() {
   delete require.cache[modulePath];
   delete require.cache[fileModulePath];
   const environment = require("../src/environment") as typeof import("../src/environment");
-  environment.registerEnvironmentCommands({ subscriptions: [] } as unknown as vscode.ExtensionContext);
+  const { checkStartupEnvironment } = environment.registerEnvironmentCommands({ subscriptions: [] } as unknown as vscode.ExtensionContext);
   return {
     state, updates, probes, deferredProbes, lines, messages, executions, source, values, resources, notebooks, openedNotebooks, fakeVscode,
+    checkStartupEnvironment,
     run: (name: string, retryCommand?: string, resource?: vscode.Uri, retryTarget?: vscode.Uri) => {
       const command = commands.get(name);
       assert.ok(command, `${name} must be registered`);
@@ -238,6 +241,54 @@ describe("Python environment commands", () => {
   let harness: ReturnType<typeof environmentHarness>;
   beforeEach(() => { harness = environmentHarness(); });
   afterEach(() => { harness.restore(); });
+
+  it("checks the analysis target's Python on startup without opening output or setup notifications", async () => {
+    assert.equal(harness.probes.length, 0);
+    await harness.checkStartupEnvironment();
+    assert.equal(harness.probes.length, 1);
+    assert.equal(harness.probes[0].executable, "old-python");
+    assert.equal(harness.probes[0].env.TEST_TOKEN, "private-test-value");
+    assert.equal(lastPythonEnvironment()?.resource, harness.source);
+    assert.equal(lastPythonEnvironment()?.report?.executable, "old-python");
+    assert.deepEqual(harness.messages, []);
+    assert.deepEqual(harness.updates, []);
+  });
+
+  it("leaves notebook startup checks to the actual kernel environment", async () => {
+    harness.source.fsPath = "/project/schedule.ipynb";
+    await harness.checkStartupEnvironment();
+    assert.deepEqual(harness.probes, []);
+    assert.deepEqual(harness.notebooks, []);
+  });
+
+  it("does not run the startup probe in an untrusted workspace or an unsaved file", async () => {
+    harness.state.trusted = false;
+    await harness.checkStartupEnvironment();
+    harness.state.trusted = true;
+    harness.source.scheme = "untitled";
+    await harness.checkStartupEnvironment();
+    assert.deepEqual(harness.probes, []);
+  });
+
+  it("logs startup probe failures without interrupting activation", async () => {
+    harness.state.rejectedPython = "old-python";
+    await harness.checkStartupEnvironment();
+    assert.ok(harness.lines.some((line) => line.includes("Original interpreter probe failed")));
+    assert.deepEqual(harness.messages, []);
+  });
+
+  it("does not replace a newer environment check with a late startup result", async () => {
+    harness.state.deferredPython = "old-python";
+    const startup = harness.checkStartupEnvironment();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(harness.deferredProbes.length, 1);
+    harness.state.deferredPython = undefined;
+    await harness.run("q1lens.checkEnvironment");
+    const latest = lastPythonEnvironment();
+    harness.deferredProbes[0]();
+    await startup;
+    assert.equal(lastPythonEnvironment(), latest);
+  });
 
   it("diagnoses the VS Code selection for the original target and reflects later selections", async () => {
     harness.values.q1lens = {};
@@ -553,7 +604,7 @@ describe("Python environment commands", () => {
           } };
       };
       try {
-        registerPythonEnvironmentStatus({ subscriptions } as vscode.ExtensionContext);
+        registerPythonEnvironmentStatus({ subscriptions, extension: { packageJSON: { version: "1.2.3" } } } as vscode.ExtensionContext);
         publishPythonEnvironment({ resource: harness.source as vscode.Uri, pythonPath: "old-python", pythonArgs: [], source: "manual", sourceLabel: "Manual" });
         await harness.run("q1lens.showPythonEnvironment");
         const older = receive({ type: "follow", target: harness.source.toString() });

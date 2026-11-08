@@ -107,7 +107,7 @@ def test_trace_records_overflow_flags_before_and_after() -> None:
 
 
 @pytest.mark.parametrize("source", [
-    "wait R0\nstop", "move $MISSING,R0\nstop", "move {COUNT},R0\nstop",
+    "wait R0\nstop", "move {COUNT},R0\nstop",
     "jz @done\ndone: stop", "fb_pop_data 0,R0\nstop", "wait_trigger 0,4\nstop",
     "set_cond 1,1,0,4\nstop", "mulu16 R1,3,R0\nstop", "acquire 0,R0,4\nstop",
 ])
@@ -124,8 +124,8 @@ def test_unknown_inputs_and_unimplemented_semantics_block_before_execution(sourc
     "move 1,R64\nstop", "add R0\nstop", "bogus 1\nstop", "illegal\nstop",
     "jmp @missing\nstop", "jmp 99\nstop", "wait -1\nstop", "move 4294967296,R0\nstop",
 ])
-def test_invalid_programs_error_without_executing_instruction(source: str) -> None:
-    state = execute(source)
+def test_strict_invalid_programs_error_without_executing_instruction(source: str) -> None:
+    state = execute(source, strict_q1asm=True)
     assert state.metadata["execution"]["status"] == "error"
     assert state.metadata["execution"]["steps"] == 0
     assert issues(state) == []
@@ -267,15 +267,18 @@ def test_analysis_mode_preserves_existing_latched_register_interpretation() -> N
     assert update.meta["applied_state"]["frequency"] == 4294967292
 
 
-def test_default_analysis_preserves_compact_loop_and_unknown_following_value() -> None:
+def test_default_analysis_keeps_a_compact_loop_and_proves_its_affine_following_value() -> None:
     source = "move 3,R0\nmove 0,R1\nnop\nbody: add R1,1,R1\nnop\nloop R0,@body\nmove R1,R2\nnop\nstop"
     program = parse_q1asm(source)
     default = interpret_program(program, sequencer_id="seq0")
     explicit = interpret_program(program, sequencer_id="seq0", execution_mode="analysis")
     assert default == explicit
     assert "execution" not in default.metadata
-    assert isinstance(default.registers["R2"], Unknown)
+    assert default.registers["R2"] == Concrete(3)
+    assert any(event.kind == "loop_block" for event in default.events)
     assert any(write.meta.get("invalidated") for write in default.register_history)
+    assert any(write.register == "R1" and write.value == Concrete(3) and write.meta.get("affine")
+               for write in default.register_history)
 
 
 @pytest.mark.parametrize("options", [{"max_steps": 0}, {"max_steps": True}, {"max_steps": 1.5}])

@@ -1,0 +1,8 @@
+# This sequencer integrates independently for 800 ns per Acquire.
+wait_sync 4
+wait 296
+acquire 0,0,4     # 300–1100 ns, concurrent with the readout sequencer.
+wait 1196
+acquire 0,1,4     # 1500–2300 ns.
+wait 1696
+stop

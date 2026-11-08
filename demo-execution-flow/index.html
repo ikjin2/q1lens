@@ -6,14 +6,18 @@
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'">
   <title>Q1Lens · 실행의 한 순간</title>
   <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="timeline.css">
   <link rel="stylesheet" href="style.css">
   <script defer src="data.js"></script>
   <script defer src="history.js"></script>
+  <script defer src="instructionColors.js"></script>
+  <script defer src="views.js"></script>
   <script defer src="app.js"></script>
 </head>
-<body>
+<body class="vscode-dark">
   <header class="app-header">
     <div class="brand"><strong>Q1Lens</strong><span>실행 흐름</span><span class="demo-badge">DEMO</span></div>
+    <div class="view-switch" role="group" aria-label="실행 보기"><button id="instruction-view-button" type="button" aria-pressed="true">Instruction</button><button id="time-view-button" type="button" aria-pressed="false">Time</button></div>
     <div class="pickers">
       <label>프로그램<select id="program" aria-label="프로그램"></select></label>
       <label>입력 시나리오<select id="scenario" aria-label="입력 시나리오"></select></label>
@@ -21,20 +25,30 @@
   </header>
   <div class="evidence-bar"><span>Q1Lens 엔진 · 시뮬레이션 · 하드웨어 실측 아님</span><strong id="evidence-status" role="status"></strong></div>
   <main class="workspace">
-    <aside class="source-pane">
-      <div class="source-heading"><span>Q1ASM</span><strong id="source-name"></strong></div>
-      <p id="case-description"></p>
-      <div id="source-lines" class="source-lines" role="region" aria-label="실행과 연결된 Q1ASM 소스"></div>
-      <div class="source-legend"><span class="current-key">현재</span><span class="evidence-key">값의 출처</span><span class="next-key">다음 실행</span></div>
-    </aside>
-    <section class="flow-pane" aria-label="입력에서 다음 실행까지">
-      <div class="detail-pane">
+    <section class="overview-pane" aria-label="Q1 실행과 시간 관계">
+      <div class="overview-heading"><strong id="view-title">Q1 · 실행 순서</strong><span id="view-caption"></span>
+        <div id="instruction-controls"><button id="instruction-zoom-out" type="button" aria-label="명령 폭 줄이기">−</button><span id="instruction-zoom">100%</span><button id="instruction-zoom-in" type="button" aria-label="명령 폭 늘리기">＋</button><button id="instruction-fit" type="button">Fit</button></div>
+        <div id="time-controls" hidden><button id="time-focus" type="button">선택 주변</button><button id="time-all" type="button">전체 시간</button></div>
+      </div>
+      <div class="overview-scroll"><div id="instruction-view" class="shared-timeline-stage" aria-label="Q1 명령 순서"></div><div id="time-view" class="shared-timeline-stage" aria-label="Q1과 RT의 실제 시간" hidden></div></div>
+    </section>
+    <div id="pane-splitter" role="separator" tabindex="0" aria-label="타임라인과 상세 패널 높이 조절" aria-orientation="horizontal" aria-valuemin="15" aria-valuemax="80" aria-valuenow="40"></div>
+    <section class="details-dock" aria-label="선택 상세">
+      <header class="panel-heading"><div class="detail-tabs" role="tablist" aria-label="상세 보기"><button id="detail-instruction" role="tab" aria-selected="true" aria-controls="selection-detail">명령 상세</button><button id="detail-history" role="tab" aria-selected="false" aria-controls="loop-detail">반복 변화</button><button id="detail-source" role="tab" aria-selected="false" aria-controls="source-detail">소스</button></div><span id="selection-context"></span></header>
       <div class="navigation">
         <div class="step-navigation"><span class="toolbar-label">명령</span><button id="previous-step" type="button" aria-label="이전 명령" title="이전 명령 (←)">←</button><span id="step-position" class="step-position"></span><button id="next-step" type="button" aria-label="다음 명령" title="다음 명령 (→)">→</button></div>
         <div class="decision-navigation"><span class="toolbar-label">분기</span><button id="previous-decision" type="button" aria-label="이전 분기" title="이전 분기">←</button><button id="next-decision" type="button" aria-label="다음 분기" title="다음 분기">→</button></div>
         <button id="return-focus" class="return-button" type="button" hidden>↩ 원래 명령</button>
       </div>
-      <section class="decisions-panel" aria-label="판단이 바뀌는 지점"><h2>분기 이력</h2><div id="decision-ribbon" class="decision-ribbon" aria-label="실행된 분기 목록"></div></section>
+      <div class="panel-body">
+        <section id="loop-detail" role="tabpanel" aria-labelledby="detail-history" hidden>
+      <section class="history-panel" aria-label="루프의 처음 몇 회 변화">
+        <div class="history-heading"><h2>반복 이력</h2><strong id="history-point"></strong><button id="history-more" type="button" hidden>5회 더 보기</button></div>
+        <p class="history-hint">변경된 항목만 · 레지스터 반영값 / Latched 설정값 · 셀을 눌러 원인 보기</p>
+        <div class="history-scroll" tabindex="0" role="region" aria-label="회차별 값 비교"><table id="history-table"></table><p id="history-empty" class="empty-state" hidden></p></div>
+      </section>
+        </section>
+        <section id="selection-detail" role="tabpanel" aria-labelledby="detail-instruction" class="detail-pane">
       <div id="exploration" class="exploration" hidden><span id="exploration-label" role="status"></span><button id="reset-branches" type="button">↩ 원래 실행</button></div>
       <div id="branch-error" class="branch-error" role="alert" hidden></div>
       <div id="run-end" class="run-end" role="status"></div>
@@ -49,14 +63,18 @@
       <div id="branch-paths" class="branch-paths" aria-label="Jump와 Continue 경로"></div>
       <p id="branch-hint" class="branch-hint"></p>
       <div id="next-action" class="next-action"></div>
-      <section class="provenance-panel"><div class="section-heading"><h2>값의 출처</h2><span>값을 만든 명령으로 이동</span></div><div id="provenance" class="provenance-list"></div></section>
+      <details class="decisions-panel"><summary>분기 이력</summary><div id="decision-ribbon" class="decision-ribbon" aria-label="실행된 분기 목록"></div></details>
+      <details class="provenance-panel"><summary>값의 출처</summary><div id="provenance" class="provenance-list"></div></details>
+      <section class="rt-context" aria-label="선택한 Q1 명령에 연결된 RT"><div class="section-heading"><h2>연결된 RT 동작</h2><span id="rt-relation"></span></div><div id="rt-links"></div></section>
       <footer class="scenario-foot"><div id="input-label"></div></footer>
+        </section>
+        <section id="source-detail" role="tabpanel" aria-labelledby="detail-source" hidden>
+    <details class="source-reference"><summary>Q1ASM 소스 <strong id="source-name"></strong></summary>
+      <p id="case-description"></p>
+      <div id="source-lines" class="source-lines" role="region" aria-label="실행과 연결된 Q1ASM 소스"></div>
+      <div class="source-legend"><span class="current-key">현재</span><span class="evidence-key">값의 출처</span><span class="next-key">다음 실행</span></div>
+    </details>        </section>
       </div>
-      <section class="history-panel" aria-label="루프의 처음 몇 회 변화">
-        <div class="history-heading"><h2>반복 이력</h2><strong id="history-point"></strong><button id="history-more" type="button" hidden>5회 더 보기</button></div>
-        <p class="history-hint">변경된 항목만 · 레지스터 반영값 / Latched 설정값 · 셀을 눌러 원인 보기</p>
-        <div class="history-scroll" tabindex="0" role="region" aria-label="회차별 값 비교"><table id="history-table"></table><p id="history-empty" class="empty-state" hidden></p></div>
-      </section>
     </section>
   </main>
 </body>

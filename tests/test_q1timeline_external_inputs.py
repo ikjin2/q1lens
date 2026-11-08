@@ -153,8 +153,8 @@ def test_zero_duration_still_consumes_shared_occurrence_only_once_per_recipient(
 
 @pytest.mark.parametrize("source,status", [
     ("move 1,R0\nwait_trigger R0,R0\nstop", "error"),
-    ("wait_trigger 16,4\nstop", "error"),
-    ("wait_trigger 1,-4\nstop", "error"),
+    ("wait_trigger 16,4\nstop", "completed"),
+    ("wait_trigger 1,-4\nstop", "completed"),
     ("wait_trigger R0,R1\nstop", "blocked"),
     ("move 17,R0\nmove 4,R1\nnop\nwait_trigger R0,R1\nstop", "blocked"),
 ])

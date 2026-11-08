@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from q1timeline.analysis.critical_path import critical_path_from_timeline
+from q1timeline.analysis.acquisition_windows import acquisition_windows, scope_acquisition_windows
 from q1timeline.analysis.interpreter import AnalysisState, TimelineEvent
 from q1timeline.analysis.hardware_readiness import hardware_readiness_summary
 from q1timeline.analysis.values import value_to_json
@@ -94,7 +95,24 @@ def timeline_ir_from_states(
     diagnostics: list[Diagnostic] | None = None,
 ) -> dict[str, Any]:
     _validate_unique_sequencer_ids(states)
-    events = [_event_to_dict(event) for state in states for event in state.events]
+    events = []
+    sequencers = []
+    for state in states:
+        sequencer = {"id": state.sequencer_id}
+        if state.metadata.get("module"):
+            sequencer["module"] = state.metadata["module"]
+        if state.metadata.get("hardware_parameters"):
+            sequencer["hardware_parameters"] = _jsonable(state.metadata["hardware_parameters"])
+        sequencers.append(sequencer)
+        windows = acquisition_windows(state)
+        scope_windows = scope_acquisition_windows(state)
+        for event in state.events:
+            serialized = _event_to_dict(event)
+            if event.id in windows:
+                serialized["meta"]["acquisition_window"] = windows[event.id]
+            if event.id in scope_windows:
+                serialized["meta"]["scope_acquisition_window"] = scope_windows[event.id]
+            events.append(serialized)
     input_diagnostics = (
         list(diagnostics)
         if diagnostics is not None
@@ -107,7 +125,10 @@ def timeline_ir_from_states(
         feedback_balance = {"status": "simulated", "channels": {}}
         generated_diagnostics = []
     else:
-        feedback_flows, feedback_balance, generated_diagnostics = _analytical_feedback(events)
+        feedback_flows, feedback_balance, generated_diagnostics = _analytical_feedback(
+            events, {item["id"]: item.get("module") for item in sequencers},
+            (project or {}).get("feedback_transport_delay_ns", 200),
+        )
     alignment = {
         state.sequencer_id: _jsonable(state.metadata.get("alignment", {}))
         for state in states
@@ -129,8 +150,9 @@ def timeline_ir_from_states(
         "project": _jsonable(project or {}),
         "analysis": {
             "event_kinds": sorted(REQUIRED_EVENT_KINDS | {event["kind"] for event in events}),
+            "feedback_latencies_ns": LINQ_FEEDBACK_LATENCIES_NS,
         },
-        "sequencers": [{"id": state.sequencer_id} for state in states],
+        "sequencers": sequencers,
         "events": events,
         "register_history": [
             {
@@ -269,7 +291,9 @@ def _source_map_sources(event: dict[str, Any]) -> list[dict[str, Any]]:
     return sources
 
 
-def _analytical_feedback(events: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any], list[Diagnostic]]:
+def _analytical_feedback(
+    events: list[dict[str, Any]], modules: dict[str, str | None], transport_delay_ns: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any], list[Diagnostic]]:
     branch_ids = sorted({
         str(entry["event"]["meta"]["branch_comparison_branch_id"])
         for entry in _feedback_entries(events)
@@ -296,7 +320,7 @@ def _analytical_feedback(events: list[dict[str, Any]]) -> tuple[list[dict[str, A
             if not event.get("meta", {}).get("branch_comparison_branch_id")
             or assumptions.get(str(event["meta"]["branch_comparison_branch_id"])) == event["meta"].get("branch_comparison_path")
         ] if branch_ids else events
-        flows = _feedback_flows(selected_events)
+        flows = _feedback_flows(selected_events, modules, transport_delay_ns)
         balance = _feedback_balance(selected_events, flows)
         findings = [
             *_feedback_route_mismatch_diagnostics(selected_events, flows),
@@ -321,7 +345,9 @@ def _analytical_feedback(events: list[dict[str, Any]]) -> tuple[list[dict[str, A
     return list(combined_flows.values()), {"status": "comparison", "channels": {}, "alternatives": alternatives}, diagnostics
 
 
-def _feedback_flows(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _feedback_flows(
+    events: list[dict[str, Any]], modules: dict[str, str | None], transport_delay_ns: int,
+) -> list[dict[str, Any]]:
     pending_sends_by_channel: dict[str, list[dict[str, Any]]] = {}
     flows: list[dict[str, Any]] = []
     send_order = 0
@@ -367,17 +393,19 @@ def _feedback_flows(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         source = str(send_feedback.get("source", "feedback"))
         target = str(feedback.get("target", "consumer"))
         flow_id = f"feedback-flow-{len(flows)}"
-        flows.append(
-            {
-                "id": flow_id,
-                "from_event_id": send["id"],
-                "to_event_id": event["id"],
-                "channel": channel,
-                "source": source,
-                "target": target,
-                "label": f"feedback ch {channel}: {source} -> {target}",
-            }
-        )
+        flow = {
+            "id": flow_id,
+            "from_event_id": send["id"],
+            "to_event_id": event["id"],
+            "channel": channel,
+            "source": source,
+            "target": target,
+            "label": f"feedback ch {channel}: {source} -> {target}",
+            "timing": _feedback_timing(send, event, channel, modules, transport_delay_ns),
+        }
+        if send.get("meta", {}).get("acquisition_window", {}).get("source") == "hardware_parameters":
+            flow["send_available_ns"] = _feedback_send_available_time(send)
+        flows.append(flow)
     return flows
 
 
@@ -614,14 +642,19 @@ def _feedback_latency_diagnostics(events: list[dict[str, Any]], flows: list[dict
         if send is None or receive is None:
             continue
         channel = str(flow.get("channel", "default"))
-        route = _linq_feedback_route(channel)
-        if route is None:
+        timing = flow["timing"]
+        route = timing["route"]
+        data_type = timing["data_type"]
+        required_latency = timing["latency_ns"]
+        if required_latency is None or timing["arrival_ns"] is None:
+            diagnostics.append(Diagnostic(
+                severity="warning", category="analysis_incomplete",
+                message=f"Feedback arrival on channel {channel} is unknown; packet emission time or data type is unresolved.",
+                source=_event_source_location(receive), related_events=[receive["id"], send["id"]],
+                details={"analysis_scope": "feedback", "reason": "feedback_timing_unknown", "channel": channel},
+            ))
             continue
-        data_type = _linq_feedback_data_type(send)
-        required_latency = LINQ_FEEDBACK_LATENCIES_NS.get(data_type, {}).get(route)
-        if required_latency is None:
-            continue
-        send_time = _feedback_send_available_time(send)
+        send_time = timing["send_available_ns"]
         receive_time = _feedback_receive_time(receive)
         if send_time is None or receive_time is None:
             continue
@@ -629,13 +662,15 @@ def _feedback_latency_diagnostics(events: list[dict[str, Any]], flows: list[dict
         if actual_gap >= required_latency:
             continue
         missing_wait = required_latency - actual_gap
+        op = receive.get("meta", {}).get("op", "fb_pop_data")
         diagnostics.append(
             Diagnostic(
                 severity="warning",
                 category="feedback_latency_violation",
                 message=(
-                    f"Feedback receive on channel {channel} occurs {missing_wait} ns before "
-                    f"the official LINQ {route.replace('_', ' ')} latency for {data_type.replace('_', ' ')}."
+                    f"{op} on channel {channel} may block for {missing_wait} ns before estimated feedback arrival "
+                    f"({route.replace('_', ' ')}: {timing['base_latency_ns']} ns LINQ + "
+                    f"{timing['transport_delay_ns']} ns configured transport delay for {data_type.replace('_', ' ')})."
                 ),
                 source=_event_source_location(receive),
                 related_events=[send["id"], receive["id"]],
@@ -647,6 +682,10 @@ def _feedback_latency_diagnostics(events: list[dict[str, Any]], flows: list[dict
                     "missing_wait_ns": missing_wait,
                     "required_latency_ns": required_latency,
                     "route": route,
+                    "base_latency_ns": timing["base_latency_ns"],
+                    "transport_delay_ns": timing["transport_delay_ns"],
+                    "arrival_ns": timing["arrival_ns"],
+                    "receive_op": op,
                 },
             )
         )
@@ -665,7 +704,7 @@ def _linq_feedback_route_scope(channel: str) -> str | None:
     return None
 
 
-def _linq_feedback_route(channel: str) -> str | None:
+def _linq_feedback_route(channel: str, send: dict[str, Any], receive: dict[str, Any], modules: dict[str, str | None]) -> str | None:
     try:
         channel_id = int(channel, 10)
     except ValueError:
@@ -673,8 +712,26 @@ def _linq_feedback_route(channel: str) -> str | None:
     if 1 <= channel_id <= 15:
         return "self_cast"
     if 16 <= channel_id <= 255:
+        source_module = modules.get(send["sequencer_id"])
+        target_module = modules.get(receive["sequencer_id"])
+        if source_module and target_module and source_module == target_module:
+            return "intra_cast"
         return "multi_cast_worst_case"
     return None
+
+
+def _feedback_timing(send: dict[str, Any], receive: dict[str, Any], channel: str,
+                     modules: dict[str, str | None], transport_delay_ns: int) -> dict[str, Any]:
+    route = _linq_feedback_route(channel, send, receive, modules)
+    data_type = _linq_feedback_data_type(send)
+    base = LINQ_FEEDBACK_LATENCIES_NS.get(data_type, {}).get(route)
+    extra = 0 if route == "self_cast" else transport_delay_ns
+    latency = base + extra if base is not None else None
+    send_time = _feedback_send_available_time(send)
+    return {"route": route, "data_type": data_type, "base_latency_ns": base,
+            "transport_delay_ns": extra, "latency_ns": latency,
+            "send_available_ns": send_time,
+            "arrival_ns": send_time + latency if send_time is not None and latency is not None else None}
 
 
 def _linq_feedback_data_type(send: dict[str, Any]) -> str:
@@ -689,9 +746,23 @@ def _linq_feedback_data_type(send: dict[str, Any]) -> str:
 
 
 def _feedback_send_available_time(event: dict[str, Any]) -> int | None:
+    meta = event.get("meta", {})
+    feedback = meta.get("feedback", {})
+    if meta.get("conditional_time_unknown") or feedback.get("send_time_unknown"):
+        return None
     if event.get("kind") == "acquire":
-        aligned_t1 = _event_aligned_t1(event)
-        return aligned_t1 if aligned_t1 is not None else _concrete_event_time(event, "t1")
+        if feedback.get("send_on") == "command_start":
+            aligned_t0 = _aligned_event_time(event)
+            return aligned_t0 if aligned_t0 is not None else _concrete_event_time(event, "t0")
+        window = event.get("meta", {}).get("acquisition_window")
+        if window is not None:
+            end = window.get("end_ns")
+            if window.get("status") == "unknown" or not isinstance(end, int):
+                return None
+            local_start = _concrete_event_time(event, "t0")
+            aligned_start = _aligned_event_time(event)
+            return end + aligned_start - local_start if aligned_start is not None and local_start is not None else end
+        return None
     aligned_t0 = _aligned_event_time(event)
     return aligned_t0 if aligned_t0 is not None else _concrete_event_time(event, "t0")
 
@@ -699,14 +770,6 @@ def _feedback_send_available_time(event: dict[str, Any]) -> int | None:
 def _feedback_receive_time(event: dict[str, Any]) -> int | None:
     aligned_t0 = _aligned_event_time(event)
     return aligned_t0 if aligned_t0 is not None else _concrete_event_time(event, "t0")
-
-
-def _event_aligned_t1(event: dict[str, Any]) -> int | None:
-    aligned_t0 = _aligned_event_time(event)
-    duration = _concrete_event_time(event, "duration")
-    if aligned_t0 is None or duration is None:
-        return None
-    return aligned_t0 + duration
 
 
 def _event_source_location(event: dict[str, Any]) -> SourceLocation:

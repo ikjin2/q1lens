@@ -1,0 +1,6 @@
+# The same Acquire starts a 1000 ns integration and a 16384 ns scope capture.
+wait_sync 4
+wait 996
+acquire 0,0,4
+wait 16996
+stop

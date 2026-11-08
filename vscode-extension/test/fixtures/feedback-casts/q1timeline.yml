@@ -1,0 +1,17 @@
+analysis:
+  execution_mode: simulation
+alignment:
+  mode: none
+simulation:
+  startup_delay_ns: 200
+  max_time_ns: 4000
+  routes:
+    - {source: sender, target: intra, id: 16, latency_ns: 480}
+    - {source: sender, target: multi_a, id: 32, latency_ns: 640}
+    - {source: sender, target: multi_b, id: 32, latency_ns: 800}
+    - {source: sender, target: sender, id: 4, latency_ns: 320}
+sequencers:
+  - {id: sender, module: QCM0, file: sender.q1asm}
+  - {id: intra, module: QCM0, file: receiver.q1asm}
+  - {id: multi_a, module: QCM1, file: multi_receiver.q1asm}
+  - {id: multi_b, module: QCM2, file: multi_receiver.q1asm}

@@ -317,21 +317,23 @@ def test_active_or_unknown_condition_retains_only_the_supported_playback_prefix(
     "set_cond 0,-1,0,4", "set_cond 0,0,8,4",
     "move 0,R0\nset_cond R0,R0,R0,4",
 ])
-def test_condition_validation_precedes_unsupported_trigger_semantics(condition: str) -> None:
+def test_invalid_conditions_are_excluded_while_runtime_hazards_still_stop_playback(condition: str) -> None:
     playback = session(f"{condition}\nupd_param 4\nstop")
     result = playback.run()
-    assert result["status"] == "error"
-    assert result["steps"] == int(condition.startswith("move"))
+    runtime_hazard = condition.startswith("move")
+    assert result["status"] == ("error" if runtime_hazard else "completed")
+    assert result["steps"] == (1 if runtime_hazard else 2)
     state = playback.runners[0].state
-    assert state.rt_time_ns == Concrete(0)
+    assert state.rt_time_ns == Concrete(0 if runtime_hazard else 4)
     assert not any(event.kind == "q1_issue" and event.meta["op"] == "set_cond" for event in state.events)
 
 
 @pytest.mark.parametrize("source", ["loop\nstop", "loop R0\nstop", "move 1\nstop"])
-def test_malformed_instruction_returns_error_without_crashing(source: str) -> None:
+def test_malformed_instruction_is_excluded_without_crashing(source: str) -> None:
     playback = session(source)
-    assert playback.run()["status"] == "error"
-    assert playback.steps == 0
+    assert playback.run()["status"] == "completed"
+    assert playback.steps == 1
+    assert playback.snapshot()["diagnostics"][0]["details"]["source_line_skipped"] is True
 
 
 def test_register_hazard_stops_without_fabricating_read_value() -> None:
@@ -408,16 +410,18 @@ def test_actual_golden_wait_loop_continues_through_assumed_feedback_receipts() -
     assert loop["first_iteration_end"]["value"] == 65563
 
 
-def test_full_golden_trace_has_one_partial_outer_loop_and_no_return_loops_or_orphan_bars() -> None:
+def test_full_golden_trace_converges_with_no_return_loops_or_orphan_bars() -> None:
     root = Path(__file__).resolve().parents[1]
     playback = PlaybackSession.from_project(root / "examples/golden-section/q1timeline.yml")
     ir = finish(playback)
     loops = ir["playback"]["loops"]
     outer, = [loop for loop in loops if loop["source_start"]["line"] == 12]
     inner = [loop for loop in loops if loop["source_start"]["line"] == 87]
-    assert ir["playback"]["status"] == "limit"
-    assert not outer["complete"] and outer["completed_iterations"] > 2
-    assert outer["count"] == f">={outer['completed_iterations']}"
+    assert ir["playback"]["status"] == "completed"
+    assert outer["complete"] and outer["completed_iterations"] > 2
+    assert outer["count"] == outer["completed_iterations"]
+    registers = playback.runners[0].state.registers
+    assert (registers["R5"].value - registers["R4"].value) & 0xFFFFFFFF < 20
     assert len(inner) > 4 and all(loop["count"] == 15 and loop["complete"] for loop in inner)
     assert len(loops) == len(inner) + 1
     hidden = {event_id for loop in loops for event_id in loop["hidden_event_ids"]}

@@ -12,11 +12,13 @@ function harness() {
   const updates: unknown[] = [];
   const subscriptions: vscode.Disposable[] = [];
   const panels: any[] = [];
+  const warnings: string[] = [];
   let updateGate: Promise<void> | undefined;
   const fakeVscode = {
     StatusBarAlignment: { Right: 2 }, ViewColumn: { Active: -1 },
     ConfigurationTarget: { WorkspaceFolder: 3, Global: 1 },
     window: {
+      showWarningMessage: async (message: string) => { warnings.push(message); },
       createStatusBarItem: () => ({ show() {}, dispose() {} }),
       createWebviewPanel: () => {
         let receive: (message: unknown) => Promise<void>;
@@ -51,9 +53,9 @@ function harness() {
   };
   delete require.cache[modulePath];
   const status = require("../src/pythonEnvironmentStatus") as typeof import("../src/pythonEnvironmentStatus");
-  status.registerPythonEnvironmentStatus({ subscriptions } as vscode.ExtensionContext);
+  status.registerPythonEnvironmentStatus({ subscriptions, extension: { packageJSON: { version: "1.2.3" } } } as vscode.ExtensionContext);
   return {
-    ...status, panels, executions, selections, updates,
+    ...status, panels, executions, selections, updates, warnings,
     waitForUpdate: (gate: Promise<void>) => { updateGate = gate; },
     open: () => commands.get("q1lens.showPythonEnvironment")!(),
     restore: () => {
@@ -87,6 +89,47 @@ describe("Python environment status panel", () => {
   let test: ReturnType<typeof harness>;
   beforeEach(() => { test = harness(); });
   afterEach(() => test.restore());
+
+  for (const source of ["vscode", "manual", "notebook"] as const) {
+    for (const packageVersion of ["1.2.2", "1.2.4"]) {
+      it(`warns once when the ${source} Python package is ${packageVersion} and the extension is 1.2.3`, () => {
+        const selected = { ...environment("a", source),
+          report: { executable: "/env/a/python", version: "3.12.10", supported: true, packageVersion } };
+        test.publishPythonEnvironment(selected);
+        test.publishPythonEnvironment(selected);
+        assert.equal(test.warnings.length, 1);
+        assert.ok(test.warnings[0].includes(`Python package ${packageVersion}, VS Code extension 1.2.3`));
+        assert.match(test.warnings[0], /both use the same version/);
+        assert.match(test.warnings[0], /\/env\/a\/python/);
+      });
+    }
+  }
+
+  it("keeps matching, unknown and unsupported package versions quiet", () => {
+    for (const report of [undefined,
+      { executable: "/env/a/python", version: "3.12.10", supported: true },
+      { executable: "/env/a/python", version: "3.12.10", supported: true, packageVersion: "1.2.3" },
+      { executable: "/env/a/python", version: "3.9.0", supported: false, packageVersion: "1.2.2" }]) {
+      test.publishPythonEnvironment({ ...environment("a"), report });
+    }
+    assert.deepEqual(test.warnings, []);
+  });
+
+  it("warns again for a different Python environment or package version", () => {
+    for (const [name, packageVersion] of [["a", "1.2.2"], ["b", "1.2.2"], ["b", "1.2.4"]]) {
+      test.publishPythonEnvironment({ ...environment(name),
+        report: { executable: `/env/${name}/python`, version: "3.12.10", supported: true, packageVersion } });
+    }
+    assert.equal(test.warnings.length, 3);
+  });
+
+  it("does not warn for a stale check result", () => {
+    const stale = test.beginPythonEnvironmentCheck();
+    test.beginPythonEnvironmentCheck();
+    test.publishPythonEnvironment({ ...environment("a"),
+      report: { executable: "/env/a/python", version: "3.12.10", supported: true, packageVersion: "1.2.2" } }, stale);
+    assert.deepEqual(test.warnings, []);
+  });
 
   it("reopens with the latest checked target and keeps its buttons on that target", async () => {
     test.publishPythonEnvironment(environment("a"));

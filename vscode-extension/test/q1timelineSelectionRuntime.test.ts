@@ -47,6 +47,8 @@ function createNode(eventId: string, eventIds?: string, classes = ["event"]) {
   return {
     dataset: { eventId, eventIds }, attributes, classNames,
     classList: {
+      add(name: string) { classNames.add(name); },
+      remove(name: string) { classNames.delete(name); },
       contains(name: string) { return classNames.has(name); },
       toggle(name: string, enabled: boolean) {
         if (enabled) classNames.add(name);
@@ -70,25 +72,47 @@ function loadSelectionRuntime(merged = false) {
   const document = {
     querySelectorAll(selector: string) {
       selectors.push(selector);
+      if (selector === '.event.is-selected, .event[aria-selected="true"], .shared-timeline-stage .timeline-block[aria-selected="true"]') {
+        return nodes.filter((node) => node.classList.contains("is-selected") || node.attributes["aria-selected"] === "true");
+      }
       assert.equal(selector, ".event[data-event-id]", "Related selection must target event blocks, leaving LINQ connectors alone");
       return nodes;
     },
   };
-  const runtime = Function("adapter", "document", "events", `
+  const runtime = Function("adapter", "document", "events", "nodes", `
     const timelineIr = { events };
     let timelineSelectionEvents;
     let timelineSelectionIndex = new Map();
+    let selectedTimelineEventId;
+    const selectedSourceEventIds = new Set();
+    const hardwareSelections = [], inspectedEventIds = [], clickEvents = [];
+    const hardwareView = { selectEvent(id) { hardwareSelections.push(id); } };
+    const isTimelineEventVisible = () => true;
+    const expandQ1IssueLanesForHighlight = () => false;
+    const syncSharedAnnotationSelection = () => {};
+    const renderSharedEventInspector = (id) => inspectedEventIds.push(id);
+    const syncTimelineZoomActionState = () => {};
+    const openAnalysisDetails = () => {};
+    function CustomEvent(type, init) { this.type = type; this.detail = init.detail; }
+    const timelineEventsById = new Map(events.map((event) => [String(event.id), event]));
     let builds = 0;
     const window = { q1timelineTimelineAdapter: {
       buildQ1TimelineSelectionIndex(ir) { builds += 1; return adapter.buildQ1TimelineSelectionIndex(ir); },
-    } };
-    ${functionSource(script, "syncTimelineRelatedSelection")}
+    }, dispatchEvent(event) { clickEvents.push(event.detail); } };
+    ${["currentTimelineSelectionIndex", "syncTimelineRelatedSelection", "eventIsQ1Issue", "prioritizedHighlightEventIds", "sourceNavigationEvent", "selectEventNode"]
+      .map((name) => functionSource(script, name)).join("\n")}
     return {
       select: syncTimelineRelatedSelection,
+      prioritize: prioritizedHighlightEventIds,
+      navigate: (id) => sourceNavigationEvent(timelineEventsById.get(id))?.id,
+      preparation: (id) => currentTimelineSelectionIndex().get(id)?.rtPreparation,
+      click: (id, options) => selectEventNode(nodes.find((node) => node.dataset.eventId === id), options),
+      selectedEventId: () => selectedTimelineEventId,
+      hardwareSelections, inspectedEventIds, clickEvents,
       replaceEvents(events) { timelineIr.events = events; },
       builds: () => builds,
     };
-  `)(adapter, document, events);
+  `)(adapter, document, events, nodes);
   return {
     ...runtime, events, nodes, feedback, selectors,
     highlighted(className: string): string[] {
@@ -98,6 +122,42 @@ function loadSelectionRuntime(merged = false) {
 }
 
 describe("Q1 timeline related selection", () => {
+  it("prefers RT execution for source navigation while retaining Q1-only selection and setter navigation", () => {
+    const runtime = loadSelectionRuntime();
+    assert.deepEqual(runtime.prioritize(["wait-issue", "wait"]), ["wait", "wait-issue"]);
+    assert.deepEqual(runtime.prioritize(["play-issue-1", "play-path-1", "play-path-0"]), ["play-path-1", "play-path-0", "play-issue-1"]);
+    assert.deepEqual(runtime.prioritize(["pending-1", "setter-1"]), ["setter-1", "pending-1"]);
+    assert.deepEqual(runtime.prioritize(["wait-issue"]), ["wait-issue"]);
+    runtime.select("wait");
+    assert.equal(runtime.builds(), 1);
+  });
+
+  it("navigates Q1 settings to the next RT instruction independently of their parameter application", () => {
+    const runtime = loadSelectionRuntime();
+    assert.equal(runtime.navigate("setter-2"), "replay");
+    assert.equal(runtime.navigate("wait-issue"), "wait");
+    assert.equal(runtime.navigate("wait"), "wait");
+    assert.equal(runtime.preparation("setter-1"), true);
+    assert.equal(runtime.navigate("setter-1"), "play-path-0");
+  });
+
+  it("moves the hardware cursor to the mapped RT start when a Q1 block is selected while preserving its source selection", () => {
+    const runtime = loadSelectionRuntime();
+    for (const id of ["setter-2", "play-issue-1"]) {
+      runtime.click(id);
+      assert.equal(runtime.hardwareSelections.at(-1), runtime.navigate(id));
+      assert.equal(runtime.selectedEventId(), id);
+      assert.equal(runtime.inspectedEventIds.at(-1), id);
+      assert.deepEqual(runtime.clickEvents.at(-1), { eventId: id });
+
+      const calls = runtime.hardwareSelections.length;
+      runtime.click(id, { syncHardware: false, notify: false });
+      assert.equal(runtime.hardwareSelections.length, calls, "Hardware-driven selection must preserve the replay cursor");
+      assert.equal(runtime.selectedEventId(), id);
+      assert.equal(runtime.inspectedEventIds.at(-1), id);
+    }
+  });
+
   it("highlights the first applying RT command for the selected setter occurrence", () => {
     const runtime = loadSelectionRuntime();
     assert.deepEqual(runtime.select("setter-1").sort(), ["play-path-0", "play-path-1"]);

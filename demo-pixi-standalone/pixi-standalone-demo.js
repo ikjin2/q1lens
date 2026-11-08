@@ -56,6 +56,7 @@
     kind: {
       play: 0x87bfff,
       acquire: 0x45d68a,
+      acquisition_window: 0x45d68a,
       wait_trigger: 0xf2c85b,
       wait_sync: 0x6ee7f9,
       feedback_pop: 0xb58cff,
@@ -74,6 +75,7 @@
     "rt.wait",
     "rt.play",
     "rt.acquire",
+    "physical.acquire",
     "rt.feedback",
     "rt.branch",
     "rt.loop",
@@ -308,6 +310,15 @@
       eventCount: records(state.ir?.events).length,
       feedbackCount: records(state.ir?.feedback_flows).length,
       sequencerCount: state.ir ? sequencerIds(state.ir).length : 0,
+      acquisitionRows: (state.layout?.lanes || []).filter((lane) => lane.lane === "physical.acquire").map((lane) => ({
+        sequencerId: lane.sequencerId, y: lane.y, height: lane.height,
+        windows: state.layout.events.filter((event) => event.kind === "acquisition_window" && event.sequencerId === lane.sequencerId).map((event) => ({
+          sourceEventId: event.sourceEvent.id, startNs: event.t0Ns,
+          endNs: event.meta.acquisition_window.end_ns === null ? null : event.t1Ns,
+          status: event.meta.acquisition_window.status,
+          x: event.x, y: event.y + 5, width: event.width, height: event.height,
+        })),
+      })),
       selected: state.selected,
     };
   }
@@ -386,17 +397,15 @@
     const lanes = [];
     const laneMap = new Map();
     const sequencerOrder = sequencerIds(ir);
-    const visibleEvents = records(ir.events)
-      .filter((event) => isVisibleEvent(event, mode))
-      .map((event) => normalizeEvent(event));
+    const visibleEvents = visibleTimelineEvents(ir, mode);
 
     for (const event of visibleEvents) {
-      const key = isCompactMode(mode) ? event.sequencerId : laneKey(event);
+      const key = eventRowKey(event, mode);
       if (!laneMap.has(key)) {
         const lane = {
           key,
           sequencerId: event.sequencerId,
-          lane: isCompactMode(mode) ? "compact" : event.lane,
+          lane: event.kind === "acquisition_window" ? event.lane : isCompactMode(mode) ? "compact" : event.lane,
           events: [],
         };
         laneMap.set(key, lane);
@@ -411,7 +420,7 @@
         return seqDiff;
       }
       if (isCompactMode(mode)) {
-        return 0;
+        return Number(a.lane === "physical.acquire") - Number(b.lane === "physical.acquire");
       }
       return laneRank(a.lane) - laneRank(b.lane) || a.lane.localeCompare(b.lane);
     });
@@ -423,31 +432,34 @@
 
     const panels = [];
     let currentSequencer = "";
+    let nextY = top;
     for (let index = 0; index < lanes.length; index += 1) {
       const lane = lanes[index];
-      lane.y = top + index * laneHeight;
-      lane.height = laneHeight;
+      lane.y = nextY;
+      lane.height = lane.lane === "physical.acquire" ? 26 : laneHeight;
+      nextY += lane.height;
       if (lane.sequencerId !== currentSequencer) {
         currentSequencer = lane.sequencerId;
-        panels.push({ sequencerId: currentSequencer, y: lane.y, height: laneHeight, lanes: 1 });
+        panels.push({ sequencerId: currentSequencer, y: lane.y, height: lane.height, lanes: 1 });
       } else {
         const panel = panels[panels.length - 1];
-        panel.height += laneHeight;
+        panel.height += lane.height;
         panel.lanes += 1;
       }
     }
 
     const eventLayouts = [];
     for (const event of visibleEvents) {
-      const lane = laneMap.get(isCompactMode(mode) ? event.sequencerId : laneKey(event));
+      const lane = laneMap.get(eventRowKey(event, mode));
       const x0 = scaleTime(event.t0Ns, minTime, maxTime, plotLeft, plotRight);
       const x1 = scaleTime(event.t1Ns, minTime, maxTime, plotLeft, plotRight);
       const minWidth = event.kind === "q1_issue" ? 3 : event.durationNs === 0 ? 8 : 6;
       const widthPx = Math.max(minWidth, x1 - x0);
       const compact = isCompactMode(mode);
-      const heightPx = compact ? compactEventHeight(event) : Math.max(12, lane.height - 15);
-      const y = compact ? lane.y + compactEventOffset(event) : lane.y + 2;
-      const labelText = compact ? compactLabel(event, widthPx) : eventLabel(event, widthPx);
+      const acquisition = event.kind === "acquisition_window";
+      const heightPx = acquisition ? 12 : compact ? compactEventHeight(event) : Math.max(12, lane.height - 15);
+      const y = acquisition ? lane.y + 2 : compact ? lane.y + compactEventOffset(event) : lane.y + 2;
+      const labelText = acquisition ? eventLabel(event, widthPx) : compact ? compactLabel(event, widthPx) : eventLabel(event, widthPx);
       const eventLayout = {
         ...event,
         x: x0,
@@ -455,17 +467,17 @@
         width: widthPx,
         height: heightPx,
         labelLayout: {
-          visible: Boolean(labelText) && (compact ? compactLabelVisible(event, widthPx, labelText) : widthPx >= 38 && heightPx >= 15),
+          visible: Boolean(labelText) && (acquisition ? widthPx >= 48 : compact ? compactLabelVisible(event, widthPx, labelText) : widthPx >= 38 && heightPx >= 15),
           text: labelText,
           x: x0 + 6,
-          y: compact ? y + 1 : lane.y + 11,
+          y: acquisition ? y + 4 : compact ? y + 1 : lane.y + 11,
         },
       };
       eventLayouts.push(eventLayout);
     }
     applyEventLabelLayout(eventLayouts);
 
-    const height = top + lanes.length * laneHeight + 64;
+    const height = nextY + 64;
     return {
       width,
       height,
@@ -485,10 +497,36 @@
   }
 
   function computeFullTimeExtent(ir, mode) {
-    const visibleEvents = records(ir.events)
+    return computeTimeExtent(visibleTimelineEvents(ir, mode));
+  }
+
+  function eventRowKey(event, mode) {
+    return event.kind === "acquisition_window" ? laneKey(event) : isCompactMode(mode) ? event.sequencerId : laneKey(event);
+  }
+
+  function visibleTimelineEvents(ir, mode) {
+    const events = records(ir.events)
       .filter((event) => isVisibleEvent(event, mode))
       .map((event) => normalizeEvent(event));
-    return computeTimeExtent(visibleEvents);
+    return [...events, ...events.filter((event) => event.kind === "acquire").map((event) => {
+      const window = event.meta.acquisition_window || {
+        start_ns: event.localT0Ns, end_ns: null, configured_duration_ns: null,
+        effective_duration_ns: null, source: "unknown", status: "unknown",
+      };
+      const offset = event.t0Ns - event.localT0Ns;
+      const start = Number.isFinite(window.start_ns) ? window.start_ns + offset : event.t0Ns;
+      const end = Number.isFinite(window.end_ns) ? Math.max(start, window.end_ns + offset) : start;
+      return {
+        ...event, id: `${event.id}:acquisition-window`, kind: "acquisition_window", lane: "physical.acquire",
+        label: `acq ${acquisitionTarget(event.meta.acquisition_index)} · bin ${acquisitionTarget(event.meta.bin_index)}`,
+        meta: { ...event.meta, acquisition_window: window }, sourceEvent: event,
+        t0Ns: start, t1Ns: end, durationNs: end - start,
+      };
+    })];
+  }
+
+  function acquisitionTarget(value) {
+    return value && typeof value === "object" ? value.display ?? value.value ?? "?" : value ?? "?";
   }
 
   function computeTimeExtent(events) {
@@ -557,6 +595,18 @@
         if (!from || !to) {
           return null;
         }
+        const hasAvailability = Object.prototype.hasOwnProperty.call(flow, "send_available_ns");
+        if (hasAvailability && !Number.isFinite(flow.send_available_ns) ||
+            !hasAvailability && from.kind === "acquire" && from.meta.acquisition_window?.status === "unknown") {
+          return null;
+        }
+        const emitNs = hasAvailability ? flow.send_available_ns : from.t1Ns;
+        const acquisition = layoutEvents.get(`${from.id}:acquisition-window`);
+        const anchor = hasAvailability ? {
+          ...from,
+          x: scaleTime(emitNs, layout.timeScale.tMinNs, layout.timeScale.tMaxNs, layout.timeScale.plotLeft, layout.timeScale.plotRight),
+          width: 0, y: acquisition?.y ?? from.y, height: acquisition?.height ?? from.height,
+        } : from;
         return {
           id: String(flow.id || `feedback-flow-${index}`),
           channel: String(flow.channel || ""),
@@ -565,9 +615,9 @@
           target: String(flow.target || ""),
           fromKind: from.kind,
           toKind: to.kind,
-          from,
+          from: anchor,
           to,
-          emitNs: from.t1Ns,
+          emitNs,
           consumeNs: to.t0Ns,
         };
       })
@@ -643,11 +693,13 @@
       if (compact) {
         const centerY = lane.y + lane.height / 2 + 2;
         line(g, scale.plotLeft, centerY, scale.plotRight, centerY, colors.laneRule, 1, 0.42);
-      } else {
+      }
+      if (!compact || lane.lane === "physical.acquire") {
         line(g, scale.plotLeft, lane.y + lane.height - 4, scale.plotRight, lane.y + lane.height - 4, colors.laneRule, 1, 0.72);
-        const label = makeText(PIXI, laneDisplay(lane.lane), 11, colors.muted, 500);
-        label.x = 92;
-        label.y = lane.y + 10;
+        const acquisition = lane.lane === "physical.acquire";
+        const label = makeText(PIXI, acquisition ? "ACQ" : laneDisplay(lane.lane), 11, acquisition ? colors.kind.acquire : colors.muted, 500);
+        label.x = acquisition ? 148 : 92;
+        label.y = lane.y + (acquisition ? 7 : 10);
         root.addChild(label);
       }
     }
@@ -699,6 +751,10 @@
       if (isCompactMode(state.layout.mode) && isLoopOverlayEvent(event)) {
         continue;
       }
+      if (event.kind === "acquisition_window") {
+        drawAcquisitionWindow(PIXI, root, g, event);
+        continue;
+      }
       const fill = eventFill(event);
       const alpha = event.kind === "loop_block" || event.kind === "branch_region" ? 0.25 : 0.94;
       roundedRect(g, event.x, event.y + 5, event.width, event.height, 5, fill, alpha);
@@ -709,6 +765,24 @@
         label.y = event.labelLayout.y;
         root.addChild(label);
       }
+    }
+  }
+
+  function drawAcquisitionWindow(PIXI, root, g, event) {
+    const window = event.meta.acquisition_window;
+    const unknown = window.end_ns === null;
+    const color = unknown ? colors.muted : colors.kind.acquire;
+    roundedRect(g, event.x, event.y + 5, event.width, event.height, 3, color, unknown ? 0.12 : 0.28);
+    strokeRect(g, event.x, event.y + 5, event.width, event.height, 3, color, 1, 0.85);
+    if (window.status === "interrupted") {
+      const end = event.x + event.width;
+      line(g, end, event.y + 3, end, event.y + event.height + 7, colors.warning, 3, 1);
+    }
+    if (unknown || event.labelLayout.visible) {
+      const label = makeText(PIXI, unknown ? "?" : event.labelLayout.text, 10, unknown ? colors.muted : colors.text, 500);
+      label.x = unknown ? event.x + 1 : event.labelLayout.x;
+      label.y = event.labelLayout.y;
+      root.addChild(label);
     }
   }
 
@@ -756,7 +830,8 @@
     const hoverId = state.hovered?.event?.id || state.hovered?.annotation?.event?.id;
     const scale = state.layout.timeScale;
     for (const event of state.layout.events) {
-      if (event.id !== selected && event.id !== hoverId) {
+      const sourceId = event.sourceEvent?.id || event.id;
+      if (sourceId !== selected && sourceId !== hoverId) {
         continue;
       }
       const left = Math.max(scale.plotLeft, event.x - 3);
@@ -764,7 +839,7 @@
       if (right <= left) {
         continue;
       }
-      const color = event.id === selected ? colors.cursor : colors.text;
+      const color = sourceId === selected ? colors.cursor : colors.text;
       strokeRect(g, left, event.y + 2, right - left, event.height + 6, 6, color, 7, 0.1);
       strokeRect(g, left, event.y + 2, right - left, event.height + 6, 6, color, 1.5, 0.98);
     }
@@ -1073,7 +1148,8 @@
         point.y >= event.y + 5 &&
         point.y <= event.y + 5 + event.height
       ) {
-        return { type: "event", id: event.id, event };
+        const sourceEvent = event.sourceEvent || event;
+        return { type: "event", id: sourceEvent.id, event: sourceEvent };
       }
     }
     return null;
@@ -1195,6 +1271,7 @@
         `kind: ${event.kind}`,
         `time: ${formatNumber(event.t0Ns)} -> ${formatNumber(event.t1Ns)} ns`,
         `sequencer: ${event.sequencerId}`,
+        ...acquisitionDetails(event).map(([label, value]) => `${label}: ${value}`),
         source,
       ];
     }
@@ -1247,7 +1324,17 @@
     }
     const event = hit.event;
     const source = event.source || {};
+    const acquisition = Object.fromEntries(acquisitionDetails(event));
     els.inspector.innerHTML = [
+      ...(event.kind === "acquire" ? [
+        field("Effective integration", acquisition["Effective integration"] === "unknown" ? "Unknown integration length" :
+          `${acquisition["Effective integration"]} / ${acquisition["Integration setting"]} configured`),
+        field("Integration status", event.meta.acquisition_window?.status === "interrupted" ? "Interrupted by next Acquire" :
+          event.meta.acquisition_window?.status === "completed" ? "Completed" : "Unknown"),
+        field("RT wait", acquisition["RT wait"]),
+        ...Object.entries(acquisition).filter(([label]) => !["Effective integration", "Integration setting", "Integration status", "RT wait"].includes(label))
+          .map(([label, value]) => field(label, value)),
+      ] : []),
       field("Event", event.id),
       field("Kind", event.kind),
       field("Sequencer", event.sequencerId),
@@ -1257,6 +1344,27 @@
       field("Source", source.file ? `${basename(source.file)}:${source.line || 1}` : "unavailable"),
       field("Q1ASM", source.raw || ""),
     ].join("");
+  }
+
+  function acquisitionDetails(event) {
+    if (event.kind !== "acquire") {
+      return [];
+    }
+    const window = event.meta.acquisition_window || {};
+    const ns = (value) => Number.isFinite(value) ? `${numberText(value)} ns` : "unknown";
+    const offset = event.t0Ns - event.localT0Ns;
+    const start = Number.isFinite(window.start_ns) ? window.start_ns + offset : null;
+    const end = Number.isFinite(window.end_ns) ? window.end_ns + offset : null;
+    return [
+      ["RT wait", ns(event.durationNs)],
+      ["Integration setting", ns(window.configured_duration_ns)],
+      ["Effective integration", ns(window.effective_duration_ns)],
+      ["Integration status", window.status || "unknown"],
+      ...(window.interrupted_by_event_id ? [["Interrupted by", window.interrupted_by_event_id]] : []),
+      ["Integration window", `${ns(start)} → ${ns(end)}`],
+      ["Acquisition target", `index ${acquisitionTarget(event.meta.acquisition_index)} · bin ${acquisitionTarget(event.meta.bin_index)}`],
+      ["Integration source", window.source === "hardware_parameters" ? "hardware parameters · integration_length_acq" : window.source || "unknown"],
+    ];
   }
 
   function updateMetrics() {
@@ -1870,6 +1978,9 @@
       measureLabelWidth,
       advancePlayhead,
       computeTimelineLayout,
+      computeFullTimeExtent,
+      acquisitionDetails,
+      createFeedbackFlows,
     };
   }
 })();

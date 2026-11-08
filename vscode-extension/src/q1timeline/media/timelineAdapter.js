@@ -163,7 +163,7 @@
         ...branch,
       };
     }
-    if (options.mode === "debug" && lane.startsWith("debug.")) {
+    if (options.mode === "debug" && lane.startsWith("debug.") && event.kind !== "underflow_warning") {
       return {
         id: `${base}:${lane}`,
         label: `${comparison ? `${prefix} · ` : ""}${lane === "debug.underflow" ? "RT underflow" : lane.replace(/^debug\./, "debug / ")}`,
@@ -184,13 +184,13 @@
 
   function shouldIncludeEvent(event, options) {
     const lane = eventLaneName(event);
+    if (["feedback_pop", "feedback_send", "feedback_receive"].includes(event.kind)) return false;
+    if (event.kind === "underflow_warning") return !event.meta?.eventual && event.meta?.status !== "possible_underflow";
+    if (event.kind === "analysis_incomplete") return false;
     if (["queue_depth", "slack", "latched_state_pending", "control_flow_loop", "control_flow_branch"].includes(event.kind)) {
       return false;
     }
     if (event.kind === "q1_issue") {
-      return true;
-    }
-    if (event.kind === "underflow_warning" || event.kind === "analysis_incomplete") {
       return true;
     }
     if (options.mode !== "debug" && lane.startsWith("debug.")) {
@@ -268,6 +268,7 @@
       eventId: String(eventIds[0] || event.id),
       eventIds,
       label: eventLabelToken(event, options),
+      commandToken: instructionColors.eventCommandToken(event),
       detail,
       kind: String(event.kind || "event"),
       visualKind: eventVisualKind(event),
@@ -297,6 +298,43 @@
         meta,
       },
     };
+  }
+
+  function acquisitionWindow(event, options = {}, field = "acquisition_window") {
+    const window = event.meta?.[field] || {};
+    const localStart = eventTimeValue(event.t0 ?? event.t0_ns, Number.NaN);
+    const start = eventEdgeTime(event, "t0", options);
+    const offset = start - localStart;
+    const end = Number.isFinite(window.end_ns) && window.status !== "unknown"
+      ? window.end_ns + offset : undefined;
+    return { ...window, start, end, status: end === undefined ? "unknown" : window.status };
+  }
+
+  function acquisitionMode(event) {
+    const op = instructionColors.eventCommandToken(event);
+    return ({ acquire_weighed: "weighted", acquire_weighted: "weighted", acquire_ttl: "ttl",
+      acquire_timetags: "timetags", acquire_digital: "digital" })[op] || "integration";
+  }
+
+  function acquisitionLane(event, options) {
+    const parent = eventLane(event, options);
+    return { ...parent, id: `${parent.id}:acquisition`, label: parent.branchComparisonPath
+      ? `${parent.branchComparisonPath === "taken" ? "Jump" : "Continue"} · Acquisition` : "Acquisition",
+      kind: "acquisition", role: "acquisition", parentGroupId: parent.parentGroupId || parent.id };
+  }
+
+  function acquisitionBlock(event, options, scope = false) {
+    const window = acquisitionWindow(event, options, scope ? "scope_acquisition_window" : "acquisition_window");
+    const block = eventBlock(event, options);
+    const mode = scope ? "scope" : acquisitionMode(event);
+    const target = `acq ${displayValue(event.meta?.acquisition_index, "?")} · bin ${displayValue(event.meta?.bin_index, "?")}`;
+    const duration = window.end === undefined ? 0 : Math.max(0, window.end - window.start);
+    const label = window.end === undefined ? "?" : duration < 1000 ? `${duration} ns` : `${Number((duration / 1000).toFixed(3))} μs`;
+    return { ...block, id: `${event.id}${scope ? ":scope" : ""}:acquisition-window`, kind: "acquisition_window", visualKind: "acquisition_window",
+      start: window.start, duration,
+      label, detail: "", accentColor: undefined, acquisitionMode: mode, acquisitionTrack: scope ? 1 : 0,
+      classNames: `${block.classNames} acquisition-window acquisition-${window.status}`,
+      title: `${scope ? `Scope · paths ${(window.paths || []).join(", ")}` : `${mode} · ${target}`} | ${window.end === undefined ? "Unknown length" : `${window.effective_duration_ns} ns / ${window.configured_duration_ns} ns configured`} | ${window.status}` };
   }
 
   function playMergeTimeKey(event, options) {
@@ -417,20 +455,50 @@
     return channel ? `fb ch ${channel}` : "fb";
   }
 
+  function feedbackEndpointTitle(event, role, time, options, integrationEnd = false, latency) {
+    const arrival = latency !== undefined || event.kind === "feedback_receive" || event.kind === "trigger_receive";
+    const core = arrival ? "queue" : event.kind === "feedback_pop" || event.kind === "q1_issue" ? "Q1" : "RT";
+    const command = latency ? "estimated feedback queue arrival"
+      : arrival ? `${event.kind === "feedback_receive" ? "feedback queue" : "trigger"} arrival`
+      : `${instructionColors.eventCommandToken(event)}${integrationEnd ? " integration end" : ""}`;
+    const location = event.source?.file ? [String(event.source.file).split(/[\\/]/).pop(), event.source.line].filter(Boolean).join(":") : "";
+    const unknownTime = latency ? latency.unknown
+      : event.meta?.conditional_time_unknown || !integrationEnd && event.t0?.kind && event.t0.kind !== "concrete";
+    const timestamp = unknownTime ? "time unknown"
+      : `${time} ns (${options.timeBasis === "aligned" ? "aligned" : "local"})`;
+    return [`${role} (${core})`, event.sequencer_id, command, timestamp,
+      latency && (Number.isFinite(latency.ns) ? `${latency.route.replace(/_/g, " ")} +${latency.ns} ns (${latency.base} ns LINQ + ${latency.extra} ns configured transport)` : "latency unknown"),
+      latency && `Consumer: ${instructionColors.eventCommandToken(event)}`, location].filter(Boolean).join(" · ");
+  }
+
   function feedbackAnnotation(flow, eventById, options) {
     const fromEvent = eventById.get(String(flow && flow.from_event_id));
     const toEvent = eventById.get(String(flow && flow.to_event_id));
     if (!fromEvent || !toEvent) {
       return undefined;
     }
-    const fromTime = eventEdgeTime(
+    const window = fromEvent.kind === "acquire" && fromEvent.meta?.acquisition_window
+      ? acquisitionWindow(fromEvent, options) : undefined;
+    if (options.layout !== "instruction" && window?.status === "unknown") return undefined;
+    const fromEdge = fromEvent.kind === "acquire" ? "t1" : "t0";
+    const offset = (event) => eventTimeValue(options.alignment?.[event.sequencer_id]?.offset, 0);
+    const fromTime = Number.isFinite(flow.timing?.send_available_ns)
+      ? flow.timing.send_available_ns - (options.timeBasis === "aligned" ? 0 : offset(fromEvent))
+      : window?.end ?? eventEdgeTime(
       fromEvent,
-      "t1",
+      fromEdge,
       options,
       eventEdgeTime(fromEvent, "t0", options),
     );
-    const toTime = eventEdgeTime(toEvent, "t0", options, fromTime);
-    const fromLane = eventLane(fromEvent, options);
+    const timing = flow.timing;
+    const arrivalKnown = Number.isFinite(timing?.arrival_ns);
+    if (timing && !arrivalKnown && options.layout !== "instruction") return undefined;
+    const latency = timing ? { ns: timing.latency_ns, route: timing.route, base: timing.base_latency_ns,
+      extra: timing.transport_delay_ns, unknown: !arrivalKnown } : undefined;
+    const toTime = arrivalKnown ? timing.arrival_ns - (options.timeBasis === "aligned" ? 0 : offset(toEvent))
+      : eventEdgeTime(toEvent, "t0", options, fromTime);
+    const fromLane = window?.end !== undefined && options.layout !== "instruction"
+      ? acquisitionLane(fromEvent, options) : eventLane(fromEvent, options);
     const toLane = eventLane(toEvent, options);
     const id = String(flow.id || `${flow.from_event_id}->${flow.to_event_id}`);
     const base = {
@@ -439,6 +507,12 @@
       label: String(flow.label || "feedback flow"),
       labelShort: feedbackVisibleLabel(flow),
       channel: String(flow.channel || ""),
+      fromEventId: String(fromEvent.id),
+      toEventId: String(toEvent.id),
+      fromEdge,
+      fromAtTime: Boolean(timing),
+      sourceTitle: feedbackEndpointTitle(fromEvent, "Send", fromTime, options, window?.end !== undefined),
+      targetTitle: feedbackEndpointTitle(toEvent, "Receive", toTime, options, false, latency),
       eventIds: [String(flow.to_event_id), String(flow.from_event_id)],
       classNames: "feedback-flow-group",
       domain: {
@@ -523,6 +597,7 @@
     const visibleLaneIds = new Set(lanes.filter((lane) => !lane.hidden).map((lane) => lane.id));
     const positions = new Map();
     const startsByLane = new Map();
+    const durationsByLane = new Map();
     const offsetsByLane = new Map();
     const blockOrder = (block) => Math.min(...block.eventIds.map((id) => eventOrder.get(id) ?? events.length));
     let maxCount = 1;
@@ -532,6 +607,7 @@
       lane.blocks.sort((left, right) => (conditionalTimeUnknown ? 0 : left.start - right.start) || blockOrder(left) - blockOrder(right));
       const commands = lane.blocks.filter((block) => !warning(block));
       startsByLane.set(lane.id, commands.map((block) => block.start));
+      durationsByLane.set(lane.id, commands.map((block) => block.duration));
       if (!lane.hidden) maxCount = Math.max(maxCount, commands.length);
       commands.forEach((block, index) => {
         block.start = index;
@@ -563,6 +639,13 @@
       const starts = startsByLane.get(laneId) || [];
       const index = starts.findIndex((start) => start >= time);
       return (offsetsByLane.get(laneId) || 0) + (index < 0 ? starts.length : index);
+    }
+    function positionAtTime(laneId, time) {
+      const starts = startsByLane.get(laneId) || [];
+      const durations = durationsByLane.get(laneId) || [];
+      const index = starts.findIndex((start, index) => start <= time && time < start + durations[index]);
+      return index < 0 ? insertionPosition(laneId, time)
+        : (offsetsByLane.get(laneId) || 0) + index + (time - starts[index]) / durations[index];
     }
     // Queue warnings flag an RT boundary rather than occupying another instruction.
     for (const lane of lanes) {
@@ -605,8 +688,9 @@
         const flow = annotation.domain.flow;
         const from = positions.get(String(flow.from_event_id));
         const to = positions.get(String(flow.to_event_id));
-        annotation.fromTime = from ? from.end : insertionPosition(annotation.fromLaneId || annotation.laneId, annotation.fromTime);
-        annotation.toTime = to ? to.start : insertionPosition(annotation.toLaneId || annotation.laneId, annotation.toTime);
+        annotation.fromTime = from && !annotation.fromAtTime ? from[annotation.fromEdge === "t1" ? "end" : "start"]
+          : positionAtTime(annotation.fromLaneId || annotation.laneId, annotation.fromTime);
+        annotation.toTime = to ? to.start : positionAtTime(annotation.toLaneId || annotation.laneId, annotation.toTime);
         if (annotation.type === "feedback-inline") {
           annotation.start = Math.min(annotation.fromTime, annotation.toTime);
           annotation.end = Math.max(annotation.fromTime, annotation.toTime);
@@ -635,7 +719,7 @@
     }
     const nonCommandKinds = new Set([
       "marker_state", "latched_state_applied", "rt_queue_enqueue", "rt_queue_dequeue", "q1_stall",
-      "sync_wait", "trigger_wait", "feedback_receive", "feedback_send", "trigger_receive", "acquisition_result",
+      "sync_wait", "trigger_wait", "feedback_pop", "feedback_receive", "feedback_send", "trigger_receive", "acquisition_result",
     ]);
     const commands = events.filter((event) => {
       if (!/^(?:branch_compare\.(?:taken|fallthrough)\.)*rt\./.test(String(event.lane || "")) || nonCommandKinds.has(event.kind)) return false;
@@ -697,8 +781,51 @@
         index.get(issueId).appliedEventIds.add(eventId);
       }
     }
+    const rtCommands = new Set(commands.filter((event) =>
+      !["loop_block", "loop_iteration_preview", "branch_region"].includes(event.kind) &&
+      (event.kind !== "unknown_region" || event.meta?.conditional_timing_known)).map((event) => String(event.id)));
+    for (const id of rtCommands) index.get(id).rtNavigationEventId = id;
+    // Navigation follows instruction order; Q1 and RT clocks can be far apart.
+    const issues = events.filter((event) => event.kind === "q1_issue");
+    const scope = (event, common = false) => JSON.stringify([event.sequencer_id,
+      common ? undefined : event.meta?.branch_comparison_branch_id,
+      common ? undefined : event.meta?.branch_comparison_path, event.meta?.diff_status === "removed",
+      event.meta?.preview_source_event_id ? [event.meta.loop_preview, event.meta.loop_iteration_index] : undefined]);
+    const previous = new Map();
+    const leading = new Map();
+    for (const issue of issues) {
+      const entry = index.get(String(issue.id));
+      const key = scope(issue);
+      let target = [...entry.rtEventIds].find((id) => rtCommands.has(id)) || previous.get(key);
+      if (!target && issue.meta?.branch_comparison_path) {
+        const time = eventTimeValue(issue.t0, Number.NaN);
+        const shared = issues.filter((candidate) => scope(candidate) === scope(issue, true) &&
+          eventTimeValue(candidate.t0, Number.NaN) <= time && index.get(String(candidate.id)).rtEventIds.size).at(-1);
+        target = shared && [...index.get(String(shared.id)).rtEventIds].find((id) => rtCommands.has(id));
+      }
+      if (target) {
+        entry.rtNavigationEventId = target;
+        previous.set(key, target);
+      } else {
+        if (!leading.has(key)) leading.set(key, []);
+        leading.get(key).push(entry);
+      }
+    }
+    for (const [key, entries] of leading) {
+      if (previous.has(key)) for (const entry of entries) entry.rtPreparation = true;
+    }
+    // Q1 setup points to the next RT command; trailing instructions keep their preceding RT target.
+    const next = new Map();
+    for (const issue of issues.slice().reverse()) {
+      const entry = index.get(String(issue.id));
+      const key = scope(issue);
+      const own = [...entry.rtEventIds].find((id) => rtCommands.has(id));
+      if (own) next.set(key, own);
+      if (next.has(key)) entry.rtNavigationEventId = next.get(key);
+    }
     return new Map(Array.from(index, ([id, entry]) => [id, {
       relatedEventIds: [...entry.relatedEventIds], appliedEventIds: [...entry.appliedEventIds], rtEventIds: [...entry.rtEventIds],
+      rtNavigationEventId: entry.rtNavigationEventId, rtPreparation: entry.rtPreparation === true,
     }]));
   }
 
@@ -821,11 +948,17 @@
         common ? undefined : meta.branch_comparison_path, meta.diff_status === "removed" ? "removed" : undefined]);
     };
     const excluded = new Set(["marker_state", "latched_state_applied", "rt_queue_enqueue", "rt_queue_dequeue", "q1_stall",
-      "sync_wait", "trigger_wait", "feedback_receive", "feedback_send", "trigger_receive", "acquisition_result",
+      "sync_wait", "trigger_wait", "feedback_pop", "feedback_receive", "feedback_send", "trigger_receive", "acquisition_result",
       "loop_block", "loop_iteration_preview", "branch_region", "control_flow_loop", "control_flow_branch"]);
     const states = new Map(), packets = new Map(), details = new Map();
     const ordered = events.map((event, index) => ({ event, index })).filter(({ event }) =>
       eventLaneName(event).startsWith("rt.") && !excluded.has(event.kind));
+    for (const [index, event] of events.entries()) {
+      const end = concreteValue(event.t1 ?? event.t1_ns);
+      if (event.meta?.latched_state_at_join && Number.isFinite(end)) {
+        ordered.push({event: {...event, id: `${event.id}:joined-state`, kind: "branch_state_at_join", t0: end}, index: index + 0.5});
+      }
+    }
     const time = (event) => {
       const value = event.t0 ?? event.t0_ns;
       return typeof value === "number" ? value : value && (!value.kind || value.kind === "concrete") ? value.value ?? value.value_ns : undefined;
@@ -836,7 +969,8 @@
       const meta = loop.meta;
       const members = Object.values(meta.preview_iteration_event_ids || { 0: meta.first_iteration_event_ids || [] }).flat();
       const memberIndexes = members.map((id) => eventOrder.get(String(id)) ?? -1);
-      const end = time(loop) + time({t0: loop.duration}) * Number(meta.count);
+      const total = meta.total_duration === undefined ? time({t0: loop.duration}) * Number(meta.count) : time({t0: meta.total_duration});
+      const end = time(loop) + total;
       ordered.push({event: { ...loop, t0: Number.isFinite(end) ? end : undefined }, index: Math.max(eventOrder.get(String(loop.id)), ...memberIndexes) + 0.5});
     }
     ordered.sort((a, b) => a.index - b.index);
@@ -854,6 +988,12 @@
         states.set(scope, { parameters: { ...common?.parameters }, registers: common?.registers, unknown: Boolean(common?.unknown) });
       }
       const state = states.get(scope), issueMeta = issue?.meta || {};
+      if (event.kind === "branch_state_at_join") {
+        for (const [field, value] of Object.entries(meta.latched_state_at_join)) {
+          if (!(meta.pending_fields_at_join || []).includes(field)) state.parameters[field] = value;
+        }
+        continue;
+      }
       if (event.kind === "loop_block") {
         for (const field of meta.uncertain_latched_fields || []) {
           if (field in state.parameters) state.parameters[field] = {kind: "unknown", display: "? (hidden loop iterations)"};
@@ -870,12 +1010,13 @@
       const previous = { ...state.parameters };
       const blocked = event.kind === "unknown_region" && meta.playback && meta.rt_packet_id == null && !meta.output_state_unknown;
       const outputUnknown = meta.output_state_unknown || event.kind === "unknown_region" && !blocked && meta.output_state_unknown !== false;
-      if (outputUnknown) {
+      const ncoUncertain = Boolean(meta.nco_phase_uncertain);
+      if (outputUnknown && !ncoUncertain) {
         state.parameters = {};
         state.unknown = true;
       }
       const skipped = event.kind === "conditional_skip" || meta.conditional_skipped;
-      const applies = !skipped && !["wait", "wait_sync", "wait_trigger"].includes(event.kind) && !outputUnknown;
+      const applies = !skipped && !["wait", "wait_sync", "wait_trigger"].includes(event.kind) && (!outputUnknown || ncoUncertain);
       const applied = applies ? { ...meta.applied_state } : {};
       if (applies && meta.applied_state_mode === "snapshot") {
         state.parameters = {};
@@ -894,6 +1035,7 @@
         }
       }
       Object.assign(state.parameters, applied);
+      if (ncoUncertain) state.parameters.phase = {kind: "unknown", display: "? (NCO phase)"};
       const parameters = Object.entries(state.parameters).filter(([name]) =>
         name !== "scope_enable" || event.kind === "acquire" || event.kind === "upd_param" || event.kind === "upd_thres")
         .filter(() => !["stop", "feedback_pop", "feedback_com", "set_latch_en", "latch_rst"].includes(event.kind) && !String(event.kind).startsWith("fb_"))
@@ -936,7 +1078,8 @@
         : []
     );
     const instruction = options.layout === "instruction";
-    const adapterOptions = { mode, layout: options.layout, timeBasis: options.timeBasis, mergedPlayEventIds, expandedQ1IssueSequencers };
+    const adapterOptions = { mode, layout: options.layout, timeBasis: options.timeBasis, mergedPlayEventIds, expandedQ1IssueSequencers,
+      alignment: timelineIr?.alignment };
     let maxTime = 1;
 
     function ensureLane(lane) {
@@ -978,6 +1121,18 @@
       const lane = ensureLane(eventLane(event, adapterOptions));
       if (!lane.hidden) maxTime = Math.max(maxTime, block.start + Math.max(block.duration, 1));
       lane.blocks.push(block);
+      if (!instruction && event.kind === "acquire") {
+        const acquisition = acquisitionBlock(event, adapterOptions);
+        const row = ensureLane(acquisitionLane(event, adapterOptions));
+        row.blocks.push(acquisition);
+        maxTime = Math.max(maxTime, acquisition.start + acquisition.duration);
+        if (event.meta?.scope_acquisition_window) {
+          const scope = acquisitionBlock(event, adapterOptions, true);
+          row.blocks.push(scope);
+          row.acquisitionTracks = 2;
+          maxTime = Math.max(maxTime, scope.start + scope.duration);
+        }
+      }
     }
 
     for (const group of playGroups) {
@@ -995,9 +1150,9 @@
     for (const lane of lanes) {
       for (const block of lane.blocks) {
         const detail = rtDetails.get(block.eventId);
-        if (detail) block.rtDetails = detail;
+        if (detail && block.kind !== "acquisition_window") block.rtDetails = detail;
         const changes = new Set((block.eventIds || [block.eventId]).flatMap((id) => parameterChanges.get(id) || []));
-        if (changes.size) block.parameterChanges = [...changes];
+        if (changes.size && block.kind !== "acquisition_window") block.parameterChanges = [...changes];
         const rtEventIds = selectionIndex.get(block.eventId)?.rtEventIds || [];
         if (block.kind !== "q1_issue" || !rtEventIds.length) continue;
         const event = eventById.get(block.eventId);
@@ -1011,6 +1166,10 @@
       const annotation = feedbackAnnotation(flow, eventById, adapterOptions);
       if (!annotation) {
         continue;
+      }
+      for (const id of [flow.from_event_id, flow.to_event_id]) {
+        const event = eventById.get(String(id));
+        if (["feedback_pop", "feedback_send", "feedback_receive"].includes(event.kind)) ensureLane(eventLane(event, adapterOptions));
       }
       annotations.push(annotation);
       maxTime = Math.max(
@@ -1030,12 +1189,66 @@
       const key = JSON.stringify([lane.sequencer, lane.branchComparisonId]);
       const group = comparisonGroups.get(key) || [];
       comparisonGroups.delete(key);
-      const rank = (item) => (item.branchComparisonPath === "taken" ? 0 : 4) +
-        ({ "branch-runtime": 0, "q1-issue": 1, "runtime-path": 2, debug: 3 }[item.kind] || 0);
+      const rank = (item) => (item.branchComparisonPath === "taken" ? 0 : 5) +
+        ({ "branch-runtime": 0, acquisition: 1, "q1-issue": 2, "runtime-path": 3, debug: 4 }[item.kind] || 0);
       return group.sort((left, right) => rank(left) - rank(right));
     });
     lanes.splice(0, lanes.length, ...orderedLanes);
     if (instruction) maxTime = applyInstructionLayout(lanes, annotations, events);
+    const commandPositions = new Map();
+    for (const lane of lanes) {
+      for (const block of lane.blocks) {
+        if (block.acquisitionMode || ["underflow_warning", "analysis_incomplete"].includes(block.kind)) continue;
+        for (const id of block.eventIds) commandPositions.set(id, { lane, block });
+      }
+    }
+    const sameOccurrence = (left, right) => left.sequencer_id === right.sequencer_id &&
+      ["branch_comparison_branch_id", "branch_comparison_path", "loop_preview", "loop_iteration_index", "diff_status"]
+        .every((key) => left.meta?.[key] === right.meta?.[key]);
+    function addError(target, eventId, message) {
+      const errors = target.block.diagnosticErrors ||= [];
+      if (errors.some((error) => error.eventId === eventId && error.message === message)) return;
+      const error = { eventId, message };
+      errors.push(error);
+      if (target.lane.kind === "q1-issue" && target.lane.hidden) {
+        const parent = laneById.get(target.lane.parentGroupId);
+        (parent.q1Errors ||= []).push(error);
+      }
+      if (!target.block.eventIds.includes(eventId)) target.block.eventIds = [...target.block.eventIds, eventId];
+    }
+    for (const event of events) {
+      if (event.kind !== "underflow_warning" || !shouldIncludeEvent(event, adapterOptions)) continue;
+      const eventId = String(event.id);
+      const lane = laneById.get(eventLane(event, adapterOptions).id);
+      const block = lane.blocks.find((candidate) => candidate.id === eventId);
+      const target = events.filter((candidate) => sameOccurrence(event, candidate) &&
+        event.meta?.rt_packet_id !== undefined && candidate.meta?.rt_packet_id === event.meta.rt_packet_id &&
+        eventLaneName(candidate).startsWith("rt.") && !["underflow_warning", "analysis_incomplete", "marker_state",
+          "latched_state_applied", "sync_wait", "trigger_wait", "feedback_receive", "feedback_send", "trigger_receive", "acquisition_result"].includes(candidate.kind))
+        .map((candidate) => commandPositions.get(String(candidate.id)))
+        .find((position) => position && !position.lane.hidden);
+      if (target) {
+        lane.blocks.splice(lane.blocks.indexOf(block), 1);
+        addError(target, eventId, underflowLabel(event));
+      } else {
+        block.duration = 0;
+        block.diagnosticPlacement = "point";
+        block.diagnosticErrors = [{ eventId, message: underflowLabel(event) }];
+      }
+    }
+    for (const diagnostic of timelineIr.diagnostics || []) {
+      if (diagnostic.severity !== "error") continue;
+      const related = (diagnostic.related_events || []).map((id) => allEvents.find((event) => String(event.id) === String(id))).filter(Boolean);
+      if (related.some((event) => ["underflow_warning", "analysis_incomplete"].includes(event.kind))) continue;
+      const feedbackDiagnostic = diagnostic.category === "feedback_latency_violation" || diagnostic.details?.analysis_scope === "feedback";
+      const event = (feedbackDiagnostic ? related.find((candidate) => candidate.kind === "feedback_pop") : undefined) ||
+        related.find((candidate) => commandPositions.has(String(candidate.id))) ||
+        (related.length === 0 ? events.find((candidate) => candidate.kind === "q1_issue" && diagnostic.source?.file &&
+          candidate.source?.file === diagnostic.source.file && candidate.source?.line === diagnostic.source.line) : undefined);
+      const eventId = String(event?.id);
+      const target = commandPositions.get(eventId);
+      if (target) addError(target, eventId, diagnostic.message || diagnostic.category);
+    }
     const viewport = {
       start: 0,
       end: maxTime,
@@ -1059,12 +1272,12 @@
     };
   }
 
-  function timeScaleFromGaps(gaps) {
+  function timeScaleFromGaps(gaps, ranges = gaps) {
     return {
       gaps,
       toDisplay(time) {
         let removed = 0;
-        for (const gap of gaps) {
+        for (const gap of ranges) {
           if (time < gap.start) break;
           if (time <= gap.end) {
             return gap.displayStart + ((time - gap.start) / (gap.end - gap.start)) * (gap.displayEnd - gap.displayStart);
@@ -1075,7 +1288,7 @@
       },
       fromDisplay(time) {
         let removed = 0;
-        for (const gap of gaps) {
+        for (const gap of ranges) {
           if (time < gap.displayStart) break;
           if (time <= gap.displayEnd) {
             return gap.start + ((time - gap.displayStart) / (gap.displayEnd - gap.displayStart)) * (gap.end - gap.start);
@@ -1095,11 +1308,12 @@
       value?.kind === "concrete" && typeof value.value === "number" && Number.isFinite(value.value) ? value.value : NaN;
     const count = concrete(meta.count);
     const period = concrete(meta.period);
+    const total = meta.total_duration === undefined ? count * period : concrete(meta.total_duration);
     const visible = Math.max(Number(meta.visible_iteration_count) || 1,
       ...(meta.shown_iterations || [0]).filter((index) => Number.isInteger(index) && index >= 0).map((index) => index + 1));
     const start = concrete(event.t0) + visible * period;
-    const end = concrete(event.t0) + count * period;
-    return Number.isInteger(count) && Number.isInteger(visible) && count > visible && period > 0 &&
+    const end = concrete(event.t0) + total;
+    return Number.isInteger(count) && Number.isInteger(visible) && count > visible && period >= 0 && total > 0 &&
       Number.isFinite(start) && Number.isFinite(end) && Number.isFinite(concrete(event.t1)) ? { start, end } : undefined;
   }
 
@@ -1181,20 +1395,82 @@
         last.loopKeys = [...new Set([...last.loopKeys, ...interval.loopKeys])];
       } else merged.push({ ...interval });
     }
+    let pixelsPerNs;
+    let fittedWidth;
+    let foldShrink = 1;
+    let foldWidths;
+    const viewport = options.viewport;
+    if (options.plotWidth > 0 && viewport && viewport.end > viewport.start) {
+      foldWidths = merged.map((interval) => options.foldWidth ? options.foldWidth(interval) : 64);
+      let foldedTime = 0;
+      let requestedWidth = 0;
+      for (const [index, interval] of merged.entries()) {
+        const visible = Math.max(0, Math.min(viewport.end, interval.end) - Math.max(viewport.start, interval.start));
+        foldedTime += visible;
+        requestedWidth += foldWidths[index] * visible / (interval.end - interval.start);
+      }
+      const unfoldedTime = viewport.end - viewport.start - foldedTime;
+      // Keep folds at label width, with space for visible commands on dense traces.
+      const foldedWidth = Math.min(requestedWidth, options.plotWidth * 0.75);
+      foldShrink = requestedWidth ? foldedWidth / requestedWidth : 1;
+      pixelsPerNs = Math.min(options.plotWidth / (viewport.end - viewport.start),
+        unfoldedTime > 0 ? (options.plotWidth - foldedWidth) / unfoldedTime : Infinity);
+      fittedWidth = unfoldedTime * pixelsPerNs + foldedWidth;
+    }
     let removed = 0;
-    const gaps = merged.map((interval) => {
+    const gaps = merged.map((interval, index) => {
       const duration = interval.end - interval.start;
       // Keep a nonzero break so pointer positions still map to real times.
-      const width = interval.loopKeys.length ? Math.min(64, duration / 10) : 64;
+      const width = pixelsPerNs ? foldWidths[index] * foldShrink / pixelsPerNs
+        : interval.loopKeys.length ? Math.min(64, duration / 10) : 64;
       const displayStart = interval.start - removed;
       removed += duration - width;
       return { ...interval, displayStart, displayEnd: displayStart + width };
     });
-    return timeScaleFromGaps(gaps);
+    let ranges = gaps;
+    if (pixelsPerNs && options.commandWidths?.length) {
+      const commands = [];
+      for (const command of [...options.commandWidths].sort((a, b) => a.start - b.start)) {
+        if (command.end <= command.start || command.width <= (command.end - command.start) * pixelsPerNs ||
+          gaps.some((gap) => gap.start < command.end && gap.end > command.start)) continue;
+        const rate = command.width / (command.end - command.start);
+        const last = commands[commands.length - 1];
+        if (last && command.start < last.end) {
+          last.end = Math.max(last.end, command.end);
+          last.rate = Math.max(last.rate, rate);
+        } else commands.push({ start: command.start, end: command.end, rate });
+      }
+      ranges = [...gaps, ...commands.map((command) => ({ ...command,
+        displayStart: 0, displayEnd: (command.end - command.start) * command.rate / pixelsPerNs }))]
+        .sort((a, b) => a.start - b.start);
+      let flexibleTime = viewport.end - viewport.start;
+      let fixedWidth = 0;
+      for (const interval of ranges) {
+        const visible = Math.max(0, Math.min(viewport.end, interval.end) - Math.max(viewport.start, interval.start));
+        flexibleTime -= visible;
+        fixedWidth += (interval.displayEnd - interval.displayStart) * pixelsPerNs * visible / (interval.end - interval.start);
+      }
+      // Fit flexible time around readable commands and fixed-width fold tabs.
+      const fittedRate = flexibleTime > 0 && fixedWidth < options.plotWidth
+        ? Math.min(pixelsPerNs, (options.plotWidth - fixedWidth) / flexibleTime) : pixelsPerNs;
+      const widthRatio = pixelsPerNs / fittedRate;
+      pixelsPerNs = fittedRate;
+      let removed = 0;
+      for (const interval of ranges) {
+        const width = (interval.displayEnd - interval.displayStart) * widthRatio;
+        interval.displayStart = interval.start - removed;
+        interval.displayEnd = interval.displayStart + width;
+        removed += interval.end - interval.start - width;
+      }
+      const scale = timeScaleFromGaps(gaps, ranges);
+      fittedWidth = Math.min(options.plotWidth, (scale.toDisplay(viewport.end) - scale.toDisplay(viewport.start)) * pixelsPerNs);
+    }
+    return { ...timeScaleFromGaps(gaps, ranges), ...(fittedWidth === undefined ? {} : { plotWidth: Math.max(1, fittedWidth) }) };
   }
 
   function buildWaitTimeScale(timelineIr, options = {}) {
     const gaps = [];
+    const acquisitionWindows = [];
     const scale = timeScaleFromGaps(gaps);
     function concreteTime(value) {
       if (typeof value === "number" && Number.isFinite(value)) return value;
@@ -1271,7 +1547,7 @@
       ignoredKinds.add("branch_region");
     }
     const waitKinds = new Set(["wait", "wait_sync", "wait_trigger"]);
-    const knownKinds = new Set(["upd_param", "latched_state_applied", "marker_state", "branch_region", "feedback_com", "feedback_pop", "feedback_receive", "feedback_send", "acquisition_result", "fb_acq_tb_id", "fb_acq_iq_id", "fb_acq_tb_valid", "fb_acq_tb_cfg", "fb_acq_iq_shift"]);
+    const knownKinds = new Set(["upd_param", "latched_state_applied", "marker_state", "branch_region", "sync_wait", "feedback_com", "fb_com_data", "feedback_pop", "feedback_receive", "feedback_send", "acquisition_result", "fb_acq_tb_id", "fb_acq_iq_id", "fb_acq_tb_valid", "fb_acq_tb_cfg", "fb_acq_iq_shift"]);
     if (events.some((event) => event.sequencer_id === undefined && !ignoredKinds.has(event.kind))) return scale;
     let common;
     for (const id of sequencers) {
@@ -1303,12 +1579,18 @@
       }
       records.sort((a, b) => a.start - b.start);
       if (!records.length) return scale;
+      const windows = records.flatMap(({ event, start }) => event.kind === "acquire" && event.confidence === "exact"
+        ? [event.meta?.acquisition_window, event.meta?.scope_acquisition_window]
+          .filter((window) => window && Number.isFinite(window.end_ns) && window.status !== "unknown")
+          .map((window) => ({ start, end: window.end_ns + offset })) : []);
+      acquisitionWindows.push(...windows);
       if (playback) {
         // Compress explicit waiting in this assumed path, not presumed physical idle.
         // Visible Q1 controls, RT commands and feedback boundaries stay outside
         // the omission; ordinary Q1 blocks use the same reversible time scale.
         const waits = merge(records.filter(({ event }) => waitKinds.has(event.kind)).map(({ start, end }) => ({ start, end })));
         const activity = records.filter(({ event }) => !waitKinds.has(event.kind)).map(({ start, end }) => ({ start, end }));
+        activity.push(...windows.map(({ end }) => ({ start: end, end })));
         const unchanged = subtract(waits, activity);
         common = common === undefined ? unchanged : intersect(common, unchanged);
         if (!common.length) return scale;
@@ -1318,13 +1600,14 @@
         const meta = event.meta || {};
         const count = concreteTime(meta.count);
         const period = concreteTime(meta.period);
-        const end = start + count * period;
+        const total = meta.total_duration === undefined ? count * period : concreteTime(meta.total_duration);
+        const end = start + total;
         return event.kind === "loop_block" && event.confidence === "exact" && meta.wait_only === true &&
-          Number.isInteger(count) && count > 0 && period > 0 && Number.isFinite(end)
+          Number.isInteger(count) && count > 0 && period >= 0 && total > 0 && Number.isFinite(end)
           ? [{ start, end }] : [];
       });
       const observed = [{ start: records[0].start,
-        end: [...records, ...waitLoops].reduce((last, record) => Math.max(last, record.end), records[0].start) }];
+        end: [...records, ...waitLoops, ...windows].reduce((last, record) => Math.max(last, record.end), records[0].start) }];
       const blocked = [];
       const acquisitionEnds = new Map();
       for (const { event, start } of records) {
@@ -1349,7 +1632,8 @@
         if (event.kind === "loop_block") {
           const count = concreteTime(meta.count);
           const period = concreteTime(meta.period);
-          if (meta.wait_only === true && Number.isInteger(count) && count > 0 && period > 0 && Number.isFinite(start + count * period)) continue;
+          const total = meta.total_duration === undefined ? count * period : concreteTime(meta.total_duration);
+          if (meta.wait_only === true && Number.isInteger(count) && count > 0 && period >= 0 && total > 0 && Number.isFinite(start + total)) continue;
           const shown = new Set(meta.shown_iterations || [0]);
           let visible = 0;
           while (shown.has(visible)) visible += 1;
@@ -1359,7 +1643,15 @@
           blocked.push({ start, end: Infinity });
         } else if (event.kind === "acquire") {
           const acquisition = acquisitionEnds.get(meta.rt_packet_id);
-          blocked.push({ start, end: acquisition && acquisition.start === start ? Math.max(end, acquisition.end) : Infinity });
+          const configuredWindows = [meta.acquisition_window, meta.scope_acquisition_window].filter(Boolean);
+          if (configuredWindows.length && configuredWindows.every((window) => Number.isFinite(window.end_ns) && window.status !== "unknown")) {
+            // Acquiring is a constant mode between its boundaries. Keep the RT
+            // command and every integration/scope end visible, but fold its interior.
+            blocked.push({ start, end });
+            for (const window of configuredWindows) {
+              blocked.push({ start: window.end_ns + offset, end: window.end_ns + offset });
+            }
+          } else blocked.push({ start, end: acquisition && acquisition.start === start ? Math.max(end, acquisition.end) : Infinity });
         } else {
           const annotation = event.kind === "underflow_warning" && meta.status === "possible_underflow";
           blocked.push({ start, end: knownKinds.has(event.kind) || annotation ? end : Infinity });
@@ -1386,7 +1678,13 @@
         if (expandedGaps.some((gap) => gap.start === start && gap.end === end)) continue;
         const displayStart = start - removed;
         const displayEnd = displayStart + 64;
-        gaps.push({ start, end, displayStart, displayEnd });
+        // A whole acquisition's unchanged interior carries its full duration on
+        // the tab. Partial spans between other commands retain their actual length.
+        const matching = acquisitionWindows.filter((window) => window.end === interval.end &&
+          window.start <= interval.start && interval.start <= window.start + 16);
+        const acquisition = matching.length && matching.every((window) =>
+          window.start === matching[0].start && window.end === matching[0].end) ? matching[0] : undefined;
+        gaps.push({ start, end, displayStart, displayEnd, ...(acquisition ? { acquisition } : {}) });
         removed += end - start - 64;
       }
     }
@@ -1394,6 +1692,8 @@
   }
 
   const api = {
+    acquisitionWindow,
+    acquisitionMode,
     buildQ1TimelineSharedModel,
     buildQ1TimelineSelectionIndex,
     buildTimelineTimeScale,

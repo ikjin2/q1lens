@@ -178,7 +178,7 @@
   }
 
   function renderFeedbackInlineAnnotation(annotation, viewport, handlers) {
-    const style = rangeStyle(annotation.start, annotation.end, viewport, 0.0035);
+    const style = rangeStyle(annotation.start, annotation.end, viewport, 0);
     if (!style) {
       return undefined;
     }
@@ -186,6 +186,11 @@
     node.dataset.flowId = String(annotation.flowId || annotation.id || "");
     node.style.left = `${style.leftPercent}%`;
     node.style.width = `${style.widthPercent}%`;
+    const fromTime = annotation.fromTime ?? annotation.start;
+    const toTime = annotation.toTime ?? annotation.end;
+    if (fromTime > toTime) node.classList.add("is-reversed");
+    if (timePointStyle(fromTime, viewport)?.clipped) node.classList.add("is-clipped-source");
+    if (timePointStyle(toTime, viewport)?.clipped) node.classList.add("is-clipped-target");
     if (style.clippedStart) {
       node.classList.add("is-clipped-start");
     }
@@ -195,17 +200,46 @@
     if (annotation.selected) {
       node.classList.add("is-selected");
     }
-    node.title = annotation.label || annotation.title || "";
+    node.title = [annotation.label || annotation.title, annotation.sourceTitle, annotation.targetTitle].filter(Boolean).join("\n");
+    node.setAttribute("aria-label", node.title);
     const sourceDot = element("span", "feedback-dot feedback-dot-source");
     sourceDot.dataset.feedbackRole = "source";
+    sourceDot.dataset.flowId = node.dataset.flowId;
+    sourceDot.dataset.eventId = annotation.fromEventId || "";
+    sourceDot.title = annotation.sourceTitle || node.title;
+    sourceDot.setAttribute("aria-label", sourceDot.title);
     node.appendChild(sourceDot);
-    node.appendChild(element("span", "feedback-mini-track feedback-mini-track-before"));
+    const route = element("span", "feedback-inline-route");
+    route.setAttribute("aria-hidden", "true");
+    for (const [index, d] of ["M 0 0 L 10 10 Q 12 12 14 12", "M 0 12 Q 2 12 4 10 L 14 0"].entries()) {
+      if (index) {
+        route.appendChild(element("span", "feedback-mini-track feedback-mini-track-before"));
+        route.appendChild(element("span", "feedback-mini-track feedback-mini-track-after"));
+      }
+      const bend = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+      bend.setAttribute("class", "feedback-route-bend");
+      bend.setAttribute("viewBox", "0 0 14 12");
+      bend.setAttribute("preserveAspectRatio", "none");
+      const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      path.setAttribute("d", d);
+      path.setAttribute("vector-effect", "non-scaling-stroke");
+      bend.appendChild(path);
+      if (index) {
+        const arrow = document.createElementNS("http://www.w3.org/2000/svg", "path");
+        arrow.setAttribute("class", "feedback-mini-arrow");
+        arrow.setAttribute("d", "M 8 1 L 14 0 L 13 6 Z");
+        bend.appendChild(arrow);
+      }
+      route.appendChild(bend);
+    }
+    node.appendChild(route);
     node.appendChild(element("span", "feedback-label", annotation.labelShort || "fb"));
-    const afterTrack = element("span", "feedback-mini-track feedback-mini-track-after");
-    afterTrack.appendChild(element("span", "feedback-mini-arrow"));
-    node.appendChild(afterTrack);
     const targetDot = element("span", "feedback-dot feedback-dot-target");
     targetDot.dataset.feedbackRole = "target";
+    targetDot.dataset.flowId = node.dataset.flowId;
+    targetDot.dataset.eventId = annotation.toEventId || "";
+    targetDot.title = annotation.targetTitle || node.title;
+    targetDot.setAttribute("aria-label", targetDot.title);
     node.appendChild(targetDot);
     installAnnotationInteractions(node, annotation, handlers);
     return node;
@@ -228,7 +262,9 @@
     if (annotation.selected) {
       node.classList.add("is-selected");
     }
-    node.title = annotation.label || annotation.title || "";
+    node.dataset.eventId = (role === "source" ? annotation.fromEventId : annotation.toEventId) || "";
+    node.title = (role === "source" ? annotation.sourceTitle : annotation.targetTitle) || annotation.label || annotation.title || "";
+    node.setAttribute("aria-label", node.title);
     node.appendChild(element("span", "feedback-endpoint-marker"));
     node.appendChild(element("span", "feedback-endpoint-label", annotation.labelShort || "fb"));
     installAnnotationInteractions(node, annotation, handlers);
@@ -340,8 +376,9 @@
     if (selection) {
       ruler.appendChild(selection);
     }
-    for (const tick of model.ticks || []) {
+    for (const [index, tick] of (model.ticks || []).entries()) {
       const tickNode = element("div", "tick");
+      if (index === model.ticks.length - 1 && tick.leftPercent > 90) tickNode.classList.add("is-end");
       tickNode.style.left = `${tick.leftPercent}%`;
       tickNode.appendChild(element("span", "", tick.label));
       ruler.appendChild(tickNode);
@@ -382,29 +419,61 @@
     }
     node.dataset.blockId = String(block.id);
     node.dataset.startClipped = String(Number(block.start) < viewport.start);
+    node.dataset.endClipped = String(Number(block.start) + (Number(block.duration) || 0) > viewport.end);
     node.dataset.connectionStartKnown = String(block.connectionStartKnown !== false);
     node.dataset.search = String(block.search || `${block.label || ""} ${block.detail || ""}`.toLowerCase());
     node.style.left = `${style.leftPercent}%`;
-    node.style.width = block.issueMarker ? `min(24px, ${style.widthPercent}%)` : `${style.widthPercent}%`;
+    node.style.width = block.diagnosticPlacement === "point" ? "10px" :
+      block.issueMarker ? `min(24px, ${style.widthPercent}%)` : `${style.widthPercent}%`;
     if (block.accentColor) {
       node.classList.add("has-command-color");
       node.style.setProperty("--timeline-block-accent", block.accentColor);
     }
-    node.setAttribute("aria-selected", block.selected ? "true" : "false");
-    if (block.title) {
-      node.title = block.title;
+    if (block.acquisitionMode) {
+      node.dataset.acquisitionMode = block.acquisitionMode;
+      node.style.setProperty("--timeline-acquisition-offset", `${(block.acquisitionTrack || 0) * 20}px`);
+      node.setAttribute("aria-label", block.title || `${block.acquisitionMode} · ${block.label}`);
     }
-    if (block.issueMarker) {
+    node.setAttribute("aria-selected", block.selected ? "true" : "false");
+    const errorMessages = (block.diagnosticErrors || []).map((error) => error.message);
+    if (errorMessages.length) {
+      node.classList.add("has-error");
+      node.dataset.diagnosticMessage = errorMessages.join("\n");
+      node.setAttribute("aria-description", node.dataset.diagnosticMessage);
+    }
+    const title = block.title || (block.issueMarker ? `Q1 issue start: ${block.label || ""}` : "");
+    if (title || errorMessages.length) {
+      node.title = [title, ...errorMessages.filter((message) => message !== title)].filter(Boolean).join("\n");
+    }
+    if (block.diagnosticPlacement) {
+      node.classList.add("timeline-diagnostic", `diagnostic-${block.diagnosticPlacement}`);
+      node.dataset.diagnosticPlacement = block.diagnosticPlacement;
+      node.setAttribute("aria-label", node.title);
+    } else if (block.issueMarker) {
       node.classList.add("timeline-issue-marker");
       node.dataset.issueMarker = "true";
       node.dataset.rtEventIds = (block.rtEventIds || []).map(String).join(" ");
-      node.title = block.title || `Q1 issue start: ${block.label || ""}`;
       node.setAttribute("aria-label", node.title);
       node.innerHTML = '<svg class="issue-packet-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2 4.5 8 1.5l6 3v7L8 14.5l-6-3Z M2 4.5l6 3 6-3 M8 7.5v7 M5 3l6 3"/></svg>';
+    } else if (block.acquisitionMode) {
+      const icons = {
+        integration: '<path d="M18 4H6l7 8-7 8h12"/>',
+        weighted: '<path d="M4 6h4m4 0h8M4 12h10m4 0h2M4 18h2m4 0h10M8 3v6m6 0v6m-4 0v6"/>',
+        scope: '<path d="M2 12h4l3-8 6 16 3-8h4"/>',
+        ttl: '<path d="M4 8h16M4 16h16M10 3 8 21M17 3l-2 18"/>',
+        timetags: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+        digital: '<path d="M2 17h5V7h10v10h5"/>',
+      };
+      node.appendChild(element("span", "acquisition-bracket"));
+      const label = element("span", "block-label");
+      const icon = element("span", "acquisition-mode-icon");
+      icon.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">${icons[block.acquisitionMode] || icons.integration}</svg>`;
+      label.append(icon, element("span", "acquisition-duration", block.label));
+      node.appendChild(label);
     } else {
-      const labelText = block.label || "";
+      const labelText = block.commandLabel || block.label || "";
       const label = element("span", "block-label", labelText);
-      const tokens = block.accentColor ? instructionColors.sourceTokens(labelText) : [];
+      const tokens = block.accentColor && !errorMessages.length ? instructionColors.sourceTokens(labelText) : [];
       if (tokens[0]?.kind === "command" && tokens[0].family !== "unknown" && tokens[0].start === 0) {
         label.textContent = "";
         let offset = 0;
@@ -419,6 +488,11 @@
       }
       node.appendChild(label);
       node.appendChild(element("span", "block-detail", block.detail || ""));
+    }
+    if (errorMessages.length) {
+      const mark = element("span", "timeline-error-mark", "!");
+      mark.setAttribute("aria-hidden", "true");
+      node.prepend(mark);
     }
     node.addEventListener("click", (event) => {
       if (handlers && handlers.onBlockClick) {
@@ -437,9 +511,18 @@
   function renderLane(lane, model, handlers, layout) {
     const row = element("div", `timeline-row timeline-row-${lane.kind || "default"}`);
     row.dataset.lane = lane.id;
-    if (layout.offset) {
+    const feedbackOffset = laneAnnotations(lane, model).some((annotation) => annotation.type === "feedback-inline" &&
+      rangeStyle(annotation.start, annotation.end, model.viewport, 0.0035)) ? 12 : 0;
+    if (feedbackOffset) {
+      row.dataset.feedbackOffset = String(feedbackOffset);
+      row.style.setProperty("--timeline-feedback-offset", `${feedbackOffset}px`);
+    }
+    if (lane.acquisitionTracks > 1) row.classList.add("has-scope");
+    const hasDiagnosticPoint = (lane.blocks || []).some((block) => block.diagnosticPlacement === "point");
+    if (layout.offset || hasDiagnosticPoint) {
       row.style.setProperty("--timeline-loop-offset", `${layout.offset}px`);
-      row.style.minHeight = `${(Number(model.rowHeight) || 36) + layout.offset}px`;
+      const height = lane.role === "acquisition" ? 22 + (lane.acquisitionTracks > 1 ? 20 : 0) : Number(model.rowHeight) || 36;
+      row.style.minHeight = `${(hasDiagnosticPoint ? Math.max(height, 38) : height) + layout.offset + feedbackOffset}px`;
     }
     if (lane.parentGroupId) {
       row.dataset.parentLane = lane.parentGroupId;
@@ -455,10 +538,22 @@
     }
     const label = element("div", "lane-label");
     label.appendChild(element("span", "lane-label-text", lane.label));
+    if (lane.q1Errors?.length) {
+      const mark = element("button", "event q1-error-marker timeline-error-mark", "!");
+      mark.type = "button";
+      mark.dataset.eventId = lane.q1Errors[0].eventId;
+      mark.dataset.eventIds = lane.q1Errors.map((error) => error.eventId).join(" ");
+      mark.dataset.diagnosticMessage = lane.q1Errors.map((error) => error.message).join("\n");
+      mark.title = mark.dataset.diagnosticMessage;
+      mark.setAttribute("aria-label", `${lane.sequencer || lane.label} · ${lane.q1Errors.length} Q1 error${lane.q1Errors.length === 1 ? "" : "s"}`);
+      mark.addEventListener("click", (event) => handlers?.onBlockClick?.({}, mark, event));
+      label.appendChild(mark);
+    }
     row.appendChild(label);
 
     const track = element("div", `lane-track lane-track-${lane.kind || "default"}`);
-    if (layout.offset) track.style.minHeight = row.style.minHeight;
+    if (lane.acquisitionTracks > 1) track.classList.add("has-scope");
+    if (row.style.minHeight) track.style.minHeight = row.style.minHeight;
     const selection = renderSelectionOverlay(lane.selectionRange === undefined ? model.selectionRange : lane.selectionRange, model.viewport);
     if (selection) {
       track.appendChild(selection);
@@ -523,7 +618,7 @@
   }
 
   function feedbackEndpointAnchorY(rowHeight) {
-    return rowHeight - 4;
+    return rowHeight - 9.5;
   }
 
   function renderFeedbackConnectorPath(annotation, model, laneGeometryById, handlers) {
@@ -534,8 +629,8 @@
     if (!fromLane || !toLane || !fromPoint || !toPoint) {
       return undefined;
     }
-    const y1 = fromLane.top + feedbackEndpointAnchorY(fromLane.height);
-    const y2 = toLane.top + feedbackEndpointAnchorY(toLane.height);
+    const y1 = fromLane.top + feedbackEndpointAnchorY(fromLane.height) - fromLane.feedbackOffset;
+    const y2 = toLane.top + feedbackEndpointAnchorY(toLane.height) - toLane.feedbackOffset;
     const x1 = fromPoint.leftPercent;
     const x2 = toPoint.leftPercent;
     const direction = Math.sign(y2 - y1 || 1);
@@ -546,7 +641,7 @@
     path.setAttribute("class", `feedback-connector${annotation.selected ? " is-selected" : ""}`);
     path.setAttribute("d", `M ${x1} ${y1} C ${x1} ${controlY1} ${x2} ${controlY2} ${x2} ${y2}`);
     path.setAttribute("aria-label", annotation.label || annotation.title || "Feedback flow");
-    path.setAttribute("marker-end", "url(#feedback-bridge-arrow)");
+    if (!toPoint.clipped) path.setAttribute("marker-end", "url(#feedback-bridge-arrow)");
     path.setAttribute("vector-effect", "non-scaling-stroke");
     installAnnotationInteractions(path, annotation, handlers);
     return path;
@@ -584,9 +679,10 @@
     for (const lane of visibleLanes) {
       const row = rows.get(lane.id);
       const layout = layouts ? layouts.get(lane.id) : loopAnnotationLayout(laneAnnotations(lane, model), model.viewport);
-      const height = row && row.offsetHeight || rowHeight + layout.offset;
+      const feedbackOffset = Number(row?.dataset.feedbackOffset) || 0;
+      const height = row && row.offsetHeight || rowHeight + layout.offset + feedbackOffset;
       const top = row && row.offsetHeight ? row.offsetTop : totalHeight;
-      laneGeometryById.set(lane.id, { top, height });
+      laneGeometryById.set(lane.id, { top, height, feedbackOffset });
       totalHeight = top + height;
     }
     const layer = element("div", "timeline-connector-layer");
@@ -821,6 +917,7 @@
     parameterConnections.get(rootNode)?.cleanup();
     const root = rootNode;
     const section = element("section", "shared-timeline-stage timeline-stage");
+    if (Number.isFinite(model.plotWidth)) section.style.setProperty("--timeline-time-width", `${model.plotWidth}px`);
     const header = element("div", "stage-header");
     const heading = element("div", "stage-heading");
     heading.appendChild(element("div", "stage-title", model.title || "Timeline"));

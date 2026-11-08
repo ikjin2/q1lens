@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 
 type Gap = { start: number; end: number; displayStart: number; displayEnd: number; loopKeys?: string[] };
-type TimeScale = { gaps: Gap[]; toDisplay: (time: number) => number; fromDisplay: (time: number) => number };
-type ScaleOptions = { timeBasis?: string; expandedGaps?: { start: number; end: number }[]; expandedPlaybackLoops?: string[] };
+type TimeScale = { gaps: Gap[]; plotWidth?: number; toDisplay: (time: number) => number; fromDisplay: (time: number) => number };
+type ScaleOptions = { timeBasis?: string; expandedGaps?: { start: number; end: number }[]; expandedPlaybackLoops?: string[];
+  viewport?: { start: number; end: number }; plotWidth?: number; foldWidth?: (gap: Gap) => number;
+  commandWidths?: { start: number; end: number; width: number }[] };
 const { buildWaitTimeScale, buildTimelineTimeScale } = require("../src/q1timeline/media/timelineAdapter.js") as {
   buildWaitTimeScale: (ir: any, options?: ScaleOptions) => TimeScale;
   buildTimelineTimeScale: (ir: any, options?: ScaleOptions & { waitGaps?: Gap[] }) => TimeScale;
@@ -20,6 +22,67 @@ function closeTo(actual: number, expected: number) {
   assert.ok(Math.abs(actual - expected) < 0.000001, `${actual} should equal ${expected}`);
 }
 function bounds(scale: TimeScale) { return scale.gaps.map(({ start, end }) => ({ start, end })); }
+
+describe("compact time scale layout", () => {
+  const waitGaps = [{ start: 100, end: 900, displayStart: 100, displayEnd: 164 }];
+  const fit = (start = 0, end = 1000, plotWidth = 1000) => buildTimelineTimeScale({ events: [] }, {
+    waitGaps, viewport: { start, end }, plotWidth, foldWidth: () => 60,
+  });
+  const pixelSpan = (scale: TimeScale, start: number, end: number, viewportStart = 0, viewportEnd = 1000) =>
+    (scale.toDisplay(end) - scale.toDisplay(start)) /
+    (scale.toDisplay(viewportEnd) - scale.toDisplay(viewportStart)) * scale.plotWidth!;
+
+  it("keeps a folded interval at its label width and leaves unused space on the right", () => {
+    const scale = fit();
+    assert.equal(scale.plotWidth, 260);
+    closeTo(pixelSpan(scale, 100, 900), 60);
+    closeTo(pixelSpan(scale, 0, 100), 100);
+    const wider = fit(0, 1000, 1600);
+    closeTo(pixelSpan(wider, 100, 900), 60);
+    assert.ok(wider.plotWidth! < 1600);
+  });
+
+  it("fits unfolded time and partial folds while retaining reversible coordinates", () => {
+    const scale = fit(500, 1000, 500);
+    closeTo(pixelSpan(scale, 500, 900, 500, 1000), 30);
+    assert.ok(scale.plotWidth! < 500);
+    for (const time of [-100, 0, 100, 500, 900, 1000, 2000]) closeTo(scale.fromDisplay(scale.toDisplay(time)), time);
+    const inside = fit(200, 800, 500);
+    closeTo(inside.plotWidth!, 45);
+  });
+
+  it("fits dense folds without exceeding the available width and expands to the full plot", () => {
+    const scale = buildTimelineTimeScale({ events: [] }, { viewport: { start: 0, end: 1000 }, plotWidth: 100,
+      foldWidth: () => 500, waitGaps });
+    assert.ok(scale.plotWidth! <= 100);
+    closeTo(pixelSpan(scale, 100, 900), 75);
+    const expanded = buildTimelineTimeScale({ events: [] }, { viewport: { start: 0, end: 1000 }, plotWidth: 100 });
+    closeTo(expanded.plotWidth!, 100);
+    closeTo(expanded.toDisplay(1000), 1000);
+  });
+
+  it("reserves readable command names without adding folds or changing real timestamps", () => {
+    const options = { viewport: { start: 0, end: 1000 }, plotWidth: 1000, foldWidth: () => 60, waitGaps,
+      commandWidths: [{ start: 0, end: 4, width: 60 }, { start: 0, end: 8, width: 80 }] };
+    const before = JSON.stringify(options);
+    const scale = buildTimelineTimeScale({ events: [] }, options);
+    assert.equal(scale.gaps.length, 1);
+    closeTo(pixelSpan(scale, 0, 4), 60);
+    closeTo(pixelSpan(scale, 100, 900), 60);
+    assert.ok(scale.plotWidth! < 1000);
+    for (const time of [-100, 0, 2, 4, 8, 100, 500, 900, 1000]) closeTo(scale.fromDisplay(scale.toDisplay(time)), time);
+    assert.equal(JSON.stringify(options), before);
+  });
+
+  it("shrinks flexible time before command names and fold labels when fitting", () => {
+    const scale = buildTimelineTimeScale({ events: [] }, { viewport: { start: 0, end: 1000 }, plotWidth: 200,
+      foldWidth: () => 60, waitGaps: [{ start: 100, end: 200, displayStart: 100, displayEnd: 164 }],
+      commandWidths: [{ start: 0, end: 4, width: 60 }] });
+    closeTo(scale.plotWidth!, 200);
+    closeTo(pixelSpan(scale, 0, 4), 60);
+    closeTo(pixelSpan(scale, 100, 200), 60);
+  });
+});
 
 describe("Q1 timeline wait folding", () => {
   it("folds unchanged spans while preserving their real duration", () => {
@@ -476,6 +539,32 @@ describe("static compact loop time folding", () => {
       { ...compact, meta: { ...compact.meta, period: { kind: "unknown" } } },
       { ...compact, meta: { ...compact.meta, visible_iteration_count: 3 } },
     ]) assert.deepEqual(buildTimelineTimeScale({ events: [item] }).gaps, []);
+  });
+
+  it("uses the proven total for growing and shrinking loop periods", () => {
+    for (const period of [40, 48]) {
+      const compact = loop("affine-loop", 0, period, 3, {
+        total_duration: { kind: "concrete", value: 132 }, period_invariant: false,
+      });
+      const scale = buildTimelineTimeScale({ events: [compact] });
+      assert.deepEqual(bounds(scale), [{ start: period, end: 132 }]);
+      for (const time of [0, period, 80, 132, 200]) closeTo(scale.fromDisplay(scale.toDisplay(time)), time);
+    }
+  });
+
+  it("keeps a zero first period distinct from the proven positive total", () => {
+    const compact = loop("affine-loop", 0, 0, 3, { total_duration: { kind: "concrete", value: 300 } });
+    assert.deepEqual(bounds(buildTimelineTimeScale({ events: [compact] })), [{ start: 0, end: 300 }]);
+  });
+
+  it("uses a proven wait-only total and rejects an explicitly unknown total", () => {
+    const compact: any = loop("affine-loop", 0, 4000, 3, {
+      wait_only: true, total_duration: { kind: "concrete", value: 13_200 },
+    });
+    assert.deepEqual(bounds(buildWaitTimeScale({ events: [event("wait", 0, 4000), compact, event("stop", 13_200)] },
+      { expandedPlaybackLoops: ["affine-loop"] })), [{ start: 16, end: 13_184 }]);
+    const unknown = { ...compact, meta: { ...compact.meta, total_duration: { kind: "unknown" } } };
+    assert.deepEqual(bounds(buildTimelineTimeScale({ events: [unknown] })), []);
   });
 
   it("preserves aligned peer activity inside an omitted static interval", () => {

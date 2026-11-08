@@ -89,9 +89,21 @@ export function registerPythonEnvironmentStatus(context: vscodeTypes.ExtensionCo
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 99);
   status.name = "Q1Lens Python Environment";
   status.command = "q1lens.showPythonEnvironment";
+  const extensionVersion: string = context.extension.packageJSON.version;
+  const warnedVersions = new Set<string>();
   let panel: vscodeTypes.WebviewPanel | undefined;
   update = () => {
     if (!current) return;
+    const report = current.report;
+    if (report?.supported && report.packageVersion && report.packageVersion !== extensionVersion) {
+      const key = JSON.stringify([report.executable, report.packageVersion]);
+      if (!warnedVersions.has(key)) {
+        warnedVersions.add(key);
+        void vscode.window.showWarningMessage(
+          `Q1Lens version mismatch: Python package ${report.packageVersion}, VS Code extension ${extensionVersion}. Update the Python package or VS Code extension so both use the same version. Python: ${report.executable}`,
+        );
+      }
+    }
     const source = current.source === "vscode" ? "VS Code" : current.source === "manual" ? "Manual" : "Notebook";
     const executable = current.report?.executable ?? current.pythonPath;
     const folder = dirname(executable);

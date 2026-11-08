@@ -32,6 +32,86 @@ function selection(index: Map<string, any>, id: string) {
 const empty = { relatedEventIds: [], appliedEventIds: [] };
 
 describe("Q1 timeline latched selection", () => {
+  it("navigates equal-duration conditional RT commands to their own uncertain-output block", () => {
+    const events = [event("wait-issue", "q1_issue", 0),
+      event("wait", "wait", 100, { q1_issue_event_id: "wait-issue" }),
+      event("conditional-issue", "q1_issue", 4),
+      event("conditional", "unknown_region", 200, {
+        q1_issue_event_id: "conditional-issue", conditional_timing_known: true, output_state_unknown: true,
+      }),
+      event("setting", "q1_issue", 8)];
+    const index = buildIndex({ events });
+    assert.equal(index.get("conditional").rtNavigationEventId, "conditional");
+    assert.equal(index.get("conditional-issue").rtNavigationEventId, "conditional");
+    assert.equal(index.get("setting").rtNavigationEventId, "conditional");
+  });
+
+  it("navigates to the next RT instruction in program order and retains the last RT for trailing Q1 commands", () => {
+    const events = [
+      event("setup", "q1_issue", 0),
+      event("issue", "q1_issue", 4, { rt_packet_id: "packet" }),
+      event("rt", "wait", 1000, { q1_issue_event_id: "issue" }),
+      event("other-issue", "q1_issue", 0, { rt_packet_id: "packet" }, { sequencer_id: "Other" }),
+      event("other-rt", "wait", 2000, { q1_issue_event_id: "other-issue" }, { sequencer_id: "Other" }),
+      event("setting", "q1_issue", 8),
+      event("repeat-issue", "q1_issue", 12, { rt_packet_id: "repeat" }),
+      event("repeat-rt", "wait", 1100, { q1_issue_event_id: "repeat-issue" }),
+      event("repeat-setting", "q1_issue", 16),
+    ];
+    const before = JSON.stringify(events);
+    const index = buildIndex({ events });
+    assert.equal(index.get("setup").rtPreparation, true);
+    assert.equal(index.get("setup").rtNavigationEventId, "rt");
+    assert.equal(index.get("setting").rtNavigationEventId, "repeat-rt");
+    assert.equal(index.get("repeat-setting").rtNavigationEventId, "repeat-rt");
+    for (const id of ["rt", "other-rt", "repeat-rt"]) assert.equal(index.get(id).rtNavigationEventId, id);
+    assert.equal(JSON.stringify(events), before);
+  });
+
+  it("navigates to the next RT in each branch alternative and retains its last RT at the end", () => {
+    const events = [event("common-issue", "q1_issue", 0),
+      event("common-rt", "wait", 100, { q1_issue_event_id: "common-issue" })];
+    for (const path of ["taken", "fallthrough"]) {
+      const branch = { branch_comparison_branch_id: "branch", branch_comparison_path: path };
+      events.push(event(`${path}-before`, "q1_issue", 4, branch),
+        event(`${path}-issue`, "q1_issue", 8, branch),
+        event(`${path}-rt`, "wait", 200, { ...branch, q1_issue_event_id: `${path}-issue` },
+          { lane: `branch_compare.${path}.rt.wait` }),
+        event(`${path}-after`, "q1_issue", 12, branch));
+    }
+    const index = buildIndex({ events });
+    for (const path of ["taken", "fallthrough"]) {
+      assert.equal(index.get(`${path}-before`).rtNavigationEventId, `${path}-rt`);
+      assert.equal(index.get(`${path}-after`).rtNavigationEventId, `${path}-rt`);
+    }
+  });
+
+  it("keeps next-RT navigation within each loop preview occurrence and diff version", () => {
+    const events = [event("issue", "q1_issue", 0),
+      event("rt", "wait", 100, { q1_issue_event_id: "issue" }),
+      event("tail", "q1_issue", 4)];
+    for (const iteration of [1, 2]) {
+      const preview = { loop_preview: "loop", loop_iteration_index: iteration };
+      events.push(event(`setup-${iteration}`, "q1_issue", 0, { ...preview, preview_source_event_id: "tail" }),
+        event(`issue-${iteration}`, "q1_issue", 4, { ...preview, preview_source_event_id: "issue" }),
+        event(`rt-${iteration}`, "wait", 100 + iteration * 4, {
+          ...preview, preview_source_event_id: "rt", q1_issue_event_id: `issue-${iteration}`,
+        }));
+    }
+    events.push(event("removed-setup", "q1_issue", 0, { diff_status: "removed" }),
+      event("removed-issue", "q1_issue", 4, { diff_status: "removed" }),
+      event("removed-rt", "wait", 200, { diff_status: "removed", q1_issue_event_id: "removed-issue" }));
+    const index = buildIndex({ events });
+    assert.equal(index.get("tail").rtNavigationEventId, "rt");
+    for (const iteration of [1, 2]) assert.equal(index.get(`setup-${iteration}`).rtNavigationEventId, `rt-${iteration}`);
+    assert.equal(index.get("removed-setup").rtNavigationEventId, "removed-rt");
+  });
+
+  it("leaves Q1-only programs without an invented RT target", () => {
+    const index = buildIndex({ events: [event("setup", "q1_issue", 0), event("add", "q1_issue", 4)] });
+    for (const id of ["setup", "add"]) assert.equal(index.get(id).rtNavigationEventId, undefined);
+  });
+
   it("shows the setter only on Q1 in both layouts and modes without removing IR state", () => {
     const ir = { events: [
       event("setter", "q1_issue", 0, { op: "set_freq" }), pending("pending", "setter"),

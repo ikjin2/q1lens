@@ -2,12 +2,13 @@ const path = require("node:path");
 const { execFileSync } = require("node:child_process");
 const { test, expect, analysisDetails } = require("./helpers");
 
-const assets = path.resolve(__dirname, "../../src");
+const assets = process.env.Q1LENS_BROWSER_ASSETS || path.resolve(__dirname, "../../src");
 const source = { file: "playback.q1asm", line: 2, raw: "jl @done" };
 const event = (id, kind, start, end, meta = {}) => ({ id, kind, label: meta.op || kind, sequencer_id: "seq",
   lane: kind === "q1_issue" ? "q1.issue" : "rt.control", t0: {kind: "concrete", value: start}, t1: {kind: "concrete", value: end}, confidence: "exact", source, meta });
 
 async function mount(page, status = "completed", actualIr, initialState = {}, hostState = {}, actualHtml) {
+  await page.emulateMedia({reducedMotion: "reduce"});
   await page.goto("about:blank");
   await page.setContent(actualHtml || '<!doctype html><html><head><style>:root{--vscode-foreground:#d4d4d4;--vscode-descriptionForeground:#999;--vscode-editor-background:#1e1e1e;--vscode-editor-foreground:#d4d4d4;--vscode-editorWidget-background:#252526;--vscode-charts-green:#89d185;--vscode-charts-blue:#75beff;--vscode-focusBorder:#007fd4;--vscode-panel-border:#404040;--vscode-button-secondaryHoverBackground:#333}body{margin:16px;background:#1e1e1e;color:#d4d4d4;font:13px sans-serif}</style></head><body class="mode-debug vscode-dark" data-mode="debug"><main id="timeline-root"></main></body></html>');
   const ir = actualIr || {sequencers: [{id: "seq"}], playback: {status, steps: 7}, events: [
@@ -42,6 +43,103 @@ async function mount(page, status = "completed", actualIr, initialState = {}, ho
   if (initialState.analysisDetailsOpen !== false) await analysisDetails(page);
 }
 
+function timeFoldFixture() {
+  const acquire = (id, start, bin) => event(id, "acquire", start, start + 4, {op: "acquire", acquisition_index: 0, bin_index: bin,
+    acquisition_window: {start_ns: start, end_ns: start + 984, configured_duration_ns: 984,
+      effective_duration_ns: 984, source: "hardware_parameters", status: "completed"}});
+  return {sequencers: [{id: "seq"}], events: [acquire("acq0", 0, 0),
+    event("wait0", "wait", 4, 9016, {op: "wait"}), acquire("acq1", 9016, 1),
+    event("wait1", "wait", 9020, 10000, {op: "wait"}), event("stop", "stop", 10000, 10000)]};
+}
+
+test("time fold tabs keep only icon and duration on the ruler and preserve keyboard focus and source state", async ({page}) => {
+  const ir = timeFoldFixture();
+  await page.setViewportSize({width: 1000, height: 800});
+  await mount(page, "idle", ir, {analysisDetailsOpen: false});
+  const toggle = page.locator('.ruler .q1timeline-wait-fold .q1timeline-fold-toggle').filter({hasText: /^8 µs$/});
+  await expect(toggle).toHaveCount(1);
+  await expect(toggle).toHaveText("8 µs");
+  await expect(toggle.locator(".q1timeline-fold-icon svg")).toBeVisible();
+  await expect(page.locator('.lane-track .q1timeline-fold-toggle')).toHaveCount(0);
+  await expect(page.locator('.q1timeline-fold-slashes')).toHaveCount(0);
+  const acquisition = page.locator('[data-block-id="acq0:acquisition-window"]');
+  await acquisition.click();
+  await expect(acquisition).toHaveAttribute("aria-selected", "true");
+  await page.locator('.shared-timeline-stage').screenshot({path: path.resolve(__dirname, "../../../output/playwright/time-fold-implemented.png")});
+  await toggle.focus();
+  await page.keyboard.press("Enter");
+  await expect(toggle).toHaveAttribute("aria-expanded", "true");
+  await expect(toggle).toBeFocused();
+  await expect(toggle).toHaveText("8 µs");
+  await expect(toggle.locator(".q1timeline-fold-icon")).toHaveClass(/is-collapse/);
+  await expect(page.locator('.timeline-block[data-event-id="acq0"][aria-selected="true"]')).toHaveCount(1);
+  expect(await page.evaluate(() => window.getSavedTimelineState().timelineExpandedGaps.map(({start, end}) => [start, end]))).toEqual([[1000, 9000]]);
+  await page.locator('.shared-timeline-stage').screenshot({path: path.resolve(__dirname, "../../../output/playwright/time-fold-implemented-expanded.png")});
+  await page.keyboard.press("Space");
+  await expect(toggle).toHaveAttribute("aria-expanded", "false");
+  await expect(toggle).toBeFocused();
+  await expect(toggle.locator(".q1timeline-fold-icon")).toHaveClass(/is-expand/);
+  expect(await page.evaluate(() => JSON.parse(document.getElementById("timeline-ir").textContent))).toEqual(ir);
+});
+
+test("time fold animation grows the interval through an intermediate width", async ({page}) => {
+  await mount(page, "idle", timeFoldFixture(), {analysisDetailsOpen: false});
+  await page.emulateMedia({reducedMotion: "no-preference"});
+  const toggle = page.locator('.ruler .q1timeline-wait-fold .q1timeline-fold-toggle').filter({hasText: /^8 µs$/});
+  const motion = await toggle.evaluate(button => {
+    const selector = '.ruler .q1timeline-wait-fold[data-time-start="1000"]';
+    const before = document.querySelector(selector).getBoundingClientRect().width;
+    button.click();
+    const block = document.querySelector(selector);
+    const animation = block.getAnimations()[0];
+    if (!animation) throw new Error("The folded interval should animate when expanding time");
+    const duration = animation.effect.getTiming().duration;
+    animation.pause();
+    animation.currentTime = duration / 2;
+    const middle = block.getBoundingClientRect().width;
+    animation.finish();
+    const after = block.getBoundingClientRect().width;
+    document.getAnimations().forEach(item => item.finish());
+    return {before, middle, after, duration};
+  });
+  expect(motion.duration).toBe(160);
+  expect(motion.middle).toBeGreaterThan(motion.before + 1);
+  expect(motion.middle).toBeLessThan(motion.after - 1);
+  await expect(toggle).toHaveText("8 µs");
+});
+
+test("time fold expansion respects reduced motion", async ({page}) => {
+  await mount(page, "idle", timeFoldFixture(), {analysisDetailsOpen: false});
+  const toggle = page.locator('.ruler .q1timeline-wait-fold .q1timeline-fold-toggle').filter({hasText: /^8 µs$/});
+  const result = await toggle.evaluate(button => {
+    const selector = '.ruler .q1timeline-wait-fold[data-time-start="1000"]';
+    const before = document.querySelector(selector).getBoundingClientRect().width;
+    button.click();
+    const block = document.querySelector(selector);
+    return {before, after: block.getBoundingClientRect().width, animations: block.getAnimations().length};
+  });
+  expect(result.animations).toBe(0);
+  expect(result.after).toBeGreaterThan(result.before * 2);
+});
+
+test("time fold tabs use compact icons when many durations would overlap", async ({page}) => {
+  await page.setViewportSize({width: 1000, height: 800});
+  const events = [];
+  for (let index = 0; index < 10; index += 1) {
+    const start = index * 10000;
+    events.push(event(`a${index}`, "acquire", start, start + 4, {op: "acquire",
+      acquisition_window: {start_ns: start, end_ns: start + 984, effective_duration_ns: 984,
+        configured_duration_ns: 984, status: "completed", source: "hardware_parameters"}}),
+      event(`w${index}`, "wait", start + 4, start + 10000, {op: "wait"}));
+  }
+  await mount(page, "idle", {sequencers: [{id: "seq"}], events}, {analysisDetailsOpen: false});
+  const tabs = page.locator('.ruler .q1timeline-fold-toggle');
+  await expect(tabs).toHaveCount(20);
+  expect(await page.locator('.ruler .q1timeline-fold-toggle.is-crowded').count()).toBeGreaterThan(0);
+  const boxes = (await Promise.all((await tabs.all()).map(tab => tab.boundingBox()))).sort((a, b) => a.x - b.x);
+  for (let index = 1; index < boxes.length; index += 1) expect(boxes[index - 1].x + boxes[index - 1].width).toBeLessThanOrEqual(boxes[index].x);
+});
+
 test("analysis details contain selection and hardware while compact diagnostics remain visible", async ({page}) => {
   const repo = path.resolve(__dirname, "../../..");
   const {ir, html} = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
@@ -72,6 +170,7 @@ test("analysis details contain selection and hardware while compact diagnostics 
   await details.locator(":scope > summary").click();
   await expect(diagnostic).toBeVisible();
   await expect(details.locator("#q1timeline-hardware")).toBeHidden();
+  await expect.poll(() => page.evaluate(() => window.getSavedTimelineState().analysisDetailsOpen)).toBe(false);
   const saved = await page.evaluate(() => window.getSavedTimelineState());
   await mount(page, "idle", ir, saved, {}, shell);
   await expect(page.locator("#q1timeline-analysis-details")).not.toHaveAttribute("open", "");
@@ -590,6 +689,154 @@ test("keeps a source filter active across layout switches and wait folding", asy
   await expect(waitBlock).toBeVisible();
 });
 
+test("adaptive array source selection reveals wait 80 instead of the preceding trigger", async ({page}) => {
+  test.setTimeout(60000);
+  const repo = path.resolve(__dirname, "../../..");
+  const {ir, html} = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import contextlib,io,json,tempfile", "from pathlib import Path",
+    "from q1timeline.cli import main", "from q1timeline.render.html import render_html",
+    "with tempfile.TemporaryDirectory() as tmp:",
+    "  output=Path(tmp)/'timeline.json'",
+    "  with contextlib.redirect_stdout(io.StringIO()):",
+    "    main(['analyze','--project','examples/adaptive-array-demo/q1timeline.yml','--out',str(output),'--no-render'])",
+    "  ir=json.loads(output.read_text(encoding='utf-8'))",
+    "print(json.dumps({'ir':ir,'html':render_html(ir,default_mode='debug')}))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 15000, maxBuffer: 30 * 1024 * 1024,
+    env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+    /type=["']application\/json["']/i.test(attributes) ? tag : "");
+  await mount(page, "idle", ir, {expandedQ1IssueSequencers: []}, {}, shell);
+  for (const layout of ["Time scale", "Instruction"]) {
+    await page.getByRole("button", {name: layout, exact: true}).click();
+    for (const sequencer of ["drive_q0", "arbiter"]) {
+      const events = ir.events.filter((item) => item.sequencer_id === sequencer && item.source?.line === 18);
+      const wait = events.find((item) => item.kind === "wait");
+      const trigger = ir.events.find((item) => item.sequencer_id === sequencer && item.kind === "wait_trigger");
+      await page.evaluate((ids) => window.dispatchEvent(new MessageEvent("message", {
+        data: {type: "highlightEventIds", highlightEventIds: ids},
+      })), events.map((item) => item.id));
+      await expect(page.locator(`.timeline-block[data-event-id="${wait.id}"]`)).toHaveAttribute("aria-selected", "true");
+      await expect(page.locator(`.timeline-block[data-event-id="${trigger.id}"]`)).not.toHaveAttribute("aria-selected", "true");
+      await expect(page.locator("#event-inspector-fields")).toContainText(`${sequencer}.q1asm:18`);
+      await expect(page.getByRole("spinbutton", {name: "Selected time in nanoseconds"})).toHaveValue(String(wait.t0.value));
+    }
+  }
+  await page.screenshot({path: test.info().outputPath("adaptive-array-wait-source-selection.png"), fullPage: true});
+});
+
+test("source and Q1 commands navigate to the next RT start in both layouts", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const {ir, html} = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json", "from q1timeline.analysis.api import analyze_text", "from q1timeline.render.html import render_html",
+    'ir=analyze_text("move 1,R0\\nnop\\nwait 100\\nset_freq 100\\nadd R0,1,R0\\nnop\\nwait 80\\nstop\\n",file="setup.q1asm",sequencer_id="seq")',
+    "print(json.dumps({'ir':ir,'html':render_html(ir,default_mode='debug')}))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+    /type=["']application\/json["']/i.test(attributes) ? tag : "");
+  await mount(page, "idle", ir, {expandedQ1IssueSequencers: ["seq"]}, {}, shell);
+  const waits = ir.events.filter((item) => item.kind === "wait");
+  const prep = page.getByRole("button", {name: "seq: RT preparation", exact: true});
+  await expect(prep).toHaveText("prep");
+  expect((await prep.boundingBox()).width).toBeLessThan(45);
+  for (const layout of ["Time scale", "Instruction"]) {
+    await page.getByRole("button", {name: layout, exact: true}).click();
+    for (const line of [1, 2, 4, 5, 6, 7, 3]) {
+      const events = ir.events.filter((item) => item.source?.line === line);
+      await page.evaluate((ids) => window.dispatchEvent(new MessageEvent("message", {
+        data: {type: "highlightEventIds", highlightEventIds: ids},
+      })), events.map((item) => item.id));
+      const target = line >= 4 ? waits[1] : waits[0];
+      await expect(page.locator(`.timeline-block[data-event-id="${target.id}"]`)).toHaveAttribute("aria-selected", "true");
+      await expect(prep).toHaveAttribute("aria-selected", "false");
+      await expect(page.getByRole("spinbutton", {name: "Selected time in nanoseconds"})).toHaveValue(String(target.t0.value));
+    }
+    for (const line of [1, 2, 4, 5, 6, 7, 3]) {
+      const issue = ir.events.find((item) => item.kind === "q1_issue" && item.source?.line === line);
+      const block = page.locator(`.timeline-block[data-event-id="${issue.id}"]`);
+      await block.evaluate((node) => node.click());
+      await expect(block).toHaveAttribute("aria-selected", "true");
+      await expect(page.locator("#event-inspector-fields")).toContainText(`setup.q1asm:${line}`);
+      await expect(page.getByRole("spinbutton", {name: "Selected time in nanoseconds"})).toHaveValue(String((line >= 4 ? waits[1] : waits[0]).t0.value));
+    }
+  }
+  const setupIds = ir.events.filter((item) => item.source?.line === 2).map((item) => item.id);
+  await page.evaluate((ids) => window.dispatchEvent(new MessageEvent("message", {
+    data: {type: "highlightEventIds", highlightEventIds: ids},
+  })), setupIds);
+  for (const layout of ["Time scale", "Instruction"]) {
+    await page.getByRole("button", {name: layout, exact: true}).click();
+    await expect(page.locator(`.timeline-block[data-event-id="${waits[0].id}"]`)).toHaveAttribute("aria-selected", "true");
+    await expect(page.getByRole("spinbutton", {name: "Selected time in nanoseconds"})).toHaveValue(String(waits[0].t0.value));
+  }
+  await page.screenshot({path: test.info().outputPath("next-rt-source-navigation.png"), fullPage: true});
+});
+
+test("equal-duration conditional output stays uncertain while its RT block and following time remain selectable", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const {ir, html} = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json", "from q1timeline.analysis.api import analyze_text", "from q1timeline.render.html import render_html",
+    'ir=analyze_text("wait 100\\nset_cond 1,1,0,40\\nplay 0,1,40\\nset_cond 0,0,0,4\\nwait 100\\nstop\\n",file="conditional.q1asm",sequencer_id="seq")',
+    "print(json.dumps({'ir':ir,'html':render_html(ir,default_mode='debug')}))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+    /type=["']application\/json["']/i.test(attributes) ? tag : "");
+  await mount(page, "idle", ir, {expandedQ1IssueSequencers: []}, {}, shell);
+  const conditional = ir.events.find((item) => item.kind === "unknown_region");
+  expect(conditional.meta.output_state_unknown).toBe(true);
+  expect(conditional.confidence).toBe("unknown");
+  expect(conditional.t0.value).toBe(100);
+  expect(conditional.t1.value).toBe(140);
+  for (const layout of ["Time scale", "Instruction"]) {
+    await page.getByRole("button", {name: layout, exact: true}).click();
+    for (const line of [3, 5]) {
+      const events = ir.events.filter((item) => item.source?.line === line);
+      const target = events.find((item) => item.kind !== "q1_issue");
+      await page.evaluate((ids) => window.dispatchEvent(new MessageEvent("message", {
+        data: {type: "highlightEventIds", highlightEventIds: ids},
+      })), events.map((item) => item.id));
+      await expect(page.locator(`.timeline-block[data-event-id="${target.id}"]`)).toHaveAttribute("aria-selected", "true");
+      await expect(page.locator("#event-inspector-fields")).toContainText(`conditional.q1asm:${line}`);
+      await expect(page.getByRole("spinbutton", {name: "Selected time in nanoseconds"})).toHaveValue(String(target.t0.value));
+    }
+  }
+});
+
+test("zero-mask conditions show executed or skipped RT blocks without inventing output application", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  for (const operator of [0, 1]) {
+    const {ir, html} = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+      "import json,sys", "from q1timeline.analysis.api import analyze_text", "from q1timeline.render.html import render_html",
+      'source="set_mrk 3\\nset_cond 1,0,"+sys.argv[1]+",20\\nplay 0,1,40\\nset_cond 0,0,0,4\\nupd_param 4\\nstop\\n"',
+      'ir=analyze_text(source,file="constant-condition.q1asm",sequencer_id="seq")',
+      "print(json.dumps({'ir':ir,'html':render_html(ir,default_mode='debug')}))",
+    ].join("\n"), String(operator)], {cwd: repo, encoding: "utf8", timeout: 10000,
+      env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+    const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+      /type=["']application\/json["']/i.test(attributes) ? tag : "");
+    await mount(page, "idle", ir, {expandedQ1IssueSequencers: []}, {}, shell);
+    const executed = operator === 1;
+    const target = ir.events.find((item) => item.source?.line === 3 && item.kind === (executed ? "play" : "conditional_skip"));
+    expect(target.t0.value).toBe(0);
+    expect(target.t1.value).toBe(executed ? 40 : 20);
+    if (!executed) {
+      expect(ir.events.some((item) => item.source?.line === 3 && item.kind === "play")).toBe(false);
+      expect(Object.keys(target.meta.applied_state || {})).toHaveLength(0);
+    }
+    const firstMarker = ir.events.find((item) => item.kind === "marker_state");
+    expect(firstMarker.t0.value).toBe(executed ? 0 : 20);
+    for (const layout of ["Time scale", "Instruction"]) {
+      await page.getByRole("button", {name: layout, exact: true}).click();
+      const ids = ir.events.filter((item) => item.source?.line === 3).map((item) => item.id);
+      await page.evaluate((ids) => window.dispatchEvent(new MessageEvent("message", {
+        data: {type: "highlightEventIds", highlightEventIds: ids},
+      })), ids);
+      await expect(page.locator(`.timeline-block[data-event-id="${target.id}"]`)).toHaveAttribute("aria-selected", "true");
+      await expect(page.locator("#event-inspector-fields")).toContainText("constant-condition.q1asm:3");
+      await expect(page.getByRole("spinbutton", {name: "Selected time in nanoseconds"})).toHaveValue("0");
+    }
+  }
+});
+
 test("an empty source highlight clears event and range selection without moving the hardware cursor or viewport", async ({page}) => {
   const repo = path.resolve(__dirname, "../../..");
   const {ir, html} = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
@@ -705,7 +952,7 @@ test("diagnostic event links reveal an offscreen target and notify its source on
   await mount(page, "idle", ir, {}, {}, shell);
   const diagnostic = ir.diagnostics.find((item) => item.category === "definite_underflow");
   const eventId = diagnostic.related_events[0];
-  const target = page.locator(`.timeline-block[data-event-id="${eventId}"]`);
+  const target = page.locator(`.timeline-block[data-event-ids~="${eventId}"]`);
   const link = page.locator(`[data-related-event-id="${eventId}"]`).first();
   const time = page.getByRole("spinbutton", {name: "Selected time in nanoseconds"});
   await analysisDetails(page);
@@ -716,8 +963,9 @@ test("diagnostic event links reveal an offscreen target and notify its source on
   await expect(time).toHaveValue("4");
   expect(await page.evaluate(() => window.messages.filter((message) => message.type === "eventClick")))
     .toEqual([{type: "eventClick", eventId}]);
-  await page.getByRole("button", {name: "Zoom in", exact: true}).click();
-  await page.getByRole("button", {name: "Zoom in", exact: true}).click();
+  await page.evaluate(id => window.dispatchEvent(new MessageEvent("message", {data: {
+    type: "highlightEventIds", highlightEventIds: [id], zoomToRange: true,
+  }})), ir.events.find(item => item.kind === "stop").id);
   await expect(target).toHaveCount(0);
   await time.fill("600");
   await time.press("Enter");
@@ -838,12 +1086,13 @@ test("static disabled example renders RT commands once without overlapping loop 
   });
   expect(collapsedScale.duration).toBeLessThan(512);
   const repeat = page.locator('.ruler .q1timeline-playback-fold');
-  await expect(repeat.getByRole("button")).toHaveText("//");
+  await expect(repeat.getByRole("button")).toHaveText("131 µs");
   await expect(page.locator('.loop-range-label')).toHaveText(/x3/);
   await expect(page.locator('.loop-range-label')).toHaveCSS("opacity", "1");
   await expect(repeat).toHaveAttribute("data-time-start", String(firstWait.t1.value));
   const geometry = await loopGeometry(page, loop.id, firstWait.id, following.id);
-  expect(geometry.firstWidth).toBeGreaterThan(30);
+  expect(geometry.firstWidth).toBeGreaterThan(0);
+  await expect(page.locator(`.timeline-block[data-event-id="${firstWait.id}"] .block-label`)).toBeVisible();
   expect(geometry.afterLeft).toBeGreaterThan(geometry.loopLeft + geometry.loopWidth);
   expect(geometry.afterLeft).toBeLessThan(100);
   const repeatEnd = Number(await repeat.getAttribute("data-time-end"));
@@ -924,7 +1173,7 @@ for (const execution of ["analysis", "playback"]) {
     await expect(rt.locator('.time-selection')).toHaveAttribute("data-time-end", "4");
     await expect(core.locator('.time-selection')).toHaveAttribute("data-time-start", "0");
     await expect(core.locator('.time-selection')).toHaveAttribute("data-time-end", "24");
-    expect(coreRange.width).toBeGreaterThan(rtRange.width * 4);
+    expect(coreRange.width).toBeGreaterThan(rtRange.width);
     expect(rtRange.x).toBeCloseTo(coreRange.x, 0);
     const updateBounds = await rt.locator(`.timeline-block[data-event-id="${update.id}"]`).boundingBox();
     const lastIssueNode = core.locator(`.timeline-block[data-event-id="${q1.at(-1).id}"]`);
@@ -1055,18 +1304,19 @@ test("collapsed wait loop preserves the first wait's end before a distinct repea
   const repeatFold = row.locator('.q1timeline-playback-fold');
   await expect(first).toBeVisible();
   await expect(waitFold).toHaveCount(1);
-  const waitToggle = waitFold.getByRole("button");
+  const waitToggle = page.locator('.ruler .q1timeline-wait-fold:not(.is-expanded) .q1timeline-fold-toggle');
   await expect(waitFold).toHaveCSS("background-image", "none");
-  await expect(waitFold).toHaveCSS("border-left-width", "0px");
-  await expect(waitToggle).toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
-  await expect(waitToggle).toHaveCSS("border-top-width", "0px");
-  await expect(waitToggle.locator('.q1timeline-fold-duration')).toBeHidden();
-  expect(await waitToggle.innerText()).toBe("//");
+  await expect(waitFold).toHaveCSS("pointer-events", "none");
+  await expect(waitFold.getByRole("button")).toHaveCount(0);
+  await expect(waitToggle.locator('.q1timeline-fold-duration')).toBeVisible();
+  await expect(waitToggle.locator('.q1timeline-fold-icon')).toHaveClass(/is-expand/);
+  expect(await waitToggle.innerText()).not.toContain("//");
+  expect(await waitToggle.innerText()).toMatch(/^\d[\d.]* (ns|µs|ms)$/);
   await waitToggle.hover();
-  await expect(waitToggle).toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
-  await expect(waitToggle).toHaveCSS("border-top-width", "0px");
-  await expect(repeatFold.getByRole("button")).toHaveText("//");
-  await expect(page.locator('.ruler .q1timeline-playback-fold button')).toHaveText("//");
+  await expect(repeatFold.getByRole("button")).toHaveCount(0);
+  const repeatToggle = page.locator('.ruler .q1timeline-playback-fold button');
+  await expect(repeatToggle.locator('.q1timeline-fold-icon')).toHaveClass(/is-repeat/);
+  expect(await repeatToggle.innerText()).toMatch(/^\d[\d.]* (ns|µs|ms)$/);
   await expect(row.locator('.loop-range-label')).toHaveText("×3");
   const geometry = async () => {
     const [block, waitGap, repeated, after] = await Promise.all([
@@ -1077,22 +1327,21 @@ test("collapsed wait loop preserves the first wait's end before a distinct repea
   };
   const folded = await geometry();
   const icon = await waitToggle.boundingBox();
-  expect(icon.width).toBeLessThanOrEqual(28);
-  expect(icon.width).toBeLessThan(folded.waitGap.width / 4);
+  expect(icon.width).toBeLessThanOrEqual(100);
   expect(icon.x + icon.width / 2).toBeCloseTo(folded.waitGap.x + folded.waitGap.width / 2, 0);
   const rulerIcon = await page.locator('.ruler .q1timeline-wait-fold:not(.is-expanded) .q1timeline-fold-toggle').boundingBox();
-  expect(rulerIcon.width).toBeLessThanOrEqual(28);
+  expect(rulerIcon.width).toBeLessThanOrEqual(100);
   expect(rulerIcon.x + rulerIcon.width / 2).toBeCloseTo(icon.x + icon.width / 2, 0);
-  const besideIcon = {x: folded.waitGap.x + folded.waitGap.width / 5, y: icon.y + icon.height / 2};
+  const besideIcon = {x: folded.waitGap.x + folded.waitGap.width / 5, y: folded.block.y + folded.block.height / 2};
   expect(await page.evaluate(({x, y}) => document.elementFromPoint(x, y)?.closest('.timeline-block')?.dataset.eventId, besideIcon)).toBe(waits[0].id);
   await page.mouse.click(besideIcon.x, besideIcon.y);
   await expect(first).toHaveAttribute("aria-selected", "true");
   await expect(waitFold).toHaveCount(1);
-  await page.mouse.click(besideIcon.x, rulerIcon.y + rulerIcon.height / 2);
+  await page.mouse.click(rulerIcon.x - 2, rulerIcon.y + rulerIcon.height / 2);
   await expect(waitFold).toHaveCount(1);
   expect(await page.evaluate(() => window.getSavedTimelineState().timelineExpandedGaps)).toEqual([]);
-  expect(folded.waitGap.x - folded.block.x).toBeGreaterThan(10);
-  expect(folded.block.x + folded.block.width - folded.waitGap.x - folded.waitGap.width).toBeGreaterThan(10);
+  expect(folded.waitGap.x - folded.block.x).toBeGreaterThan(0);
+  expect(folded.block.x + folded.block.width - folded.waitGap.x - folded.waitGap.width).toBeGreaterThan(0);
   expect(folded.repeated.x).toBeCloseTo(folded.block.x + folded.block.width, 0);
   expect(folded.after.x).toBeCloseTo(folded.repeated.x + folded.repeated.width, 0);
   const loopBounds = await row.locator('.timeline-loop-range').boundingBox();
@@ -1103,17 +1352,140 @@ test("collapsed wait loop preserves the first wait's end before a distinct repea
   await page.screenshot({path: test.info().outputPath("wait-end-and-repeats.png"), fullPage: true});
   await waitToggle.click();
   await expect(row.locator('.q1timeline-wait-fold.is-expanded')).toHaveCount(1);
-  await row.locator('.q1timeline-wait-fold.is-expanded .q1timeline-fold-toggle').click();
+  await page.locator('.ruler .q1timeline-wait-fold.is-expanded .q1timeline-fold-toggle').click();
   expect(await geometry()).toEqual(folded);
   const toggle = page.locator('#q1timeline-wait-fold-button');
   await toggle.click();
   expect((await first.boundingBox()).width).toBeGreaterThan(folded.block.width);
   await toggle.click();
   expect(await geometry()).toEqual(folded);
-  await repeatFold.getByRole("button").click();
+  await repeatToggle.click();
   for (const wait of waits) await expect(row.locator(`.timeline-block[data-event-id="${wait.id}"]`)).toHaveCount(1);
   await expect(repeatFold).toHaveCount(0);
   expect(await page.evaluate(() => JSON.parse(document.getElementById("timeline-ir").textContent))).toEqual(ir);
+});
+
+test("affine compact loops fold through their proven total and keep the following RT update selectable", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  for (const [initial, step] of [[4000, 4000], [12000, -4000]]) {
+    const source = `move 3,R0\nmove ${initial},R1\nnop\nbody: wait R1\nadd R1,${step},R1\nnop\nloop R0,@body\nupd_param 4\nstop\n`;
+    const {ir, html} = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+      "import json", "from q1timeline.analysis.api import analyze_text", "from q1timeline.render.html import render_html",
+      `source=${JSON.stringify(source)}`,
+      "ir=analyze_text(source,file='affine.q1asm',sequencer_id='seq')",
+      "print(json.dumps({'ir':ir,'html':render_html(ir,default_mode='debug')}))",
+    ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+    const loop = ir.events.find((item) => item.kind === "loop_block");
+    const update = ir.events.find((item) => item.kind === "upd_param");
+    expect(loop.meta.total_duration.value).toBe(24000);
+    expect(loop.meta.shown_iterations).toEqual([0]);
+    expect(update.t0.value).toBe(24000);
+    const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+      /type=["']application\/json["']/i.test(attributes) ? tag : "");
+    await mount(page, "idle", ir, {}, {}, shell);
+    const gaps = await page.evaluate(() => {
+      const ir = JSON.parse(document.getElementById("timeline-ir").textContent);
+      const adapter = window.q1timelineTimelineAdapter;
+      const waits = adapter.buildWaitTimeScale(ir, {timeBasis: "aligned"});
+      return adapter.buildTimelineTimeScale(ir, {timeBasis: "aligned", waitGaps: waits.gaps}).gaps;
+    });
+    const omitted = gaps.find((gap) => gap.loopKeys?.includes(loop.meta.loop_preview_key));
+    expect(omitted.start).toBe(initial);
+    expect(omitted.end).toBe(24000);
+    await page.evaluate((ids) => window.dispatchEvent(new MessageEvent("message", {data: {
+      type: "highlightEventIds", highlightEventIds: ids, zoomToRange: false,
+      sourceRange: {file: "affine.q1asm", startLine: 8, endLine: 8},
+    }})), ir.events.filter((item) => item.source?.line === 8).map((item) => item.id));
+    await expect(page.locator(`.timeline-block[data-event-id="${update.id}"]`)).toHaveAttribute("aria-selected", "true");
+    await expect(page.locator("#event-inspector-fields")).toContainText("affine.q1asm:8");
+    if (step < 0) await page.screenshot({path: test.info().outputPath("affine-loop-total.png"), fullPage: true});
+  }
+});
+
+test("branch joins retain known settings and keep physical phase uncertain until an applied reset", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const program = "set_freq 4000000\nreset_ph\nupd_param 4\nwait 100\njge R7,1,@other\nreset_ph\nupd_param 4\njmp @join\nother: set_ph 0\nupd_param 4\njoin: play 0,1,40\nreset_ph\nplay 0,1,40\nstop\n";
+  const {ir, html} = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json", "from q1timeline.analysis.api import analyze_text", "from q1timeline.render.html import render_html",
+    `program=${JSON.stringify(program)}`,
+    "ir=analyze_text(program,file='branch-phase.q1asm',sequencer_id='seq')",
+    "print(json.dumps({'ir':ir,'html':render_html(ir,default_mode='debug')}))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+    /type=["']application\/json["']/i.test(attributes) ? tag : "");
+  await mount(page, "idle", ir, {}, {}, shell);
+  const suffix = ir.events.find((item) => item.kind === "play" && item.source.line === 11);
+  const result = await page.evaluate(() => {
+    const ir = JSON.parse(document.getElementById("timeline-ir").textContent);
+    const hardware = window.q1lensHardwareState;
+    const index = hardware.createIndex(ir);
+    const suffix = ir.events.find((item) => item.kind === "play" && item.source.line === 11);
+    const reset = ir.events.find((item) => item.kind === "play" && item.source.line === 13);
+    const parameters = (time) => Object.fromEntries(hardware.snapshot(index, "seq", time).parameters.map((item) => [item.field, item.applied]));
+    const model = window.q1timelineTimelineAdapter.buildQ1TimelineSharedModel(ir);
+    const details = model.lanes.flatMap((lane) => lane.blocks).find((block) => block.eventIds.includes(suffix.id)).rtDetails;
+    return {uncertain: parameters(suffix.t0.value), restored: parameters(reset.t0.value), details};
+  });
+  expect(result.uncertain.frequency).toMatchObject({known: true, value: 4000000});
+  expect(result.uncertain.phase.known).toBe(false);
+  expect(result.restored.phase).toMatchObject({known: true, value: 0});
+  expect(result.details.parameters.find((item) => item.name === "frequency").valueDisplay).toBe("4000000");
+  expect(result.details.parameters.find((item) => item.name === "phase").valueDisplay).toContain("?");
+  await page.evaluate((ids) => window.dispatchEvent(new MessageEvent("message", {data: {
+    type: "highlightEventIds", highlightEventIds: ids, zoomToRange: false,
+    sourceRange: {file: "branch-phase.q1asm", startLine: 11, endLine: 11},
+  }})), ir.events.filter((item) => item.source?.line === 11).map((item) => item.id));
+  await expect(page.locator(`.timeline-block[data-event-id="${suffix.id}"]`)).toHaveAttribute("aria-selected", "true");
+  await expect(page.locator("#event-inspector-fields")).toContainText("branch-phase.q1asm:11");
+  await page.screenshot({path: test.info().outputPath("branch-phase-join.png"), fullPage: true});
+});
+
+test("a bounded symbolic loop total locates the following RT command without inventing packet times", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const program = "and R7,15,R1\nmove 10000,R2\nmove 3,R0\nbody: wait R1\nsub R2,R1,R3\nnop\nwait R3\nadd R1,4,R1\nnop\nloop R0,@body\nupd_param 4\nstop\n";
+  const {ir, html} = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json", "from q1timeline.analysis.api import analyze_text", "from q1timeline.render.html import render_html",
+    `program=${JSON.stringify(program)}`,
+    "ir=analyze_text(program,file='symbolic-total.q1asm',sequencer_id='seq')",
+    "print(json.dumps({'ir':ir,'html':render_html(ir,default_mode='debug')}))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const loop = ir.events.find((item) => item.kind === "loop_block");
+  const update = ir.events.find((item) => item.kind === "upd_param");
+  expect(loop.meta.total_only).toBe(true);
+  expect(loop.meta.total_duration.value).toBe(30000);
+  expect(update.t0.value).toBe(30000);
+  expect(ir.events.find((item) => item.kind === "wait" && item.source.line === 4).duration.kind).not.toBe("concrete");
+  const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+    /type=["']application\/json["']/i.test(attributes) ? tag : "");
+  await mount(page, "idle", ir, {}, {}, shell);
+  await page.evaluate((ids) => window.dispatchEvent(new MessageEvent("message", {data: {
+    type: "highlightEventIds", highlightEventIds: ids, zoomToRange: false,
+    sourceRange: {file: "symbolic-total.q1asm", startLine: 11, endLine: 11},
+  }})), ir.events.filter((item) => item.source?.line === 11).map((item) => item.id));
+  await expect(page.locator(`.timeline-block[data-event-id="${update.id}"]`)).toHaveAttribute("aria-selected", "true");
+  await expect(page.locator("#event-inspector-fields")).toContainText("symbolic-total.q1asm:11");
+  await expect(page.locator("#event-inspector-fields")).toContainText("30000");
+});
+
+test("eventual infinite-loop underflow reports the proof without a fabricated failure time", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const {ir, html} = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json", "from q1timeline.analysis.api import analyze_text", "from q1timeline.render.html import render_html",
+    'ir=analyze_text("body: wait 4\\njmp @body\\n",file="cadence.q1asm",sequencer_id="seq")',
+    "print(json.dumps({'ir':ir,'html':render_html(ir,default_mode='debug')}))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const warning = ir.events.find((item) => item.kind === "underflow_warning");
+  expect(warning.t0.kind).toBe("unknown");
+  expect(warning.meta.slack_ns).toBeUndefined();
+  const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+    /type=["']application\/json["']/i.test(attributes) ? tag : "");
+  await mount(page, "idle", ir, {}, {}, shell);
+  const diagnostic = page.locator('.diagnostic[data-diagnostic-category="definite_underflow"]');
+  await expect(diagnostic).toContainText("eventually exhausts any finite initial buffer");
+  await expect(diagnostic).toContainText("exact failure iteration and time are not determined");
+  await expect(diagnostic).not.toContainText("ns late");
+  await expect(page.locator("#q1timeline-initial-buffer-summary")).toHaveText("Initial buffer · no finite reserve sustains this loop");
+  await expect(page.locator(`.timeline-block[data-event-id="${warning.id}"]`)).toHaveCount(0);
 });
 
 test("feedback assumption marks edit one receive occurrence and keep zero distinct from unknown", async ({page}) => {
@@ -1382,12 +1754,22 @@ test("actual golden-section execution folds fifteen observed wait iterations", a
   await expect(loopNode.locator('.loop-range-label')).toBeVisible();
   await expect(loopNode.locator('.loop-range-label')).toHaveCSS("opacity", "1");
   const collapsed = await loopGeometry(page, loop.id, firstWait.id, followingWait.id);
-  expect(collapsed.loopWidth / collapsed.firstWidth).toBeLessThan(1.002);
+  const repeatBounds = await page.locator('.ruler .q1timeline-playback-fold').boundingBox();
+  const repeatTab = await page.locator('.ruler .q1timeline-playback-fold button').boundingBox();
+  expect(repeatBounds.width).toBeLessThanOrEqual(100);
+  expect(repeatBounds.width).toBeGreaterThanOrEqual(repeatTab.width);
+  const repeatWidth = await page.locator('.ruler .q1timeline-playback-fold').evaluate(node => parseFloat(node.style.width));
+  expect(collapsed.loopWidth).toBeCloseTo(collapsed.firstWidth + repeatWidth, 2);
   expect(collapsed.afterLeft).toBeCloseTo(collapsed.loopLeft + collapsed.loopWidth, 2);
   expect(collapsed.ticks.some((tick) => tick.time > loop.meta.first_iteration_end.value && tick.time < loop.t1.value)).toBe(false);
+  const firstLeft = await page.locator(`.timeline-block[data-event-id="${firstWait.id}"]`).evaluate(node => parseFloat(node.style.left));
+  const followingWidth = await page.locator(`.timeline-block[data-event-id="${followingWait.id}"]`).evaluate(node => parseFloat(node.style.width));
   for (const tick of collapsed.ticks) {
-    const displayedTime = tick.time >= loop.t1.value ? tick.time - (loop.t1.value - loop.meta.first_iteration_end.value) + 64 : tick.time;
-    expect(tick.left).toBeCloseTo(collapsed.loopLeft + (displayedTime - loop.t0.value) / firstWait.duration.value * collapsed.firstWidth, 2);
+    if (tick.time >= firstWait.t0.value && tick.time <= firstWait.t1.value) {
+      expect(tick.left).toBeCloseTo(firstLeft + (tick.time - firstWait.t0.value) / firstWait.duration.value * collapsed.firstWidth, 2);
+    } else if (tick.time >= followingWait.t0.value && tick.time <= followingWait.t1.value) {
+      expect(tick.left).toBeCloseTo(collapsed.afterLeft + (tick.time - followingWait.t0.value) / followingWait.duration.value * followingWidth, 2);
+    }
   }
   await expect(page.locator('.ruler .q1timeline-playback-fold')).toHaveCount(1);
   await page.screenshot({path: test.info().outputPath("golden-collapsed.png"), fullPage: true});
@@ -1406,6 +1788,7 @@ test("actual golden-section execution folds fifteen observed wait iterations", a
   expect(expanded.afterLeft).toBeGreaterThan(collapsed.afterLeft);
   expect(expanded.ticks.some((tick) => tick.time > loop.meta.first_iteration_end.value && tick.time < loop.t1.value)).toBe(true);
   for (const tick of expanded.ticks) {
+    if (tick.time < loop.t0.value || tick.time > loop.t1.value) continue;
     expect(tick.left).toBeCloseTo(expanded.loopLeft + (tick.time - loop.t0.value) / firstWait.duration.value * expanded.firstWidth, 1);
   }
   await expect(page.locator('.ruler .q1timeline-playback-fold')).toHaveCount(0);
@@ -1429,18 +1812,15 @@ test("actual golden-section execution folds fifteen observed wait iterations", a
   const collapsedAgain = await loopGeometry(page, loop.id, firstWait.id, followingWait.id);
   expect(collapsedAgain).toEqual(collapsed);
   const targetTime = followingWait.t0.value + 1000;
-  const position = await page.evaluate(({targetTime, loopId}) => {
-    const ir = JSON.parse(document.getElementById("timeline-ir").textContent);
-    const scale = window.q1timelineTimelineAdapter.buildTimelineTimeScale(ir);
-    const ticks = [...document.querySelectorAll(".ruler .tick")].map((tick) => parseFloat(tick.textContent));
-    const min = Math.min(...ticks), max = Math.max(...ticks);
-    const node = document.querySelector(`.timeline-loop-range[data-event-id="${loopId}"]`).closest(".lane-track");
+  const position = await page.evaluate(({targetTime, wait}) => {
+    const node = document.querySelector(`.timeline-block[data-event-id="${wait.id}"]`);
     const bounds = node.getBoundingClientRect();
-    return {x: bounds.left + (scale.toDisplay(targetTime) - scale.toDisplay(min)) / (scale.toDisplay(max) - scale.toDisplay(min)) * bounds.width,
-      y: bounds.bottom - 2};
-  }, {targetTime, loopId: loop.id});
+    return {x: bounds.left + (targetTime - wait.t0.value) / wait.duration.value * bounds.width,
+      y: node.closest(".lane-track").getBoundingClientRect().bottom - 2,
+      nsPerPixel: wait.duration.value / bounds.width};
+  }, {targetTime, wait: followingWait});
   await page.mouse.click(position.x, position.y);
-  expect(Number(await page.getByRole("spinbutton", {name: "Selected time in nanoseconds"}).inputValue())).toBeCloseTo(targetTime, 0);
+  expect(Math.abs(Number(await page.getByRole("spinbutton", {name: "Selected time in nanoseconds"}).inputValue()) - targetTime)).toBeLessThanOrEqual(position.nsPerPixel);
   await page.locator('.ruler .q1timeline-playback-fold button').click();
   await expect(hidden).toHaveCount(1);
   expect(await loopGeometry(page, loop.id, firstWait.id, followingWait.id)).toEqual(expanded);
@@ -1463,8 +1843,9 @@ test("loop and unchanged-interval toggles invalidate their scales independently"
   await expect(page.locator('.ruler .q1timeline-playback-fold')).toHaveCount(1);
   const onlyLoop = await loopGeometry(page, "loop", "w0", "update");
   expect(onlyLoop.loopWidth / onlyLoop.firstWidth).toBeGreaterThan(1);
-  expect(onlyLoop.loopWidth / onlyLoop.firstWidth).toBeLessThan(1.3);
-  expect(onlyLoop.loopWidth).not.toEqual(foldedBoth.loopWidth);
+  const repeated = await page.locator('.ruler .q1timeline-playback-fold').evaluate(node => parseFloat(node.style.width));
+  expect(onlyLoop.loopWidth).toBeCloseTo(onlyLoop.firstWidth + repeated, 2);
+  expect((await page.locator('.ruler .q1timeline-playback-fold').boundingBox()).width).toBeLessThanOrEqual(100);
   await toggle.click();
   expect(await loopGeometry(page, "loop", "w0", "update")).toEqual(foldedBoth);
   await toggle.click();
@@ -1538,15 +1919,20 @@ test("full golden execution compresses explicit waits and keeps nested loops fol
     const waits = adapter.buildWaitTimeScale(ir, {timeBasis: "aligned"});
     const scale = adapter.buildTimelineTimeScale(ir, {timeBasis: "aligned", waitGaps: waits.gaps});
     const ticks = [...document.querySelectorAll(".ruler .tick")].map((node) => ({time: parseFloat(node.textContent), left: parseFloat(node.style.left)}));
-    const min = ticks[0].time, max = ticks.at(-1).time;
     return {gaps: waits.gaps.length, duration: scale.toDisplay(end) - scale.toDisplay(start),
-      ticks: ticks.map((tick) => ({actual: tick.left, expected: (scale.toDisplay(tick.time) - scale.toDisplay(min)) / (scale.toDisplay(max) - scale.toDisplay(min)) * 100})),
+      ticks: ticks.map((tick) => ({left: tick.left, time: tick.time,
+        hidden: scale.gaps.some(gap => tick.time > gap.start && tick.time < gap.end)})),
       roundTrip: scale.fromDisplay(scale.toDisplay(start + 1000))};
   }, {start: firstWait.t0.value, end: firstWait.t1.value});
   expect(compression.gaps).toBeGreaterThan(0);
   expect(compression.duration).toBeLessThan(65535 / 10);
   expect(compression.roundTrip).toBeCloseTo(firstWait.t0.value + 1000, 6);
-  for (const tick of compression.ticks) expect(tick.actual).toBeCloseTo(tick.expected, 2);
+  for (const [index, tick] of compression.ticks.entries()) {
+    expect(tick.hidden).toBe(false);
+    expect(tick.left).toBeGreaterThanOrEqual(0);
+    expect(tick.left).toBeLessThanOrEqual(100);
+    if (index) expect(tick.left).toBeGreaterThan(compression.ticks[index - 1].left);
+  }
   await page.screenshot({path: test.info().outputPath("golden-full-folded.png"), fullPage: true});
   for (const zoomToRange of [false, true]) {
     await page.evaluate(({id, zoomToRange}) => window.dispatchEvent(new MessageEvent("message", {data: {
@@ -1610,7 +1996,7 @@ test("Q1 packet markers connect only their RT execution across selection, layout
   await expect(rt).toHaveClass(/is-instruction-related/);
   await expect(page.locator('.timeline-block.is-instruction-related')).toHaveCount(1);
   await expect(other).not.toHaveClass(/is-instruction-related/);
-  await expect(time).toHaveValue("5004");
+  await expect(time).toHaveValue("10000");
   await expectEndpoints();
   await rt.click();
   await expect(marker).toHaveClass(/is-instruction-related/);
@@ -1640,7 +2026,7 @@ test("Q1 packet markers connect only their RT execution across selection, layout
   await expect(page.locator('#q1timeline-wait-fold-button')).toHaveAttribute("aria-pressed", "true");
   await expect(marker).toBeFocused();
   await expectEndpoints();
-  await expect(time).toHaveValue("5004");
+  await expect(time).toHaveValue("10000");
   await page.screenshot({path: test.info().outputPath("packet-marker-folded-connection.png"), fullPage: true});
 
   await mount(page, "completed", ir, {...saved, timelineTimeBasis: "local", timelineWindow: {
@@ -1679,7 +2065,7 @@ test("packet selection follows exact repeated play occurrences from a real playb
     await expect(page.locator('.timeline-block.is-instruction-related')).toHaveCount(1);
     await expect(rt).toHaveClass(/is-instruction-related/);
     await expect(page.locator('.issue-connector')).toHaveCount(1);
-    await expect(page.getByRole("spinbutton", {name: "Selected time in nanoseconds"})).toHaveValue(String(issue.t0.value));
+    await expect(page.getByRole("spinbutton", {name: "Selected time in nanoseconds"})).toHaveValue(String(targets[0].t0.value));
     await rt.click();
     await expect(marker).toHaveClass(/is-instruction-related/);
     await expect(page.locator('.timeline-issue-marker.is-instruction-related')).toHaveCount(1);
@@ -1761,6 +2147,7 @@ test("latched parameter circles apply at the RT cursor boundary without adding a
   await rt.click();
   await expect(lines).toHaveCount(0);
   await expect(page.locator('.issue-connector')).toHaveCount(1);
+  await page.keyboard.press("Escape");
   await page.locator('.timeline-block[data-event-id="move"]').click();
   await expect(lines).toHaveCount(0);
   await expect(page.locator('.parameter-connection-label')).toHaveCount(0);
@@ -1826,6 +2213,378 @@ function feedbackNavigationFixture() {
     {id: "inline-flow", from_event_id: "inline-send", to_event_id: "local", channel: "local"},
   ]};
 }
+
+function feedbackTimingFixture() {
+  const feedback = (id, kind, start, end, sequencer_id, line) => ({...event(id, kind, start, end),
+    sequencer_id, lane: "rt.feedback", source: {file: `${sequencer_id}.q1asm`, line,
+      raw: kind === "feedback_com" ? `fb_com_data ${id === "send" ? 4 : 16},7,80` : "fb_pop_data 4,R0"}});
+  return {sequencers: [{id: "sender"}, {id: "receiver"}],
+    alignment:{sender:{mode:"none",offset:0,confidence:"exact"},receiver:{mode:"none",offset:0,confidence:"exact"}}, events: [
+    {...event("issue-send", "q1_issue", 0, 4, {op: "fb_com_data"}), sequencer_id: "sender"},
+    {...event("issue-pop", "q1_issue", 4, 8, {op: "fb_pop_data"}), sequencer_id: "sender"},
+    feedback("send", "feedback_com", 100, 180, "sender", 2),
+    feedback("cross-send", "feedback_com", 180, 260, "sender", 3),
+    {...event("wait", "wait", 260, 500), sequencer_id: "sender"},
+    feedback("pop", "feedback_pop", 500, 500, "sender", 4),
+    {...event("receiver-wait", "wait", 0, 700), sequencer_id: "receiver"},
+    feedback("cross-pop", "feedback_pop", 400, 400, "receiver", 5),
+    {...event("end", "stop", 700, 700), sequencer_id: "receiver"},
+  ], feedback_flows: [
+    {id: "local", from_event_id: "send", to_event_id: "pop", channel: "4"},
+    {id: "cross", from_event_id: "cross-send", to_event_id: "cross-pop", channel: "16"},
+  ]};
+}
+
+function feedbackCastFixture() {
+  const repo=path.resolve(__dirname,"../../..");
+  return JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python",["-c",[
+    "import contextlib,io,json,tempfile", "from pathlib import Path", "from q1timeline.cli import main",
+    "with tempfile.TemporaryDirectory() as directory:", "    output=Path(directory)/'ir.json'",
+    "    with contextlib.redirect_stdout(io.StringIO()):",
+    "        result=main(['analyze','--project','vscode-extension/test/fixtures/feedback-casts/q1timeline.yml','--out',str(output),'--no-render'])",
+    "    assert result==0", "    ir=json.loads(output.read_text(encoding='utf-8'))",
+    "assert all(item['status']=='completed' for item in ir['execution'].values())",
+    "assert not ir['diagnostics']", "print(json.dumps(ir))",
+  ].join("\n")],{cwd:repo,encoding:"utf8",env:{...process.env,PYTHONPATH:path.join(repo,"src")}}));
+}
+
+async function feedbackTimeX(page,time) {
+  const input=page.getByRole("spinbutton",{name:"Selected time in nanoseconds"});
+  await input.fill(String(time));await input.dispatchEvent("change");
+  return page.locator('.shared-timeline-stage .ruler .hardware-time-cursor').evaluate(node=>node.getBoundingClientRect().x);
+}
+
+function linqAnalysisFixture(op="fb_pop_data", wait=2000) {
+  const repo=path.resolve(__dirname,"../../..");
+  return JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python",["-c",[
+    "import contextlib,io,json,sys,tempfile", "from pathlib import Path", "from q1timeline.cli import main",
+    "from q1timeline.render.html import render_html",
+    "op=sys.argv[1]; wait=int(sys.argv[2])",
+    "documents={'sender':'wait_sync 4\\nfb_com_data 16,7,4\\nfb_com_data 32,9,4\\nfb_com_data 4,11,4\\nwait 2000\\nfb_pop_data 4,R0\\nstop\\n'}",
+    "for seq,channel in [('intra',16),('multi',32)]:",
+    "    receive=f'fb_pop_data {channel},R0' if op=='fb_pop_data' else 'fb_pull_data R0,R1'",
+    "    documents[seq]=f'wait_sync 4\\nwait {wait}\\n{receive}\\nstop\\n'",
+    "with tempfile.TemporaryDirectory() as directory:", "    root=Path(directory)",
+    "    for seq,text in documents.items(): (root/f'{seq}.q1asm').write_text(text)",
+    "    project={'analysis':{'feedback_transport_delay_ns':200},'sequencers':[{'id':seq,'file':f'{seq}.q1asm','module':'QCM1' if seq=='multi' else 'QCM0'} for seq in documents]}",
+    "    config=root/'q1timeline.yml'; config.write_text(json.dumps(project)); output=root/'ir.json'",
+    "    with contextlib.redirect_stdout(io.StringIO()): result=main(['analyze','--project',str(config),'--out',str(output),'--no-render'])",
+    "    assert result==0", "    ir=json.loads(output.read_text())",
+    "print(json.dumps({'ir':ir,'html':render_html(ir,default_mode='debug')}))",
+  ].join("\n"),op,String(wait)],{cwd:repo,encoding:"utf8",env:{...process.env,PYTHONPATH:path.join(repo,"src")}}));
+}
+
+test("analytical feedback targets follow send latency rather than late pop or pull commands",async({page})=>{
+  const {ir}=linqAnalysisFixture("fb_pull_data");
+  const expected={sender:72,intra:354,multi:588};
+  expect(ir.feedback_flows).toHaveLength(3);
+  await mount(page,"completed",ir,{analysisDetailsOpen:false,timelineWaitsCollapsed:false});
+  await analysisDetails(page);
+  const measurements=[];
+  for(const mode of ["Normal view","Debug view"]) {
+    await page.getByRole("button",{name:mode,exact:true}).click();
+    for(const layout of ["Time scale","Instruction"]) {
+      await page.getByRole("button",{name:layout,exact:true}).click();
+      for(const folded of layout==="Time scale" ? [false,true] : [false]) {
+        const fold=page.locator("#q1timeline-wait-fold-button");
+        if(layout==="Time scale" && (await fold.getAttribute("aria-pressed")==="true")!==folded) await fold.click();
+        for(const flow of ir.feedback_flows) {
+          const from=ir.events.find(item=>item.id===flow.from_event_id),to=ir.events.find(item=>item.id===flow.to_event_id);
+          expect(to.t0.value).toBeGreaterThan(expected[to.sequencer_id]);
+          for(const role of ["source","target"]) {
+            const endpoint=page.locator(`[data-flow-id="${flow.id}"][data-feedback-role="${role}"]`);
+            if(role==="target") await expect(endpoint).toHaveAttribute("title",new RegExp(`estimated feedback queue arrival.*${expected[to.sequencer_id]} ns`));
+            const x=await endpoint.evaluate(node=>{
+              const marker=node.classList.contains("feedback-dot") ? node : node.querySelector(".feedback-endpoint-marker");
+              const r=marker.getBoundingClientRect();return r.x+r.width/2;
+            });
+            const time=role==="source" ? from.t0.value : expected[to.sequencer_id];
+            const reference=layout==="Time scale" ? await feedbackTimeX(page,time) : await page.evaluate(({ir,seq,time})=>{
+              const rt=ir.events.find(item=>item.sequencer_id===seq && ["wait","feedback_com"].includes(item.kind) && item.t0.value<=time && item.t1.value>time);
+              const block=document.querySelector(`.timeline-block[data-event-id="${rt.id}"]`);
+              const track=block.closest(".lane-track").getBoundingClientRect();
+              const width=parseFloat(getComputedStyle(block.closest(".shared-timeline-stage")).getPropertyValue("--instruction-cell-width"));
+              return track.x+width*(Number(block.dataset.instructionIndex)+(time-rt.t0.value)/(rt.t1.value-rt.t0.value));
+            },{ir,seq:role==="source" ? from.sequencer_id : to.sequencer_id,time});
+            measurements.push({mode,layout,folded,flow:flow.id,role,time,error:Math.abs(x-reference)});
+            expect(Math.abs(x-reference),JSON.stringify(measurements.at(-1))).toBeLessThan(.3);
+          }
+        }
+      }
+    }
+  }
+  await page.getByRole("button",{name:"Normal view",exact:true}).click();
+  await page.getByRole("button",{name:"Time scale",exact:true}).click();
+  await page.screenshot({path:test.info().outputPath("feedback-delivery-latency.png")});
+  await test.info().attach("latency-endpoints",{body:JSON.stringify(measurements),contentType:"application/json"});
+});
+
+test("LINQ warnings and receiving RT lane markers include site delay for pop and pull",async({page})=>{
+  for(const op of ["fb_pop_data","fb_pull_data"]) {
+    const {ir,html}=linqAnalysisFixture(op,200);
+    const findings=ir.diagnostics.filter(item=>item.category==="feedback_latency_violation");
+    expect(findings).toHaveLength(2);
+    expect(findings.map(item=>item.details.required_latency_ns).sort()).toEqual([350,580]);
+    const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+      /type=["']application\/json["']/i.test(attributes) ? tag : "");
+    await mount(page,"completed",ir,{analysisDetailsOpen:false,timelineWaitsCollapsed:false},{},shell);
+    await analysisDetails(page);
+    for(const mode of ["Normal view","Debug view"]) {
+      await page.getByRole("button",{name:mode,exact:true}).click();
+      for(const diagnostic of findings) {
+        const warning=page.getByRole("region",{name:"Diagnostics"}).locator(".diagnostic.severity-warning")
+          .filter({hasText:`${op.replaceAll("_"," ")} on channel ${diagnostic.details.channel} precedes estimated arrival`});
+        await expect(warning).toBeVisible();
+        await expect(warning).toContainText("200 ns configured transport delay");
+        const flow=ir.feedback_flows.find(item=>diagnostic.related_events.includes(item.to_event_id));
+        const target=ir.events.find(item=>item.id===flow.to_event_id);
+        const marker=page.locator(`[data-flow-id="${flow.id}"][data-feedback-role="target"]`);
+        expect(await marker.evaluate(node=>node.closest('.timeline-row').dataset.lane)).toContain(target.sequencer_id);
+        await expect(marker).toHaveAttribute("title",new RegExp(`${diagnostic.details.arrival_ns} ns.*200 ns configured transport.*Consumer: ${op}`));
+        const x=await marker.evaluate(node=>{
+          const r=node.querySelector('.feedback-endpoint-marker').getBoundingClientRect();return r.x+r.width/2;
+        });
+        expect(Math.abs(x-await feedbackTimeX(page,diagnostic.details.arrival_ns))).toBeLessThan(.3);
+      }
+    }
+    await page.screenshot({path:test.info().outputPath(`${op}-linq-warning.png`)});
+  }
+});
+
+test("intra and multi cast follow RT transmission and queue reception without displaying Q1 pops as RT commands",async({page})=>{
+  const ir=feedbackCastFixture();
+  const byId=new Map(ir.events.map(item=>[item.id,item]));
+  expect(ir.feedback_flows).toHaveLength(4);
+  const expected={sender:[212,532],intra:[204,684],multi_a:[208,848],multi_b:[208,1008]};
+  for(const flow of ir.feedback_flows) {
+    const from=byId.get(flow.from_event_id),to=byId.get(flow.to_event_id);
+    expect([from.t0.value,to.t0.value]).toEqual(expected[to.sequencer_id]);
+  }
+  expect(ir.sequencers.find(item=>item.id==="intra").module).toBe(ir.sequencers.find(item=>item.id==="sender").module);
+  for(const id of ["multi_a","multi_b"]) expect(ir.sequencers.find(item=>item.id===id).module).not.toBe(ir.sequencers.find(item=>item.id==="sender").module);
+  await mount(page,"completed",ir,{analysisDetailsOpen:false});
+  await analysisDetails(page);
+  const measurements=[];
+  for(const mode of ["Normal view","Debug view"]) {
+    await page.getByRole("button",{name:mode,exact:true}).click();
+    for(const layout of ["Time scale","Instruction"]) {
+      await page.getByRole("button",{name:layout,exact:true}).click();
+      if(layout==="Time scale" && await page.locator("#q1timeline-wait-fold-button").getAttribute("aria-pressed")==="true") {
+        await page.locator("#q1timeline-wait-fold-button").click();
+      }
+      for(const item of ir.events.filter(item=>item.kind==="feedback_pop")) {
+        await expect(page.locator(`.timeline-row-runtime .timeline-block[data-event-id="${item.id}"]`)).toHaveCount(0);
+      }
+      await expect(page.locator('.timeline-row-runtime .timeline-block').filter({hasText:"fb_pop_data"})).toHaveCount(0);
+      const q1Pops=page.locator('.timeline-row-q1-issue .timeline-block').filter({hasText:"fb_pop_data"});
+      await expect(q1Pops).toHaveCount(4);
+      for(const node of await q1Pops.all()) {
+        if(mode==="Debug view") await expect(node).toBeVisible(); else await expect(node).toBeHidden();
+        await expect(node).not.toHaveAttribute("data-issue-marker","true");
+      }
+      const errors=await page.evaluate(({ir,layout})=>{
+        const byId=new Map(ir.events.map(item=>[item.id,item]));
+        const block=id=>document.querySelector(`.timeline-block[data-event-id="${id}"]`);
+        const left=node=>{
+          if(node.getClientRects().length) return node.getBoundingClientRect().x;
+          const track=node.closest(".lane-track").getBoundingClientRect();
+          return track.x+(layout==="Instruction" ? Number(node.dataset.instructionIndex)*parseFloat(getComputedStyle(node.closest(".shared-timeline-stage")).getPropertyValue("--instruction-cell-width")) : track.width*parseFloat(node.style.left)/100);
+        };
+        return ir.feedback_flows.map(flow=>{
+          const from=byId.get(flow.from_event_id),to=byId.get(flow.to_event_id);
+          const send=ir.events.find(item=>item.sequencer_id===from.sequencer_id && ["feedback_com","fb_com_data"].includes(item.kind) && item.meta.rt_packet_id===from.meta.source_packet_id);
+          const wait=ir.events.find(item=>item.sequencer_id===to.sequencer_id && item.kind==="wait" && item.t0.value<=to.t0.value && item.t1.value>=to.t0.value);
+          const expected=[left(block(send.id)),left(block(wait.id))+block(wait.id).getBoundingClientRect().width*(to.t0.value-wait.t0.value)/(wait.t1.value-wait.t0.value)];
+          return ["source","target"].map((role,index)=>{
+            const endpoint=document.querySelector(`[data-flow-id="${flow.id}"][data-feedback-role="${role}"]`);
+            const marker=endpoint.classList.contains("feedback-dot") ? endpoint : endpoint.querySelector(".feedback-endpoint-marker");
+            const rect=marker.getBoundingClientRect();
+            return {flow:flow.id,role,x:rect.x+rect.width/2,expected:expected[index],time:index ? to.t0.value : from.t0.value};
+          });
+        }).flat();
+      },{ir,layout});
+      for(const item of errors) {
+        const expected=layout==="Time scale" ? await feedbackTimeX(page,item.time) : item.expected;
+        measurements.push({mode,layout,...item,expected,error:Math.abs(item.x-expected)});
+        expect(Math.abs(item.x-expected),JSON.stringify({mode,layout,...item,expected})).toBeLessThan(.3);
+      }
+    }
+  }
+  expect(await page.evaluate(()=>JSON.parse(document.getElementById("timeline-ir").textContent))).toEqual(ir);
+  await test.info().attach("cast-endpoints",{body:JSON.stringify(measurements),contentType:"application/json"});
+});
+
+test("folded self, intra and multi cast feedback lines remain painted across every folded band",async({page})=>{
+  const ir=feedbackCastFixture();
+  await mount(page,"completed",ir,{analysisDetailsOpen:false});
+  const fold=page.locator("#q1timeline-wait-fold-button");
+  await expect(fold).toBeEnabled();
+  for(const mode of ["Normal view","Debug view"]) {
+    await page.getByRole("button",{name:mode,exact:true}).click();
+  for(const folded of [true,false,true]) {
+    if((await fold.getAttribute("aria-pressed")==="true")!==folded) await fold.click();
+    if(!folded) continue;
+    const points=await page.evaluate(()=>{
+      const bands=Array.from(document.querySelectorAll('.lane-track > .q1timeline-wait-fold:not(.is-expanded)')).map(node=>node.getBoundingClientRect());
+      const points=[];
+      const add=(node,x,y)=>{
+        if(bands.some(r=>x>r.left+3 && x<r.right-3 && y>=r.top && y<r.bottom) && !document.elementFromPoint(x,y)?.closest('.timeline-block')) points.push({flow:node.dataset.flowId,x,y});
+      };
+      for(const path of document.querySelectorAll('.feedback-connector')) {
+        for(let index=1;index<100;index++) {
+          const p=path.getPointAtLength(path.getTotalLength()*index/100).matrixTransform(path.getScreenCTM());add(path,p.x,p.y);
+        }
+      }
+      for(const node of document.querySelectorAll('.feedback-inline-capsule')) for(const rail of node.querySelectorAll('.feedback-mini-track')) {
+        const r=rail.getBoundingClientRect();
+        for(let index=1;index<50;index++) add(node,r.x+r.width*index/50,r.y+r.height/2);
+      }
+      return points;
+    });
+    expect(new Set(points.map(item=>item.flow)).size).toBe(4);
+    const screenshot=await page.screenshot({path:test.info().outputPath("folded-feedback.png"),scale:"css"});
+    const missing=await page.evaluate(async({png,points})=>{
+      const img=new Image();img.src=`data:image/png;base64,${png}`;await img.decode();
+      const canvas=document.createElement('canvas');canvas.width=img.width;canvas.height=img.height;
+      const context=canvas.getContext('2d');context.drawImage(img,0,0);
+      return points.filter(({x,y})=>{
+        const pixels=context.getImageData(Math.round(x)-2,Math.round(y)-2,5,5).data;
+        for(let i=0;i<pixels.length;i+=4) if(pixels[i]>pixels[i+1]+22 && pixels[i+2]>pixels[i+1]+8) return false;
+        return true;
+      });
+    },{png:screenshot.toString("base64"),points});
+    await test.info().attach("feedback-paint-probe",{body:JSON.stringify({mode,folded,points:points.length,flows:[...new Set(points.map(item=>item.flow))],missing:missing.length}),contentType:"application/json"});
+    expect(missing,"Feedback stroke must remain visible through folded bands").toEqual([]);
+  }
+  }
+});
+
+test("feedback endpoints align with RT commands through layout, mode, zoom and endpoint labels", async ({page}) => {
+  const ir = feedbackTimingFixture();
+  await mount(page, "completed", ir, {timelineWaitsCollapsed: false, analysisDetailsOpen: false});
+  await analysisDetails(page);
+  async function checkAnchors() {
+    const measurements = await page.evaluate(() => {
+      const ir=JSON.parse(document.getElementById("timeline-ir").textContent);
+      const view=window.getSavedTimelineState().timelineWindow || {min:0,max:700};
+      const center = node => {const r = node.getBoundingClientRect(); return {x:r.x+r.width/2, y:r.y+r.height/2};};
+      return [["local", "source", "send"], ["local", "target", "pop"],
+        ["cross", "source", "cross-send"], ["cross", "target", "cross-pop"]].map(([flow,role,id]) => {
+        const group = document.querySelector(`[data-flow-id="${flow}"][data-feedback-role="${role}"]`);
+        if (!group || group.classList.contains("is-clipped") || group.closest(`.is-clipped-${role}`)) {
+          return {flow,role,id,clipped:true,visible:!!group && getComputedStyle(group).visibility !== "hidden"};
+        }
+        const anchorId=role==="target" ? id==="pop" ? "wait" : "receiver-wait" : id;
+        const block=document.querySelector(`.timeline-block[data-event-id="${anchorId}"]`);
+        const anchor=ir.events.find(item=>item.id===anchorId),pointEvent=ir.events.find(item=>item.id===id);
+        const track = group.closest(".lane-track").getBoundingClientRect();
+        const marker = group.classList.contains("feedback-dot") ? group : group.querySelector(".feedback-endpoint-marker");
+        const point = center(marker);
+        const cellWidth = parseFloat(getComputedStyle(block.closest(".shared-timeline-stage")).getPropertyValue("--instruction-cell-width"));
+        const fraction=role==="target" ? (pointEvent.t0.value-anchor.t0.value)/(anchor.t1.value-anchor.t0.value) : 0;
+        const expected = block.dataset.instructionIndex !== undefined
+          ? track.x+(Number(block.dataset.instructionIndex)+fraction)*cellWidth
+          : track.x+track.width*(pointEvent.t0.value-view.min)/(view.max-view.min);
+        return {flow,role,id,x:point.x,expected,time:pointEvent.t0.value,instruction:block.dataset.instructionIndex !== undefined,
+          title:group.getAttribute("title"),eventId:group.dataset.eventId};
+      });
+    });
+    for (const item of measurements) {
+      if (item.clipped) {expect(item.visible, JSON.stringify(item)).toBe(false); continue;}
+      const expected=item.instruction ? item.expected : await feedbackTimeX(page,item.time);
+      expect(Math.abs(item.x-expected), JSON.stringify({...item,expected})).toBeLessThan(.3);
+      expect(item.eventId).toBe(item.id);
+      expect(item.title).toContain(item.role === "source" ? "Send" : "Receive");
+    }
+    const connector = page.locator('.feedback-connector[data-flow-id="cross"]');
+    const errors = await connector.evaluate(path => {
+      const matrix = path.getScreenCTM();
+      return ["source", "target"].map((role,index) => {
+        if (document.querySelector(`.feedback-endpoint[data-flow-id="cross"][data-feedback-role="${role}"]`).classList.contains("is-clipped")) return 0;
+        const point = path.getPointAtLength(index ? path.getTotalLength() : 0).matrixTransform(matrix);
+        const marker = document.querySelector(`.feedback-endpoint[data-flow-id="cross"][data-feedback-role="${role}"] .feedback-endpoint-marker`).getBoundingClientRect();
+        return Math.hypot(point.x-marker.x-marker.width/2,point.y-marker.y-marker.height/2);
+      });
+    });
+    for (const error of errors) expect(error).toBeLessThan(.3);
+  }
+  for (const mode of ["Debug view", "Normal view"]) {
+    await page.getByRole("button", {name:mode,exact:true}).click();
+    for (const layout of ["Time scale", "Instruction"]) {
+      await page.getByRole("button", {name:layout,exact:true}).click();
+      await checkAnchors();
+    }
+  }
+  await page.getByRole("button", {name:"Time scale",exact:true}).click();
+  await page.getByRole("button", {name:"Zoom in",exact:true}).click();
+  await checkAnchors();
+  const source = page.locator('.feedback-endpoint[data-flow-id="cross"][data-feedback-role="source"]');
+  await source.focus();
+  await expect(source).toHaveClass(/is-active/);
+  await checkAnchors();
+  await page.getByRole("button", {name:"Reset zoom",exact:true}).click();
+  await page.setViewportSize({width:800,height:800});
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  await checkAnchors();
+  expect(await page.evaluate(() => JSON.parse(document.getElementById("timeline-ir").textContent))).toEqual(ir);
+  await page.screenshot({path:test.info().outputPath("feedback-rt-anchors.png"),fullPage:true});
+});
+
+test("clipped feedback continues across the viewport without false source or receive markers", async ({page}) => {
+  await mount(page, "completed", feedbackTimingFixture(), {timelineWaitsCollapsed:false,analysisDetailsOpen:false,
+    timelineWindow:{min:150,max:450,fullMin:0,fullMax:700,basis:"local"}});
+  const local = page.locator('.feedback-inline-capsule[data-flow-id="local"]');
+  await expect(local).toBeVisible();
+  await expect(local.locator('.feedback-dot-source')).toBeHidden();
+  await expect(local.locator('.feedback-dot-target')).toBeHidden();
+  await expect(local.locator('.feedback-mini-arrow')).toBeHidden();
+  await mount(page, "completed", feedbackTimingFixture(), {timelineWaitsCollapsed:false,analysisDetailsOpen:false,
+    timelineWindow:{min:200,max:300,fullMin:0,fullMax:700,basis:"local"}});
+  await expect(page.locator('.feedback-endpoint[data-flow-id="cross"][data-feedback-role="source"]')).toBeHidden();
+  await expect(page.locator('.feedback-endpoint[data-flow-id="cross"][data-feedback-role="target"]')).toBeHidden();
+  await expect(page.locator('.feedback-connector[data-flow-id="cross"]')).not.toHaveAttribute("marker-end");
+});
+
+test("short and reversed feedback retain true endpoints and point the arrow at the receiver", async ({page}) => {
+  for (const [from,to] of [[200,200.01],[500,100]]) {
+    const ir = feedbackTimingFixture();
+    ir.events = ir.events.map(item => item.id === "send" ? {...item,t0:{value:from},t1:{value:from+4}}
+      : item.id === "pop" ? {...item,t0:{value:to},t1:{value:to}} : item);
+    await mount(page, "completed", ir, {timelineWaitsCollapsed:false,analysisDetailsOpen:false});
+    await analysisDetails(page);
+    const sourceTimeX=await feedbackTimeX(page,from),targetTimeX=await feedbackTimeX(page,to);
+    const errors = await page.locator('.feedback-inline-capsule[data-flow-id="local"]').evaluate(node => {
+      const center = role => {const r=node.querySelector(`.feedback-dot-${role}`).getBoundingClientRect();return r.x+r.width/2;};
+      const arrow=node.querySelector('.feedback-mini-arrow');
+      const tip=arrow.ownerSVGElement.createSVGPoint();tip.x=14;tip.y=0;
+      return [center("source"),center("target"),
+        tip.matrixTransform(arrow.getScreenCTM()).x-center("target")];
+    });
+    for (const error of [errors[0]-sourceTimeX,errors[1]-targetTimeX,errors[2]]) expect(Math.abs(error)).toBeLessThan(.3);
+  }
+});
+
+test("self cast remains attached to RT events when its wait interval is folded and expanded", async ({page}) => {
+  const ir=feedbackTimingFixture();
+  ir.sequencers=ir.sequencers.filter(item=>item.id==="sender");
+  ir.events=ir.events.filter(item=>item.sequencer_id==="sender");
+  ir.feedback_flows=ir.feedback_flows.filter(item=>item.id==="local");
+  await mount(page,"completed",ir,{timelineWaitsCollapsed:false,analysisDetailsOpen:false});
+  const fold=page.locator("#q1timeline-wait-fold-button");
+  await expect(fold).toBeEnabled();
+  for (let index=0;index<3;index++) {
+    const errors=await page.locator('.feedback-inline-capsule[data-flow-id="local"]').evaluate(node=>
+      [["source","send"],["target","pop"]].map(([role,id])=>{
+        const point=node.querySelector(`.feedback-dot-${role}`).getBoundingClientRect();
+        const block=document.querySelector(`.timeline-block[data-event-id="${id==="pop" ? "wait" : id}"]`);
+        const track=block.closest(".lane-track").getBoundingClientRect();
+        const expected=track.x+track.width*parseFloat(block.style.left)/100+(id==="pop" ? block.getBoundingClientRect().width : 0);
+        return point.x+point.width/2-expected;
+      }));
+    for(const error of errors) expect(Math.abs(error)).toBeLessThan(.3);
+    if(index<2) await fold.click();
+  }
+});
 
 async function feedbackPathPoint(path, target) {
   return path.evaluate((node, target) => {

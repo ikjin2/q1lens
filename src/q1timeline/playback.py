@@ -56,6 +56,8 @@ class PlaybackSession:
         self.alignment_anchor_kinds = alignment_anchor_kinds
         self.project = project or {}
         self.sequencer_metadata: dict[str, dict] = {}
+        self.hardware_parameters: dict[str, dict] = {}
+        self.acquisition_context: dict[str, dict] = {}
         self.sequence_names: dict[str, Any] = {}
         self.parameters: list[dict] = []
         self.programs = {seq: parse_q1asm(text, file=file) for seq, (file, text) in documents.items()}
@@ -76,10 +78,14 @@ class PlaybackSession:
             alignment_anchor_kinds=config.alignment_anchor_kinds,
             external_inputs=config.external_inputs,
             project={"root": str(config.root), "alignment_mode": config.alignment_mode,
+                     "feedback_transport_delay_ns": config.analysis.feedback_transport_delay_ns,
                      "alignment_anchor_kinds": list(config.alignment_anchor_kinds),
                      "display": config.display, "display_file": str(config.display_file) if config.display_file else None},
         )
         session.sequencer_metadata = {seq.id: {"module": seq.module} for seq in config.sequencers if seq.module}
+        session.hardware_parameters = {seq.id: dict(seq.hardware_parameters) for seq in config.sequencers}
+        session.acquisition_context = {seq.id: {"sequencer_index": seq.sequencer_index, "module_type": seq.module_type}
+                                       for seq in config.sequencers}
         session.sequence_names = {seq.id: load_sequence_names(seq.sequence_json) for seq in config.sequencers if seq.sequence_json}
         for name, value in sorted(session.params.items()):
             parameter = {"name": name, "value_json": json.dumps(value, sort_keys=True, allow_nan=False),
@@ -113,7 +119,7 @@ class PlaybackSession:
             core._diagnose_program(state, symbols, program)
             state.has_expanded_instructions = any(
                 item.op in {"loop", "jlt"} or (item.op == "jge" and len(item.args) == 3)
-                for item in program.instructions
+                for item in state.instructions_by_pc.values()
             )
             state.metadata["execution"] = {
                 "mode": "playback", "status": "paused", "steps": 0,
@@ -122,7 +128,8 @@ class PlaybackSession:
                                 "External trigger times are assumed receiver arrivals on the unaligned analytical RT clock; hardware transport latency is not modeled."],
             }
             self.runners.append(_Runner(state, symbols))
-            errors = [item for item in state.diagnostics if item.severity == "error"]
+            errors = [item for item in state.diagnostics
+                      if item.severity == "error" and not item.details.get("source_line_skipped")]
             if errors:
                 self.status, self.reason = "error", errors[0].message
 
@@ -225,6 +232,11 @@ class PlaybackSession:
         core._apply_ready_register_writes(state)
         instruction = state.instructions_by_pc.get(state.pc)
         if instruction is None:
+            if state.pc == len(state.instructions_by_pc) and any(
+                item.details.get("source_line_skipped") for item in state.diagnostics
+            ):
+                state.stopped = True
+                return True
             self.status, self.reason = "error", "Execution reached a PC without an instruction or stop."
             return False
         spec = get_instruction_spec(instruction.op)
@@ -572,6 +584,9 @@ class PlaybackSession:
                         loop_summaries[parent["loop_id"]]["hidden_event_ids"].append(loop["loop_id"])
                 parents.append(loop)
             metadata = dict(state.metadata)
+            metadata.update(self.sequencer_metadata.get(state.sequencer_id, {}))
+            metadata["hardware_parameters"] = dict(self.hardware_parameters.get(state.sequencer_id, {}))
+            metadata.update(self.acquisition_context.get(state.sequencer_id, {}))
             metadata["execution"] = {**metadata["execution"]}
             if not state.stopped and metadata["execution"]["status"] == "paused":
                 metadata["execution"]["status"] = self.status

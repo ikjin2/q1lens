@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.8
+
+- Use one LINQ arrival estimate for feedback markers and early pop/pull warnings, with data-type and route-specific base delays and a configurable 200 ns non-self transport allowance.
+- Keep feedback endpoints on the RT time axis, route self-cast lines below commands, preserve lines through folded intervals, and hide Q1 pop/pull commands from RT rows.
+- Correct simulated `fb_pull_data` to retrieve the next FIFO entry's ID and data.
+- Show integration and selected scope capture in a compact Acquisition row, separate from RT instruction spacing, with explicit saved hardware settings and unknown timing where necessary.
+- Improve interval folding, acquisition compression, readable command widths, timeline fitting, and zoom/pan behavior.
+- Highlight errors on the affected Q1/RT commands, keep warnings in Diagnostics, and improve source navigation, applied settings, and uncertain NCO phase state.
+- Keep the timeline available for valid Q1ASM lines when other lines contain source errors, and preserve error indicators on commands across timeline modes.
+- Improve bounded register, bit, branch, and loop reasoning, including feasible-path queue checks and eventual underflow in supported infinite loops.
+- Check the Python environment on startup and warn when Python and extension versions differ.
+- Pair with Python package 0.2.8.
+
 ## 0.2.7
 
 - Check acquisition burst pressure and sustained overload, with module-aware uncertainty.

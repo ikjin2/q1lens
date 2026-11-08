@@ -122,6 +122,7 @@ function loadQ1TimelineFoldRuntime(script: string, timelineIr: any, options: any
     "readPersistedWebviewState", "writePersistedWebviewState", "timelineExtentMatches",
     "snapTimelineNs", "formatWindowValue", "formatFoldDuration", "timelineTimeScale", "timelineWaitTimeScale",
     "displayTimelineTime", "realTimelineTime", "timelineDisplayWindow", "toggleTimelineGap",
+    "timelineFoldPositions", "animateTimelineFoldChange", "positionTimelineFoldToggle", "toolbarSvgIcon",
     "toggleTimelineFolds", "renderWaitFolds", "clamp", "sharedTimelinePointerAnchorRatio",
     "timelinePointerAnchorRatio", "timelineTimeFromPointer", "renderHardwareCursor", "isTimelineSelectionTarget",
     "eventIsQ1Issue", "sourceRangeTimelineBounds", "zoomTimelineToEventRange",
@@ -150,7 +151,8 @@ function loadQ1TimelineFoldRuntime(script: string, timelineIr: any, options: any
         return this.parentElement?.closest(selector);
       },
     };
-    node.classList = { contains: (name: string) => node.className.split(" ").includes(name) };
+    node.classList = { contains: (name: string) => node.className.split(" ").includes(name),
+      add: (name: string) => { if (!node.className.split(" ").includes(name)) node.className += ` ${name}`; } };
     return node;
   }
   const adapter = require(join(__dirname, "..", "src", "q1timeline", "media", "timelineAdapter.js"));
@@ -166,6 +168,7 @@ function loadQ1TimelineFoldRuntime(script: string, timelineIr: any, options: any
     const currentFoldState = true;
     ${expandedState}
     const timelineTimeScales = new Map();
+    const timelineCommandWidths = [];
     const expandedPlaybackLoops = new Set();
     const visiblePlaybackEvent = event => event;
     let timelineWindow = options.current || { min: 0, max: 10000 };
@@ -1161,13 +1164,15 @@ describe("timeline webview assets", () => {
     const stage = { scrollLeft: 0, dataset: {}, querySelectorAll: () => [] };
     const root = { querySelector: (selector: string) => selector === ".shared-timeline-stage" ? stage : undefined, querySelectorAll: () => [] };
     const noopNames = [
-      "renderTimelineLayoutToggle", "renderTimelineWindowStatus", "renderTimeBasisToggle", "installSharedQ1IssueControls",
+      "renderTimelineLayoutToggle", "renderTimelineWindowStatus", "renderTimeBasisToggle", "installSharedQ1IssueControls", "installRtPreparationMarkers",
       "syncSharedSequencerFoldControls", "installTimelineControlChips", "installTimelineMouseInteractions", "applySharedSelection",
-      "renderWaitFolds", "renderPlaybackFolds", "renderHardwareCursor", "setInstructionView",
+      "renderWaitFolds", "renderPlaybackFolds", "positionTimelineFoldToggles", "renderHardwareCursor", "setInstructionView",
     ];
     const runtime = Function("window", "document", "state", "writePersistedWebviewState", `
       let timelineLayout = "time", timelineTimeBasis = "local", sharedTimelineActive = false;
       let activeTimelineControlChip, rtDetailsByEvent = new Map();
+      let timelineCommandWidths = [];
+      const timelineTimeScales = new Map();
       let instructionView = { cellWidth: 112, leftOrdinal: 0 }, selectedTimelineEventId = "play";
       const selectedSourceEventIds = new Set(), expandedQ1IssueSequencers = new Set(), expandedPlaybackLoops = new Set();
       const timelineIr = { sequencers: [{ id: "seq" }], events: [
@@ -1264,7 +1269,7 @@ describe("timeline webview assets", () => {
     assert.match(sharedRenderer, /function visibleTimelineLanes\(model\)/);
     assert.match(sharedRenderer, /!\(lane && lane\.hidden\)/);
     assert.match(sharedRenderer, /function feedbackEndpointAnchorY\(rowHeight\)/);
-    assert.match(sharedRenderer, /return rowHeight - 4;/);
+    assert.match(sharedRenderer, /return rowHeight - 9\.5;/);
     assert.match(sharedRenderer, /const visibleLanes = visibleTimelineLanes\(model\)/);
     assert.match(sharedRenderer, /const laneGeometryById = new Map/);
     assert.match(sharedRenderer, /totalHeight = top \+ height/);
@@ -1308,8 +1313,8 @@ describe("timeline webview assets", () => {
 
     assert.match(q1TimelineCss, /body\.vscode-dark \.shared-timeline-stage \.feedback-inline-capsule\s*{[^}]*background:\s*transparent;[^}]*border-color:\s*transparent;/s);
     assert.match(q1TimelineCss, /body\.vscode-dark \.shared-timeline-stage \.feedback-inline-capsule\.is-active,[\s\S]*body\.vscode-dark \.shared-timeline-stage \.feedback-inline-capsule\.is-selected\s*{[^}]*background:\s*transparent;[^}]*border-color:\s*transparent;/s);
-    assert.match(q1TimelineCss, /body\.vscode-dark \.shared-timeline-stage \.feedback-inline-capsule \.feedback-mini-track\s*{[^}]*height:\s*2px;/s);
-    assert.match(q1TimelineCss, /body\.vscode-dark \.shared-timeline-stage \.feedback-inline-capsule \.feedback-mini-arrow\s*{[^}]*border-left-color:\s*var\(--q1timeline-feedback-accent\);/s);
+    assert.match(q1TimelineCss, /body\.vscode-dark \.shared-timeline-stage \.feedback-inline-route\s*{[^}]*--feedback-line-width:\s*1\.5px;/s);
+    assert.match(q1TimelineCss, /body\.vscode-dark \.shared-timeline-stage \.feedback-inline-capsule \.feedback-mini-arrow\s*{[^}]*fill:\s*var\(--q1timeline-feedback-accent\);/s);
   });
 
   it("keeps q1timeline source jump and zoom controls active in the shared renderer", () => {
@@ -1492,7 +1497,7 @@ describe("timeline webview assets", () => {
 
     assert.match(script, /function selectEventNode\(eventNode, options = \{\}\)/);
     assert.match(script, /options\.notify !== false/);
-    assert.match(script, /selectEventNode\(target, \{ notify: false, syncHardware: visibleEvent === highlightedEvent \}\)/);
+    assert.match(script, /selectEventNode\(target, \{ notify: false, syncHardware: visibleEvent === highlightedEvent,/);
   });
 
   it("marks hardware source jumps to preserve the readable-time cursor", () => {
@@ -1611,7 +1616,7 @@ describe("timeline webview assets", () => {
     assert.match(script, /function zoomTimelineToHighlightedEvent\(event\)/);
     assert.match(script, /const highlightEventIds = prioritizedHighlightEventIds\(event\.data\.highlightEventIds \|\| \[\]\)/);
     assert.match(script, /expandQ1IssueLanesForHighlight\(highlightEventIds\)/);
-    assert.match(script, /const highlightedEvent = highlightedEventForIds\(highlightEventIds\)/);
+    assert.match(script, /const highlightedEvent = sourceNavigationEvent\(highlightedEventForIds\(highlightEventIds\)\)/);
     assert.match(script, /zoomTimelineToHighlightedEvent\(visibleEvent\)/);
   });
 
@@ -2413,12 +2418,13 @@ describe("timeline webview assets", () => {
     assert.deepEqual(markers.map((items: any[]) => items.length), [2, 2, 2]);
     assert.deepEqual(markers[0].map((node: any) => node.style), markers[1].map((node: any) => node.style));
     assert.deepEqual(markers[1].map((node: any) => node.style), markers[2].map((node: any) => node.style));
-    const button = markers[1][0].children.find((child: any) => child.tagName === "BUTTON");
-    assert.ok(button, "The folded interval must be directly expandable from a sequencer lane");
-    assert.equal(button.children.find((node: any) => node.classList.contains("q1timeline-fold-slashes")).textContent, "//");
+    assert.ok(markers.slice(1).flat().every((marker: any) => marker.children.length === 0), "Lanes have non-interactive time bands, not duplicate controls");
+    const button = markers[0][0].children.find((child: any) => child.tagName === "BUTTON");
+    assert.ok(button, "The ruler owns the shared interval control");
+    assert.ok(button.children.find((node: any) => node.classList.contains("is-expand")));
     assert.equal(button.children.find((node: any) => node.classList.contains("q1timeline-fold-duration")).textContent, "4.97 µs");
     assert.equal(button.getAttribute("aria-expanded"), "false");
-    assert.equal(button.dataset.trackIndex, "1");
+    assert.equal(button.dataset.trackIndex, "0");
     assert.equal(runtime.isTimelineSelectionTarget(button), false);
     let pointerStopped = false;
     let clickStopped = false;
@@ -2443,17 +2449,13 @@ describe("timeline webview assets", () => {
     assert.deepEqual(expandedMarkers.map((items: any[]) => items.map((node: any) => node.classList.contains("is-expanded"))), [[true, false], [true, false], [true, false]]);
     assert.deepEqual(expandedMarkers[0].map((node: any) => node.style), expandedMarkers[1].map((node: any) => node.style));
     assert.deepEqual(expandedMarkers[1].map((node: any) => node.style), expandedMarkers[2].map((node: any) => node.style));
-    for (const items of expandedMarkers) {
-      const expandedButton = items[0].children.find((child: any) => child.tagName === "BUTTON");
-      assert.equal(expandedButton.getAttribute("aria-expanded"), "true");
-      assert.equal(expandedButton.children.some((node: any) => node.classList.contains("q1timeline-fold-slashes")), false);
-      assert.equal(expandedButton.children.find((node: any) => node.classList.contains("q1timeline-fold-duration")).textContent, "4.97 µs expanded · collapse");
-    }
-    const collapseButton = expandedMarkers[1][0].children.find((child: any) => child.tagName === "BUTTON");
+    const collapseButton = expandedMarkers[0][0].children.find((child: any) => child.tagName === "BUTTON");
+    assert.ok(collapseButton.children.find((node: any) => node.classList.contains("is-collapse")));
+    assert.equal(collapseButton.children.find((node: any) => node.classList.contains("q1timeline-fold-duration")).textContent, "4.97 µs");
     assert.equal(runtime.activeElement(), collapseButton);
     assert.equal(collapseButton.dataset.timeStart, "16");
     assert.equal(collapseButton.dataset.timeEnd, "4984");
-    assert.equal(collapseButton.dataset.trackIndex, "1");
+    assert.equal(collapseButton.dataset.trackIndex, "0");
     assert.equal(runtime.toolbar.title, "Expand all unchanged intervals");
 
     collapseButton.listeners.click({ stopPropagation() {}, preventDefault() {} });
@@ -2465,10 +2467,10 @@ describe("timeline webview assets", () => {
     assert.deepEqual(runtime.tracks.map((track: any) => track.querySelector(".hardware-time-cursor").style), originalCursorStyles);
     const refoldedMarkers = runtime.tracks.map((track: any) => track.children.filter((child: any) => child.classList.contains("q1timeline-wait-fold")));
     assert.deepEqual(refoldedMarkers.map((items: any[]) => items.map((node: any) => node.classList.contains("is-expanded"))), [[false, false], [false, false], [false, false]]);
-    const refoldedButton = refoldedMarkers[1][0].children.find((child: any) => child.tagName === "BUTTON");
+    const refoldedButton = refoldedMarkers[0][0].children.find((child: any) => child.tagName === "BUTTON");
     assert.equal(runtime.activeElement(), refoldedButton);
     assert.equal(refoldedButton.getAttribute("aria-expanded"), "false");
-    assert.equal(refoldedButton.children.find((node: any) => node.classList.contains("q1timeline-fold-slashes")).textContent, "//");
+    assert.ok(refoldedButton.children.find((node: any) => node.classList.contains("is-expand")));
   });
 
   it("restores per-gap choices only for matching coordinates and can expand or refold every interval", () => {
@@ -2519,7 +2521,7 @@ describe("timeline webview assets", () => {
     const options = { current: { min: 0, max: 15_000 }, full: { min: 0, max: 15_000 } };
     const runtime = loadQ1TimelineFoldRuntime(script, ir, options);
     const preserved = JSON.parse(JSON.stringify(runtime.preserved()));
-    const markers = (view: any) => view.tracks[1].children.filter((node: any) => node.classList.contains("q1timeline-wait-fold"));
+    const markers = (view: any) => view.tracks[0].children.filter((node: any) => node.classList.contains("q1timeline-wait-fold"));
     const click = (marker: any) => marker.children.find((node: any) => node.tagName === "BUTTON").listeners.click({ stopPropagation() {}, preventDefault() {} });
     runtime.toggleTimelineFolds();
     assert.equal(runtime.displayTimelineTime(15_000), 15_000);
@@ -2642,14 +2644,16 @@ describe("timeline webview assets", () => {
     const stage = { scrollLeft: 88, dataset: {}, style: { setProperty() {} }, querySelectorAll: () => [] };
     const root = { querySelector: (selector: string) => selector === ".shared-timeline-stage" ? stage : undefined, querySelectorAll: () => [] };
     const noopNames = [
-      "renderTimelineLayoutToggle", "renderTimelineWindowStatus", "renderTimeBasisToggle", "installSharedQ1IssueControls",
+      "renderTimelineLayoutToggle", "renderTimelineWindowStatus", "renderTimeBasisToggle", "installSharedQ1IssueControls", "installRtPreparationMarkers",
       "syncSharedSequencerFoldControls", "installTimelineControlChips", "installTimelineMouseInteractions", "applySharedSelection",
-      "renderWaitFolds", "renderPlaybackFolds", "renderHardwareCursor",
+      "renderWaitFolds", "renderPlaybackFolds", "positionTimelineFoldToggles", "renderHardwareCursor",
       "setInstructionView", "applyTimelineEventFilter",
     ];
     const runtime = Function("window", "document", `
       let timelineLayout = "time", timelineTimeBasis = "local", sharedTimelineActive = false;
       let activeTimelineControlChip, rtDetailsByEvent = new Map();
+      let timelineCommandWidths = [];
+      const timelineTimeScales = new Map();
       let instructionView = { cellWidth: 112, leftOrdinal: 0 };
       let selectedTimelineEventId;
       const selectedSourceEventIds = new Set(["play-path1"]);

@@ -1,0 +1,8 @@
+# No integration setting is supplied for this sequencer.
+wait_sync 4
+wait 396
+acquire 0,0,4
+wait 996
+acquire 0,1,4
+wait 1796
+stop

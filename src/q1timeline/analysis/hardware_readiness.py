@@ -253,6 +253,7 @@ def _enabled_scope_without_acquisition(state: AnalysisState) -> TimelineEvent | 
     if any(
         candidate.kind == "q1_issue"
         and str(candidate.meta.get("op", "")).startswith("acquire")
+        and not candidate.meta.get("conditional_skipped")
         for candidate in state.events[event_index:]
     ):
         return None

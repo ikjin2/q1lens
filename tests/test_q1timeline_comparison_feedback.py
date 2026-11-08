@@ -119,3 +119,14 @@ def test_ordinary_feedback_schema_and_counts_remain_unchanged() -> None:
     assert ir["feedback_balance"]["status"] == "balanced"
     assert "alternatives" not in ir["feedback_balance"]
     assert "comparison_assumptions" not in ir["feedback_flows"][0]
+
+
+def test_feedback_display_has_route_latencies_without_changing_consumer_time() -> None:
+    ir = analyze_text("fb_com_data 4,123,4\nwait 1000\nfb_pop_data 4,R0\nstop\n")
+
+    assert ir["analysis"]["feedback_latencies_ns"]["q1_register_or_immediate"] == {
+        "self_cast": 60, "intra_cast": 150, "multi_cast_worst_case": 380,
+    }
+    flow = ir["feedback_flows"][0]
+    consumer = next(event for event in ir["events"] if event["id"] == flow["to_event_id"])
+    assert consumer["t0"]["value"] == 1004

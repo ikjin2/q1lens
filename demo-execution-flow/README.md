@@ -3,6 +3,18 @@
 This is the retained design reference. See the [accepted interactions and
 extension integration sequence](../docs/execution-exploration.md).
 
+The current web demo opens in **Instruction** mode with Q1 in one horizontal
+lane. It loads the extension's shared timeline CSS and instruction colors,
+including its 22px command blocks. Thin loop bands show Q1ASM labels and the
+selected iteration; the chevron folds a loop without wrapping the command lane.
+Click a loop label to open its first-five change table in the bottom panel.
+**Time** uses the same selected occurrence on a shared, actual Q1/RT time axis.
+The connected-RT rows follow engine packet and setter identities, including
+latched settings applied by a later RT instruction. Click a row to focus that
+relationship in Time, then switch back without losing the selected occurrence.
+The resizable bottom panel has instruction, iteration-change and source tabs.
+Command width controls and Fit operate on the Instruction view only.
+
 A standalone design prototype for following one Q1ASM execution occurrence from
 its actual read operands to its result and next instruction. It uses the Python
 Q1Lens simulation engine in this checkout; the browser does not interpret Q1ASM.
@@ -16,12 +28,12 @@ python demo-execution-flow/build.py --build-only
 Open `output/execution-flow/index.html` in a separate browser window. All assets
 are local. The prototype does not install or modify the VS Code extension.
 The compact layout follows the extension's dark Hardware UI palette and 12px
-typography, with independent source and inspector scrolling. Input values and
+typography. Input values and
 the source rows below them both link to the exact writer occurrence.
 
 Click a loop marker (`↻ @name`) or its backward branch in the source to open
-the first five iterations automatically. The bottom table stays visible while
-the instruction detail scrolls. It includes registers and latched settings that
+the first five iterations automatically. Clicking a cell retains the table and
+opens its instruction detail underneath. The table includes registers and latched settings that
 change inside the selected loop; constant fields are omitted. Use `5회 더 보기`
 to reveal more iterations. Inner loops can be selected separately.
 

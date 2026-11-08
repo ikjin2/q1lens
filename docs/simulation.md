@@ -63,6 +63,47 @@ simulation:
 IDs must reference project sequencers. Route latencies are explicit scenario
 values; no instrument topology is inferred. Omitting `id` matches any nonzero
 feedback ID from the source. Scheduled input times use the shared unaligned clock.
+
+## LINQ arrival estimates in analysis
+
+Analytical feedback arrows and early pop/pull warnings use the same per-flow
+arrival estimate. The base delays come from the [Qblox LINQ latency table](https://docs.qblox.com/en/main/products/architecture/sequencers/linq_based_feedback.html#latencies-of-linq-based-feedback-data-types).
+IDs 1–15 use self-cast; IDs 16–255 use intra-cast when both sequencers have the
+same configured `module`, otherwise the multi-cast worst-case estimate.
+
+| Data type | Self-cast (ns) | Intra-cast (ns) | Multi-cast (ns) |
+| --- | ---: | ---: | ---: |
+| Q1 register / immediate | 60 | 150 | 380 |
+| Thresholded bits | 160 | 250 | 472 |
+| IQ values | 164 | 270 | 492 |
+| High-resolution time tags | 910 | 1000 | 1260 |
+| Time delta | 910 | 1000 | 1260 |
+| TTL counts | 146 | 236 | 480 |
+| Low-latency time tags | 146 | 236 | 480 |
+
+The site's additional transport allowance defaults to **200 ns for non-self
+routes**, including intra-cast. This is an experimental setup assumption, separate
+from the official base delays. Adjust it in `q1timeline.yml`:
+
+```yaml
+analysis:
+  feedback_transport_delay_ns: 200
+```
+
+Self-cast always adds zero. Explicit simulation `routes[].latency_ns` already
+specifies the complete route delay; the analysis allowance is not added again.
+
+Readout TB/IQ emission uses the configured integration end, not the acquire
+instruction's RT duration. TTL count and time-delta packets use the time-tag
+window close. Streaming time tags require an actual tag emission time: without
+that input, analysis reports unknown timing and omits a numeric arrival marker.
+Unknown readout integration length and unmodeled nonzero QTM fine delay are
+handled the same way.
+
+A pop/pull before estimated arrival raises a warning because Q1 may block.
+Blocking alone is valid; the event-driven simulator reports an error only if RT
+work actually runs out while Q1 waits. The arrival marker does not move to the
+later Q1 consumption time.
 Display alignment does not change execution.
 
 `fb_pop_data` and `fb_pull_data` wait for matching IDs, discarding earlier FIFO

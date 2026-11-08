@@ -1,0 +1,4 @@
+wait_sync 4
+wait 2000
+fb_pop_data 32,R0
+stop

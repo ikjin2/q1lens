@@ -813,7 +813,11 @@
       setBlock("rt", snapshot.rt.status, snapshot.rt.status === "active", eventLabel(snapshot.rt.event));
       const plays = snapshot.awg.filter((entry) => entry.event);
       setBlock("awg", plays.length ? "Last play command" : "No resolved play", false, plays.map((entry) => `Path ${entry.path}: ${eventLabel(entry.event)}`).join(" · ") || "No resolved play command. Waveform duration is not inferred from RT command duration.");
-      setBlock("acquisition", snapshot.acquisition.event ? "Last acquire command" : "No resolved acquire", snapshot.acquisition.status === "active", eventLabel(snapshot.acquisition.event));
+      const integration = snapshot.acquisition.event?.meta?.acquisition_window;
+      const acquisitionStatus = !snapshot.acquisition.event ? "No resolved acquire" : snapshot.acquisition.status === "active"
+        ? "Integrating" : snapshot.acquisition.status === "unknown" ? "Integration length unknown"
+        : integration?.status === "interrupted" ? "Interrupted" : "Last acquire command";
+      setBlock("acquisition", acquisitionStatus, snapshot.acquisition.status === "active", eventLabel(snapshot.acquisition.event));
       setBlock("bins", `${snapshot.bins.total} targets`, snapshot.acquisition.status === "active", snapshot.simulation ? "Acquisition targets, completed I/Q and threshold results, with input provenance." : "Acquisition targets and their write history; measured results are unavailable.");
       for (const core of ["q1", "rt"]) {
         text(values[`${core}-event`], `${snapshot[core].status} · ${eventLabel(snapshot[core].event)}`);

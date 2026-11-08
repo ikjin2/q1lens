@@ -674,6 +674,11 @@ def _analyze_command(args: argparse.Namespace) -> int:
             return 2
     if execution_mode != "simulation":
         analyze_underflows(states)
+    for state, sequencer in zip(states, config.sequencers):
+        state.metadata["module"] = sequencer.module
+        state.metadata["hardware_parameters"] = dict(sequencer.hardware_parameters)
+        state.metadata["sequencer_index"] = sequencer.sequencer_index
+        state.metadata["module_type"] = sequencer.module_type
     analyze_project_hardware_readiness(states, config.sequencers, include_optional_checks=args.hardware_readiness)
     align_timelines(states, mode=alignment_mode, anchor_kinds=alignment_anchor_kinds)
     diagnostics.extend(diagnostic for state in states for diagnostic in state.diagnostics)
@@ -685,12 +690,10 @@ def _analyze_command(args: argparse.Namespace) -> int:
             "alignment_anchor_kinds": list(alignment_anchor_kinds),
             "display_file": str(display_file) if display_file else None,
             "display": display,
+            "feedback_transport_delay_ns": config.analysis.feedback_transport_delay_ns,
         },
         diagnostics=diagnostics,
     )
-    for entry, sequencer in zip(ir["sequencers"], config.sequencers):
-        if sequencer.module:
-            entry["module"] = sequencer.module
     output_target: Path | None = None
     try:
         ir["analysis"]["parameters"] = []

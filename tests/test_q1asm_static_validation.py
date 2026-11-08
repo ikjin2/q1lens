@@ -115,7 +115,7 @@ def test_strict_mode_checks_placeholders_after_stop(execution_mode: str) -> None
 
 @pytest.mark.parametrize("execution_mode", ["concrete", "simulation"])
 @pytest.mark.parametrize("operand,strict", [("$MISSING", False), ("{COUNT}", True)])
-def test_known_source_errors_block_execution_before_a_valid_prefix(
+def test_source_recovery_preserves_strict_operand_validation(
     execution_mode: str, operand: str, strict: bool,
 ) -> None:
     program = parse_q1asm(f"wait 1000\nstop\nmove {operand},R0\n", file="preflight.q1asm")
@@ -124,9 +124,9 @@ def test_known_source_errors_block_execution_before_a_valid_prefix(
     else:
         state = simulate_programs({"s": program}, strict_q1asm=strict)[0]
 
-    assert state.metadata["execution"]["status"] == "blocked"
-    assert state.metadata["execution"]["steps"] == 0
-    assert state.events == []
+    assert state.metadata["execution"]["status"] == ("blocked" if strict else "completed")
+    assert state.metadata["execution"]["steps"] == (0 if strict else 2)
+    assert bool(state.events) == (not strict)
     assert any(item.category == "unresolved_symbol" and item.severity == "error" for item in state.diagnostics)
 
 
@@ -175,12 +175,14 @@ def test_playback_reports_invalid_dead_code_before_running() -> None:
 
     snapshot = session.snapshot()
 
-    assert snapshot["playback"]["status"] == "error"
+    assert snapshot["playback"]["status"] == "idle"
     assert snapshot["playback"]["steps"] == 0
     assert snapshot["events"] == []
     diagnostic, = snapshot["diagnostics"]
     assert diagnostic["category"] == "invalid_argument_count"
     assert diagnostic["source"]["line"] == 2
+    assert diagnostic["details"]["source_line_skipped"] is True
+    assert session.run()["status"] == "completed"
 
 
 def test_cli_rejects_invalid_instruction_after_stop(tmp_path: Path, capsys) -> None:
@@ -199,10 +201,10 @@ def test_cli_rejects_invalid_instruction_after_stop(tmp_path: Path, capsys) -> N
 
 
 @pytest.mark.parametrize("branch", ["jmp @missing", "jge R0,1,@missing", "loop R0,@missing"])
-def test_undefined_analysis_branch_keeps_unknown_boundary_without_falling_through(branch: str) -> None:
+def test_undefined_analysis_branch_is_excluded_and_remaining_lines_are_rendered(branch: str) -> None:
     ir = analyze_documents({"static.q1asm": f"{branch}\nwait 20\nstop"}, alignment_mode="none")
 
     assert sum(item["category"] == "undefined_label" for item in ir["diagnostics"]) == 1
-    assert any(event["kind"] == "unknown_region" and event["meta"].get("reason") == "undefined_label"
-               for event in ir["events"])
-    assert not any(event["kind"] == "wait" for event in ir["events"])
+    assert not any(event["kind"] == "unknown_region" for event in ir["events"])
+    assert any(event["kind"] == "wait" for event in ir["events"])
+    assert not any(event["kind"] == "q1_issue" and event["source"]["line"] == 1 for event in ir["events"])

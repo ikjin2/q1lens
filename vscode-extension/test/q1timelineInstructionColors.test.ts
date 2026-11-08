@@ -40,6 +40,17 @@ function withDom(callback: () => void) {
 }
 
 describe("Q1ASM command colors", () => {
+  it("keeps eventual underflow proofs out of timed and instruction-position blocks", () => {
+    const ir = {events: [{id: "eventual", kind: "underflow_warning", lane: "debug.underflow", sequencer_id: "seq",
+      t0: {kind: "unknown", reason: "eventual failure time"}, t1: null,
+      meta: {eventual: true, status: "definite_underflow"}}]};
+    for (const mode of ["normal", "debug"]) {
+      for (const layout of ["time", "instruction"]) {
+        assert.deepEqual(buildQ1TimelineSharedModel(ir, {mode, layout}).lanes.flatMap((lane: any) => lane.blocks), []);
+      }
+    }
+  });
+
   it("gives every supported family the same color in Q1 and RT blocks in either layout", () => {
     const events = Object.entries(colors.families).filter(([family]) => family !== "directive").flatMap(([family, spec]: [string, any]) =>
       spec.ops.flatMap((op: string, index: number) => ["q1_issue", op].map((kind) => ({
@@ -50,7 +61,8 @@ describe("Q1ASM command colors", () => {
       }))),
     );
     for (const layout of ["time", "instruction"]) {
-      const blocks = buildQ1TimelineSharedModel({ events }, { layout }).lanes.flatMap((lane: any) => lane.blocks);
+      const blocks = buildQ1TimelineSharedModel({ events }, { layout }).lanes
+        .filter((lane: any) => lane.role !== "acquisition").flatMap((lane: any) => lane.blocks);
       assert.equal(blocks.length, events.length);
       for (const block of blocks) {
         const family = block.domain.meta.expectedFamily;
@@ -95,7 +107,7 @@ describe("Q1ASM command colors", () => {
   it("prefers explicit opcode metadata and uses semantic fallbacks for generated events", () => {
     const events = [
       { id: "metadata", kind: "q1_issue", meta: { op: "cmp" }, source: { raw: "set_freq 1" }, expected: "q1" },
-      { id: "pop", kind: "feedback_pop", expected: "feedback" },
+      { id: "send", kind: "feedback_com", expected: "feedback" },
       { id: "sync", kind: "sync_wait", expected: "sync" },
       { id: "branch", kind: "branch_region", source: { raw: "play 0,1,4" }, expected: "flow" },
       { id: "unknown", kind: "q1_issue", source: { raw: "future_opcode 4" }, expected: "unknown" },
@@ -213,7 +225,7 @@ describe("Shared timeline overlapping loop annotations", () => {
     renderTimeline(root, model);
     let nodes = descendants(root);
     let connector = nodes.find((node) => node.attributes.class === "feedback-connector");
-    assert.equal(connector.attributes.d, "M 25 60 C 25 105 75 115 75 160");
+    assert.equal(connector.attributes.d, "M 25 54.5 C 25 99.5 75 109.5 75 154.5");
     assert.equal(nodes.find((node) => node.attributes.class === "feedback-connector-svg").attributes.viewBox, "0 0 100 164");
     const rows = nodes.filter((node) => node.dataset.lane && !node.dataset.timelineHidden);
     for (const [index, row] of rows.entries()) {
@@ -223,7 +235,7 @@ describe("Shared timeline overlapping loop annotations", () => {
     renderAnnotations(nodes.find((node) => node.className === "timeline-lanes"), model);
     nodes = descendants(root);
     connector = nodes.filter((node) => node.attributes.class === "feedback-connector").at(-1);
-    assert.match(connector.attributes.d, /^M 25 61 C .* 75 163$/);
+    assert.match(connector.attributes.d, /^M 25 55.5 C .* 75 157.5$/);
     assert.equal(nodes.filter((node) => node.attributes.class === "feedback-connector-svg").at(-1).attributes.viewBox, "0 0 100 167");
   }));
 });

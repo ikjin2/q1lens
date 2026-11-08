@@ -91,12 +91,13 @@
     return String(value);
   }
 
-  function addInspectorField(fields, label, value) {
+  function addInspectorField(fields, label, value, className) {
     const displayed = displayInspectorValue(value);
     if (!displayed) {
       return;
     }
-    fields.push(`<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(displayed)}</dd>`);
+    const attributes = className ? ` class="${className}"` : "";
+    fields.push(`<dt>${escapeHtml(label)}</dt><dd${attributes}>${escapeHtml(displayed)}</dd>`);
   }
 
   function appendDiffInspectorFields(fields, event) {
@@ -170,7 +171,33 @@
     return !eventNode.classList.contains("is-filtered");
   }
 
-  function renderSharedEventInspector(eventId) {
+  function appendAcquisitionInspectorFields(fields, event) {
+    if (event.kind !== "acquire") return;
+    const window = windowAcquisition(event);
+    const ns = (value) => Number.isFinite(value) ? `${value} ns` : "unknown";
+    const mode = globalThis.q1timelineTimelineAdapter.acquisitionMode(event);
+    addInspectorField(fields, "Acquisition mode", ({ integration: "Integration", weighted: "Weighted integration",
+      ttl: "TTL counts", timetags: "Timetags", digital: "Digital" })[mode]);
+    addInspectorField(fields, "Effective integration", window.end === undefined ? "Unknown integration length"
+      : `${ns(window.effective_duration_ns)} / ${ns(window.configured_duration_ns)} configured`);
+    addInspectorField(fields, "Integration status", window.status === "interrupted" ? "Interrupted by next Acquire" : window.status);
+    addInspectorField(fields, "RT wait", ns(eventTime(event, "t1") - eventTime(event, "t0")));
+    addInspectorField(fields, "Integration window", `${ns(window.start)} → ${ns(window.end)}`);
+    addInspectorField(fields, "Acquisition target", `index ${displayInspectorValue(event.meta?.acquisition_index)} · bin ${displayInspectorValue(event.meta?.bin_index)}`);
+    addInspectorField(fields, "Integration source", window.source === "hardware_parameters" ? "hardware parameters · integration_length_acq" : "unknown");
+    if (event.meta?.scope_acquisition_window) {
+      const scope = globalThis.q1timelineTimelineAdapter.acquisitionWindow(event, { timeBasis: timelineTimeBasis }, "scope_acquisition_window");
+      addInspectorField(fields, "Scope window", `${ns(scope.start)} → ${ns(scope.end)}`);
+      addInspectorField(fields, "Scope capture", `${ns(scope.effective_duration_ns)} / ${ns(scope.configured_duration_ns)} configured · paths ${(scope.paths || []).join(", ")}`);
+      addInspectorField(fields, "Scope status", scope.status === "retriggered" ? "Retriggered by next Acquire" : scope.status);
+    }
+  }
+
+  function windowAcquisition(event) {
+    return window.q1timelineTimelineAdapter.acquisitionWindow(event, { timeBasis: timelineTimeBasis });
+  }
+
+  function renderSharedEventInspector(eventId, diagnosticMessage = findVisibleEventNodeByIds([eventId])?.dataset.diagnosticMessage) {
     const inspectorFields = document.getElementById("event-inspector-fields");
     if (!inspectorFields) {
       return;
@@ -183,9 +210,13 @@
     const meta = event.meta || {};
     const source = event.source || {};
     const fields = [];
+    appendAcquisitionInspectorFields(fields, event);
     appendDiffInspectorFields(fields, event);
     appendTriggerInspectorFields(fields, meta);
     addInspectorField(fields, "Label", event.kind === "underflow_warning" ? window.q1timelineTimelineAdapter.underflowLabel(event) : event.label || event.kind);
+    for (const message of diagnosticMessage?.split("\n") || []) {
+      addInspectorField(fields, "Error", message, "diagnostic-error-message");
+    }
     addInspectorField(fields, "Sequencer", event.sequencer_id);
     addInspectorField(fields, "Lane", event.lane);
     addInspectorField(fields, "Time range", `${displayInspectorValue(eventTime(event, "t0"))} -> ${displayInspectorValue(eventTime(event, "t1"))}`);
@@ -229,10 +260,11 @@
       if (replacement) replacement.focus({ preventScroll: true });
     }
     if (hardwareView && options.syncHardware !== false) {
-      hardwareView.selectEvent(eventId);
+      const navigationEvent = sourceNavigationEvent(timelineEventsById.get(String(eventId)));
+      hardwareView.selectEvent(navigationEvent?.id || eventId);
     }
     syncSharedAnnotationSelection(eventId);
-    renderSharedEventInspector(eventId);
+    renderSharedEventInspector(eventId, eventNode?.dataset.diagnosticMessage);
     syncTimelineZoomActionState();
     if (options.notify !== false) {
       openAnalysisDetails();
@@ -266,13 +298,17 @@
     vscode.postMessage({ type: "eventClick", eventId: String(event.id) });
   }
 
-  function syncTimelineRelatedSelection(eventId) {
+  function currentTimelineSelectionIndex() {
     const adapter = window.q1timelineTimelineAdapter;
     if (timelineSelectionEvents !== timelineIr.events && adapter && adapter.buildQ1TimelineSelectionIndex) {
       timelineSelectionIndex = adapter.buildQ1TimelineSelectionIndex(timelineIr);
       timelineSelectionEvents = timelineIr.events;
     }
-    const relation = timelineSelectionIndex.get(String(eventId));
+    return timelineSelectionIndex;
+  }
+
+  function syncTimelineRelatedSelection(eventId) {
+    const relation = currentTimelineSelectionIndex().get(String(eventId));
     const relatedIds = new Set(relation ? relation.relatedEventIds : []);
     const appliedIds = new Set(relation ? relation.appliedEventIds : []);
     for (const node of document.querySelectorAll(".event[data-event-id]")) {
@@ -326,15 +362,55 @@
 
   function prioritizedHighlightEventIds(eventIds) {
     const ids = Array.isArray(eventIds) ? eventIds.map((eventId) => String(eventId)) : [];
+    const selectionIndex = currentTimelineSelectionIndex();
+    const rtEventIds = new Set(ids.filter((id) => selectionIndex.get(id)?.rtNavigationEventId === id));
     return ids.slice().sort((left, right) => {
       const leftIsQ1Issue = eventIsQ1Issue(timelineEventsById.get(left));
       const rightIsQ1Issue = eventIsQ1Issue(timelineEventsById.get(right));
-      return Number(rightIsQ1Issue) - Number(leftIsQ1Issue);
+      return Number(rtEventIds.has(right)) - Number(rtEventIds.has(left)) || Number(rightIsQ1Issue) - Number(leftIsQ1Issue);
     });
   }
 
   function eventSequencerId(event) {
     return normalizeSequencerId((event && event.sequencer_id) || timelineSequencerFromLane(event && event.lane));
+  }
+
+  function sourceNavigationEvent(event) {
+    const targetId = event && currentTimelineSelectionIndex().get(String(event.id))?.rtNavigationEventId;
+    return timelineEventsById.get(targetId) || event;
+  }
+
+  function installRtPreparationMarkers() {
+    const groups = new Map();
+    for (const [id, entry] of currentTimelineSelectionIndex()) {
+      if (!entry.rtPreparation) continue;
+      const event = timelineEventsById.get(id);
+      const seq = String(event.sequencer_id);
+      if (event.meta?.branch_comparison_path || event.meta?.diff_status === "removed") continue;
+      if (!groups.has(seq)) groups.set(seq, []);
+      groups.get(seq).push(id);
+    }
+    for (const [seq, ids] of groups) {
+      const row = Array.from(document.querySelectorAll(".shared-timeline-stage .timeline-row-runtime"))
+        .find((node) => node.dataset.lane === `sequencer:${seq}`);
+      const label = row?.querySelector(".lane-label");
+      if (!label) continue;
+      const marker = document.createElement("button");
+      marker.type = "button";
+      marker.className = "event q1timeline-rt-prep";
+      marker.textContent = "prep";
+      marker.title = "RT preparation · Q1 setup before the first RT command. Navigation marker; no time duration.";
+      marker.setAttribute("aria-label", `${seq}: RT preparation`);
+      marker.setAttribute("aria-selected", "false");
+      marker.dataset.eventId = ids[0];
+      marker.dataset.eventIds = ids.join(" ");
+      marker.dataset.rtPreparation = "true";
+      marker.addEventListener("click", (event) => {
+        event.stopPropagation();
+        selectEventNode(marker);
+      });
+      label.append(marker);
+    }
   }
 
   function expandQ1IssueLanesForHighlight(eventIds) {
@@ -985,7 +1061,7 @@
         timelineTimeScales.clear();
         writePersistedWebviewState({ expandedPlaybackLoops: Array.from(expandedPlaybackLoops) });
         closeTimelineControlPopover();
-        renderSharedTimelineIfAvailable();
+        animateTimelineFoldChange(() => renderSharedTimelineIfAvailable());
         restoreLoopFocus();
       }, { text: true, active: expanded, disabled: !(meta.hidden_event_ids || []).length });
     } else if (actionKind === "loop") {
@@ -1118,6 +1194,7 @@
     const chipStackCounts = new Map();
     const hiddenControls = new Map();
     for (const node of branchNodes) {
+      if (node.dataset.diagnosticPlacement || node.dataset.blockId?.endsWith(":acquisition-window")) continue;
       const event = timelineEventsById.get(String(node.dataset.eventId));
       const actionKind = eventHasFeedbackControl(event) ? "feedback" : event && eventHasBranchControl(event) ? "branch" : undefined;
       if (actionKind) {
@@ -1187,16 +1264,111 @@
     const window = currentTimelineWindow();
     const display = timelineDisplayWindow(window);
     const span = Math.max(display.max - display.min, 1e-9);
-    return visibleTimelineTicks(window).map((tick) => ({
+    const ticks = visibleTimelineTicks(window).map((tick) => ({
       leftPercent: Math.round(((displayTimelineTime(tick) - display.min) / span) * 100000) / 1000,
       label: `${formatWindowValue(tick)} ns`,
     }));
+    const width = timelineTimeScale()?.plotWidth;
+    if (!width) return ticks;
+    const result = [];
+    const last = ticks[ticks.length - 1];
+    const lastLeft = last.leftPercent / 100 * width - (last.leftPercent > 90 ? last.label.length * 6 : 0);
+    for (const [index, tick] of ticks.entries()) {
+      const previous = result[result.length - 1];
+      const x = tick.leftPercent / 100 * width;
+      const left = index === ticks.length - 1 ? lastLeft : x;
+      if (previous && (left < previous.leftPercent / 100 * width + previous.label.length * 6 + 12 ||
+        index < ticks.length - 1 && x + tick.label.length * 6 + 12 > lastLeft - 12)) continue;
+      result.push(tick);
+    }
+    return result;
   }
 
   function formatFoldDuration(duration) {
     const unit = duration >= 1e6 ? "ms" : duration >= 1e3 ? "µs" : "ns";
     const divisor = unit === "ms" ? 1e6 : unit === "µs" ? 1e3 : 1;
     return `${Number((duration / divisor).toPrecision(3))} ${unit}`;
+  }
+
+  function timelineFoldPositions() {
+    const positions = new Map();
+    const selector = ".timeline-block, .tick, .q1timeline-wait-fold, .q1timeline-playback-fold, .q1timeline-fold-toggle, " +
+      ".hardware-time-cursor, .timeline-loop-range, .timeline-parameter-marker, .feedback-endpoint, " +
+      ".feedback-inline-capsule, .feedback-connector, .time-selection";
+    for (const node of document.querySelectorAll(`.shared-timeline-stage :is(${selector})`)) {
+      const interval = node.closest("[data-time-start]")?.dataset || {};
+      const key = JSON.stringify([node.closest("[data-lane]")?.dataset.lane || "ruler", node.classList[0],
+        node.dataset.blockId, node.dataset.annotationId, node.dataset.flowId, node.dataset.feedbackRole,
+        node.dataset.eventId, node.dataset.parameterTime, interval.timeStart, interval.timeEnd,
+        node.classList.contains("tick") ? node.textContent : ""]);
+      const style = getComputedStyle(node);
+      const geometry = node.getAttribute("d") ? { d: `path("${node.getAttribute("d")}")` }
+        : { left: style.left, width: style.width };
+      positions.set(key, { node, geometry });
+    }
+    return positions;
+  }
+
+  function animateTimelineFoldChange(update) {
+    if (typeof window.matchMedia !== "function" || window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      update();
+      return;
+    }
+    const before = timelineFoldPositions();
+    update();
+    const animations = [];
+    for (const [key, { node, geometry }] of timelineFoldPositions()) {
+      const previous = before.get(key)?.geometry;
+      if (!previous || typeof node.animate !== "function" || JSON.stringify(previous) === JSON.stringify(geometry)) continue;
+      animations.push(node.animate([previous, geometry], { duration: 160, easing: "ease" }));
+    }
+    if (animations.length && activeTimelineControlChip) {
+      const reposition = () => {
+        repositionActiveTimelineControlPopover();
+        if (animations.some((animation) => animation.playState === "running")) requestAnimationFrame(reposition);
+      };
+      requestAnimationFrame(reposition);
+    }
+  }
+
+  function positionTimelineFoldToggle(toggle, marker, track) {
+    const width = track.clientWidth || track.getBoundingClientRect().width;
+    const buttonWidth = toggle.offsetWidth || 60;
+    const start = Number.parseFloat(marker.style.left) / 100 * width;
+    const middle = start + Number.parseFloat(marker.style.width) / 100 * width / 2;
+    const inset = buttonWidth / 2 + 4;
+    toggle.style.left = `${clamp(middle, inset, Math.max(inset, width - inset)) - start - (marker.clientLeft || 0)}px`;
+  }
+
+  function positionTimelineFoldToggles() {
+    const toggles = Array.from(document.querySelectorAll(".ruler .q1timeline-fold-toggle"));
+    for (const toggle of toggles) {
+      toggle.classList.remove("is-crowded");
+      positionTimelineFoldToggle(toggle, toggle.parentElement, toggle.closest(".ruler"));
+    }
+    const ordered = toggles.map((node) => ({ node, box: node.getBoundingClientRect() }))
+      .sort((left, right) => left.box.left - right.box.left);
+    for (let index = 1; index < ordered.length; index += 1) {
+      if (ordered[index - 1].box.right + 4 > ordered[index].box.left) {
+        ordered[index - 1].node.classList.add("is-crowded");
+        ordered[index].node.classList.add("is-crowded");
+      }
+    }
+    for (const toggle of toggles) positionTimelineFoldToggle(toggle, toggle.parentElement, toggle.closest(".ruler"));
+    if (!toggles.length) return;
+    const bounds = toggles[0].closest(".ruler").getBoundingClientRect();
+    const packed = toggles.map((node) => ({ node, box: node.getBoundingClientRect() })).sort((a, b) => a.box.left - b.box.left);
+    let edge = bounds.left + 4;
+    for (const item of packed) {
+      item.left = Math.max(item.box.left, edge);
+      edge = item.left + item.box.width + 4;
+    }
+    edge = bounds.right - 4;
+    for (const item of packed.reverse()) {
+      item.left = Math.min(item.left, edge - item.box.width);
+      edge = item.left - 4;
+    }
+    for (const { node, box, left } of packed) node.style.left = `${parseFloat(node.style.left) + left - box.left}px`;
   }
 
   function toggleTimelineGap(gap) {
@@ -1217,7 +1389,7 @@
     }
     timelineTimeScales.clear();
     writePersistedWebviewState({ timelineWaitsCollapsed, timelineExpandedGaps });
-    applyTimelineScale();
+    animateTimelineFoldChange(() => applyTimelineScale());
   }
 
   function toggleTimelineFolds() {
@@ -1226,7 +1398,7 @@
     timelineExpandedGaps = [];
     timelineTimeScales.clear();
     writePersistedWebviewState({ timelineWaitsCollapsed, timelineExpandedGaps });
-    applyTimelineScale();
+    animateTimelineFoldChange(() => applyTimelineScale());
   }
 
   function renderWaitFolds() {
@@ -1255,9 +1427,9 @@
       const end = Math.min(gap.end, current.max);
       const left = displayTimelineTime(start);
       const right = displayTimelineTime(end);
-      if ((right - left) / span < 0.001) continue;
+      if (right <= left) continue;
       for (const [trackIndex, track] of tracks.entries()) {
-        // Keep issuance markers accessible; the shared fold controls remain on the ruler and RT rows.
+        // Mark the same time interval on every lane; only the ruler owns a control.
         if (track.classList.contains("lane-track-q1-issue")) continue;
         const marker = document.createElement("span");
         marker.className = `q1timeline-wait-fold${folded ? "" : " is-expanded"}${timelineIr.playback ? " is-playback-wait" : ""}`;
@@ -1265,27 +1437,29 @@
         marker.style.width = `${(right - left) / span * 100}%`;
         marker.dataset.timeStart = String(gap.start);
         marker.dataset.timeEnd = String(gap.end);
-        const duration = formatFoldDuration(gap.end - gap.start);
+        track.appendChild(marker);
+        if (!track.classList.contains("ruler")) continue;
+        track.classList.add("has-time-folds");
+        const duration = formatFoldDuration(gap.acquisition ? gap.acquisition.end - gap.acquisition.start : gap.end - gap.start);
         const toggle = document.createElement("button");
         toggle.type = "button";
         toggle.className = "q1timeline-fold-toggle";
         toggle.dataset.timeStart = String(gap.start);
         toggle.dataset.timeEnd = String(gap.end);
         toggle.dataset.trackIndex = String(trackIndex);
-        const description = timelineIr.playback ? "Display compression of an executed wait. Acquisition or output may remain active; assumptions are unchanged." : "No Q1ASM state changes occur here; constant output or marker levels may remain active.";
+        const description = (gap.acquisition ? `Acquisition duration: ${duration}. The compressed interior keeps context at both ends. ` : "") +
+          (timelineIr.playback ? "Display compression of an executed wait. Acquisition or output may remain active; assumptions are unchanged." : "No Q1ASM state changes occur here; acquisition, constant output or marker levels may remain active.");
         toggle.title = `${folded ? "Folded" : "Expanded at full duration:"} ${formatWindowValue(gap.end - gap.start)} ns (${formatWindowValue(gap.start)}..${formatWindowValue(gap.end)} ns). Click to ${folded ? "expand" : "collapse"} only this interval across all sequencers. ${description}`;
-        toggle.setAttribute("aria-label", `${folded ? "Expand" : "Collapse"} ${duration} interval across all sequencers (${formatWindowValue(gap.start)}..${formatWindowValue(gap.end)} ns)`);
+        toggle.setAttribute("aria-label", `${folded ? "Expand" : "Collapse"} ${duration} ${gap.acquisition ? "acquisition" : "interval"} across all sequencers (${formatWindowValue(gap.start)}..${formatWindowValue(gap.end)} ns)`);
         toggle.setAttribute("aria-expanded", String(!folded));
-        if (folded) {
-          const slash = document.createElement("span");
-          slash.className = "q1timeline-fold-slashes";
-          slash.textContent = "//";
-          slash.setAttribute("aria-hidden", "true");
-          toggle.append(slash);
-        }
+        const icon = document.createElement("span");
+        icon.className = `q1timeline-fold-icon ${folded ? "is-expand" : "is-collapse"}`;
+        icon.setAttribute("aria-hidden", "true");
+        icon.innerHTML = toolbarSvgIcon(folded ? "expandTime" : "collapseTime");
+        toggle.append(icon);
         const label = document.createElement("span");
         label.className = "q1timeline-fold-duration";
-        label.textContent = !folded ? `${duration} expanded · collapse` : track.classList.contains("ruler") ? `${duration} folded · expand` : duration;
+        label.textContent = duration;
         toggle.append(label);
         toggle.addEventListener("pointerdown", (event) => event.stopPropagation());
         toggle.addEventListener("click", (event) => {
@@ -1299,7 +1473,7 @@
           }
         });
         marker.append(toggle);
-        track.appendChild(marker);
+        positionTimelineFoldToggle(toggle, marker, track);
       }
     }
   }
@@ -1322,10 +1496,19 @@
         marker.dataset.timeEnd = String(gap.end);
         marker.style.left = `${(displayTimelineTime(Math.max(gap.start, current.min)) - display.min) / span * 100}%`;
         marker.style.width = `${(displayTimelineTime(Math.min(gap.end, current.max)) - displayTimelineTime(Math.max(gap.start, current.min))) / span * 100}%`;
-        if (track.classList.contains("ruler") || track.closest(".timeline-row-runtime")) {
+        if (track.classList.contains("ruler")) {
+          track.classList.add("has-time-folds");
           const button = document.createElement("button");
           button.type = "button";
-          button.textContent = "//";
+          button.className = "q1timeline-fold-toggle";
+          const icon = document.createElement("span");
+          icon.className = "q1timeline-fold-icon is-repeat";
+          icon.setAttribute("aria-hidden", "true");
+          icon.innerHTML = toolbarSvgIcon("repeatTime");
+          const label = document.createElement("span");
+          label.className = "q1timeline-fold-duration";
+          label.textContent = formatFoldDuration(gap.end - gap.start);
+          button.append(icon, label);
           const interval = `${formatWindowValue(gap.start)}..${formatWindowValue(gap.end)} ns`;
           button.title = `Repeated iterations folded: ${interval}. ${loop?.meta.playback ? "Click to expand." : "Click for loop preview options."}`;
           button.setAttribute("aria-label", loop?.meta.playback ? `Expand repeated interval ${interval}` : `Loop preview options for repeated interval ${interval}`);
@@ -1344,11 +1527,13 @@
             for (const key of gap.loopKeys) expandedPlaybackLoops.add(key);
             timelineTimeScales.clear();
             writePersistedWebviewState({ expandedPlaybackLoops: Array.from(expandedPlaybackLoops) });
-            renderSharedTimelineIfAvailable();
+            animateTimelineFoldChange(() => renderSharedTimelineIfAvailable());
           });
           marker.append(button);
         }
         track.append(marker);
+        const toggle = marker.querySelector(".q1timeline-fold-toggle");
+        if (toggle) positionTimelineFoldToggle(toggle, marker, track);
       }
     }
   }
@@ -1377,7 +1562,8 @@
     }
     const selectedNode = selectedTimelineEventId ? findVisibleEventNodeByIds([selectedTimelineEventId]) : undefined;
     if (selectedNode) {
-      selectEventNode(selectedNode, { notify: false, syncHardware: false });
+      selectEventNode(selectedNode, { notify: false, syncHardware: false,
+        ...(selectedNode.dataset.rtPreparation === "true" ? { eventId: selectedTimelineEventId } : {}) });
       return;
     }
     syncTimelineRelatedSelection(undefined);
@@ -1416,12 +1602,28 @@
     rtDetailsByEvent = new Map(model.lanes.flatMap((lane) => lane.blocks.filter((block) => block.rtDetails)
       .flatMap((block) => (block.eventIds || [block.eventId]).map((id) => [String(id), block.rtDetails]))));
     if (timelineLayout !== "instruction") {
+      timelineCommandWidths = [];
+      for (const lane of model.lanes.filter((lane) => ["runtime", "branch-runtime", "runtime-path"].includes(lane.kind))) {
+        for (const block of lane.blocks.filter((block) => !block.diagnosticPlacement && !["underflow_warning", "analysis_incomplete", "unknown_region"].includes(block.kind))) {
+          block.commandLabel = block.commandToken || block.label;
+          block.classNames += " q1timeline-command-name";
+          if (!block.duration) block.classNames += " q1timeline-command-point";
+          const label = block.diagnosticErrors?.length ? `! ${block.commandLabel}` : block.commandLabel;
+          timelineCommandWidths.push({ start: block.start, end: block.start + block.duration, label });
+        }
+      }
+      timelineTimeScales.delete(`${timelineTimeBasis}:combined`);
       model.viewport = sharedTimelineViewport();
+      model.plotWidth = model.viewport.timeScale?.plotWidth;
       model.ticks = sharedTimelineTicks();
       model.selectionRange = sharedTimelineSelectionRange();
     }
     for (const lane of model.lanes || []) {
       for (const block of lane.blocks || []) {
+        if (block.acquisitionMode && timelineWaitTimeScale()?.gaps.some((gap) =>
+          gap.acquisition?.start === block.start && gap.acquisition.end === block.start + block.duration)) {
+          block.classNames += " acquisition-time-folded";
+        }
         block.selected = (selectedTimelineEventId !== undefined && String(block.eventId || block.id) === selectedTimelineEventId) ||
           (block.eventIds || [block.eventId || block.id]).some((id) => selectedSourceEventIds.has(String(id)));
       }
@@ -1444,7 +1646,7 @@
         if (event && typeof event.stopPropagation === "function") {
           event.stopPropagation();
         }
-        selectEventNode(node, { preserveFocus: Boolean(block.rtDetails) });
+        selectEventNode(node, { preserveFocus: Boolean(block.rtDetails || node.dataset.diagnosticMessage) });
         if (block.rtDetails) {
           const target = findVisibleEventNodeByIds([String(block.eventId)]);
           if (target) openTimelineControlPopover(target, timelineEventsById.get(String(block.eventId)), "rt-details");
@@ -1480,7 +1682,8 @@
         node.dataset.instructionIndex = String(index);
         // Use exact slots, without the time renderer's minimum width or rounded percentages.
         node.style.left = `calc(var(--instruction-cell-width) * ${index})`;
-        node.style.width = node.dataset.issueMarker === "true"
+        node.style.width = blocks.get(node.dataset.blockId).diagnosticPlacement && !blocks.get(node.dataset.blockId).duration
+          ? "10px" : node.dataset.issueMarker === "true"
           ? "min(24px, var(--instruction-cell-width))" : "var(--instruction-cell-width)";
         node.classList.remove("is-tiny", "is-compact");
       });
@@ -1493,31 +1696,18 @@
     renderTimelineWindowStatus(currentTimelineWindow());
     renderTimeBasisToggle();
     installSharedQ1IssueControls();
+    installRtPreparationMarkers();
     syncSharedSequencerFoldControls();
     installTimelineControlChips();
     for (const node of root.querySelectorAll(".timeline-block[data-event-id]")) {
-      const event = timelineEventsById.get(node.dataset.eventId);
-      if (["underflow_warning", "analysis_incomplete"].includes(event?.kind)) {
-        const underflow = event.kind === "underflow_warning";
-        node.classList.add("q1timeline-timing-warning");
-        node.classList.toggle("is-incomplete", !underflow);
-        node.textContent = underflow ? "!" : "?";
-        node.title = underflow ? window.q1timelineTimelineAdapter.underflowLabel(event) :
-          `Underflow analysis incomplete · ${event.meta?.reason || "Timing unknown"}`;
-        node.setAttribute("aria-label", node.title);
-        node.style.width = "16px";
-      }
+      if (node.dataset.blockId?.endsWith(":acquisition-window")) continue;
+      if (node.dataset.diagnosticPlacement) continue;
       if (!rtDetailsByEvent.has(node.dataset.eventId)) continue;
       node.dataset.rtDetailEventId = node.dataset.eventId;
       node.dataset.controlChipId = `rt-details:${node.dataset.eventId}`;
       node.setAttribute("aria-haspopup", "dialog");
       node.setAttribute("aria-expanded", "false");
       node.title = `${node.title || ""}\nClick or press Enter to expand latched parameters and registers used.`;
-      const disclosure = document.createElement("span");
-      disclosure.className = "q1timeline-rt-disclosure";
-      disclosure.textContent = "▸";
-      disclosure.setAttribute("aria-hidden", "true");
-      node.prepend(disclosure);
     }
     if (expandedDetailsId && rtDetailsByEvent.has(expandedDetailsId)) {
       const node = findVisibleEventNodeByIds([expandedDetailsId]);
@@ -1528,6 +1718,7 @@
     if (focusedEventId) findVisibleEventNodeByIds([focusedEventId])?.focus({ preventScroll: true });
     renderWaitFolds();
     renderPlaybackFolds();
+    positionTimelineFoldToggles();
     renderHardwareCursor();
     applyTimelineEventFilter();
     return true;
@@ -1658,6 +1849,7 @@
       const meta = event.meta || {};
       const source = event.source || {};
       const fields = [];
+      appendAcquisitionInspectorFields(fields, event);
       appendDiffInspectorFields(fields, event);
       appendTriggerInspectorFields(fields, meta);
       addInspectorField(fields, "Label", event.kind === "underflow_warning" ? window.q1timelineTimelineAdapter.underflowLabel(event) : event.label || event.kind);
@@ -1733,7 +1925,8 @@
       const relatedEventIds = syncTimelineRelatedSelection(eventId);
       expandQ1IssueLanesForHighlight(relatedEventIds);
       if (hardwareView && options.syncHardware !== false) {
-        hardwareView.selectEvent(eventId);
+        const navigationEvent = sourceNavigationEvent(timelineEventsById.get(String(eventId)));
+        hardwareView.selectEvent(navigationEvent?.id || eventId);
       }
       renderInspector(eventId);
       syncTimelineZoomActionState();
@@ -1908,6 +2101,7 @@
     ? readPersistedWebviewState().timelineExpandedGaps : []).filter((gap) => gap &&
       ["local", "aligned"].includes(gap.basis) && [gap.start, gap.end, gap.fullMin, gap.fullMax].every(Number.isFinite) && gap.end > gap.start);
   const timelineTimeScales = new Map();
+  let timelineCommandWidths = [];
   if (!currentFoldState) writePersistedWebviewState({ timelineFoldStateVersion: 2, timelineFoldSnapshotId: state.playbackSnapshotId,
     timelineWaitsCollapsed: true, expandedPlaybackLoops: [], timelineExpandedGaps: [] });
   let timelineZoom = 1;
@@ -2237,6 +2431,9 @@
       play: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 11 7-11 7z"/></svg>',
       pause: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14M16 5v14"/></svg>',
       foldWaits: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 8h6l-3 8h6l-3-8h6l-3 8h9"/></svg>',
+      expandTime: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 12H2m3-3-3 3 3 3M16 12h6m-3-3 3 3-3 3M12 2v2m0 4v2m0 4v2m0 4v2"/></svg>',
+      collapseTime: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12h6M5 9l3 3-3 3M22 12h-6m3-3-3 3 3 3M12 2v2m0 4v2m0 4v2m0 4v2"/></svg>',
+      repeatTime: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m17 2 4 4-4 4M3 11V8a2 2 0 0 1 2-2h16M7 22l-4-4 4-4m14-1v3a2 2 0 0 1-2 2H3"/></svg>',
       refresh: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/></svg>',
       sync: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 0 1-15.4 6.4"/><path d="M3 12A9 9 0 0 1 18.4 5.6"/><path d="M3 19v-5h5"/><path d="M21 5v5h-5"/></svg>',
       alignment: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16"/><path d="M7 12h10"/><path d="M4 17h16"/><path d="M12 4v16"/></svg>',
@@ -2307,6 +2504,8 @@
       ["warning", "error"].includes(diagnostic.severity) &&
       bufferCategories.has(diagnostic.category));
     if (!hasBufferFinding) return;
+    const eventualUnderflow = (timelineIr.diagnostics || []).some((diagnostic) =>
+      diagnostic.category === "definite_underflow" && diagnostic.details?.eventual);
     const underflow = timelineIr.assumptions?.underflow;
     const assumed = underflow?.initial_buffer_assumed_ns;
     const possible = underflow?.initial_buffer_possible_ns;
@@ -2314,9 +2513,11 @@
     const summary = document.createElement("span");
     summary.id = "q1timeline-initial-buffer-summary";
     summary.className = "q1timeline-initial-buffer-summary";
-    summary.textContent = `Initial buffer ≈ ${formatFoldDuration(assumed)} · up to ${formatFoldDuration(possible)} probably OK`;
+    summary.textContent = eventualUnderflow ? "Initial buffer · no finite reserve sustains this loop"
+      : `Initial buffer ≈ ${formatFoldDuration(assumed)} · up to ${formatFoldDuration(possible)} probably OK`;
     const details = [
-      `${formatFoldDuration(assumed)} of initial RT buffer is assumed. Up to ${formatFoldDuration(possible)} may be sufficient, but is unconfirmed.`,
+      eventualUnderflow ? "The infinite loop consumes RT packets faster than Q1 can supply them; any finite initial reserve is eventually exhausted."
+        : `${formatFoldDuration(assumed)} of initial RT buffer is assumed. Up to ${formatFoldDuration(possible)} may be sufficient, but is unconfirmed.`,
       "These are user-provided assumptions, not measured hardware values. The buffer covers cumulative Q1 supply gaps during RT execution; no RT startup delay is added.",
     ];
     for (const [sequencer, execution] of Object.entries(timelineIr.execution || {})) {
@@ -3026,6 +3227,12 @@
           max = Math.max(max, value);
         }
       }
+      if (event.kind === "acquire") {
+        for (const field of ["acquisition_window", "scope_acquisition_window"]) {
+          const end = window.q1timelineTimelineAdapter.acquisitionWindow(event, { timeBasis: timelineTimeBasis }, field).end;
+          if (Number.isFinite(end)) max = Math.max(max, end);
+        }
+      }
     }
     if (max <= min) {
       max = min + 1;
@@ -3205,14 +3412,34 @@
     const adapter = window.q1timelineTimelineAdapter;
     if (timelineSvg() || !adapter || !adapter.buildTimelineTimeScale) return timelineWaitTimeScale();
     const key = `${timelineTimeBasis}:combined`;
-    if (!timelineTimeScales.has(key)) {
-      timelineTimeScales.set(key, adapter.buildTimelineTimeScale(timelineIr, {
+    const current = currentTimelineWindow();
+    const root = document.getElementById("timeline-root");
+    const style = root?.clientWidth ? getComputedStyle(root) : undefined;
+    // Leave room for the lane label, stage border and the final command's end cap.
+    const plotWidth = style ? Math.max(1, root.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight) - 168 - 37) : 0;
+    const cached = timelineTimeScales.get(key);
+    if (!cached || cached.min !== current.min || cached.max !== current.max || cached.plotWidth !== plotWidth) {
+      const waitGaps = timelineWaitTimeScale()?.gaps || [];
+      const measure = plotWidth ? document.createElement("canvas").getContext("2d") : undefined;
+      if (measure) measure.font = `600 11px ${style.fontFamily}`;
+      const commandWidths = measure ? timelineCommandWidths.map((command) => ({ ...command,
+        width: Math.ceil(measure.measureText(command.label).width) + 18 })) : [];
+      if (measure) measure.font = `11px ${style.fontFamily}`;
+      const scale = adapter.buildTimelineTimeScale(timelineIr, {
         timeBasis: timelineTimeBasis,
         expandedPlaybackLoops: Array.from(expandedPlaybackLoops),
-        waitGaps: timelineWaitTimeScale()?.gaps || [],
-      }));
+        waitGaps,
+        ...(plotWidth ? { viewport: { start: current.min, end: current.max }, plotWidth,
+          commandWidths,
+          foldWidth: (gap) => {
+            const acquisition = waitGaps.find((item) => item.start === gap.start && item.end === gap.end)?.acquisition;
+            const label = formatFoldDuration(acquisition ? acquisition.end - acquisition.start : gap.end - gap.start);
+            return Math.ceil(measure.measureText(label).width) + 40;
+          } } : {}),
+      });
+      timelineTimeScales.set(key, { scale, min: current.min, max: current.max, plotWidth });
     }
-    return timelineTimeScales.get(key);
+    return timelineTimeScales.get(key).scale;
   }
 
   function displayTimelineTime(time) {
@@ -4437,6 +4664,8 @@
       startClientX: Number(event.clientX),
       startMin: current.min,
       startMax: current.max,
+      timeScale: timelineTimeScale(),
+      plotWidth: timelinePlotPixelWidth(svg, svg ? timelineGeometry(svg) : undefined),
       moved: false,
     };
     if (typeof container.setPointerCapture === "function" && event.pointerId !== undefined) {
@@ -4457,15 +4686,20 @@
     if ((!svg && !document.querySelector(".shared-timeline-stage")) || !Number.isFinite(Number(event.clientX))) {
       return;
     }
-    const geometry = svg ? timelineGeometry(svg) : undefined;
     const span = Math.max(1e-9, timelineDrag.startMax - timelineDrag.startMin);
     const deltaX = Number(event.clientX) - timelineDrag.startClientX;
     if (!timelineDrag.moved && Math.abs(deltaX) < timelineDragThresholdPx) {
       return;
     }
     timelineDrag.moved = true;
-    const shift = -(deltaX / timelinePlotPixelWidth(svg, geometry)) * span;
-    setTimelineDisplayWindow(timelineDrag.startMin + shift, timelineDrag.startMax + shift);
+    const shift = -(deltaX / timelineDrag.plotWidth) * span;
+    // A compact plot can resize while panning. Keep the gesture in its original
+    // projection so repeated pointer positions cannot move the window again.
+    const scale = timelineDrag.timeScale;
+    const full = fullTimelineWindow();
+    const window = timelineWindowForRange(timelineDrag.startMin + shift, timelineDrag.startMax + shift,
+      { min: scale ? scale.toDisplay(full.min) : full.min, max: scale ? scale.toDisplay(full.max) : full.max }, 1e-9);
+    if (window) setTimelineWindow(scale ? scale.fromDisplay(window.min) : window.min, scale ? scale.fromDisplay(window.max) : window.max);
     event.preventDefault();
   }
 
@@ -4673,7 +4907,18 @@
       closeTimelineControlPopover();
     }
   });
-  window.addEventListener("resize", repositionActiveTimelineControlPopover);
+  let timelineRootWidth = document.getElementById("timeline-root")?.clientWidth;
+  function resizeTimelineLayout() {
+    const width = document.getElementById("timeline-root")?.clientWidth;
+    if (width !== timelineRootWidth) {
+      timelineRootWidth = width;
+      if (timelineLayout !== "instruction") requestAnimationFrame(() => applyTimelineScale());
+    }
+    positionTimelineFoldToggles();
+    repositionActiveTimelineControlPopover();
+  }
+  window.addEventListener("resize", resizeTimelineLayout);
+  if (typeof ResizeObserver === "function") new ResizeObserver(resizeTimelineLayout).observe(document.getElementById("timeline-root"));
   document.addEventListener("scroll", repositionActiveTimelineControlPopover, true);
 
   document.addEventListener("click", (event) => {
@@ -4789,12 +5034,13 @@
     }
     const highlightEventIds = prioritizedHighlightEventIds(event.data.highlightEventIds || []);
     expandQ1IssueLanesForHighlight(highlightEventIds);
-    const highlightedEvent = highlightedEventForIds(highlightEventIds);
+    const highlightedEvent = sourceNavigationEvent(highlightedEventForIds(highlightEventIds));
     const visibleEvent = visiblePlaybackEvent(highlightedEvent);
     zoomTimelineToHighlightedEvent(visibleEvent);
     const target = findVisibleEventNodeByIds(visibleEvent ? [visibleEvent.id, ...highlightEventIds] : highlightEventIds);
     if (target) {
-      selectEventNode(target, { notify: false, syncHardware: visibleEvent === highlightedEvent });
+      selectEventNode(target, { notify: false, syncHardware: visibleEvent === highlightedEvent,
+        ...(target.dataset.rtPreparation === "true" ? { eventId: String(highlightedEvent.id) } : {}) });
       if (visibleEvent !== highlightedEvent && highlightedEvent) {
         if (hardwareView) hardwareView.selectEvent(highlightedEvent.id);
         renderSharedEventInspector(highlightedEvent.id);

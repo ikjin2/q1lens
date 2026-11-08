@@ -410,13 +410,14 @@ def test_fb_com_data_accepts_full_feedback_id_range() -> None:
     assert _error_categories("fb_cmd 255,0,4\nstop\n") == []
 
 
-def test_fb_cmd_unresolved_channel_reports_feedback_channel_role() -> None:
+def test_fb_cmd_undefined_alias_reports_the_excluded_source_operand() -> None:
     state = _state("fb_cmd $CH,0,4\nstop\n")
 
     assert any(
         diagnostic.category == "unresolved_symbol"
         and diagnostic.details.get("op") == "fb_cmd"
-        and diagnostic.details.get("operand_role") == "feedback_channel"
+        and diagnostic.details.get("operand") == "$CH"
+        and diagnostic.details.get("source_line_skipped")
         for diagnostic in state.diagnostics
     )
 
@@ -628,7 +629,7 @@ def test_fb_pull_data_feedback_flow_uses_fifo_send_channel() -> None:
         alignment_mode="none",
     )
 
-    assert ir["feedback_flows"] == [
+    assert [{key: value for key, value in flow.items() if key != "timing"} for flow in ir["feedback_flows"]] == [
         {
             "id": "feedback-flow-0",
             "from_event_id": "producer:e5",
@@ -729,8 +730,8 @@ def test_fb_pop_data_discard_does_not_consume_other_receivers_queues() -> None:
     assert ir["feedback_balance"]["channels"]["19"]["discarded_payloads"] == 0
 
 
-def test_set_cond_remains_explicitly_analysis_incomplete() -> None:
-    state = _state("set_cond 1,0,0,4\nplay 0,1,8\nstop\n")
+def test_set_cond_with_unknown_trigger_remains_explicitly_analysis_incomplete() -> None:
+    state = _state("set_cond 1,1,0,4\nplay 0,1,8\nstop\n")
 
     assert any(
         diagnostic.category == "analysis_incomplete"

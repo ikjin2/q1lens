@@ -13,8 +13,9 @@
     'run-end', 'return-focus', 'numeric-format', 'exploration',
     'exploration-label', 'reset-branches', 'branch-error', 'branch-hint',
     'history-point', 'history-more', 'history-table', 'history-empty',
+    'view-title', 'view-caption', 'rt-relation', 'selection-context', 'instruction-zoom',
   ].map(id => [id, byId(id)]));
-  let caseIndex = 0;
+  let caseIndex = Math.max(0, cases.findIndex(item => item.id === 'latched'));
   let scenarioIndex = 0;
   let stepIndex = 0;
   let returnIndex = null;
@@ -32,6 +33,13 @@
   let historyLimit = 5;
   let historyIteration = 1;
   let historyKey = null;
+  let view = 'instruction';
+  let focusedTime = false;
+  let expandedLoops = new Set();
+  let loopProjections = [];
+  let detailTab = 'instruction';
+  let historyDetail = false;
+  let instructionWidth = 144;
   const operationNames = {
     move: '값 복사', add: '더하기', sub: '빼기',
     muls16: '부호 있는 16비트 곱셈', muls32: '부호 있는 32비트 곱셈',
@@ -84,7 +92,12 @@
     if (busy || !steps().length) return;
     if (remember && index !== stepIndex && returnIndex === null) returnIndex = stepIndex;
     stepIndex = Math.max(0, Math.min(steps().length - 1, index));
-    document.querySelector('.detail-pane').scrollTop = 0;
+    if (detailTab === 'source') detailTab = 'instruction';
+    if (detailTab === 'history') historyDetail = true;
+    else document.querySelector('.panel-body').scrollTop = 0;
+    loopProjections.forEach(item => {
+      if (item.rows.some(row => stepIndex >= row.start && stepIndex <= row.end)) expandedLoops.add(item.loop.id);
+    });
     render();
   }
   function jumpToWriter(writerId) {
@@ -95,6 +108,7 @@
     const list = steps();
     eventIndexes = new Map(list.map((step, index) => [String(step.id), index]));
     decisionIndexes = list.flatMap((step, index) => step.branch && step.op !== 'jmp' ? [index] : []);
+    loopProjections = (currentCase().loops || []).map(loop => ({ loop, ...projectLoop(list, loop) }));
   }
   function cancelRequest() {
     requestVersion += 1;
@@ -109,11 +123,17 @@
     originalFocus = null;
     branchError = '';
     indexScenario();
-    stepIndex = decisionIndexes.find(index => steps()[index].op !== 'loop') ?? decisionIndexes[0] ?? 0;
+    const firstLoop = currentCase().loops?.[0];
+    const firstSetter = steps().findIndex(step => step.latched?.length && firstLoop && step.pc >= firstLoop.startPc && step.pc <= firstLoop.endPc);
+    stepIndex = decisionIndexes.find(index => steps()[index].op !== 'loop') ?? (firstSetter >= 0 ? firstSetter : decisionIndexes[0] ?? 0);
     historyLoop = currentCase().loops?.[0]?.id ?? null;
     historyLimit = 5;
     historyIteration = 1;
     historyKey = null;
+    detailTab = 'instruction';
+    historyDetail = false;
+    document.querySelector('.panel-body').scrollTop = 0;
+    expandedLoops = new Set(currentCase().loops?.length ? [currentCase().loops[0].id] : []);
     returnIndex = null;
     renderSource();
     render();
@@ -389,13 +409,17 @@
   function selectLoop(id) {
     if (busy) return;
     historyLoop = id;
+    expandedLoops.add(id);
     historyLimit = 5;
     historyIteration = 1;
     historyKey = null;
+    detailTab = 'history';
+    historyDetail = false;
+    document.querySelector('.panel-body').scrollTop = 0;
     const loop = currentCase().loops.find(item => item.id === id);
     const first = projectLoop(steps(), loop).rows[0];
-    if (first) selectStep(first.focusIndex);
-    else render();
+    if (first) stepIndex = first.focusIndex;
+    render();
   }
   function renderHistory() {
     const loop = currentCase().loops?.find(item => item.id === historyLoop);
@@ -469,6 +493,223 @@
     });
     elements['history-table'].replaceChildren(head, body);
   }
+  function commandBlock(op, text) {
+    const button = el('button', 'timeline-block has-command-color');
+    button.type = 'button';
+    button.disabled = busy;
+    button.style.setProperty('--timeline-block-accent', q1asmInstructionColors.commandAccentColor(op));
+    const label = el('span', 'block-label');
+    const source = text.replace(/\s+/g, ' ').trim();
+    let offset = 0;
+    q1asmInstructionColors.sourceTokens(source).forEach(token => {
+      label.append(document.createTextNode(source.slice(offset, token.start)));
+      const span = el('span', '', source.slice(token.start, token.end));
+      span.style.color = token.kind === 'command' ? q1asmInstructionColors.commandAccentColor(op) : q1asmInstructionColors.argumentAccentColor(token.kind);
+      label.append(span);
+      offset = token.end;
+    });
+    label.append(document.createTextNode(source.slice(offset)));
+    button.append(label);
+    return button;
+  }
+  function instructionNode(index) {
+    const step = steps()[index];
+    const button = commandBlock(step.op, step.text);
+    button.classList.add('q1-node');
+    button.dataset.index = index;
+    button.setAttribute('aria-label', `Q1 L${step.line} ${step.occurrence}회 ${step.op}`);
+    button.setAttribute('aria-selected', String(index === stepIndex));
+    button.title = `#${index + 1} · L${step.line} · ${step.occurrence}번째 실행\n${step.text}`;
+    button.addEventListener('click', () => { detailTab = 'instruction'; historyKey = null; selectStep(index); });
+    return button;
+  }
+  function timelineRow(label, width, className = '') {
+    const row = el('div', `timeline-row ${className}`);
+    const track = el('div', 'lane-track');
+    track.style.width = `${width}px`;
+    row.append(el('div', 'lane-label', label), track);
+    return { row, track };
+  }
+  function renderInstruction() {
+    const host = byId('instruction-view');
+    const layout = ExecutionViews.instructionLayout(steps(), loopProjections, expandedLoops, stepIndex, historyLoop, historyIteration);
+    const width = Math.max(host.clientWidth - 168, layout.blocks.length * instructionWidth + 8);
+    const canvas = el('div', 'timeline-canvas');
+    canvas.style.width = `${width + 168}px`;
+    const ruler = el('div', 'ruler');
+    const stride = Math.max(1, Math.ceil(60 / instructionWidth));
+    layout.blocks.forEach((block, position) => {
+      if (position % stride) return;
+      const tick = el('div', 'tick');
+      tick.style.left = `${position * instructionWidth}px`;
+      tick.append(el('span', '', block.kind === 'instruction' ? `#${block.index + 1}` : '↻'));
+      ruler.append(tick);
+    });
+    canvas.append(el('div', 'axis-label', '실행 순서 #'), ruler);
+    const depth = layout.ranges.length ? Math.max(...layout.ranges.map(range => range.depth)) + 1 : 0;
+    for (let level = 0; level < depth; level++) {
+      const band = timelineRow(level ? '중첩 반복' : '반복 범위', width, 'loop-band-row');
+      layout.ranges.filter(range => range.depth === level).forEach(range => {
+        const strip = el('div', 'loop-band');
+        strip.style.left = `${range.start * instructionWidth}px`;
+        strip.style.width = `${(range.end - range.start) * instructionWidth - 4}px`;
+        strip.classList.toggle('is-active', range.loop.id === historyLoop && detailTab === 'history');
+        const toggle = el('button', 'loop-toggle', range.expanded ? '⌄' : '›');
+        toggle.type = 'button';
+        toggle.disabled = busy;
+        toggle.setAttribute('aria-label', `루프 ${range.loop.name} ${range.expanded ? '접기' : '펼치기'}`);
+        toggle.setAttribute('aria-expanded', String(range.expanded));
+        toggle.addEventListener('click', () => {
+          if (range.expanded) { expandedLoops.delete(range.loop.id); render(); }
+          else selectLoop(range.loop.id);
+        });
+        const title = `↻ @${range.loop.name} · ${range.row.iteration} / ${range.rows.length}회`;
+        const button = el('button', 'loop-title', title);
+        button.type = 'button';
+        button.disabled = busy;
+        button.title = `${title}\nL${range.loop.startLine}–${range.loop.endLine} · 클릭하여 처음 5회 변화 보기`;
+        button.setAttribute('aria-label', `루프 ${range.loop.name}의 처음 5회 보기`);
+        button.addEventListener('click', () => selectLoop(range.loop.id));
+        strip.append(toggle, button);
+        band.track.append(strip);
+      });
+      canvas.append(band.row);
+    }
+    const lane = timelineRow('Q1 · 명령', width);
+    layout.blocks.forEach((block, position) => {
+      const button = block.kind === 'instruction' ? instructionNode(block.index) : commandBlock('loop', `↻ @${block.loop.name}`);
+      button.style.left = `${position * instructionWidth}px`;
+      button.style.width = `${instructionWidth - 4}px`;
+      if (block.kind === 'loop') {
+        button.title = `${block.rows.length}회 기록 · 클릭하여 펼치기`;
+        button.addEventListener('click', () => selectLoop(block.loop.id));
+      }
+      lane.track.append(button);
+    });
+    canvas.append(lane.row);
+    host.replaceChildren(canvas);
+    if (view === 'instruction') {
+      const selected = host.querySelector('.q1-node[aria-selected="true"]');
+      if (selected) {
+        const box = selected.getBoundingClientRect(), frame = host.getBoundingClientRect();
+        if (box.left < frame.left + 168 || box.right > frame.right) host.scrollLeft += box.left - frame.left - 192;
+      }
+    }
+    setText('instruction-zoom', `${Math.round(instructionWidth / 144 * 100)}%`);
+  }
+  function renderTime() {
+    const selected = steps()[stepIndex];
+    if (!selected) return;
+    const host = byId('time-view');
+    const packets = currentScenario().rtPackets || [];
+    const related = new Set(ExecutionViews.relatedPackets(selected, packets).map(packet => packet.id));
+    const range = ExecutionViews.timeWindow(steps(), packets, selected, focusedTime);
+    const width = Math.max(520, host.clientWidth - 180);
+    const x = value => (value - range.start) / (range.end - range.start) * width;
+    const canvas = el('div', 'timeline-canvas');
+    canvas.style.width = `${width + 168}px`;
+    const ruler = el('div', 'ruler');
+    const unit = range.end >= 1000 ? 1000 : 1;
+    for (let i = 0; i < 6; i++) {
+      const value = range.start + (range.end - range.start) * i / 6;
+      const tick = el('div', 'tick');
+      tick.style.left = `${x(value)}px`;
+      tick.append(el('span', '', `${Number((value / unit).toFixed(1))} ${unit === 1000 ? 'µs' : 'ns'}`));
+      ruler.append(tick);
+    }
+    canvas.append(el('div', 'axis-label', '실행 시간'), ruler);
+    const q1 = timelineRow('Q1 · 명령', width), rt = timelineRow('RT · 동작', width);
+    const place = (track, button, start, end) => {
+      if (!Number.isFinite(start) || !Number.isFinite(end) || end < range.start || start > range.end) return;
+      const left = x(Math.max(range.start, start));
+      const blockWidth = Math.max(1, x(Math.min(range.end, end)) - left);
+      button.style.left = `${left}px`;
+      button.style.width = `${blockWidth}px`;
+      if (blockWidth < 25) button.classList.add('is-compact');
+      track.append(button);
+    };
+    steps().forEach((step, index) => {
+      const button = instructionNode(index);
+      button.title += `\nQ1 ${time(step.q1Start)} → ${time(step.q1End)}`;
+      place(q1.track, button, step.q1Start, step.q1End);
+    });
+    packets.forEach(packet => {
+      const button = commandBlock(packet.op, packet.op);
+      button.setAttribute('aria-selected', String(related.has(packet.id)));
+      button.setAttribute('aria-label', `RT ${packet.op} L${packet.line} ${time(packet.start)}부터`);
+      button.title = `RT ${packet.op} · L${packet.line}\n${time(packet.start)} → ${time(packet.end)}`;
+      button.addEventListener('click', () => {
+        const index = eventIndexes.get(String(packet.q1Id));
+        if (index !== undefined) { detailTab = 'instruction'; selectStep(index); }
+      });
+      place(rt.track, button, packet.start, packet.end);
+    });
+    canvas.append(q1.row, rt.row);
+    const links = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    links.setAttribute('class', 'time-links');
+    links.setAttribute('viewBox', `0 0 ${width} 72`);
+    links.setAttribute('aria-hidden', 'true');
+    links.style.width = `${width}px`;
+    packets.filter(packet => related.has(packet.id) && Number.isFinite(packet.start)).forEach(packet => {
+      const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      path.setAttribute('d', `M${x(selected.q1End)},29 L${x(packet.start)},43`);
+      links.append(path);
+    });
+    canvas.append(links);
+    const unknown = packets.filter(packet => !Number.isFinite(packet.start)).length;
+    host.replaceChildren(canvas, el('p', 'time-note', `${focusedTime ? '선택 명령과 연결된 RT 주변' : '전체 실행'} · 작은 명령은 가는 선으로 표시${unknown ? ` · ${unknown}개 packet의 RT 실행 시각 미확정` : ''}`));
+    byId('time-focus').setAttribute('aria-pressed', String(focusedTime));
+    byId('time-all').setAttribute('aria-pressed', String(!focusedTime));
+  }
+  function renderRtContext() {
+    const step = steps()[stepIndex];
+    if (!step) return;
+    const packets = ExecutionViews.relatedPackets(step, currentScenario().rtPackets || []);
+    setText('rt-relation', packets.length ? `${step.latched?.length ? '설정값이 적용되는 RT' : '이 명령이 만든 packet'} · ${packets.length}개` : 'Q1 연산 · 직접 연결된 RT 기록 없음');
+    const links = packets.slice(0, 3).map(packet => {
+      const button = el('button', 'rt-link');
+      button.type = 'button';
+      button.disabled = busy;
+      const fields = step.latched?.length ? step.latched.map(item => item.field) : packet.updatedFields;
+      button.append(el('strong', '', `${packet.op} · L${packet.line}`), el('span', '', Number.isFinite(packet.start) ? `${time(packet.start)} → ${time(packet.end)}` : 'RT 실행 미기록'));
+      const settings = fields.filter(field => packet.settings[field] !== undefined).map(field => `${field} ${displayValue(packet.settings[field])}`).join(' · ');
+      if (settings) button.append(el('code', '', settings));
+      button.title = 'Time 보기에서 이 명령과 RT 관계 확인';
+      button.addEventListener('click', () => { view = 'time'; focusedTime = true; render(); });
+      return button;
+    });
+    byId('rt-links').replaceChildren(...links);
+  }
+  function renderViews() {
+    byId('instruction-view').hidden = view !== 'instruction';
+    byId('time-view').hidden = view !== 'time';
+    byId('time-controls').hidden = view !== 'time';
+    byId('instruction-controls').hidden = view !== 'instruction';
+    byId('instruction-view-button').setAttribute('aria-pressed', String(view === 'instruction'));
+    byId('time-view-button').setAttribute('aria-pressed', String(view === 'time'));
+    setText('view-title', view === 'instruction' ? 'Q1 · 실행 순서' : 'Q1 / RT · 실제 시간');
+    setText('view-caption', view === 'instruction' ? '실행 번호 # · 같은 폭의 명령 · 반복은 선택한 한 회차' : '같은 시간축 · 점선은 Q1과 RT 연결');
+    renderDock();
+    renderInstruction();
+    if (view === 'time') renderTime();
+    renderRtContext();
+  }
+  function renderDock() {
+    ['instruction', 'history', 'source'].forEach(tab => {
+      const button = byId(`detail-${tab}`);
+      button.setAttribute('aria-selected', String(detailTab === tab));
+      button.tabIndex = detailTab === tab ? 0 : -1;
+    });
+    byId('loop-detail').hidden = detailTab !== 'history';
+    byId('selection-detail').hidden = detailTab === 'source' || (detailTab === 'history' && !historyDetail);
+    byId('source-detail').hidden = detailTab !== 'source';
+    const step = steps()[stepIndex];
+    setText('selection-context', step ? `#${stepIndex + 1} · L${step.line} · ${step.occurrence}번째 실행` : '');
+    if (detailTab === 'source') {
+      document.querySelector('.source-reference').open = true;
+      if (step) showSource(step);
+    }
+  }
   function render() {
     const scenario = currentScenario();
     const list = steps();
@@ -525,6 +766,7 @@
     renderRibbon();
     showSource(step);
     renderHistory();
+    renderViews();
     const nextStep = list[stepIndex + 1];
     if (nextStep) {
       const next = el('button', 'next-instruction', `다음 명령 L${nextStep.line} · ${nextStep.op} →`);
@@ -539,6 +781,7 @@
     return;
   }
   selectOptions(elements.program, cases);
+  elements.program.value = String(caseIndex);
   function loadCase() {
     selectOptions(elements.scenario, currentCase().scenarios);
     scenarioIndex = 0;
@@ -572,5 +815,48 @@
       selectStep(stepIndex + (event.key === 'ArrowLeft' ? -1 : 1));
     }
   });
+  ['instruction', 'time'].forEach(mode => byId(`${mode}-view-button`).addEventListener('click', () => { view = mode; renderViews(); }));
+  ['instruction', 'history', 'source'].forEach((tab, index, tabs) => {
+    const button = byId(`detail-${tab}`);
+    button.addEventListener('click', () => { detailTab = tab; document.querySelector('.panel-body').scrollTop = 0; render(); });
+    button.addEventListener('keydown', event => {
+      if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
+      event.preventDefault();
+      const next = tabs[(index + (event.key === 'ArrowRight' ? 1 : tabs.length - 1)) % tabs.length];
+      detailTab = next;
+      render();
+      byId(`detail-${next}`).focus();
+    });
+  });
+  byId('instruction-zoom-out').addEventListener('click', () => { instructionWidth = Math.max(24, instructionWidth - 24); renderInstruction(); });
+  byId('instruction-zoom-in').addEventListener('click', () => { instructionWidth = Math.min(288, instructionWidth + 24); renderInstruction(); });
+  byId('instruction-fit').addEventListener('click', () => {
+    const layout = ExecutionViews.instructionLayout(steps(), loopProjections, expandedLoops, stepIndex, historyLoop, historyIteration);
+    instructionWidth = Math.max(24, Math.min(288, (byId('instruction-view').clientWidth - 176) / Math.max(1, layout.blocks.length)));
+    renderInstruction();
+  });
+  const splitter = byId('pane-splitter');
+  const workspace = document.querySelector('.workspace');
+  function resizeTimeline(height) {
+    const total = workspace.clientHeight;
+    const next = Math.max(130, Math.min(total - 170, height));
+    workspace.style.setProperty('--timeline-height', `${next}px`);
+    splitter.setAttribute('aria-valuenow', String(Math.round(next / total * 100)));
+  }
+  splitter.addEventListener('pointerdown', event => { splitter.setPointerCapture(event.pointerId); });
+  splitter.addEventListener('pointermove', event => {
+    if (splitter.hasPointerCapture(event.pointerId)) resizeTimeline(event.clientY - workspace.getBoundingClientRect().top);
+  });
+  splitter.addEventListener('pointerup', event => { splitter.releasePointerCapture(event.pointerId); });
+  splitter.addEventListener('keydown', event => {
+    if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return;
+    event.preventDefault();
+    resizeTimeline(document.querySelector('.overview-pane').clientHeight + (event.key === 'ArrowUp' ? -20 : 20));
+  });
+  window.addEventListener('resize', () => { resizeTimeline(document.querySelector('.overview-pane').clientHeight); renderViews(); });
+  byId('time-focus').addEventListener('click', () => { focusedTime = true; renderTime(); });
+  byId('time-all').addEventListener('click', () => { focusedTime = false; renderTime(); });
+  document.querySelector('.source-reference').addEventListener('toggle', () => { if (steps()[stepIndex]) showSource(steps()[stepIndex]); });
   loadCase();
+  resizeTimeline(document.querySelector('.overview-pane').clientHeight);
 })();

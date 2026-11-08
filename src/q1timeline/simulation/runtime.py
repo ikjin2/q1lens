@@ -151,7 +151,7 @@ class _Runtime:
             core._diagnose_program(state, symbols, program)
             state.has_expanded_instructions = any(
                 instruction.op in {"loop", "jlt"} or (instruction.op == "jge" and len(instruction.args) == 3)
-                for instruction in program.instructions
+                for instruction in state.instructions_by_pc.values()
             )
             state.metadata["execution"] = {
                 "mode": "simulation", "status": "completed", "steps": 0, "max_steps": max_steps,
@@ -166,7 +166,8 @@ class _Runtime:
                 ],
             }
             seq = self.sequencers[name] = _Sequencer(state, symbols)
-            errors = [item for item in state.diagnostics if item.severity == "error"]
+            errors = [item for item in state.diagnostics
+                      if item.severity == "error" and not item.details.get("source_line_skipped")]
             if errors:
                 status = "error" if any(item.category != "unresolved_symbol" for item in errors) else "blocked"
                 self.fail(seq, status, errors[0].message)
@@ -291,6 +292,11 @@ class _Runtime:
         state.q1_time_ns = Concrete(self.now)
         instruction = state.instructions_by_pc.get(state.pc)
         if instruction is None:
+            if state.pc == len(state.instructions_by_pc) and any(
+                item.details.get("source_line_skipped") for item in state.diagnostics
+            ):
+                seq.q1_done = True
+                return
             self.fail(seq, "error", "Execution reached a PC without an instruction or stop.")
             return
         if state.metadata["execution"]["steps"] >= self.max_steps:
@@ -307,16 +313,14 @@ class _Runtime:
             return
         feedback = None
         if instruction.op in {"fb_pop_data", "fb_pull_data"}:
-            # The documented pull form reads its first register as the requested
-            # ID. The analysis-only approximation treats both as destinations.
-            id_value = resolve_arg_value(instruction.args[0], scope)
-            if not isinstance(id_value, Concrete):
-                self.fail(seq, "blocked", "Feedback ID register is unknown.", instruction)
-                return
-            if instruction.op == "fb_pull_data" and core._pending_register_write(state, core._register_name(instruction.args[0], state)) is not None:
-                self.fail(seq, "error", "Feedback ID register is not yet readable.", instruction)
-                return
-            matching_index = next((index for index, item in enumerate(seq.feedback) if item["id"] == id_value.value), len(seq.feedback))
+            if instruction.op == "fb_pull_data":
+                matching_index = 0
+            else:
+                id_value = resolve_arg_value(instruction.args[0], scope)
+                if not isinstance(id_value, Concrete):
+                    self.fail(seq, "blocked", "Feedback ID is unknown.", instruction)
+                    return
+                matching_index = next((index for index, item in enumerate(seq.feedback) if item["id"] == id_value.value), len(seq.feedback))
             feedback = seq.feedback[matching_index] if matching_index < len(seq.feedback) else None
             discarded = seq.feedback[:matching_index]
             if discarded:
@@ -328,9 +332,6 @@ class _Runtime:
                 return
         state.next_pc = state.pc + 1
         register_metadata = core._register_issue_metadata(state, instruction, scope)
-        if instruction.op == "fb_pull_data":
-            register = core._register_name(instruction.args[0], state)
-            register_metadata["register_reads"][register] = value_to_json(resolve_arg_value(instruction.args[0], scope))
         before = dict(state.alu_flags) if state.alu_flags is not None else None
         state.current_resolved_args = core._resolved_args_for_instruction(instruction, scope, state)
         event_start = len(state.events)
@@ -368,12 +369,16 @@ class _Runtime:
                 state.rt_time_ns = old_rt
                 seq.phase_reset = seq.phase_reset or instruction.op == "reset_ph"
         elif feedback is not None:
-            register = core._register_name(instruction.args[1], state)
-            value = Concrete(feedback["value"] & 0xFFFFFFFF)
-            provenance = core._register_provenance(state, register, expression=f"feedback id {feedback['id']}", value=value,
-                steps=[core._provenance_step(instruction, f"feedback id {feedback['id']}", value)])
-            provenance["input_event_id"] = feedback["event_id"]
-            core._schedule_register_write(state, instruction, register, value, provenance)
+            values = [(instruction.args[1], feedback["value"])]
+            if instruction.op == "fb_pull_data":
+                values.insert(0, (instruction.args[0], feedback["id"]))
+            for argument, result in values:
+                register = core._register_name(argument, state)
+                value = Concrete(result & 0xFFFFFFFF)
+                provenance = core._register_provenance(state, register, expression=f"feedback id {feedback['id']}", value=value,
+                    steps=[core._provenance_step(instruction, f"feedback id {feedback['id']}", value)])
+                provenance["input_event_id"] = feedback["event_id"]
+                core._schedule_register_write(state, instruction, register, value, provenance)
         issue = core._emit_q1_issue(
             state, instruction, Concrete(self.now), state.q1_time_ns, packet_id,
             register_metadata=register_metadata,
@@ -420,6 +425,8 @@ class _Runtime:
             packet = core.RtPacket(packet_id, state.sequencer_id, instruction.source, instruction.op, Concrete(rt_duration),
                                    Concrete(self.now), state.q1_time_ns, None, None, "exact",
                                    {"operand_snapshot": args, "applied_state": settings, "q1_issue_event_id": issue.id})
+            if spec.applies_latched_state:
+                packet.meta["captured_phase_reset"] = seq.phase_reset
             state.rt_packets.append(packet)
             command = _Command(instruction, args, len(state.rt_packets)-1, rt_duration, settings, list(updates), seq.condition,
                                {key: seq.setter_ids[key] for key in settings if key in seq.setter_ids},
@@ -507,6 +514,8 @@ class _Runtime:
         if skipped:
             meta.update(condition=list(command.condition), conditional_skipped=True,
                         captured_state=command.settings, applied_state={}, applied_updated_fields=[], applied_setter_event_ids={})
+        elif command.phase_reset:
+            meta["phase_reset"] = True
         state.rt_packets[command.packet_index] = replace(packet, rt_t0=Concrete(started), rt_t1=Concrete(end), duration=Concrete(duration), meta=meta)
         state.rt_time_ns = Concrete(end)
         if not skipped and op == "play":

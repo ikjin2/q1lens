@@ -243,9 +243,19 @@ def project_scenario(case_id, program, params, config, choices=None):
         instruction = next(item for item in program.instructions if item.source.line == status_line)
         pending = {"line": status_line, "op": instruction.op, "text": instruction.source.raw.split("#", 1)[0].strip(),
                    "reason": execution.get("reason", "")}
+    packets = [{"id": packet.id, "op": packet.op, "line": packet.source.line,
+                "q1Id": packet.meta.get("q1_issue_event_id"),
+                "start": concrete(packet.rt_t0), "end": concrete(packet.rt_t1),
+                "issuedAt": concrete(packet.q1_issue_t1),
+                "settings": packet.meta.get("applied_state", {}),
+                "updatedFields": packet.meta.get("applied_updated_fields", []),
+                "setters": {field: events[event_id].meta.get("q1_issue_event_id")
+                            for field, event_id in packet.meta.get("applied_setter_event_ids", {}).items()
+                            if event_id in events}}
+               for packet in state.rt_packets]
     return {"id": config["id"], "title": config["title"], "inputLabel": config["inputLabel"],
             "status": execution["status"], "reason": execution.get("reason", ""),
-            "statusLine": status_line, "pending": pending, "steps": steps,
+            "statusLine": status_line, "pending": pending, "steps": steps, "rtPackets": packets,
             "choices": [{"pc": pc, "occurrence": occurrence, "taken": taken}
                         for (_, pc, occurrence), taken in selected.items()],
             "engine": "q1timeline.simulation.runtime.simulate_programs", "engineAssumptions": execution["assumptions"],
@@ -300,9 +310,11 @@ def main():
     OUTPUT.mkdir(parents=True, exist_ok=True)
     data = build_data()
     (OUTPUT / "data.js").write_text("window.EXECUTION_FLOW_DATA = " + json.dumps(data, ensure_ascii=False) + ";\n", encoding="utf-8")
-    for name in ("index.html", "style.css", "history.js", "app.js"):
+    for name in ("index.html", "style.css", "history.js", "views.js", "app.js"):
         if (DEMO / name).exists():
             shutil.copyfile(DEMO / name, OUTPUT / name)
+    for source, name in [("renderer.css", "timeline.css"), ("instructionColors.js", "instructionColors.js")]:
+        shutil.copyfile(ROOT / "vscode-extension/src/shared/timeline" / source, OUTPUT / name)
     print(OUTPUT / "index.html")
     for case in data["cases"]:
         for scenario in case["scenarios"]:

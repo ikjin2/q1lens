@@ -3,9 +3,12 @@ from __future__ import annotations
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
+from itertools import count, product
+import json
 from typing import Any, Literal
 
 from q1timeline.analysis.values import (
+    _symbol_lookup_names,
     Concrete,
     RuntimeDependent,
     Symbolic,
@@ -47,9 +50,11 @@ FEEDBACK_ANNOTATIONS = {
 _CLASSICAL_REGISTER_MASK = 0xFFFFFFFF
 _REGISTER_MAX_INDEX = 63
 _RT_DURATION_MAX = 65535
+_VALUE_ORIGIN_SERIALS = count(1)
 _WRAPPING_CLASSICAL_OPS = {"add", "sub", "and", "or", "xor", "asl", "asr", "lsl", "lsr"}
 _CONCRETE_OPS = {
     "nop", "stop", "move", "not", "cmp", "test", *_WRAPPING_CLASSICAL_OPS,
+    "mulu16", "muls16", "mulu32l", "mulu32h", "muls32l", "muls32h",
     "jmp", "jlt", "jge", "loop", *STATUS_BRANCH_OPS,
     "set_mrk", "set_freq", "reset_ph", "set_ph", "set_ph_delta", "set_awg_gain", "set_awg_offs",
     "set_digital", "set_scope_en", "wait", "wait_sync", "upd_param", "play", "acquire",
@@ -107,6 +112,9 @@ class PendingRegisterWrite:
     available_issue_index: int
     event_id: str
     meta: dict[str, Any] = field(default_factory=dict)
+    unsigned_bounds: tuple[int, int] | None = None
+    known_bits: tuple[int, int] | None = None
+    value_origin: tuple[str, bool] | None = field(default=None, compare=False)
 
 
 @dataclass
@@ -131,8 +139,16 @@ class AnalysisState:
     register_aliases: dict[str, str] = field(default_factory=dict)
     pc: int = 0
     registers: SymbolTable = field(default_factory=dict)
+    register_bounds: dict[str, tuple[int, int]] = field(default_factory=dict)
     latched_state: LatchedState = field(default_factory=LatchedState)
     conditional_enable: Value = field(default_factory=lambda: Concrete(0))
+    conditional_mask: Value = field(default_factory=lambda: Concrete(0))
+    conditional_operator: Value = field(default_factory=lambda: Concrete(0))
+    conditional_enable_bounds: tuple[int, int] | None = None
+    conditional_operator_bounds: tuple[int, int] | None = None
+    conditional_enable_known_bits: tuple[int, int] | None = None
+    conditional_operator_known_bits: tuple[int, int] | None = None
+    conditional_else_duration: Value = field(default_factory=lambda: Concrete(0))
     conditional_time_unknown: bool = False
     q1_time_ns: Value = field(default_factory=lambda: Concrete(0))
     rt_time_ns: Value = field(default_factory=lambda: Concrete(0))
@@ -163,6 +179,14 @@ class AnalysisState:
     execution_mode: Literal["analysis", "concrete"] = "analysis"
     has_expanded_instructions: bool = False
     static_diagnostics: list[Diagnostic] = field(default_factory=list)
+    register_known_bits: dict[str, tuple[int, int]] = field(default_factory=dict)
+    register_value_origins: dict[str, tuple[str, bool]] = field(default_factory=dict, compare=False)
+    value_origin_serial: int = field(default=0, compare=False)
+    immutable_value_origins: dict[str, tuple[str, bool]] = field(default_factory=dict, compare=False)
+    pending_phase_reset: bool | None = False
+    nco_phase_uncertain: bool = False
+    queue_alternatives: dict[str, AnalysisState] = field(default_factory=dict, compare=False, repr=False)
+    queue_alternative_probe: bool = field(default=False, compare=False, repr=False)
 
 
 def interpret_program(
@@ -204,6 +228,7 @@ def interpret_program(
     value_defs = {name: arg for name, arg in program.defs.items() if arg.kind != "reg"}
     resolved_defs = resolve_def_values(value_defs, symbols, state.diagnostics, labels=program.labels)
     state.symbol_origins = _symbol_origins(raw_params, symbols, value_defs, resolved_defs)
+    state.immutable_value_origins = _build_immutable_value_origins(symbols, value_defs, state)
     symbols.update(resolved_defs)
     _diagnose_program(state, symbols, program)
 
@@ -214,7 +239,7 @@ def interpret_program(
     else:
         _run_program_loop(state, symbols, waveform_names or {}, acquisition_names or {})
         _flush_pending_register_writes(state)
-        _diagnose_static_register_read_hazards(state, program)
+        _diagnose_static_register_read_hazards(state)
     return state
 
 
@@ -253,7 +278,8 @@ def _run_concrete_program(
         instruction.op in {"loop", "jlt"} or (instruction.op == "jge" and len(instruction.args) == 3)
         for instruction in state.instructions_by_pc.values()
     )
-    errors = [diagnostic for diagnostic in state.diagnostics if diagnostic.severity == "error"]
+    errors = [diagnostic for diagnostic in state.diagnostics
+              if diagnostic.severity == "error" and not diagnostic.details.get("source_line_skipped")]
     if errors:
         status = "error" if any(item.category != "unresolved_symbol" for item in errors) else "blocked"
         _end_concrete_execution(state, status, errors[0].message)
@@ -262,6 +288,11 @@ def _run_concrete_program(
         _apply_ready_register_writes(state)
         instruction = state.instructions_by_pc.get(state.pc)
         if instruction is None:
+            if state.pc == len(state.instructions_by_pc) and any(
+                item.details.get("source_line_skipped") for item in state.diagnostics
+            ):
+                state.stopped = True
+                break
             _end_concrete_execution(state, "error", "Execution reached a PC without an instruction or stop.")
             break
         if execution["steps"] >= max_steps:
@@ -357,7 +388,7 @@ def _concrete_instruction_ready(
             _end_concrete_execution(state, "error", f"Branch target PC {target.value} has no instruction.", instruction)
             return False
     if instruction.op in STATUS_BRANCH_OPS or (instruction.op == "jge" and len(instruction.args) == 1):
-        if state.alu_flags is None:
+        if _status_branch_decision(instruction.op, state.alu_flags) is None:
             _end_concrete_execution(state, "blocked", "Branch status flags are unknown.", instruction)
             return False
     if instruction.op in {"asl", "asr", "lsl", "lsr"}:
@@ -376,9 +407,11 @@ def _run_program_loop(
     symbols: SymbolTable,
     waveform_names: dict[int, str],
     acquisition_names: dict[int, str],
+    *,
+    stop_pc: int | None = None,
 ) -> None:
     while state.pc < len(state.instructions_by_pc):
-        if state.stopped:
+        if state.stopped or state.pc == stop_pc:
             break
         _apply_ready_register_writes(state)
         instruction = state.instructions_by_pc[state.pc]
@@ -493,18 +526,72 @@ def _diagnose_program(state: AnalysisState, symbols: SymbolTable, program: Progr
         strict_q1asm=state.strict_q1asm,
         execution_mode="concrete",
     )
-    for instruction in state.instructions_by_pc.values():
-        _validate_instruction(probe, instruction, symbols)
-    state.static_diagnostics = [item for item in probe.diagnostics if item.severity == "error"]
+    # Removing an inline label can invalidate another branch to that label.
+    while True:
+        probe.labels = state.labels
+        probe.instructions_by_pc = state.instructions_by_pc
+        probe.diagnostics = []
+        for instruction in state.instructions_by_pc.values():
+            _validate_instruction(probe, instruction, symbols)
+        errors = [item for item in probe.diagnostics
+                  if item.severity == "error" and item not in state.static_diagnostics]
+        state.static_diagnostics.extend(errors)
+        state.diagnostics.extend(errors)
+        if state.strict_q1asm or not _exclude_invalid_source_lines(state):
+            break
+        defs = {name: arg for name, arg in program.defs.items() if arg.kind != "reg"}
+        resolved = resolve_def_values(defs, symbols, labels=state.labels)
+        symbols.update(resolved)
+        for name, value in resolved.items():
+            state.symbol_origins["defs"][name]["value"] = value_to_json(value)
+        state.immutable_value_origins = _build_immutable_value_origins(symbols, defs, state)
     if not state.strict_q1asm:
         scope = _scope(symbols, probe)
-        for instruction in program.instructions:
+        for instruction in state.instructions_by_pc.values():
             for arg in instruction.args:
                 if (arg.kind == "symbol" and not str(arg.value).startswith("$")
                         and not _is_bare_defined_symbol(arg, probe)):
-                    resolve_arg_value(arg, scope, state.static_diagnostics, required=True, source=instruction.source)
-    state.diagnostics.extend(state.static_diagnostics)
-    state.diagnostics.extend(analyze_program_lints(program, known_parameters=symbols))
+                    diagnostics = []
+                    resolve_arg_value(arg, scope, diagnostics, required=True, source=instruction.source)
+                    state.static_diagnostics.extend(diagnostics)
+                    state.diagnostics.extend(diagnostics)
+    recovered_program = replace(program, labels=state.labels, instructions=list(state.instructions_by_pc.values()))
+    state.diagnostics.extend(analyze_program_lints(recovered_program, known_parameters=symbols))
+
+
+def _exclude_invalid_source_lines(state: AnalysisState) -> bool:
+    categories = {"syntax_error", "unknown_instruction", "invalid_argument_count",
+                  "invalid_argument_type", "invalid_argument_value", "undefined_label"}
+    sources = {
+        (item.source.file, item.source.line)
+        for item in state.diagnostics
+        if item.severity == "error" and item.source is not None
+        and (item.category in categories or (item.category == "unresolved_symbol"
+             and str(item.details.get("operand", "")).startswith("$")))
+    }
+    if not sources:
+        return False
+    state.diagnostics = [
+        replace(item, details={**item.details, "source_line_skipped": True})
+        if item.source is not None and (item.source.file, item.source.line) in sources else item
+        for item in state.diagnostics
+    ]
+    instructions = {}
+    pc_map = {}
+    removed_labels = set()
+    for pc, instruction in state.instructions_by_pc.items():
+        pc_map[pc] = len(instructions)
+        if (instruction.source.file, instruction.source.line) in sources:
+            if state.labels.get(instruction.label) == pc:
+                removed_labels.add(instruction.label)
+        else:
+            instructions[len(instructions)] = replace(instruction, pc=len(instructions))
+    pc_map[len(state.instructions_by_pc)] = len(instructions)
+    if len(instructions) == len(state.instructions_by_pc):
+        return False
+    state.instructions_by_pc = instructions
+    state.labels = {label: pc_map[pc] for label, pc in state.labels.items() if label not in removed_labels}
+    return True
 
 
 def _validate_instruction(
@@ -697,7 +784,16 @@ def _execute_instruction(
     if spec.category in {"rt", "sync"}:
         if state.conditional_enable != Concrete(0):
             q1_issue_event.meta["conditional_execution_unknown"] = True
+            q1_issue_event.meta["conditional_active"] = True
         event_start = len(state.events)
+        phase_reset = state.pending_phase_reset if spec.applies_latched_state else False
+        nco_pending = set(state.latched_state.pending_since) & {"frequency", "phase", "phase_delta"}
+        nco_settings = {
+            name: getattr(state.latched_state, name) or Concrete(0)
+            for name in {"frequency", "phase"} | nco_pending
+        }
+        if spec.applies_latched_state:
+            state.pending_phase_reset = False
         _execute_rt_instruction(
             state,
             instruction,
@@ -707,10 +803,49 @@ def _execute_instruction(
             q1_t0,
             q1_t1,
             rt_packet_id,
+            q1_issue_event,
         )
+        if spec.applies_latched_state:
+            _finish_nco_issue(state, q1_issue_event, rt_packet_id, event_start,
+                              phase_reset, nco_pending, nco_settings)
         for event in state.events[event_start:]:
             if event.meta.get("rt_packet_id") == rt_packet_id:
                 event.meta["q1_issue_event_id"] = q1_issue_event.id
+
+
+def _finish_nco_issue(
+    state: AnalysisState, issue: TimelineEvent, packet_id: str | None, event_start: int,
+    phase_reset: bool | None, pending: set[str], settings: dict[str, Value],
+) -> None:
+    events = [event for event in state.events[event_start:] if event.meta.get("rt_packet_id") == packet_id]
+    skipped = bool(issue.meta.get("conditional_skipped"))
+    unknown_execution = bool(issue.meta.get("conditional_execution_unknown")) or any(
+        event.kind == "unknown_region" for event in events
+    )
+    packet = state.rt_packets[-1] if state.rt_packets and state.rt_packets[-1].id == packet_id else None
+    known_settings = all(isinstance(value, Concrete) for value in settings.values())
+    if not skipped:
+        if unknown_execution:
+            state.nco_phase_uncertain |= bool(pending) or phase_reset is not False
+        elif phase_reset is True and known_settings:
+            state.nco_phase_uncertain = False
+        elif phase_reset is None or any(not isinstance(settings[name], Concrete) for name in pending):
+            state.nco_phase_uncertain = True
+    if packet is not None and not isinstance(packet.duration, Concrete) and settings["frequency"] != Concrete(0):
+        state.nco_phase_uncertain = True
+    meta: dict[str, Any] = {"captured_phase_reset": phase_reset}
+    if not skipped and not unknown_execution and phase_reset is True:
+        meta["phase_reset"] = True
+        meta["nco_state_at_issue"] = {name: _plain_value(value) for name, value in settings.items()}
+    if state.nco_phase_uncertain:
+        meta["nco_phase_uncertain"] = True
+        if not skipped:
+            meta["output_state_unknown"] = True
+    issue.meta.update(meta)
+    if packet is not None:
+        packet.meta.update(meta)
+    for event in events:
+        event.meta.update(meta)
 
 
 def _diagnose_analysis_incomplete_timing_effect(
@@ -721,11 +856,21 @@ def _diagnose_analysis_incomplete_timing_effect(
 ) -> None:
     if spec.timing_effect_status != "analysis_incomplete" or _set_cond_is_disabled(state, instruction, symbols):
         return
+    if instruction.op == "set_cond":
+        values = [resolve_arg_value(arg, _scope(symbols, state)) for arg in instruction.args[:3]]
+        if len(values) == 3 and _conditional_decision(
+            *values, enable_bounds=_unsigned_operand_bounds(instruction.args[0], values[0], state),
+            operator_bounds=_unsigned_operand_bounds(instruction.args[2], values[2], state),
+            enable_known_bits=_operand_known_bits(instruction.args[0], values[0], state),
+            operator_known_bits=_operand_known_bits(instruction.args[2], values[2], state),
+        ) is not None:
+            return
     state.diagnostics.append(
         Diagnostic(
             severity="warning",
             category="analysis_incomplete",
-            message=f"Timing effect is unknown for instruction: {instruction.op}",
+            message=("Conditional execution depends on trigger state." if instruction.op == "set_cond"
+                     else f"Timing effect is unknown for instruction: {instruction.op}"),
             source=instruction.source,
             details={"op": instruction.op},
         )
@@ -735,6 +880,42 @@ def _diagnose_analysis_incomplete_timing_effect(
 def _set_cond_is_disabled(state: AnalysisState, instruction: Instr, symbols: SymbolTable) -> bool:
     return (instruction.op == "set_cond" and bool(instruction.args)
             and resolve_arg_value(instruction.args[0], _scope(symbols, state)) == Concrete(0))
+
+
+def _conditional_control_values(
+    value: Value, bounds: tuple[int, int] | None, maximum: int, known_bits: tuple[int, int] | None = None,
+) -> tuple[int, ...] | None:
+    if isinstance(value, Concrete):
+        return (value.value,) if 0 <= value.value <= maximum else None
+    ones, zeros = known_bits or (0, 0)
+    if known_bits is not None:
+        bounds = _refine_bounds_with_bits(bounds, known_bits)
+    if bounds is None or not 0 <= bounds[0] <= bounds[1] < 1 << maximum.bit_length():
+        return None
+    values = tuple(item for item in range(bounds[0], bounds[1] + 1) if item & ones == ones and not item & zeros)
+    return values if values and max(values) <= maximum else None
+
+
+def _conditional_decision(
+    enable: Value, mask: Value, operator: Value, *, enable_bounds: tuple[int, int] | None = None,
+    operator_bounds: tuple[int, int] | None = None, enable_known_bits: tuple[int, int] | None = None,
+    operator_known_bits: tuple[int, int] | None = None,
+) -> bool | None:
+    enables = _conditional_control_values(enable, enable_bounds, 1, enable_known_bits)
+    if enables == (0,):
+        return True
+    operators = _conditional_control_values(operator, operator_bounds, 5, operator_known_bits)
+    if enables is None or mask != Concrete(0) or operators is None:
+        return None
+    # An empty trigger selection makes OR/NAND/XOR false and NOR/AND/XNOR true.
+    decisions = {enabled == 0 or operation in {1, 2, 5} for enabled in enables for operation in operators}
+    return decisions.pop() if len(decisions) == 1 else None
+
+
+def _equal_conditional_durations(state: AnalysisState, nominal: Value | None) -> bool:
+    return (_conditional_control_values(state.conditional_operator, state.conditional_operator_bounds, 5,
+                                        state.conditional_operator_known_bits) is not None
+            and isinstance(nominal, Concrete) and nominal.value > 0 and nominal == state.conditional_else_duration)
 
 
 def _diagnose_unresolved_register_operands(
@@ -1063,11 +1244,11 @@ def _diagnose_register_read_hazards(state: AnalysisState, instruction: Instr) ->
         )
 
 
-def _diagnose_static_register_read_hazards(state: AnalysisState, program: Program) -> None:
+def _diagnose_static_register_read_hazards(state: AnalysisState) -> None:
     previous_instruction: Instr | None = None
     previous_writes: set[str] = set()
 
-    for instruction in program.instructions:
+    for instruction in state.instructions_by_pc.values():
         reads = _register_read_operands(instruction, state)
         if previous_instruction is not None:
             read_by_register = {register: argument_index for argument_index, register in reads}
@@ -1123,13 +1304,34 @@ def _has_register_not_ready_diagnostic(
     return False
 
 
+def _physical_read_register(arg: Arg, state: AnalysisState) -> str | None:
+    register = _register_name(arg, state)
+    if register is not None or arg.kind not in {"symbol", "placeholder"}:
+        return register
+    name = str(arg.value)
+    if name.startswith("$"):
+        alias = state.register_aliases.get(name[1:])
+        if alias is not None:
+            return alias
+        declared = set(state.symbol_origins.get("params", {})) | set(state.symbol_origins.get("defs", {}))
+        if name in declared or name[1:] in declared:
+            return None
+        name = name[1:]
+    index = _register_index_from_raw(name) if name.startswith("R") else None
+    if index is not None and 0 <= index <= _REGISTER_MAX_INDEX and name == f"R{index}":
+        return name
+    if not _is_valid_register_arg(Arg("reg", name, name)):
+        return state.register_aliases.get(name)
+    return None
+
+
 def _register_read_operands(instruction: Instr, state: AnalysisState) -> list[tuple[int, str]]:
     destination_indexes = _register_destination_argument_indexes(instruction.op)
     reads: list[tuple[int, str]] = []
     for index, arg in enumerate(instruction.args):
         if index in destination_indexes:
             continue
-        register = _register_name(arg, state)
+        register = _physical_read_register(arg, state)
         if register is not None:
             reads.append((index, register))
     return reads
@@ -1144,7 +1346,9 @@ def _register_issue_metadata(state: AnalysisState, instruction: Instr, scope: Sy
     # displaying a register does not falsely imply that its value just changed.
     snapshot = {register: value_to_json(value) for register, value in state.registers.items()}
     snapshot.update(reads)
-    return {"register_reads": reads, "register_snapshot": snapshot}
+    bounds = {register: list(_unsigned_operand_bounds(Arg("reg", register, register), scope.get(register, Unknown(register)), state))
+              for register in reads}
+    return {"register_reads": reads, "register_snapshot": snapshot, "register_read_bounds": bounds}
 
 
 def _register_write_operands(instruction: Instr, state: AnalysisState) -> set[str]:
@@ -1224,6 +1428,11 @@ def _flush_pending_register_writes(
     state.pending_register_writes = []
 
 
+def _fresh_value_origin(state: AnalysisState) -> tuple[str, bool]:
+    state.value_origin_serial = next(_VALUE_ORIGIN_SERIALS)
+    return f"write:{state.value_origin_serial}", False
+
+
 def _apply_register_write(state: AnalysisState, pending: PendingRegisterWrite, *, time: Value | None = None) -> None:
     meta = pending.meta
     if state.execution_mode == "concrete":
@@ -1233,6 +1442,15 @@ def _apply_register_write(state: AnalysisState, pending: PendingRegisterWrite, *
             "provenance": pending.provenance,
         }
     state.registers[pending.register] = pending.value
+    if pending.unsigned_bounds is None:
+        state.register_bounds.pop(pending.register, None)
+    else:
+        state.register_bounds[pending.register] = pending.unsigned_bounds
+    if pending.known_bits is None:
+        state.register_known_bits.pop(pending.register, None)
+    else:
+        state.register_known_bits[pending.register] = pending.known_bits
+    state.register_value_origins[pending.register] = pending.value_origin if pending.value_origin is not None else _fresh_value_origin(state)
     state.register_provenance[pending.register] = pending.provenance
     _record_register_write(
         state,
@@ -1283,6 +1501,9 @@ def _invalidate_register_history(
     meta: dict[str, Any] | None = None,
 ) -> None:
     for register in sorted(registers):
+        state.register_bounds.pop(register, None)
+        state.register_known_bits.pop(register, None)
+        state.register_value_origins[register] = _fresh_value_origin(state)
         _record_register_write(
             state,
             register,
@@ -1299,7 +1520,26 @@ def _schedule_register_write(
     register: str,
     value: Value,
     provenance: dict[str, Any],
+    *,
+    unsigned_bounds: tuple[int, int] | None = None,
+    known_bits: tuple[int, int] | None = None,
+    value_origin: tuple[str, bool] | None = None,
 ) -> None:
+    # Display expressions are separate from the versioned numeric proof facts.
+    if not isinstance(value, Concrete):
+        unsigned_bounds, known_bits = _origin_peer_facts(state, value_origin, unsigned_bounds, known_bits)
+        if unsigned_bounds is not None and unsigned_bounds[0] == unsigned_bounds[1]:
+            value = Concrete(unsigned_bounds[0])
+            provenance = {**provenance, "value": value_to_json(value)}
+    if isinstance(value, (Symbolic, RuntimeDependent, Unknown)) and len(str(value)) > 1024:
+        reference = f"{register} after {instruction.op} (line {instruction.source.line})"
+        if isinstance(value, Symbolic):
+            value = Symbolic(reference, value.unresolved_symbols)
+        elif isinstance(value, RuntimeDependent):
+            value = RuntimeDependent(reference)
+        else:
+            value = Unknown(reference)
+        provenance = {**provenance, "value": value_to_json(value)}
     event_id = f"{state.sequencer_id}:e{len(state.events)}"
     if state.execution_mode == "concrete":
         provenance = _concrete_write_provenance(state, instruction, provenance, event_id)
@@ -1315,6 +1555,9 @@ def _schedule_register_write(
                 "op": instruction.op,
                 "branch_assumptions": _register_branch_assumptions(state),
             },
+            unsigned_bounds=unsigned_bounds if not isinstance(value, Concrete) else None,
+            known_bits=known_bits if not isinstance(value, Concrete) and known_bits != (0, 0) else None,
+            value_origin=value_origin if value_origin is not None else _fresh_value_origin(state),
         )
     )
 
@@ -1888,6 +2131,7 @@ def _execute_branch(
                 counter_reg=counter_reg,
                 count=state.registers.get(counter_reg, Unknown(counter_reg or "loop_count")),
                 forever=False,
+                symbols=symbols,
             )
             if not created:
                 _collapse_forward_loop_branch(
@@ -1954,11 +2198,11 @@ def _execute_branch(
                 target_arg,
             )
     elif instruction.op == "jge" and len(instruction.args) == 1:
-        _execute_status_branch(state, instruction, q1_issue_event, symbols)
+        _execute_status_branch(state, instruction, q1_issue_event, symbols, waveform_names, acquisition_names)
     elif instruction.op in {"jge", "jlt"} and len(instruction.args) >= 3:
         _execute_conditional_branch(state, instruction, q1_issue_event, symbols, waveform_names, acquisition_names)
     elif instruction.op in STATUS_BRANCH_OPS and instruction.args:
-        _execute_status_branch(state, instruction, q1_issue_event, symbols)
+        _execute_status_branch(state, instruction, q1_issue_event, symbols, waveform_names, acquisition_names)
 
 
 def _revise_q1_issue_duration(state: AnalysisState, event: TimelineEvent, duration: int) -> TimelineEvent:
@@ -1976,6 +2220,11 @@ def _revise_q1_issue_duration(state: AnalysisState, event: TimelineEvent, durati
 def _status_branch_decision(op: str, flags: dict[str, bool] | None) -> bool | None:
     if flags is None:
         return None
+    if len(flags) < 4:
+        missing = [name for name in ("zf", "nf", "cf", "of") if name not in flags]
+        decisions = {_status_branch_decision(op, {**flags, **dict(zip(missing, values))})
+                     for values in product((False, True), repeat=len(missing))}
+        return decisions.pop() if len(decisions) == 1 else None
     zf = flags["zf"]
     nf = flags["nf"]
     cf = flags["cf"]
@@ -2035,6 +2284,8 @@ def _execute_status_branch(
     instruction: Instr,
     q1_issue_event: TimelineEvent,
     symbols: SymbolTable,
+    waveform_names: dict[int, str] | None = None,
+    acquisition_names: dict[int, str] | None = None,
 ) -> None:
     target_arg = _branch_target_arg(instruction.args[0], state, symbols)
     target_label = str(target_arg.value) if target_arg.kind == "label" else None
@@ -2099,6 +2350,10 @@ def _execute_status_branch(
 
     branch_selection_meta: dict[str, Any] = {}
     branch_specific_path = state.branch_assumptions.get(branch_id)
+    if _prove_timing_only_branch_join(state, instruction, q1_issue_event, symbols, target_label, target_pc, branch_id,
+                                  taken_duration=24 if instruction.op == "jge" else 16,
+                                  waveform_names=waveform_names, acquisition_names=acquisition_names):
+        return
     if branch_specific_path in {"collapsed", "both"}:
         branch_selection_meta = {
             "assumption_source": "branch_assumption",
@@ -2132,6 +2387,9 @@ def _execute_status_branch(
         assumption = _branch_assumption(state.branch_policy)
     if assumption is not None:
         assumed_taken, assumed_path = assumption
+        q1_issue_event = _revise_q1_issue_duration(
+            state, q1_issue_event, 24 if assumed_taken and instruction.op == "jge" else 16 if assumed_taken else 4,
+        )
         q1_issue_event.meta["branch_taken"] = assumed_taken
         q1_issue_event.meta["branch_policy"] = state.branch_policy
         q1_issue_event.meta["assumed_branch_path"] = assumed_path
@@ -2302,8 +2560,20 @@ def _execute_conditional_branch(
     target_pc = _numeric_branch_target_pc(target_arg)
     left = resolve_arg_value(instruction.args[0], _scope(symbols, state))
     right = resolve_arg_value(instruction.args[1], _scope(symbols, state))
+    if isinstance(left, Concrete):
+        left = Concrete(left.value & _CLASSICAL_REGISTER_MASK)
+    if isinstance(right, Concrete):
+        right = Concrete(right.value & _CLASSICAL_REGISTER_MASK)
+    flags = _comparison_flags(instruction.args[0], left, instruction.args[1], right, state)
+    _set_alu_flags(state, instruction, flags)
     op = ">=" if instruction.op == "jge" else "<"
     decision = compare_values(left, op, right)
+    bounds = _unsigned_operand_bounds(instruction.args[0], left, state)
+    if not isinstance(decision, bool) and bounds is not None and isinstance(right, Concrete):
+        if bounds[0] >= right.value:
+            decision = instruction.op == "jge"
+        elif bounds[1] < right.value:
+            decision = instruction.op == "jlt"
     condition = f"{instruction.args[0].raw} {op} {instruction.args[1].raw}"
     branch_id = _branch_id(state, instruction, target_label, target_arg.raw)
 
@@ -2357,6 +2627,9 @@ def _execute_conditional_branch(
         q1_issue_event.meta["runtime_dependency"] = decision.source
 
     branch_specific_path = state.branch_assumptions.get(branch_id)
+    if _prove_timing_only_branch_join(state, instruction, q1_issue_event, symbols, target_label, target_pc, branch_id,
+                                  taken_duration=24, waveform_names=waveform_names, acquisition_names=acquisition_names):
+        return
     if _should_explore_both_paths(state, branch_specific_path):
         explored = _explore_conditional_branch_both_paths(
             state,
@@ -2408,6 +2681,7 @@ def _execute_conditional_branch(
         assumption = _branch_assumption(state.branch_policy)
     if assumption is not None:
         assumed_taken, assumed_path = assumption
+        q1_issue_event = _revise_q1_issue_duration(state, q1_issue_event, 24 if assumed_taken else 4)
         q1_issue_event.meta["branch_taken"] = assumed_taken
         q1_issue_event.meta["branch_policy"] = state.branch_policy
         q1_issue_event.meta["assumed_branch_path"] = assumed_path
@@ -3046,6 +3320,8 @@ def _explore_conditional_branch_both_paths(
     path_specs = (("taken", taken_pc), ("fallthrough", instruction.pc + 1))
     for path, next_pc in path_specs:
         path_state = deepcopy(base_path_state)
+        path_issue = next(event for event in path_state.events if event.id == q1_issue_event.id)
+        _revise_q1_issue_duration(path_state, path_issue, 24 if path == "taken" else 4)
         path_state.pc = next_pc
         path_state.next_pc = next_pc
         path_state.stopped = False
@@ -3096,6 +3372,588 @@ def _explore_conditional_branch_both_paths(
     return True
 
 
+def _refine_legacy_branch_arm(state: AnalysisState, instruction: Instr, symbols: SymbolTable, *, taken: bool) -> set[str]:
+    if instruction.op not in {"jge", "jlt"} or len(instruction.args) != 3:
+        return set()
+    register = _physical_read_register(instruction.args[0], state)
+    if register is None or _pending_register_write(state, register) is not None or any(
+        item.source == instruction.source and item.category == "register_not_ready" for item in state.diagnostics
+    ):
+        return set()
+    scope = _scope(symbols, state)
+    left, right = [resolve_arg_value(arg, scope) for arg in instruction.args[:2]]
+    bounds = _unsigned_operand_bounds(instruction.args[0], left, state)
+    if bounds is None or not isinstance(right, Concrete):
+        return set()
+    threshold = right.value & _CLASSICAL_REGISTER_MASK
+    greater_equal = (instruction.op == "jge") == taken
+    bounds = (max(bounds[0], threshold), bounds[1]) if greater_equal else (bounds[0], min(bounds[1], threshold - 1))
+    if bounds[0] > bounds[1]:
+        return set()
+    ones, zeros = _operand_known_bits(instruction.args[0], left, state)
+    prefix_ones, prefix_zeros = _bounds_known_bits(bounds)
+    bits = ones | prefix_ones, zeros | prefix_zeros
+    if bits[0] & bits[1]:
+        return set()
+    bounds = _refine_bounds_with_bits(bounds, bits)
+    source_origin = _operand_value_origin(instruction.args[0], left, state)
+    refined = set()
+    for index in range(_REGISTER_MAX_INDEX + 1):
+        peer = f"R{index}"
+        if _pending_register_write(state, peer) is not None:
+            continue
+        arg = Arg("reg", peer, peer)
+        value = scope.get(peer, Unknown(peer))
+        origin = _operand_value_origin(arg, value, state)
+        if origin is None or source_origin is None or origin[0] != source_origin[0]:
+            continue
+        opposite = origin[1] != source_origin[1]
+        peer_bounds = (_CLASSICAL_REGISTER_MASK - bounds[1], _CLASSICAL_REGISTER_MASK - bounds[0]) if opposite else bounds
+        current = _unsigned_operand_bounds(arg, value, state)
+        peer_bounds = max(current[0], peer_bounds[0]), min(current[1], peer_bounds[1])
+        if peer_bounds[0] > peer_bounds[1]:
+            continue
+        old_ones, old_zeros = _operand_known_bits(arg, value, state)
+        new_ones, new_zeros = (bits[1], bits[0]) if opposite else bits
+        prefix_ones, prefix_zeros = _bounds_known_bits(peer_bounds)
+        peer_bits = old_ones | new_ones | prefix_ones, old_zeros | new_zeros | prefix_zeros
+        if peer_bits[0] & peer_bits[1]:
+            continue
+        peer_bounds = _refine_bounds_with_bits(peer_bounds, peer_bits)
+        state.register_bounds[peer] = peer_bounds
+        state.register_known_bits[peer] = peer_bits
+        state.registers[peer] = Concrete(peer_bounds[0]) if peer_bounds[0] == peer_bounds[1] else value
+        refined.add(peer)
+    _set_alu_flags(state, instruction, _comparison_flags(instruction.args[0], state.registers[register], instruction.args[1], right, state))
+    return refined
+
+
+def _prove_timing_only_branch_join(
+    state: AnalysisState, instruction: Instr, q1_issue_event: TimelineEvent, symbols: SymbolTable,
+    target_label: str | None, target_pc: int | None, branch_id: str, *, taken_duration: int,
+    waveform_names: dict[int, str] | None = None, acquisition_names: dict[int, str] | None = None,
+) -> bool:
+    target_index = 2 if len(instruction.args) == 3 else 0
+    if (state.queue_alternative_probe or state.branch_policy != "collapse_unresolved" or branch_id in state.branch_assumptions
+            or state.pending_register_writes
+            or _physical_read_register(instruction.args[target_index], state) is not None
+            or state.has_expanded_instructions and target_label is None):
+        return False
+    taken_pc = _resolved_forward_branch_target_pc(state, instruction, target_label, target_pc)
+    if taken_pc is None:
+        return False
+
+    def arm(start: int) -> list[int]:
+        path = []
+        pc = start
+        while pc in state.instructions_by_pc:
+            path.append(pc)
+            item = state.instructions_by_pc[pc]
+            spec = get_instruction_spec(item.op)
+            if item.op == "jmp" and len(item.args) == 1 and _physical_read_register(item.args[0], state) is None:
+                target = _branch_target_arg(item.args[0], state, symbols)
+                next_pc = state.labels.get(str(target.value)) if target.kind == "label" else _numeric_branch_target_pc(target)
+                if next_pc is None or next_pc <= pc or state.has_expanded_instructions and target.kind != "label":
+                    break
+            elif (item.op == "nop" or spec.category == "classical"
+                  and (_register_destination_argument_indexes(item.op) or item.op in {"cmp", "test"})
+                  or spec.category == "latched" and item.op in {
+                      "set_mrk", "set_awg_gain", "set_awg_offs", "set_freq", "reset_ph", "set_ph",
+                      "set_ph_delta", "set_digital", "set_scope_en", "set_cond",
+                  }
+                  or spec.category == "rt" and spec.timing_effect_status == "known"
+                  and (item.op in {"wait", "play", "upd_param", "upd_thres"} or item.op.startswith("acquire"))):
+                next_pc = pc + 1
+            else:
+                break
+            pc = next_pc
+        return path
+
+    paths = {"taken": arm(taken_pc), "fallthrough": arm(instruction.pc + 1)}
+    taken_nodes = set(paths["taken"])
+    join_pc = next((pc for pc in paths["fallthrough"] if pc in taken_nodes), None)
+    if join_pc is None:
+        return False
+    paths = {path: pcs[:pcs.index(join_pc)] for path, pcs in paths.items()}
+    prefix_sources = {state.instructions_by_pc[pc].source for pcs in paths.values() for pc in pcs}
+    prefix_instructions = {item.source: item for item in state.instructions_by_pc.values() if item.source in prefix_sources}
+    base = deepcopy(state)
+    region = _emit_event(base, lane="rt.branch", kind="branch_region", t0=state.rt_time_ns, t1=state.rt_time_ns,
+                         duration=Concrete(0), label="common state after unresolved branch", confidence="runtime_dependent",
+                         source=instruction.source, meta={})
+    event_start, packet_start, history_start, diagnostic_start = (
+        len(base.events), len(base.rt_packets), len(base.register_history), len(base.diagnostics)
+    )
+    probes = {}
+    refined_registers = set()
+    for path, start in (("taken", taken_pc), ("fallthrough", instruction.pc + 1)):
+        probe = deepcopy(base)
+        issue = next(event for event in probe.events if event.id == q1_issue_event.id)
+        _revise_q1_issue_duration(probe, issue, taken_duration if path == "taken" else 4)
+        refined_registers.update(_refine_legacy_branch_arm(probe, instruction, symbols, taken=path == "taken"))
+        probe.pc = start
+        probe.next_pc = start
+        probe.q1_issue_index += 1
+        _run_program_loop(probe, symbols, waveform_names or {}, acquisition_names or {}, stop_pc=join_pc)
+        _apply_ready_register_writes(probe)
+        if probe.pc != join_pc or probe.stopped or probe.pending_register_writes or any(
+            item.severity == "error" or item.category == "register_not_ready"
+            for item in probe.diagnostics if item.source in prefix_sources
+        ):
+            return False
+        if any(not _issue_domains_supported(probe, prefix_instructions[issue.source], issue, symbols)
+               for issue in probe.events if issue.kind == "q1_issue" and issue.source in prefix_sources):
+            return False
+        packets = probe.rt_packets[packet_start:]
+        if not all(isinstance(packet.duration, Concrete) and packet.duration.value >= 0 for packet in packets):
+            return False
+        probes[path] = probe
+    a, b = probes["taken"], probes["fallthrough"]
+    elapsed = {path: sum(packet.duration.value for packet in probe.rt_packets[packet_start:])
+               for path, probe in probes.items()}
+    if elapsed["taken"] != elapsed["fallthrough"]:
+        return False
+
+    def same_concrete(left: Any, right: Any) -> bool:
+        if isinstance(left, Concrete) and isinstance(right, Concrete):
+            return left.value == right.value
+        if isinstance(left, tuple) and isinstance(right, tuple):
+            return len(left) == len(right) and all(same_concrete(x, y) for x, y in zip(left, right))
+        return left is None and right is None
+
+    deltas = {path: probe.events[event_start:] for path, probe in probes.items()}
+    written_fields = {event.meta["field"] for events in deltas.values() for event in events
+                      if event.kind == "latched_state_pending"}
+    latch_fields = [name for name in vars(state.latched_state) if name not in {"pending_since", "pending_event_ids"}]
+    latched_join = {}
+
+    def meet_latched(left: Any, right: Any, name: str):
+        if same_concrete(left, right):
+            return left
+        if isinstance(left, tuple) and isinstance(right, tuple) and len(left) == len(right):
+            return tuple(meet_latched(x, y, name) for x, y in zip(left, right))
+        return Unknown(f"{name} at branch join")
+
+    for name in latch_fields:
+        if (name in a.latched_state.pending_since) != (name in b.latched_state.pending_since):
+            return False
+        if name in written_fields:
+            latched_join[name] = meet_latched(getattr(a.latched_state, name), getattr(b.latched_state, name), name)
+    control_join = {}
+    if "set_cond" in written_fields:
+        for name in ("conditional_enable", "conditional_mask", "conditional_operator", "conditional_else_duration"):
+            left, right = getattr(a, name), getattr(b, name)
+            control_join[name] = left if same_concrete(left, right) else Unknown(f"{name} at branch join")
+        for name in ("conditional_enable", "conditional_operator"):
+            intervals = []
+            bits = []
+            for probe in (a, b):
+                value = getattr(probe, name)
+                bounds = ((value.value, value.value) if isinstance(value, Concrete)
+                          else getattr(probe, name + "_bounds") or (0, _CLASSICAL_REGISTER_MASK))
+                intervals.append(bounds)
+                bits.append(getattr(probe, name + "_known_bits") or _bounds_known_bits(bounds))
+            control_join[name + "_bounds"] = min(item[0] for item in intervals), max(item[1] for item in intervals)
+            control_join[name + "_known_bits"] = bits[0][0] & bits[1][0], bits[0][1] & bits[1][1]
+
+    def payload_known(value: Any) -> bool:
+        return type(value) in {int, float, bool} or isinstance(value, (list, tuple)) and all(payload_known(item) for item in value)
+
+    entry_scope = _scope(symbols, base)
+    instructions_by_source = {item.source: item for item in state.instructions_by_pc.values()}
+
+    def output_profile(probe: AnalysisState, events: list[TimelineEvent]):
+        starts = {}
+        payloads = {}
+        packet_issues = {event.meta.get("rt_packet_id"): event for event in events if event.kind == "q1_issue"}
+        offset = 0
+        for index, packet in enumerate(probe.rt_packets[packet_start:]):
+            starts[packet.id] = index, offset
+            offset += packet.duration.value
+            item = instructions_by_source[packet.source]
+            issue = packet_issues[packet.id]
+            resolved = {entry["index"]: entry["value"] for entry in issue.meta.get("resolved_args", [])}
+            operands = []
+            for arg_index, arg in enumerate(item.args):
+                value = resolved.get(arg_index)
+                if value is None:
+                    register = _physical_read_register(arg, probe)
+                    value = (issue.meta.get("register_reads", {}).get(register, issue.meta.get("register_snapshot", {}).get(register))
+                             if register is not None else value_to_json(resolve_arg_value(arg, entry_scope)))
+                operands.append(value or value_to_json(Unknown(arg.raw)))
+            payloads[packet.id] = operands
+        outputs, controls = [], []
+        feedback = []
+        payload_unknown = False
+        seen = set()
+        nco_fields = {"frequency", "phase", "phase_delta"}
+        for event in events:
+            packet_id = event.meta.get("rt_packet_id")
+            if packet_id not in starts:
+                continue
+            if (event.kind == "unknown_region" and str(event.meta.get("op", "")).startswith("acquire")
+                    and base.feedback_acq_channel is not None):
+                return None
+            if event.meta.get("feedback"):
+                feedback.append((starts[packet_id], event.meta["feedback"]))
+            if "applied_state" in event.meta and packet_id not in seen:
+                settings = event.meta["applied_state"]
+                nco = {key: value for key, value in settings.items() if key in nco_fields}
+                if event.meta.get("phase_reset"):
+                    controls.clear()
+                    nco = {**event.meta["nco_state_at_issue"], "phase_reset": True}
+                elif event.meta.get("captured_phase_reset") is None:
+                    nco["phase_reset"] = None
+                if nco:
+                    payload_unknown |= not all(payload_known(value) for value in nco.values())
+                    controls.append((starts[packet_id], nco))
+                seen.add(packet_id)
+            if event.meta.get("nco_phase_uncertain"):
+                payload_unknown = True
+            if event.lane.startswith("rt.") and event.kind not in {"wait", "conditional_skip", "unknown_region"}:
+                details = {key: value for key, value in event.meta.items() if key in {
+                    "waveform_index", "path", "acquisition_index", "bin_index", "field", "value", "applied_state", "feedback",
+                }}
+                operands = payloads[packet_id] if event.kind != "marker_state" else []
+                payload_unknown |= any(value.get("kind") != "concrete" for value in operands)
+                outputs.append((starts[packet_id], event.kind, details, operands))
+        return outputs, controls, payload_unknown, feedback
+
+    profiles = {path: output_profile(probe, deltas[path]) for path, probe in probes.items()}
+    if (any(value is None for value in profiles.values())
+            or profiles["taken"][3] != profiles["fallthrough"][3]):
+        return False
+    def nco_endpoint(probe):
+        packet_events = {}
+        last_loop = -1
+        last_reset = -1
+        for index, event in enumerate(probe.events):
+            if event.kind == "loop_block" and event.meta.get("count") != 1:
+                last_loop = index
+            packet_id = event.meta.get("rt_packet_id")
+            if packet_id is not None and "applied_state" in event.meta:
+                packet_events.setdefault(packet_id, event)
+            if event.meta.get("phase_reset"):
+                last_reset = index
+        if last_loop >= 0 and last_loop >= last_reset:
+            return None
+        frequency = accumulated = offset = 0
+        # One unit is a quarter nanocycle: f-word * ns and phase-word *4
+        # share exact integer units, including complete-turn equivalence.
+        modulus = 4_000_000_000
+        for packet in probe.rt_packets:
+            event = packet_events.get(packet.id)
+            if event is not None and not event.meta.get("conditional_skipped"):
+                settings = event.meta["applied_state"]
+                if event.meta.get("phase_reset"):
+                    accumulated = offset = 0
+                    settings = event.meta["nco_state_at_issue"]
+                if "frequency" in settings:
+                    frequency = (_signed_32_bit_register_value(settings["frequency"])
+                                 if type(settings["frequency"]) is int else None)
+                if "phase" in settings:
+                    offset = settings["phase"] * 4 if type(settings["phase"]) is int else None
+                if "phase_delta" in settings:
+                    delta = settings["phase_delta"]
+                    offset = offset + delta * 4 if offset is not None and type(delta) is int else None
+            if packet.meta.get("nco_phase_uncertain"):
+                accumulated = None
+            if accumulated is not None:
+                if frequency == 0:
+                    pass
+                elif frequency is not None and isinstance(packet.duration, Concrete):
+                    accumulated = (accumulated + frequency * packet.duration.value) % modulus
+                else:
+                    accumulated = None
+        return ((frequency, accumulated % modulus, offset % modulus)
+                if frequency is not None and accumulated is not None and offset is not None else None)
+
+    endpoints = [nco_endpoint(probes[path]) for path in ("taken", "fallthrough")]
+    same_nco = (profiles["taken"][1] == profiles["fallthrough"][1]
+                or endpoints[0] is not None and endpoints[0] == endpoints[1])
+    nco_uncertain = (a.nco_phase_uncertain or b.nco_phase_uncertain
+                     or not same_nco)
+    def unknown_payload(value: Any) -> bool:
+        if isinstance(value, dict):
+            return value.get("kind") in {"unknown", "symbolic", "runtime_dependent", "range"} or any(unknown_payload(item) for item in value.values())
+        return isinstance(value, (list, tuple)) and any(unknown_payload(item) for item in value)
+
+    output_unknown = (nco_uncertain or profiles["taken"][0] != profiles["fallthrough"][0] or profiles["taken"][2] or profiles["fallthrough"][2] or any(
+        event.meta.get("output_state_unknown") or unknown_payload(event.meta.get("applied_state"))
+        or any(key.endswith("_index") and value is None for key, value in event.meta.items())
+        for events in deltas.values() for event in events if event.lane.startswith("rt.")
+    ))
+
+    def packet_core(probe: AnalysisState):
+        result = []
+        for packet in probe.rt_packets[packet_start:]:
+            values = (packet.q1_issue_t0, packet.q1_issue_t1, packet.rt_t0, packet.rt_t1)
+            if not all(isinstance(value, Concrete) for value in values):
+                return None
+            result.append((packet.duration.value, *(value.value for value in values)))
+        return result
+
+    q1_known = isinstance(a.q1_time_ns, Concrete) and a.q1_time_ns == b.q1_time_ns
+    core_a, core_b = packet_core(a), packet_core(b)
+    queue_proven = q1_known and core_a is not None and core_a == core_b
+    alternatives = (_complete_queue_alternatives(probes, q1_issue_event.id, symbols, waveform_names or {}, acquisition_names or {})
+                    if not queue_proven and not state.queue_alternatives else {})
+    meta = {"branch_id": branch_id, "condition": q1_issue_event.meta["condition"], "branch_taken": "runtime_dependent",
+            "branch_join_proven": queue_proven, "branch_rt_join_proven": True, "join_pc": join_pc,
+            "join_q1_time_ns": a.q1_time_ns.value if q1_known else None, "join_rt_duration_ns": elapsed["taken"]}
+    if control_join:
+        meta["conditional_state_at_join"] = {name: _plain_value(value) for name, value in control_join.items()
+                                             if name in {"conditional_enable", "conditional_mask", "conditional_operator", "conditional_else_duration"}}
+        meta["conditional_join_sources"] = {}
+        for path, events in deltas.items():
+            setter = next((event for event in reversed(events) if event.kind == "latched_state_pending"
+                           and event.meta.get("field") == "set_cond"), None)
+            meta["conditional_join_sources"][path] = _source_to_json(setter.source) if setter is not None else {"before_branch": True}
+    q1_issue_event = _revise_q1_issue_duration(state, q1_issue_event, taken_duration)
+    q1_issue_event.meta.update(meta)
+    if alternatives:
+        state.queue_alternatives = alternatives
+        q1_issue_event.meta["queue_alternative_count"] = len(alternatives)
+    region.meta.update(meta)
+    state.events.append(region)
+    for event in deltas["taken"]:
+        event.meta.update(branch_join_branch_id=branch_id, branch_join_path="taken")
+        if output_unknown and event.lane.startswith("rt.") and get_instruction_spec(event.meta.get("op", "play")).applies_latched_state:
+            event.meta["output_state_unknown"] = True
+        state.events.append(replace(event, confidence="assumed" if event.confidence == "exact" else event.confidence))
+    state.rt_packets.extend(a.rt_packets[packet_start:])
+    state.diagnostics.extend(a.diagnostics[diagnostic_start:])
+    state.register_history.extend(replace(
+        write, confidence="assumed" if write.confidence == "exact" else write.confidence,
+        meta={**write.meta, "branch_join_branch_id": branch_id, "branch_join_path": "taken"},
+    ) for write in a.register_history[history_start:])
+    shared_origins = set().union(*(_linear_origin_parts(_operand_value_origin(
+        Arg("reg", f"R{index}", f"R{index}"), entry_scope.get(f"R{index}", Unknown(f"R{index}")), state))[1]
+        for index in range(_REGISTER_MAX_INDEX + 1)))
+    written = set().union(*(_register_write_operands(state.instructions_by_pc[pc], state)
+                            for pcs in paths.values() for pc in pcs))
+    for name in ("registers", "register_bounds", "register_known_bits", "register_value_origins"):
+        merged = dict(getattr(a, name))
+        original = getattr(base, name)
+        for register in refined_registers - written:
+            if register in original:
+                merged[register] = original[register]
+            else:
+                merged.pop(register, None)
+        setattr(state, name, merged)
+    state.pending_register_writes = []
+    state.latched_state = deepcopy(a.latched_state)
+    state.pending_phase_reset = a.pending_phase_reset if a.pending_phase_reset == b.pending_phase_reset else None
+    state.nco_phase_uncertain = nco_uncertain
+    for name, value in latched_join.items():
+        setattr(state.latched_state, name, value)
+    state.rt_time_ns = add_values(region.t0, Concrete(elapsed["taken"]))
+    state.q1_time_ns = a.q1_time_ns if q1_known else Unknown("Q1 arrival is not proven at branch join")
+    state.q1_issue_index = a.q1_issue_index - 1
+    state.alu_flags = {key: value for key, value in (a.alu_flags or {}).items() if (b.alu_flags or {}).get(key) is value} or None
+    state.alu_flags_source = instruction.source if state.alu_flags else None
+    for name in ("conditional_enable", "conditional_mask", "conditional_operator", "conditional_else_duration",
+                 "conditional_enable_bounds", "conditional_operator_bounds", "conditional_enable_known_bits",
+                 "conditional_operator_known_bits", "conditional_time_unknown"):
+        setattr(state, name, getattr(a, name))
+    for name, value in control_join.items():
+        setattr(state, name, value)
+    joined = {}
+    for register in sorted(written):
+        arg = Arg("reg", register, register)
+        left = a.registers.get(register, entry_scope.get(register, Unknown(register)))
+        right = b.registers.get(register, entry_scope.get(register, Unknown(register)))
+        origin_a, origin_b = _operand_value_origin(arg, left, a), _operand_value_origin(arg, right, b)
+        agreed = same_concrete(left, right)
+        shared = (origin_a is not None and origin_a == origin_b
+                  and all(root in shared_origins or root.startswith(("binding:", "template:"))
+                          for root in _linear_origin_parts(origin_a)[1]))
+        value = left if agreed or shared else Unknown(f"{register} at branch join")
+        state.registers[register] = value
+        if isinstance(value, Concrete):
+            state.register_bounds.pop(register, None)
+            state.register_known_bits.pop(register, None)
+        else:
+            bounds_a, bounds_b = _unsigned_operand_bounds(arg, left, a), _unsigned_operand_bounds(arg, right, b)
+            state.register_bounds[register] = min(bounds_a[0], bounds_b[0]), max(bounds_a[1], bounds_b[1])
+            ones_a, zeros_a = _operand_known_bits(arg, left, a)
+            ones_b, zeros_b = _operand_known_bits(arg, right, b)
+            state.register_known_bits[register] = ones_a & ones_b, zeros_a & zeros_b
+        state.register_value_origins[register] = origin_a if shared else _fresh_value_origin(state)
+        sources = {}
+        for path, probe in probes.items():
+            writer = next((write for write in reversed(probe.register_history[history_start:]) if write.register == register), None)
+            sources[path] = _source_to_json(writer.source) if writer is not None else {"before_branch": True}
+        expression = f"{register} after branch join"
+        step = {**_provenance_step(instruction, expression, value), "branch_join_sources": sources}
+        if shared:
+            source_register = next((f"R{index}" for index in range(_REGISTER_MAX_INDEX + 1)
+                                    if _operand_value_origin(Arg("reg", f"R{index}", f"R{index}"),
+                                                             entry_scope.get(f"R{index}", Unknown(f"R{index}")), base) == origin_a), None)
+            if source_register is not None:
+                step.update(branch_join_source_register=source_register,
+                            source_provenance=deepcopy(base.register_provenance.get(source_register)))
+        state.register_provenance[register] = _register_provenance(state, register, expression=expression, value=value, steps=[step])
+        _record_register_write(state, register, value, source=instruction.source, event_id=q1_issue_event.id,
+                               meta={"branch_join_proven": agreed or shared, "branch_id": branch_id, "branch_join_sources": sources})
+        joined[register] = _plain_value(value)
+    meta["join_registers"] = joined
+    q1_issue_event.meta["join_registers"] = joined
+    region.meta["join_registers"] = joined
+    entry_event_ids = {event.id for event in base.events[:event_start - 1]}
+    for name in latch_fields:
+        if name not in state.latched_state.pending_since:
+            continue
+        ids = [probe.latched_state.pending_event_ids.get(name) for probe in probes.values()]
+        if ids[0] == ids[1] and ids[0] in entry_event_ids:
+            continue
+        sources = {path: _source_to_json(probe.latched_state.pending_since[name]) for path, probe in probes.items()}
+        value = getattr(state.latched_state, name)
+        event = _emit_event(state, lane="state.pending", kind="latched_state_pending", t0=state.rt_time_ns, t1=state.rt_time_ns,
+                            duration=Concrete(0), label=f"joined {name}", confidence=_confidence_for_value(value),
+                            source=instruction.source, meta={"field": name, "value": _plain_value(value),
+                                                            "branch_join_sources": sources, "q1_issue_event_id": q1_issue_event.id})
+        state.latched_state.pending_since[name] = instruction.source
+        state.latched_state.pending_event_ids[name] = event.id
+    if output_unknown:
+        latched_sources = {}
+        for name in latch_fields:
+            if getattr(state.latched_state, name) is None:
+                continue
+            latched_sources[name] = {}
+            for path, events in deltas.items():
+                setter = next((event for event in reversed(events) if event.kind == "latched_state_pending"
+                               and event.meta.get("field") == name), None)
+                latched_sources[name][path] = _source_to_json(setter.source) if setter is not None else {"before_branch": True}
+        _emit_event(state, lane="rt.unknown", kind="unknown_region", t0=region.t0, t1=state.rt_time_ns,
+                    duration=Concrete(elapsed["taken"]), label="uncertain branch outputs", confidence="unknown",
+                    source=instruction.source, meta={"reason": "branch_outputs_unknown", "branch_id": branch_id,
+                                                    "output_state_unknown": True, "branch_timing_known": True,
+                                                    "nco_phase_uncertain": state.nco_phase_uncertain,
+                                                    "pending_phase_reset": state.pending_phase_reset,
+                                                    "latched_state_at_join": {
+                                                        name: _plain_value(getattr(state.latched_state, name)) for name in latched_sources
+                                                        if name != "phase" or not state.nco_phase_uncertain
+                                                    }, "latched_sources_at_join": latched_sources,
+                                                    "pending_fields_at_join": sorted(state.latched_state.pending_since)})
+    state.executed_pcs.update(pc for pcs in paths.values() for pc in pcs)
+    state.next_pc = join_pc
+    return True
+
+
+def _issue_domains_supported(state: AnalysisState, item: Instr, issue: TimelineEvent, symbols: SymbolTable) -> bool:
+    scope = _scope(symbols, state)
+
+    def bounds(arg):
+        register = _physical_read_register(arg, state)
+        if register is not None:
+            value = issue.meta.get("register_reads", {}).get(register, {})
+            if value.get("kind") == "concrete":
+                word = value["value"] & _CLASSICAL_REGISTER_MASK
+                return word, word
+            interval = issue.meta.get("register_read_bounds", {}).get(register)
+            return tuple(interval) if interval is not None else None
+        value = resolve_arg_value(arg, scope)
+        return (value.value, value.value) if isinstance(value, Concrete) else None
+
+    if item.op in {"asl", "asr", "lsl", "lsr"}:
+        _, arg = _docs_ordered_binary_args(item, state)
+        interval = bounds(arg)
+        return interval is not None and 0 <= interval[0] <= interval[1] <= 32
+    if get_instruction_spec(item.op).category != "latched":
+        return True
+    disabled = item.op == "set_cond" and bounds(item.args[0]) == (0, 0)
+    for index, _, low, high in _official_operand_ranges(item.op):
+        if disabled and index in {1, 2}:
+            continue
+        arg = item.args[index]
+        if _physical_read_register(arg, state) is not None and item.op in {"set_mrk", "set_freq"}:
+            continue
+        interval = bounds(arg)
+        if interval is None:
+            return False
+        if _physical_read_register(arg, state) is not None and item.op in {"set_awg_gain", "set_awg_offs"}:
+            interval = ((-0x80000000, 0x7FFFFFFF) if interval[0] < 0x80000000 <= interval[1]
+                        else tuple(_signed_32_bit_register_value(value) for value in interval))
+        if item.op == "set_cond" and index == 2 and not disabled:
+            high = 5
+        if not low <= interval[0] <= interval[1] <= high:
+            return False
+    return True
+
+
+def _complete_queue_alternatives(
+    probes: dict[str, AnalysisState], branch_issue_id: str, symbols: SymbolTable,
+    waveform_names: dict[int, str], acquisition_names: dict[int, str],
+) -> dict[str, AnalysisState]:
+    """Retain finite private packet traces; public Q1 clocks stay joined."""
+    alternatives = {}
+    for path, original in probes.items():
+        if (not isinstance(original.q1_time_ns, Concrete)
+                or any(event.kind == "loop_block" for event in original.events)
+                or any(event.kind == "q1_issue" and event.id != branch_issue_id and (
+                    get_instruction_spec(event.meta.get("op", "")).category in {"sync", "feedback", "unknown"}
+                    or str(event.meta.get("op", "")).startswith("fb_")
+                    or event.meta.get("branch_decision") == "runtime_dependent" and not event.meta.get("branch_join_proven")
+                ) for event in original.events)):
+            return {}
+        probe = deepcopy(original)
+        probe.queue_alternatives = {}
+        probe.queue_alternative_probe = True
+        issue = next(event for event in probe.events if event.id == branch_issue_id)
+        issue.meta.update(branch_decision="assumed", queue_alternative_path=path)
+        instructions = {item.source: item for item in probe.instructions_by_pc.values()}
+        if any(not _issue_domains_supported(probe, instructions[event.source], event, symbols)
+               for event in probe.events if event.kind == "q1_issue" and event.source in instructions):
+            return {}
+        for _ in range(10000):
+            if probe.stopped or probe.pc not in probe.instructions_by_pc:
+                break
+            _apply_ready_register_writes(probe)
+            item = probe.instructions_by_pc[probe.pc]
+            spec = get_instruction_spec(item.op)
+            if (item.op == "loop" or spec.category in {"unknown", "sync", "feedback"}
+                    or spec.category == "rt" and (spec.timing_effect_status != "known" or item.op not in {
+                        "wait", "play", "upd_param", "upd_thres", "acquire", "acquire_weighed", "acquire_weighted",
+                        "acquire_ttl", "acquire_timetags", "acquire_digital",
+                    })
+                    or spec.category == "latched" and item.op not in {
+                        "set_mrk", "set_awg_gain", "set_awg_offs", "set_freq", "reset_ph", "set_ph",
+                        "set_ph_delta", "set_digital", "set_scope_en", "set_cond",
+                    }):
+                return {}
+            probe.executed_pcs.add(probe.pc)
+            probe.next_pc = probe.pc + 1
+            if item.op in {"asl", "asr", "lsl", "lsr"}:
+                _, shift_arg = _docs_ordered_binary_args(item, probe)
+                shift = resolve_arg_value(shift_arg, _scope(symbols, probe))
+                bounds = _unsigned_operand_bounds(shift_arg, shift, probe)
+                if bounds is None or not 0 <= bounds[0] <= bounds[1] <= 32:
+                    return {}
+            probe.current_resolved_args = _resolved_args_for_instruction(item, _scope(symbols, probe), probe)
+            _execute_instruction(probe, item, symbols, waveform_names, acquisition_names)
+            probe.current_resolved_args = []
+            probe.q1_issue_index += 1
+            issued = next((event for event in reversed(probe.events) if event.kind == "q1_issue"), None)
+            if (issued is None or not _issue_domains_supported(probe, item, issued, symbols)
+                    or spec.category == "branch" and (
+                    issued.meta.get("branch_taken") is not True if item.op == "jmp"
+                    else issued.meta.get("branch_decision") != "concrete")
+                    or probe.next_pc is None or not probe.stopped and probe.next_pc <= probe.pc):
+                return {}
+            probe.pc = probe.next_pc
+            if len(probe.rt_packets) > 10000:
+                return {}
+        else:
+            return {}
+        if (not probe.stopped
+                or any(item.severity == "error" or item.category == "register_not_ready" for item in probe.diagnostics)
+                or any(not isinstance(packet.duration, Concrete) or packet.duration.value < 0 for packet in probe.rt_packets)):
+            return {}
+        alternatives[path] = probe
+    return alternatives
+
+
 def _resolved_forward_branch_target_pc(
     state: AnalysisState,
     instruction: Instr,
@@ -3137,6 +3995,9 @@ def _branch_comparison_events(
         meta["branch_comparison_path"] = path
         if isinstance(meta.get("rt_packet_id"), str):
             meta["rt_packet_id"] = _branch_comparison_packet_id(str(meta["rt_packet_id"]), path)
+        if isinstance(meta.get("rt_packet_affine"), dict):
+            meta["rt_packet_affine"] = {_branch_comparison_packet_id(packet_id, path): coefficients
+                                        for packet_id, coefficients in meta["rt_packet_affine"].items()}
         transformed.append(
             replace(
                 event,
@@ -3298,6 +4159,421 @@ def _emit_undefined_label(state: AnalysisState, instruction: Instr, target_label
         state.diagnostics.append(diagnostic)
 
 
+def _affine_loop_timing(
+    state: AnalysisState, body: list[Instr], events: list[TimelineEvent], count: int,
+    counter_reg: str | None, symbols: SymbolTable,
+) -> dict[str, Any] | None:
+    if count < 2 or state.conditional_enable != Concrete(0) or any(
+        item.op not in {"nop", "move", "add", "sub", "wait"} for item in body
+    ):
+        return None
+    sources = {item.source for item in body}
+    if any(item.source in sources and item.category in {
+        "register_not_ready", "invalid_argument_count", "invalid_argument_type", "invalid_argument_value"
+    } for item in state.diagnostics):
+        return None
+    issues = {event.source: event for event in events if event.kind == "q1_issue"}
+    if not body or any(item.source not in issues for item in body):
+        return None
+    writes: set[str] = set()
+    reads = set()
+    samples: dict[str, list[tuple[SourceLocation, int | None]]] = {}
+    for item in body:
+        writes.update(_register_write_operands(item, state))
+        destinations = _register_destination_argument_indexes(item.op)
+        reads.update(register for _, register in _register_read_operands(item, state))
+        event = issues[item.source]
+        for index, arg in enumerate(item.args):
+            if index in destinations:
+                continue
+            register = _physical_read_register(arg, state)
+            if register is not None:
+                value = event.meta.get("register_reads", {}).get(register, event.meta.get("register_snapshot", {}).get(register, {}))
+                if value.get("kind") != "concrete":
+                    value = next((entry["value"] for entry in event.meta.get("resolved_args", [])
+                                  if entry["index"] == index), {})
+                samples.setdefault(register, []).append((item.source, value.get("value") if value.get("kind") == "concrete" else None))
+    counter_ready = all(value == count for _, value in samples.get(counter_reg, []))
+    if counter_reg in writes:
+        return None
+    scope = _scope(symbols, state)
+
+    values = {}
+    for register in reads - writes:
+        if register == counter_reg:
+            if not counter_ready:
+                return None
+            values[register] = (count, -1)
+            continue
+        observed = [value for _, value in samples.get(register, [])]
+        if not observed or observed[0] is None or any(value != observed[0] for value in observed):
+            return None
+        values[register] = (observed[0] & _CLASSICAL_REGISTER_MASK, 0)
+    induction = {}
+    defined = set()
+    ready_definitions = []
+    live_in = set()
+    for index, item in enumerate(body):
+        defined.update(register for ready, register in ready_definitions if ready <= index)
+        destinations = _register_destination_argument_indexes(item.op)
+        inputs = {register for _, register in _register_read_operands(item, state)}
+        live_in.update((inputs & writes) - defined)
+        ready_definitions.extend((index + 2, register) for register in _register_write_operands(item, state))
+    first_final = deepcopy(state)
+    _flush_pending_register_writes(first_final, completed_issue_index=state.q1_issue_index + 1)
+    for register in live_in:
+        initial = samples.get(register, [(None, None)])[0][1]
+        result = first_final.registers.get(register)
+        if initial is None or not isinstance(result, Concrete):
+            return None
+        initial &= _CLASSICAL_REGISTER_MASK
+        induction[register] = initial, result.value - initial
+        values[register] = induction[register]
+
+    def operand(arg: Arg) -> tuple[int, int] | None:
+        register = _physical_read_register(arg, state)
+        if register is not None:
+            return values.get(register)
+        value = resolve_arg_value(arg, scope)
+        return (value.value & _CLASSICAL_REGISTER_MASK, 0) if isinstance(value, Concrete) else None
+
+    pending = []
+    packets = {}
+    for index, item in enumerate(body):
+        for ready, register, value in pending:
+            if ready <= index:
+                values[register] = value
+        pending = [entry for entry in pending if entry[0] > index]
+        if item.op == "nop":
+            continue
+        if item.op in {"move", "wait"}:
+            result = operand(item.args[0])
+        else:
+            left_arg, right_arg = _docs_ordered_binary_args(item, state)
+            left, right = operand(left_arg), operand(right_arg)
+            if left is None or right is None:
+                return None
+            sign = 1 if item.op == "add" else -1
+            result = left[0] + sign * right[0], left[1] + sign * right[1]
+        if result is None:
+            return None
+        intercept, slope = result
+        low, high = sorted((intercept, intercept + slope * (count - 1)))
+        if item.op == "wait":
+            packet_id = issues[item.source].meta.get("rt_packet_id")
+            packet = next((packet for packet in state.rt_packets if packet.id == packet_id), None)
+            if not 0 <= low <= high <= _RT_DURATION_MAX or packet is None or packet.duration != Concrete(intercept):
+                return None
+            packets[packet_id] = {"intercept": intercept, "slope": slope}
+        else:
+            modulus = _CLASSICAL_REGISTER_MASK + 1
+            if low // modulus != high // modulus:
+                return None
+            result = intercept - (low // modulus) * modulus, slope
+            destination = _register_name(item.args[1 if item.op == "move" else 2], state)
+            if destination is None:
+                return None
+            pending.append((index + 2, destination, result))
+    for ready, register, value in pending:
+        if ready > len(body) + 1:
+            return None
+        values[register] = value
+    if any(values.get(register) != (initial + step, step) for register, (initial, step) in induction.items()):
+        return None
+    intercept = sum(item["intercept"] for item in packets.values())
+    slope = sum(item["slope"] for item in packets.values())
+    total = count * intercept + slope * count * (count - 1) // 2
+    return {"period_affine": {"intercept": intercept, "slope": slope}, "total_duration": value_to_json(Concrete(total)),
+            "rt_packet_affine": packets,
+            "final_registers": {register: values[register][0] + values[register][1] * (count - 1) for register in writes}}
+
+
+def _bounded_loop_total(
+    state: AnalysisState, body: list[Instr], events: list[TimelineEvent], count: int,
+    counter_reg: str | None, symbols: SymbolTable,
+) -> dict[str, Any] | None:
+    """Prove an elapsed sum without claiming individual unknown packet times."""
+    if count < 2 or state.conditional_enable != Concrete(0) or any(
+        item.op not in {"nop", "wait", "cmp", "test"}
+        and not (get_instruction_spec(item.op).category == "classical" and _register_destination_argument_indexes(item.op))
+        for item in body
+    ):
+        return None
+    sources = {item.source for item in body}
+    if any(item.source in sources and (item.severity == "error" or item.category == "register_not_ready")
+           for item in state.diagnostics):
+        return None
+    issues = {event.source: event for event in events if event.kind == "q1_issue"}
+    if not body or any(item.source not in issues for item in body):
+        return None
+    writes = set().union(*(_register_write_operands(item, state) for item in body))
+    if counter_reg in writes:
+        return None
+    initial = {}
+    live_in = set()
+    ready = []
+    defined = set()
+    for index, item in enumerate(body):
+        defined.update(register for when, register in ready if when <= index)
+        for _, register in _register_read_operands(item, state):
+            if register in defined:
+                continue
+            live_in.add(register)
+            if register not in initial:
+                bounds = issues[item.source].meta.get("register_read_bounds", {}).get(register)
+                if not isinstance(bounds, list) or len(bounds) != 2:
+                    return None
+                initial[register] = tuple(bounds)
+        ready.extend((index + 2, register) for register in _register_write_operands(item, state))
+    if counter_reg in initial and initial[counter_reg] != (count, count):
+        return None
+    scope = _scope(symbols, state)
+    modulus = _CLASSICAL_REGISTER_MASK + 1
+
+    def plus(left, right, sign=1):
+        terms = dict(left[1])
+        for name, value in right[1].items():
+            terms[name] = terms.get(name, 0) + sign * value
+            if terms[name] == 0:
+                del terms[name]
+        return left[0] + sign * right[0], terms
+
+    def scan(headers, domains, *, infer=False):
+        values = dict(headers)
+        pending = []
+        total = (0, {})
+
+        def interval(value):
+            low = high = value[0]
+            for name, coefficient in value[1].items():
+                ends = [coefficient * endpoint for endpoint in domains[name]]
+                low += min(ends)
+                high += max(ends)
+            return low, high
+
+        def operand(arg):
+            register = _physical_read_register(arg, state)
+            if register is not None:
+                return values.get(register)
+            value = resolve_arg_value(arg, scope)
+            return (value.value & _CLASSICAL_REGISTER_MASK, {}) if isinstance(value, Concrete) else None
+
+        for index, item in enumerate(body):
+            for when, register, result in pending:
+                if when <= index:
+                    values[register] = result
+            pending = [entry for entry in pending if entry[0] > index]
+            if item.op in {"nop", "cmp", "test"}:
+                continue
+            if item.op in {"wait", "move"}:
+                result = operand(item.args[0])
+            elif item.op in {"add", "sub"}:
+                left_arg, right_arg = _docs_ordered_binary_args(item, state)
+                left, right = operand(left_arg), operand(right_arg)
+                result = plus(left, right, 1 if item.op == "add" else -1) if left is not None and right is not None else None
+            else:
+                result = None
+            if item.op == "wait" and result is None:
+                return None
+            if result is not None:
+                if item.op == "wait":
+                    if not infer:
+                        low, high = interval(result)
+                        if not 0 <= low <= high <= _RT_DURATION_MAX:
+                            return None
+                        total = plus(total, result)
+                    continue
+                if not infer:
+                    low, high = interval(result)
+                    if low // modulus == high // modulus:
+                        result = result[0] - low // modulus * modulus, result[1]
+                    else:
+                        result = None
+            if infer:
+                outputs = {register: result if result is not None else (0, {f"opaque:{index}:{register}": 1})
+                           for register in _register_write_operands(item, state)}
+            elif result is not None:
+                outputs = {register: result for register in _register_write_operands(item, state)}
+            else:
+                if item.op in {"asl", "asr", "lsl", "lsr"}:
+                    _, shift_arg = _docs_ordered_binary_args(item, state)
+                    shift = operand(shift_arg)
+                    if shift is None or not 0 <= interval(shift)[0] <= interval(shift)[1] <= 32:
+                        return None
+                probe = replace(state, registers={}, register_bounds={}, register_known_bits={}, register_value_origins={},
+                                pending_register_writes=[], register_provenance={}, register_history=[], events=[], diagnostics=[])
+                for register, expression in values.items():
+                    low, high = interval(expression)
+                    probe.registers[register] = Concrete(low) if low == high else Unknown(register)
+                    probe.register_bounds[register] = low, high
+                _execute_classical(probe, item, symbols)
+                _flush_pending_register_writes(probe, completed_issue_index=state.q1_issue_index + 2)
+                outputs = {}
+                for register in _register_write_operands(item, state):
+                    value = probe.registers.get(register, Unknown(register))
+                    if isinstance(value, Concrete):
+                        outputs[register] = value.value, {}
+                    else:
+                        atom = f"opaque:{index}:{register}"
+                        domains[atom] = probe.register_bounds.get(register, (0, _CLASSICAL_REGISTER_MASK))
+                        outputs[register] = 0, {atom: 1}
+            pending.extend((index + 2, register, value) for register, value in outputs.items())
+        for when, register, value in pending:
+            if when > len(body) + 1:
+                return None
+            values[register] = value
+        return values, total
+
+    header = {register: (0, {f"header:{register}": 1}) for register in live_in}
+    transition = scan(header, {}, infer=True)
+    if transition is None:
+        return None
+    domains = {"iteration": (0, count - 1)}
+    tracked = {}
+    for register in live_in:
+        atom = f"header:{register}"
+        bounds = initial[register]
+        expression = transition[0].get(register)
+        step = None
+        if register == counter_reg:
+            header[register] = count, {"iteration": -1}
+            continue
+        if register not in writes:
+            step = 0
+        elif expression is not None and expression[1] == {atom: 1}:
+            step = expression[0] % modulus
+            if step >= modulus // 2:
+                step -= modulus
+        if step is not None and 0 <= bounds[0] + min(0, step * (count - 1)) <= bounds[1] + max(0, step * (count - 1)) <= _CLASSICAL_REGISTER_MASK:
+            header[register] = ((bounds[0], {"iteration": step} if step else {}) if bounds[0] == bounds[1]
+                                else (0, {atom: 1, **({"iteration": step} if step else {})}))
+            domains[atom] = bounds
+            if register in writes:
+                tracked[register] = step
+        else:
+            domains[atom] = (0, _CLASSICAL_REGISTER_MASK)
+    checked = scan(header, domains)
+    if checked is None:
+        return None
+    values, period = checked
+    if any(values.get(register) != plus(header[register], (step, {})) for register, step in tracked.items()):
+        return None
+    if any(name != "iteration" for name in period[1]):
+        return None
+    intercept, slope = period[0], period[1].get("iteration", 0)
+    total = count * intercept + slope * count * (count - 1) // 2
+    final = {register: expression[0] + expression[1].get("iteration", 0) * (count - 1)
+             for register, expression in values.items() if register in writes
+             and all(name == "iteration" for name in expression[1])}
+    return {"total_duration": value_to_json(Concrete(total)), "period_affine": {"intercept": intercept, "slope": slope},
+            "total_only": True, "final_registers": final}
+
+
+def _evaluate_loop_iterations(
+    state: AnalysisState, body: list[Instr], edge: Instr, events: list[TimelineEvent],
+    count: int, counter_reg: str | None, symbols: SymbolTable,
+) -> tuple[dict[str, Any], dict[str, tuple[Any, ...]]] | None:
+    if not 2 <= count <= _CLASSICAL_REGISTER_MASK or counter_reg is None or any(
+        item.op not in {"nop", "wait", "cmp", "test"}
+        and not (get_instruction_spec(item.op).category == "classical"
+                 and _register_destination_argument_indexes(item.op))
+        for item in body
+    ):
+        return None
+    sources = {item.source for item in body} | {edge.source}
+    if any(item.source in sources and (item.severity == "error" or item.category == "register_not_ready")
+           for item in state.diagnostics):
+        return None
+    writes = set().union(*(_register_write_operands(item, state) for item in body))
+    if counter_reg in writes:
+        return None
+    packet_ids = {event.meta.get("rt_packet_id") for event in events if event.kind == "q1_issue"}
+    first_packets = [packet for packet in state.rt_packets if packet.id in packet_ids]
+    if (len(first_packets) != sum(item.op == "wait" for item in body)
+            or any(not isinstance(packet.duration, Concrete) or not 0 <= packet.duration.value <= _RT_DURATION_MAX
+                   for packet in first_packets)):
+        return None
+    series = {packet.id: [packet.duration.value] for packet in first_packets}
+    periods = [sum(packet.duration.value for packet in first_packets)]
+    probe = replace(state, registers=dict(state.registers), register_bounds=dict(state.register_bounds),
+                    register_known_bits=dict(state.register_known_bits), register_value_origins=dict(state.register_value_origins),
+                    latched_state=deepcopy(state.latched_state), pending_register_writes=deepcopy(state.pending_register_writes),
+                    events=[], rt_packets=[], diagnostics=[], register_history=[], register_provenance={},
+                    metadata=deepcopy(state.metadata), executed_pcs=set(state.executed_pcs), branch_assumptions={},
+                    current_resolved_args=[], stopped=False)
+    probe.q1_issue_index += 1
+    _apply_ready_register_writes(probe)
+    probe.registers[counter_reg] = Concrete(count - 1)
+    live_in = set()
+    defined = set()
+    for item in body:
+        live_in.update(register for _, register in _register_read_operands(item, state) if register not in defined)
+        defined.update(_register_write_operands(item, state))
+
+    def signature() -> dict[str, tuple[str, bool] | None]:
+        scope = _scope(symbols, probe)
+        return {register: _operand_value_origin(Arg("reg", register, register), scope.get(register, Unknown(register)), probe)
+                for register in live_in}
+
+    def execute(item: Instr, concrete_edge: bool = False) -> list[RtPacket] | None:
+        _apply_ready_register_writes(probe)
+        # Private evaluation must not grow symbolic strings or provenance trees.
+        probe.registers = {register: value if isinstance(value, Concrete) else Unknown(f"loop value {register}")
+                           for register, value in probe.registers.items()}
+        probe.pending_register_writes = [
+            replace(write, value=write.value if isinstance(write.value, Concrete) else Unknown(f"loop value {write.register}"),
+                    provenance={}) for write in probe.pending_register_writes
+        ]
+        probe.events.clear()
+        probe.rt_packets.clear()
+        probe.diagnostics.clear()
+        probe.register_history.clear()
+        probe.register_provenance.clear()
+        probe.pc = item.pc
+        probe.next_pc = item.pc + 1
+        probe.current_resolved_args = []
+        probe.execution_mode = "concrete" if concrete_edge else "analysis"
+        _execute_instruction(probe, item, symbols, {}, {})
+        probe.execution_mode = "analysis"
+        if probe.stopped or any(item.severity == "error" or item.category == "register_not_ready" for item in probe.diagnostics):
+            return None
+        if any(not isinstance(packet.duration, Concrete) or not 0 <= packet.duration.value <= _RT_DURATION_MAX
+               for packet in probe.rt_packets):
+            return None
+        packets = list(probe.rt_packets)
+        probe.q1_issue_index += 1
+        _apply_ready_register_writes(probe)
+        return packets
+
+    work = 0
+    repeats = False
+    for _ in range(1, count):
+        if work + len(body) + 1 > 10000:
+            return None
+        before = signature()
+        packets = []
+        for item in body:
+            issued = execute(item)
+            if issued is None:
+                return None
+            packets.extend(issued)
+        if len(packets) != len(first_packets) or execute(edge, True) is None:
+            return None
+        work += len(body) + 1
+        for original, packet in zip(first_packets, packets):
+            series[original.id].append(packet.duration.value)
+        periods.append(sum(packet.duration.value for packet in packets))
+        if before == signature():
+            repeats = True
+            break
+    total = sum(periods) + (count - len(periods)) * periods[-1]
+    facts = {register: (probe.registers.get(register, Unknown(register)), probe.register_bounds.get(register),
+                        probe.register_known_bits.get(register), probe.register_value_origins.get(register))
+             for register in writes}
+    return ({"total_duration": value_to_json(Concrete(total)), "iteration_durations": periods,
+             "rt_packet_durations": series, "repeat_last_iteration": repeats}, facts)
+
+
 def _emit_compact_loop(
     state: AnalysisState,
     instruction: Instr,
@@ -3308,6 +4584,7 @@ def _emit_compact_loop(
     count: Value | None,
     forever: bool,
     min_visible_iterations: int = 1,
+    symbols: SymbolTable | None = None,
 ) -> bool:
     start_pc = state.labels.get(target_label)
     if start_pc is None or start_pc > instruction.pc:
@@ -3327,10 +4604,21 @@ def _emit_compact_loop(
         )
         return True
 
+    body_instructions = [state.instructions_by_pc[pc] for pc in range(start_pc, instruction.pc + 1)]
+    counter_modified = counter_reg is not None and any(
+        counter_reg in _register_write_operands(item, state)
+        or item.op == "loop" and item.args and _register_name(item.args[0], state) == counter_reg
+        for item in body_instructions[:-1]
+    )
+    if not forever and counter_modified and count != Concrete(1):
+        # The value at the first loop edge does not prove the number of later
+        # iterations if the body can overwrite that counter on each pass.
+        count = Unknown(f"{counter_reg} is written inside the loop body")
+
     loop_id = f"L{state.loop_counter}"
     state.loop_counter += 1
 
-    loop_q1_jump_runtime_ns = 24
+    loop_q1_jump_runtime_ns = 16 if instruction.op == "jmp" else 24
     loop_q1_continue_runtime_ns = 4
     first_loop_edge_runtime_ns = loop_q1_jump_runtime_ns
     # The docs also describe loop as lowering to sub + jnz; use that behavior when its prose conflicts.
@@ -3346,7 +4634,6 @@ def _emit_compact_loop(
     t0, t1, duration = _loop_timing(preview_events, current_rt_time=state.rt_time_ns)
     has_hidden_iterations = forever or not isinstance(count, Concrete) or count.value > 1
     written_registers: set[str] = set()
-    body_instructions = [state.instructions_by_pc[pc] for pc in range(start_pc, instruction.pc + 1)]
     if has_hidden_iterations:
         for body_instruction in body_instructions:
             written_registers.update(_register_write_operands(body_instruction, state))
@@ -3354,11 +4641,39 @@ def _emit_compact_loop(
                 body_counter = _register_name(body_instruction.args[0], state)
                 if body_counter is not None:
                     written_registers.add(body_counter)
+    single_path = all(item.op == "nop" or get_instruction_spec(item.op).category in {"classical", "latched", "rt"}
+                      for item in body_instructions[:-1])
+    invariant_writes: set[str] = set()
+    varying_by_source: dict[SourceLocation, set[str]] = {}
+    invariant_duration_pcs: list[int] = []
+    varying_duration = False
+    read_hazards = {item.source for item in state.diagnostics if item.category == "register_not_ready"}
+    skipped_sources = {event.source for event in preview_events if event.kind == "q1_issue"
+                       and event.meta.get("conditional_skipped")}
+    for item in body_instructions[:-1]:
+        varying = written_registers - invariant_writes
+        if item.source in read_hazards:
+            varying = varying.union(register for _, register in _register_read_operands(item, state))
+        varying_by_source[item.source] = varying
+        spec = get_instruction_spec(item.op)
+        duration_index = rt_duration_arg_for_instruction(spec, item)
+        if duration_index is not None and duration_index < len(item.args):
+            if item.source in skipped_sources or _physical_read_register(item.args[duration_index], state) not in varying:
+                invariant_duration_pcs.append(item.pc)
+            else:
+                varying_duration = True
+        writes = _register_write_operands(item, state)
+        reads = {register for _, register in _register_read_operands(item, state)}
+        if single_path and item.source not in read_hazards and spec.category == "classical" and reads.isdisjoint(varying):
+            invariant_writes.update(writes)
+        else:
+            invariant_writes.difference_update(writes)
+    invariant_writes.discard(counter_reg)
     preview_by_id = {event.id: event for event in preview_events}
     uncertain_setters = {
         event.id for event in preview_events
         if event.kind == "latched_state_pending"
-        and written_registers.intersection(
+        and varying_by_source.get(event.source, written_registers).intersection(
             preview_by_id.get(event.meta.get("q1_issue_event_id"), event).meta.get("register_reads", {})
         )
     }
@@ -3370,18 +4685,55 @@ def _emit_compact_loop(
         field for field, setter_id in last_applied_setters.items() if setter_id in uncertain_setters
     )
     condition_setters = [item for item in body_instructions if item.op == "set_cond" and item.args]
-    condition_varies = bool(condition_setters and _register_name(condition_setters[-1].args[0], state) in written_registers)
+    last_condition_varying = varying_by_source.get(condition_setters[-1].source, written_registers) if condition_setters else set()
+    condition_varies = bool(condition_setters and _physical_read_register(condition_setters[-1].args[0], state) in last_condition_varying)
+    mask_varies = bool(condition_setters and _physical_read_register(condition_setters[-1].args[1], state) in last_condition_varying)
+    operator_varies = bool(condition_setters and _physical_read_register(condition_setters[-1].args[2], state) in last_condition_varying)
+    conditional_rt_sources = {event.source for event in preview_events if event.kind == "q1_issue"
+                              and event.meta.get("conditional_active")}
     conditional_loop_timing_unknown = False
     for body_instruction in body_instructions:
         if body_instruction.op == "set_cond" and body_instruction.args:
-            condition_varies = _register_name(body_instruction.args[0], state) in written_registers
-        elif condition_varies and get_instruction_spec(body_instruction.op).category in {"rt", "sync"}:
+            varying = varying_by_source.get(body_instruction.source, written_registers)
+            condition_varies = _physical_read_register(body_instruction.args[0], state) in varying
+            mask_varies = _physical_read_register(body_instruction.args[1], state) in varying
+            operator_varies = _physical_read_register(body_instruction.args[2], state) in varying
+        elif (get_instruction_spec(body_instruction.op).category in {"rt", "sync"}
+              and (condition_varies or (mask_varies or operator_varies) and body_instruction.source in conditional_rt_sources)):
             conditional_loop_timing_unknown = True
     if conditional_loop_timing_unknown:
         # Later iterations may gate RT work differently from the first one.
         duration = Unknown(f"conditional execution in compact loop {loop_id}")
         t1 = add_values(t0, duration)
         state.conditional_time_unknown = True
+    affine_timing = None
+    evaluated_facts = {}
+    if not forever and isinstance(count, Concrete) and not counter_modified and symbols is not None and not conditional_loop_timing_unknown:
+        affine_timing = _affine_loop_timing(state, body_instructions[:-1], preview_events, count.value, counter_reg, symbols)
+        if affine_timing is None:
+            evaluated = _evaluate_loop_iterations(state, body_instructions[:-1], instruction, preview_events,
+                                                  count.value, counter_reg, symbols)
+            if evaluated is not None:
+                affine_timing, evaluated_facts = evaluated
+        if affine_timing is None:
+            affine_timing = _bounded_loop_total(state, body_instructions[:-1], preview_events, count.value, counter_reg, symbols)
+        if affine_timing is not None:
+            first_period = Concrete(affine_timing["iteration_durations"][0] if "iteration_durations" in affine_timing
+                                    else affine_timing["period_affine"]["intercept"])
+            if isinstance(duration, Concrete) and duration != first_period:
+                affine_timing = None
+            else:
+                duration = first_period
+                t1 = add_values(t0, duration)
+                if affine_timing.get("total_only"):
+                    state.rt_time_ns = t1
+                varying_duration = False
+    affine_durations_vary = bool(affine_timing and (
+        affine_timing.get("total_only") or any(item["slope"] for item in affine_timing.get("rt_packet_affine", {}).values())
+        or any(len(set(items)) > 1 for items in affine_timing.get("rt_packet_durations", {}).values())))
+    if varying_duration and not forever:
+        duration = Unknown(f"RT duration changes in compact loop {loop_id}")
+        t1 = add_values(t0, duration)
     q1_period = _loop_q1_period(preview_events, q1_issue_event)
     q1_body_period = _loop_q1_body_period(q1_period, first_loop_edge_runtime_ns)
     loop_preview_key = _loop_preview_key(state, start_instruction.source, instruction.source)
@@ -3390,7 +4742,7 @@ def _emit_compact_loop(
     visible_iteration_count = max(visible_iteration_count, min_visible)
     if not forever and isinstance(count, Concrete):
         visible_iteration_count = min(visible_iteration_count, max(1, count.value))
-    if conditional_loop_timing_unknown:
+    if conditional_loop_timing_unknown or varying_duration or affine_durations_vary:
         visible_iteration_count = 1
     shown_iterations = list(range(visible_iteration_count))
     preview_policy = "first_iteration_only" if visible_iteration_count == 1 else "requested_iterations"
@@ -3424,7 +4776,7 @@ def _emit_compact_loop(
         t1=t1,
         duration=duration,
         label=f"loop {loop_id} {count_display if forever else 'x' + str(count_display)}",
-        confidence="unknown" if state.conditional_time_unknown else "exact" if forever else _confidence_for_value(count),
+        confidence="unknown" if state.conditional_time_unknown or varying_duration else "exact" if forever else _confidence_for_value(count),
         source=start_instruction.source,
         meta={
             "loop_id": loop_id,
@@ -3434,6 +4786,10 @@ def _emit_compact_loop(
             "counter_reg": counter_reg,
             "count": count_display,
             "period": value_to_json(duration),
+            "period_invariant": not varying_duration and not conditional_loop_timing_unknown
+                                and (affine_timing is None or (
+                                    len(set(affine_timing["iteration_durations"])) == 1 if "iteration_durations" in affine_timing
+                                    else affine_timing["period_affine"]["slope"] == 0)),
             "counter_before": counter_before,
             "counter_after": counter_after,
             "preview_policy": preview_policy,
@@ -3444,7 +4800,10 @@ def _emit_compact_loop(
             "loop_q1_jump_runtime_ns": loop_q1_jump_runtime_ns,
             "loop_q1_continue_runtime_ns": loop_q1_continue_runtime_ns,
             "loop_q1_first_edge_runtime_ns": first_loop_edge_runtime_ns,
+            "loop_q1_issue_event_id": q1_issue_event.id,
             "uncertain_registers": sorted(written_registers),
+            "invariant_registers": sorted(invariant_writes),
+            "invariant_duration_pcs": invariant_duration_pcs,
             "uncertain_latched_fields": uncertain_latched_fields,
             "source_start": _source_to_json(start_instruction.source),
             "source_end": _source_to_json(instruction.source),
@@ -3452,6 +4811,8 @@ def _emit_compact_loop(
             "preview_iteration_event_ids": preview_iteration_event_ids,
         },
     )
+    if affine_timing is not None:
+        loop_block.meta.update({key: value for key, value in affine_timing.items() if key != "final_registers"})
     if isinstance(t0, Concrete) and isinstance(t1, Concrete) and _is_wait_only_loop(
         state, instruction, start_pc, count, duration
     ):
@@ -3464,7 +4825,7 @@ def _emit_compact_loop(
         t1=t1,
         duration=duration,
         label=f"{loop_id} iteration 0 preview",
-        confidence="unknown" if state.conditional_time_unknown else "exact" if forever else _confidence_for_value(count),
+        confidence="unknown" if state.conditional_time_unknown or varying_duration else "exact" if forever else _confidence_for_value(count),
         source=start_instruction.source,
         meta={
             "loop_id": loop_id,
@@ -3528,6 +4889,9 @@ def _emit_compact_loop(
     # Only the first iteration is interpreted; later previews copy events without
     # executing their arithmetic. Do not expose those copies as register writes.
     _flush_pending_register_writes(state, completed_issue_index=state.q1_issue_index + 1)
+    invariant_values = {register: (state.registers.get(register, Unknown(register)), state.register_bounds.get(register),
+                                  state.register_known_bits.get(register), state.register_value_origins.get(register))
+                        for register in invariant_writes}
     if has_hidden_iterations:
         reason = f"register writes in compact loop {loop_id} are not expanded"
         _invalidate_register_history(
@@ -3550,6 +4914,14 @@ def _emit_compact_loop(
             setattr(state.latched_state, field, tuple(unknown for _ in value) if isinstance(value, tuple) else unknown)
         if condition_varies:
             state.conditional_enable = Unknown(reason)
+            state.conditional_enable_bounds = None
+            state.conditional_enable_known_bits = None
+        if mask_varies:
+            state.conditional_mask = Unknown(reason)
+        if operator_varies:
+            state.conditional_operator = Unknown(reason)
+            state.conditional_operator_bounds = None
+            state.conditional_operator_known_bits = None
     if not forever:
         _advance_compact_loop_fallthrough_state(
             state,
@@ -3560,7 +4932,47 @@ def _emit_compact_loop(
             q1_body_period=q1_body_period,
             loop_q1_jump_runtime_ns=loop_q1_jump_runtime_ns,
             loop_q1_continue_runtime_ns=loop_q1_continue_runtime_ns,
+            rt_total=Concrete(affine_timing["total_duration"]["value"]) if affine_timing is not None else None,
         )
+        if isinstance(count, Concrete):
+            for register, (value, bounds, known_bits, value_origin) in invariant_values.items():
+                state.registers[register] = value
+                if bounds is not None:
+                    state.register_bounds[register] = bounds
+                if known_bits is not None:
+                    state.register_known_bits[register] = known_bits
+                if value_origin is not None:
+                    state.register_value_origins[register] = value_origin
+                _record_register_write(state, register, value, source=instruction.source, event_id=q1_issue_event.id,
+                                       meta={"op": "loop", "loop_id": loop_id, "loop_complete": True, "invariant": True})
+        if affine_timing is not None:
+            for register, word in affine_timing.get("final_registers", {}).items():
+                value = Concrete(word)
+                state.registers[register] = value
+                state.register_bounds.pop(register, None)
+                state.register_known_bits.pop(register, None)
+                expression = f"{register} after affine loop {loop_id}"
+                state.register_provenance[register] = _register_provenance(
+                    state, register, expression=expression, value=value, steps=[_provenance_step(instruction, expression, value)],
+                )
+                _record_register_write(state, register, value, source=instruction.source, event_id=q1_issue_event.id,
+                                       meta={"op": "loop", "loop_id": loop_id, "loop_complete": True, "affine": True,
+                                             "invariant": register in invariant_values})
+        for register, (value, bounds, known_bits, value_origin) in evaluated_facts.items():
+            state.registers[register] = value
+            for mapping, fact in ((state.register_bounds, bounds), (state.register_known_bits, known_bits)):
+                if fact is None:
+                    mapping.pop(register, None)
+                else:
+                    mapping[register] = fact
+            if value_origin is not None:
+                state.register_value_origins[register] = value_origin
+            expression = f"{register} after evaluated loop {loop_id}"
+            state.register_provenance[register] = _register_provenance(
+                state, register, expression=expression, value=value, steps=[_provenance_step(instruction, expression, value)])
+            _record_register_write(state, register, value, source=instruction.source, event_id=q1_issue_event.id,
+                                   meta={"op": "loop", "loop_id": loop_id, "loop_complete": True, "evaluated": True,
+                                         "invariant": register in invariant_values})
         if counter_reg is not None:
             _record_register_write(
                 state,
@@ -3570,6 +4982,12 @@ def _emit_compact_loop(
                 event_id=q1_issue_event.id,
                 meta={"op": "loop", "loop_id": loop_id, "loop_complete": True},
             )
+    if instruction.op == "loop":
+        counter_finishes = (isinstance(count, Concrete) and count.value > 0
+                            and (count.value == 1 or not counter_modified and all(
+                                get_instruction_spec(item.op).category != "branch" for item in body_instructions[:-1])))
+        flags = _sub_flags(1, 1) if counter_finishes else None
+        _set_alu_flags(state, instruction, flags)
     return True
 
 
@@ -3769,6 +5187,138 @@ def _logic_flags(result: int) -> dict[str, bool]:
     return {"zf": result == 0, "nf": bool(result & 0x80000000), "cf": False, "of": False}
 
 
+def _result_bounds_flags(bounds: tuple[int, int] | None) -> dict[str, bool]:
+    flags = {}
+    if bounds is not None:
+        low, high = bounds
+        if high == 0 or low > 0:
+            flags["zf"] = high == 0
+        if high < 0x80000000 or low >= 0x80000000:
+            flags["nf"] = low >= 0x80000000
+    return flags
+
+
+def _bounds_known_bits(bounds: tuple[int, int]) -> tuple[int, int]:
+    low, high = bounds
+    prefix = _CLASSICAL_REGISTER_MASK ^ ((1 << (low ^ high).bit_length()) - 1)
+    return low & prefix, ~high & prefix & _CLASSICAL_REGISTER_MASK
+
+
+def _refine_bounds_with_bits(bounds: tuple[int, int] | None, known_bits: tuple[int, int]) -> tuple[int, int]:
+    low, high = known_bits[0], _CLASSICAL_REGISTER_MASK ^ known_bits[1]
+    return (low, high) if bounds is None else (max(bounds[0], low), min(bounds[1], high))
+
+
+def _shift_count_facts(
+    op: str, bounds: tuple[int, int] | None, known_bits: tuple[int, int], shift: int,
+) -> tuple[tuple[int, int], tuple[int, int], dict[str, bool]]:
+    source_ones, source_zeros = known_bits
+    result_bounds = bounds if shift == 0 else None
+    if op in {"asl", "lsl"}:
+        ones = (source_ones << shift) & _CLASSICAL_REGISTER_MASK
+        zeros = ((source_zeros << shift) | ((1 << shift) - 1)) & _CLASSICAL_REGISTER_MASK
+        if shift == 32:
+            result_bounds = 0, 0
+        elif bounds is not None and bounds[1] << shift <= _CLASSICAL_REGISTER_MASK:
+            result_bounds = bounds[0] << shift, bounds[1] << shift
+    else:
+        ones, zeros = source_ones >> shift, source_zeros >> shift
+        fill = _CLASSICAL_REGISTER_MASK ^ (_CLASSICAL_REGISTER_MASK >> shift)
+        if op == "lsr" or source_zeros & 0x80000000:
+            zeros |= fill
+        elif source_ones & 0x80000000:
+            ones |= fill
+        if bounds is not None:
+            if op == "lsr":
+                result_bounds = bounds[0] >> shift, bounds[1] >> shift
+            elif bounds[1] < 0x80000000 or bounds[0] >= 0x80000000:
+                result_bounds = tuple((_signed_32_bit_register_value(endpoint) >> shift) & _CLASSICAL_REGISTER_MASK
+                                      for endpoint in bounds)
+    result_bounds = _refine_bounds_with_bits(result_bounds, (ones, zeros))
+    flags = _result_bounds_flags(result_bounds)
+    if shift == 0:
+        flags.update(cf=False, of=False)
+    else:
+        carry_bit = 1 << ((32 - shift) if op in {"asl", "lsl"} else shift - 1)
+        if carry_bit & (source_ones | source_zeros):
+            flags["cf"] = bool(carry_bit & source_ones)
+        if op in {"asr", "lsr"}:
+            flags["of"] = False
+        elif "cf" in flags and "nf" in flags:
+            flags["of"] = flags["cf"] != flags["nf"]
+    return result_bounds, (ones, zeros), flags
+
+
+def _arithmetic_known_bits(
+    op: str, left: tuple[int, int], right: tuple[int, int], *, same_value: bool = False, complementary: bool = False,
+) -> tuple[tuple[int, int], dict[str, bool]]:
+    subtract = op == "sub"
+    carries = {int(subtract)}
+    ones, zeros = 0, 0
+    overflows = set()
+    for position in range(32):
+        bit = 1 << position
+        left_values = (1,) if left[0] & bit else (0,) if left[1] & bit else (0, 1)
+        right_values = (1,) if right[0] & bit else (0,) if right[1] & bit else (0, 1)
+        results, next_carries = set(), set()
+        for a, b, carry in product(left_values, right_values, carries):
+            if same_value and a != b or complementary and a == b:
+                continue
+            total = a + (b ^ int(subtract)) + carry
+            results.add(total & 1)
+            next_carries.add(total >> 1)
+            if position == 31:
+                overflows.add(bool(carry ^ (total >> 1)))
+        if results == {1}:
+            ones |= bit
+        elif results == {0}:
+            zeros |= bit
+        carries = next_carries
+    flags = {}
+    if len(carries) == 1:
+        flags["cf"] = bool(next(iter(carries))) != subtract
+    if len(overflows) == 1:
+        flags["of"] = next(iter(overflows))
+    return (ones, zeros), flags
+
+
+def _arithmetic_bounds_flags(
+    op: str, left: tuple[int, int] | None, right: tuple[int, int] | None,
+) -> dict[str, bool] | None:
+    if left is None or right is None:
+        return None
+    modulus = _CLASSICAL_REGISTER_MASK + 1
+    low, high = ((left[0] + right[0], left[1] + right[1]) if op == "add"
+                 else (left[0] - right[1], left[1] - right[0]))
+    bounds = (low % modulus, high % modulus) if low // modulus == high // modulus else None
+    flags = _result_bounds_flags(bounds)
+    if op == "add":
+        if high < modulus or low >= modulus:
+            flags["cf"] = low >= modulus
+    elif left[1] < right[0] or left[0] >= right[1]:
+        flags["cf"] = left[1] < right[0]
+    signed = []
+    for lower, upper in (left, right):
+        parts = []
+        if lower < 0x80000000:
+            parts.append((lower, min(upper, 0x7FFFFFFF)))
+        if upper >= 0x80000000:
+            parts.append((max(lower, 0x80000000) - modulus, upper - modulus))
+        signed.append(parts)
+    overflows = set()
+    for a, b in product(*signed):
+        low, high = ((a[0] + b[0], a[1] + b[1]) if op == "add" else (a[0] - b[1], a[1] - b[0]))
+        if -0x80000000 <= low <= high < 0x80000000:
+            overflows.add(False)
+        elif low >= 0x80000000 or high < -0x80000000:
+            overflows.add(True)
+        else:
+            return flags or None
+    if len(overflows) == 1:
+        flags["of"] = overflows.pop()
+    return flags or None
+
+
 def _add_flags(left: int, right: int) -> dict[str, bool]:
     mask = _CLASSICAL_REGISTER_MASK
     sign = 0x80000000
@@ -3800,6 +5350,8 @@ def _shift_flags(op: str, left: int, shift: int, result: int) -> dict[str, bool]
 
 
 def _binary_alu_flags(op: str, left: Value, right: Value, result: Value) -> dict[str, bool] | None:
+    if op in {"and", "or", "xor"} and isinstance(result, Concrete):
+        return _logic_flags(result.value)
     if not isinstance(left, Concrete) or not isinstance(right, Concrete) or not isinstance(result, Concrete):
         return None
     if op == "add":
@@ -3811,20 +5363,255 @@ def _binary_alu_flags(op: str, left: Value, right: Value, result: Value) -> dict
     return _logic_flags(result.value)
 
 
+def _build_immutable_value_origins(symbols: SymbolTable, defs: dict[str, Arg], state: AnalysisState) -> dict[str, tuple[str, bool]]:
+    origins = {name: (f"binding:param:{name}", False) for name in symbols}
+    for name, arg in defs.items():
+        origin = None
+        if arg.kind == "imm":
+            origin = f"constant:{int(arg.value) & _CLASSICAL_REGISTER_MASK}", False
+        elif arg.kind in {"symbol", "placeholder"} and _physical_read_register(arg, state) is None:
+            origin = next((origins[key] for key in _symbol_lookup_names(str(arg.value)) if key in origins), None)
+            if origin is None:
+                origin = f"template:{arg.value}", False
+        origins[name] = origin if origin is not None else (f"binding:def:{name}", False)
+    return origins
+
+
+def _operand_value_origin(arg: Arg, value: Value, state: AnalysisState) -> tuple[str, bool] | None:
+    if isinstance(value, Concrete):
+        return f"constant:{value.value & _CLASSICAL_REGISTER_MASK}", False
+    register = _physical_read_register(arg, state)
+    if register is not None:
+        return state.register_value_origins.get(register, (f"initial:{register}", False))
+    if arg.kind in {"symbol", "placeholder"}:
+        declared = set(state.symbol_origins.get("defs", {})) | set(state.symbol_origins.get("params", {}))
+        for name in _symbol_lookup_names(str(arg.value)):
+            if name in state.immutable_value_origins:
+                return state.immutable_value_origins[name]
+            if name.startswith("$") and name[1:] in state.immutable_value_origins:
+                return state.immutable_value_origins[name[1:]]
+            if name in declared:
+                return f"binding:{name}", False
+            if name.startswith("$") and name[1:] in declared:
+                return f"binding:{name[1:]}", False
+        return f"template:{arg.value}", False
+    return None
+
+
+def _operand_value_relation(left: Arg, left_value: Value, right: Arg, right_value: Value, state: AnalysisState) -> bool | None:
+    a = _operand_value_origin(left, left_value, state)
+    b = _operand_value_origin(right, right_value, state)
+    return a[1] != b[1] if a is not None and b is not None and a[0] == b[0] else None
+
+
+def _complement_value_origin(origin: tuple[str, bool] | None) -> tuple[str, bool] | None:
+    return (origin[0], not origin[1]) if origin is not None else None
+
+
+def _linear_origin_parts(origin: tuple[str, bool] | None):
+    if origin is None:
+        return None
+    token, complemented = origin
+    if token.startswith("linear:"):
+        offset, items = json.loads(token[7:])
+        terms = dict(items)
+    elif token.startswith("constant:"):
+        offset, terms = int(token[9:]), {}
+    else:
+        offset, terms = 0, {token: 1}
+    if complemented:
+        offset = _CLASSICAL_REGISTER_MASK - offset
+        terms = {name: (-coefficient) & _CLASSICAL_REGISTER_MASK for name, coefficient in terms.items()}
+    return offset & _CLASSICAL_REGISTER_MASK, terms
+
+
+def _canonical_linear_origin(offset: int, terms: dict[str, int]) -> tuple[str, bool] | None:
+    offset &= _CLASSICAL_REGISTER_MASK
+    terms = {name: coefficient & _CLASSICAL_REGISTER_MASK for name, coefficient in terms.items()
+             if coefficient & _CLASSICAL_REGISTER_MASK}
+    if not terms:
+        return f"constant:{offset}", False
+    if len(terms) == 1:
+        name, coefficient = next(iter(terms.items()))
+        if offset == 0 and coefficient == 1:
+            return name, False
+        if offset == _CLASSICAL_REGISTER_MASK and coefficient == _CLASSICAL_REGISTER_MASK:
+            return name, True
+    if len(terms) > 8:
+        return None
+    direct = json.dumps([offset, sorted(terms.items())], separators=(",", ":"))
+    inverse = json.dumps([_CLASSICAL_REGISTER_MASK - offset,
+                          sorted((name, (-coefficient) & _CLASSICAL_REGISTER_MASK) for name, coefficient in terms.items())],
+                         separators=(",", ":"))
+    token, complemented = (direct, False) if direct <= inverse else (inverse, True)
+    return ("linear:" + token, complemented) if len(token) <= 4096 else None
+
+
+def _arithmetic_value_origin(op: str, left: tuple[str, bool] | None, right: tuple[str, bool] | None,
+                             shift: int | None = None) -> tuple[str, bool] | None:
+    a = _linear_origin_parts(left)
+    if a is None:
+        return None
+    if op in {"lsl", "asl"} and shift is not None:
+        factor = 1 << shift
+        return _canonical_linear_origin(a[0] * factor, {name: value * factor for name, value in a[1].items()})
+    b = _linear_origin_parts(right)
+    if op == "multiply_low" and b is not None:
+        if not a[1]:
+            return _scaled_value_origin(right, a[0])
+        if not b[1]:
+            return _scaled_value_origin(left, b[0])
+        return None
+    if op not in {"add", "sub"} or b is None:
+        return None
+    sign = 1 if op == "add" else -1
+    terms = dict(a[1])
+    for name, coefficient in b[1].items():
+        terms[name] = terms.get(name, 0) + sign * coefficient
+    return _canonical_linear_origin(a[0] + sign * b[0], terms)
+
+
+def _scaled_value_origin(origin: tuple[str, bool] | None, factor: int) -> tuple[str, bool] | None:
+    parts = _linear_origin_parts(origin)
+    return (_canonical_linear_origin(parts[0] * factor, {name: value * factor for name, value in parts[1].items()})
+            if parts is not None else None)
+
+
+def _origin_peer_facts(
+    state: AnalysisState, origin: tuple[str, bool] | None,
+    bounds: tuple[int, int] | None, known_bits: tuple[int, int] | None,
+) -> tuple[tuple[int, int] | None, tuple[int, int] | None]:
+    if origin is None:
+        return bounds, known_bits
+    for register in state.register_bounds.keys() | state.register_known_bits.keys():
+        value = state.registers.get(register, Unknown(register))
+        peer = state.register_value_origins.get(register, _operand_value_origin(Arg("reg", register, register), value, state))
+        if peer is None or peer[0] != origin[0]:
+            continue
+        interval = state.register_bounds.get(register, (0, _CLASSICAL_REGISTER_MASK))
+        ones, zeros = state.register_known_bits.get(register, (0, 0))
+        if isinstance(value, Concrete):
+            word = value.value & _CLASSICAL_REGISTER_MASK
+            interval, (ones, zeros) = (word, word), (word, _CLASSICAL_REGISTER_MASK ^ word)
+        prefix_ones, prefix_zeros = _bounds_known_bits(interval)
+        ones, zeros = ones | prefix_ones, zeros | prefix_zeros
+        if peer[1] != origin[1]:
+            interval = _CLASSICAL_REGISTER_MASK - interval[1], _CLASSICAL_REGISTER_MASK - interval[0]
+            ones, zeros = zeros, ones
+        current = bounds or (0, _CLASSICAL_REGISTER_MASK)
+        bounds = max(current[0], interval[0]), min(current[1], interval[1])
+        old_ones, old_zeros = known_bits or (0, 0)
+        known_bits = old_ones | ones, old_zeros | zeros
+    if bounds is not None or known_bits not in {None, (0, 0)}:
+        bounds = _refine_bounds_with_bits(bounds, known_bits or (0, 0))
+    return bounds, known_bits
+
+
+def _unsigned_operand_bounds(arg: Arg, value: Value, state: AnalysisState) -> tuple[int, int] | None:
+    if isinstance(value, Concrete):
+        word = value.value & _CLASSICAL_REGISTER_MASK
+        return word, word
+    register = _physical_read_register(arg, state)
+    if register is None:
+        return None
+    bounds = state.register_bounds.get(register, (0, _CLASSICAL_REGISTER_MASK))
+    known_bits = state.register_known_bits.get(register)
+    return _refine_bounds_with_bits(bounds, known_bits) if known_bits is not None else bounds
+
+
+def _operand_known_bits(arg: Arg, value: Value, state: AnalysisState) -> tuple[int, int]:
+    bounds = _unsigned_operand_bounds(arg, value, state)
+    ones, zeros = _bounds_known_bits(bounds) if bounds is not None else (0, 0)
+    if not isinstance(value, Concrete):
+        register_bits = state.register_known_bits.get(_physical_read_register(arg, state), (0, 0))
+        ones |= register_bits[0]
+        zeros |= register_bits[1]
+    return ones, zeros
+
+
+def _comparison_flags(left_arg: Arg, left: Value, right_arg: Arg, right: Value, state: AnalysisState) -> dict[str, bool] | None:
+    if isinstance(left, Concrete) and isinstance(right, Concrete):
+        return _sub_flags(left.value, right.value)
+    relation = _operand_value_relation(left_arg, left, right_arg, right, state)
+    if relation is False:
+        return _sub_flags(0, 0)
+    flags = _arithmetic_bounds_flags("sub", _unsigned_operand_bounds(left_arg, left, state),
+                                     _unsigned_operand_bounds(right_arg, right, state)) or {}
+    bits, bit_flags = _arithmetic_known_bits("sub", _operand_known_bits(left_arg, left, state),
+                                           _operand_known_bits(right_arg, right, state), complementary=relation is True)
+    flags.update(bit_flags)
+    flags.update(_result_bounds_flags((bits[0], _CLASSICAL_REGISTER_MASK ^ bits[1])))
+    difference = _linear_origin_parts(_arithmetic_value_origin("sub", _operand_value_origin(left_arg, left, state),
+                                                              _operand_value_origin(right_arg, right, state)))
+    if difference is not None and not difference[1]:
+        flags.update(_result_bounds_flags((difference[0], difference[0])))
+    return flags or None
+
+
+def _multiply_operand_bounds(arg: Arg, value: Value, state: AnalysisState, width: int, signed: bool) -> tuple[int, int]:
+    mask = (1 << width) - 1
+    interval = _unsigned_operand_bounds(arg, value, state)
+    if interval is not None and interval[0] >> width == interval[1] >> width:
+        low, high = interval[0] & mask, interval[1] & mask
+    else:
+        low, high = 0, mask
+    ones, zeros = _operand_known_bits(arg, value, state)
+    low, high = max(low, ones & mask), min(high, mask ^ (zeros & mask))
+    if signed:
+        sign = 1 << (width - 1)
+        if low >= sign:
+            low, high = low - (1 << width), high - (1 << width)
+        elif high >= sign:
+            low, high = -sign, sign - 1
+    return low, high
+
+
+def _multiply_bounds(left: tuple[int, int], right: tuple[int, int], relation: bool | None, complement_sum: int) -> tuple[int, int]:
+    low, high = left
+    if relation is False:
+        return (0 if low <= 0 <= high else min(low * low, high * high)), max(low * low, high * high)
+    if relation is True:
+        candidates = [low, high, *(point for point in (complement_sum // 2, complement_sum // 2 + 1) if low <= point <= high)]
+        products = [point * (complement_sum - point) for point in candidates]
+    else:
+        products = [a * b for a in left for b in right]
+    return min(products), max(products)
+
+
+def _word_interval(bounds: tuple[int, int]) -> tuple[int, int] | None:
+    low, high = bounds
+    return (low & _CLASSICAL_REGISTER_MASK, high & _CLASSICAL_REGISTER_MASK) if low >> 32 == high >> 32 else None
+
+
 def _execute_classical(state: AnalysisState, instruction: Instr, symbols: SymbolTable) -> None:
     scope = _scope(symbols, state)
     destination = _register_name(instruction.args[1], state) if len(instruction.args) >= 2 else None
     if instruction.op == "move" and destination is not None:
         value = resolve_arg_value(instruction.args[0], scope)
         value = _wrap_concrete_classical_register_value(value)
+        value_origin = _operand_value_origin(instruction.args[0], value, state)
+        known_bits = _operand_known_bits(instruction.args[0], value, state)
+        bounds = _refine_bounds_with_bits(_unsigned_operand_bounds(instruction.args[0], value, state), known_bits)
+        if bounds[0] == bounds[1]:
+            value = Concrete(bounds[0])
         provenance = _move_provenance(state, instruction, instruction.args[0], destination, value)
-        _schedule_register_write(state, instruction, destination, value, provenance)
+        _schedule_register_write(state, instruction, destination, value, provenance,
+                                 unsigned_bounds=bounds, known_bits=known_bits, value_origin=value_origin)
     elif instruction.op == "not" and destination is not None:
         source = resolve_arg_value(instruction.args[0], scope)
+        value_origin = _complement_value_origin(_operand_value_origin(instruction.args[0], source, state))
         value = _unary_classical_value("not", source)
+        source_bounds = _unsigned_operand_bounds(instruction.args[0], source, state)
+        bounds = (_CLASSICAL_REGISTER_MASK - source_bounds[1], _CLASSICAL_REGISTER_MASK - source_bounds[0]) if source_bounds is not None else None
+        source_ones, source_zeros = _operand_known_bits(instruction.args[0], source, state)
+        known_bits = source_zeros, source_ones
+        bounds = _refine_bounds_with_bits(bounds, known_bits)
+        if bounds is not None and bounds[0] == bounds[1]:
+            value = Concrete(bounds[0])
         provenance = _unary_provenance(state, instruction, instruction.args[0], destination, value)
-        _schedule_register_write(state, instruction, destination, value, provenance)
-        _set_alu_flags(state, instruction, _logic_flags(value.value) if isinstance(value, Concrete) else None)
+        _schedule_register_write(state, instruction, destination, value, provenance, unsigned_bounds=bounds, known_bits=known_bits, value_origin=value_origin)
+        flags = _logic_flags(value.value) if isinstance(value, Concrete) else {**_result_bounds_flags(bounds), "cf": False, "of": False}
+        _set_alu_flags(state, instruction, flags)
     elif instruction.op in {"add", "sub", "and", "or", "xor", "asl", "asr", "lsl", "lsr"} and len(instruction.args) >= 3:
         destination = _register_name(instruction.args[2], state)
         if destination is None:
@@ -3832,51 +5619,259 @@ def _execute_classical(state: AnalysisState, instruction: Instr, symbols: Symbol
         left_arg, right_arg = _docs_ordered_binary_args(instruction, state)
         left = resolve_arg_value(left_arg, scope)
         right = resolve_arg_value(right_arg, scope)
-        if instruction.op == "add":
-            value = add_values(left, right)
+        relation = _operand_value_relation(left_arg, left, right_arg, right, state)
+        same_value, complementary = relation is False, relation is True
+        if complementary and instruction.op in {"and", "or", "xor", "add"}:
+            value = Concrete(0 if instruction.op == "and" else _CLASSICAL_REGISTER_MASK)
+        elif same_value and instruction.op in {"sub", "xor"}:
+            value = Concrete(0)
+        elif same_value and instruction.op in {"and", "or"}:
+            value = left
+        elif instruction.op == "add":
+            value = left if right == Concrete(0) else right if left == Concrete(0) else add_values(left, right)
         elif instruction.op == "sub":
-            value = subtract_values(left, right)
+            value = left if right == Concrete(0) else subtract_values(left, right)
         else:
             value = _binary_classical_value(instruction.op, left, right)
         if instruction.op in _WRAPPING_CLASSICAL_OPS:
             value = _wrap_concrete_classical_register_value(value)
-        _set_alu_flags(state, instruction, _binary_alu_flags(instruction.op, left, right, value))
-        provenance = _binary_provenance(
-            state,
-            instruction,
-            left_arg,
-            right_arg,
-            destination,
-            value,
-        )
-        _schedule_register_write(state, instruction, destination, value, provenance)
+        bounds = None
+        left_bounds = _unsigned_operand_bounds(left_arg, left, state)
+        right_bounds = _unsigned_operand_bounds(right_arg, right, state)
+        left_ones, left_zeros = _operand_known_bits(left_arg, left, state)
+        right_ones, right_zeros = _operand_known_bits(right_arg, right, state)
+        if left_bounds is not None and right_bounds is not None:
+            if instruction.op in {"and", "or"} and same_value:
+                bounds = left_bounds
+            elif instruction.op == "and":
+                if left_bounds == (_CLASSICAL_REGISTER_MASK, _CLASSICAL_REGISTER_MASK):
+                    bounds = right_bounds
+                elif right_bounds == (_CLASSICAL_REGISTER_MASK, _CLASSICAL_REGISTER_MASK):
+                    bounds = left_bounds
+                else:
+                    bounds = 0, min(left_bounds[1], right_bounds[1])
+            elif instruction.op in {"or", "xor"}:
+                if left == Concrete(0):
+                    bounds = right_bounds
+                elif right == Concrete(0):
+                    bounds = left_bounds
+                elif instruction.op == "xor" and left_bounds == (_CLASSICAL_REGISTER_MASK, _CLASSICAL_REGISTER_MASK):
+                    bounds = _CLASSICAL_REGISTER_MASK - right_bounds[1], _CLASSICAL_REGISTER_MASK - right_bounds[0]
+                elif instruction.op == "xor" and right_bounds == (_CLASSICAL_REGISTER_MASK, _CLASSICAL_REGISTER_MASK):
+                    bounds = _CLASSICAL_REGISTER_MASK - left_bounds[1], _CLASSICAL_REGISTER_MASK - left_bounds[0]
+                else:
+                    high = (1 << max(left_bounds[1].bit_length(), right_bounds[1].bit_length())) - 1
+                    bounds = (max(left_bounds[0], right_bounds[0]) if instruction.op == "or" else 0), high
+            elif instruction.op in {"add", "sub"}:
+                low, high = ((left_bounds[0] + right_bounds[0], left_bounds[1] + right_bounds[1]) if instruction.op == "add"
+                             else (left_bounds[0] - right_bounds[1], left_bounds[1] - right_bounds[0]))
+                modulus = _CLASSICAL_REGISTER_MASK + 1
+                if low // modulus == high // modulus:
+                    bounds = low % modulus, high % modulus
+        known_bits = None
+        arithmetic_bit_flags = {}
+        shift_counts = None
+        shift_flags = None
+        if instruction.op == "and":
+            known_bits = left_ones & right_ones, left_zeros | right_zeros
+        elif instruction.op == "or":
+            known_bits = left_ones | right_ones, left_zeros & right_zeros
+        elif instruction.op == "xor":
+            known_bits = (left_ones & right_zeros) | (left_zeros & right_ones), (left_ones & right_ones) | (left_zeros & right_zeros)
+        elif instruction.op in {"add", "sub"} and not isinstance(value, Concrete):
+            known_bits, arithmetic_bit_flags = _arithmetic_known_bits(
+                instruction.op, (left_ones, left_zeros), (right_ones, right_zeros), same_value=same_value, complementary=complementary,
+            )
+        elif instruction.op in {"asl", "asr", "lsl", "lsr"}:
+            if isinstance(right, Concrete):
+                shift_counts = [right.value] if 0 <= right.value <= 32 else None
+            elif right_bounds is not None and 0 <= right_bounds[0] <= right_bounds[1] <= 32:
+                shift_counts = [value for value in range(right_bounds[0], right_bounds[1] + 1)
+                                if value & right_ones == right_ones and value & right_zeros == 0]
+            if shift_counts:
+                facts = []
+                for shift in shift_counts:
+                    input_bounds, input_bits = left_bounds, (left_ones, left_zeros)
+                    if relation is not None:
+                        word = shift ^ (_CLASSICAL_REGISTER_MASK if complementary else 0)
+                        input_bounds, input_bits = (word, word), (word, _CLASSICAL_REGISTER_MASK ^ word)
+                    facts.append(_shift_count_facts(instruction.op, input_bounds, input_bits, shift))
+                bounds = min(item[0][0] for item in facts), max(item[0][1] for item in facts)
+                ones, zeros = _CLASSICAL_REGISTER_MASK, _CLASSICAL_REGISTER_MASK
+                for _, bits, _ in facts:
+                    ones &= bits[0]
+                    zeros &= bits[1]
+                known_bits = ones, zeros
+                shift_flags = {name: value for name, value in facts[0][2].items()
+                               if all(item[2].get(name) == value for item in facts)}
+        if known_bits is not None and known_bits != (0, 0):
+            bounds = _refine_bounds_with_bits(bounds, known_bits)
+        if bounds is not None and bounds[0] == bounds[1]:
+            value = Concrete(bounds[0])
+        left_origin = _operand_value_origin(left_arg, left, state)
+        right_origin = _operand_value_origin(right_arg, right, state)
+        arithmetic_origin = _arithmetic_value_origin(instruction.op, left_origin, right_origin,
+                                                     shift_counts[0] if shift_counts and len(shift_counts) == 1 else None)
+        if arithmetic_origin is not None and not isinstance(value, Concrete):
+            bounds, known_bits = _origin_peer_facts(state, arithmetic_origin, bounds, known_bits)
+        parts = _linear_origin_parts(arithmetic_origin)
+        if parts is not None and not parts[1]:
+            value = Concrete(parts[0])
+            bounds = value.value, value.value
+            known_bits = value.value, _CLASSICAL_REGISTER_MASK ^ value.value
+        elif bounds is not None and bounds[0] == bounds[1]:
+            value = Concrete(bounds[0])
+        flags = (_sub_flags(0, 0) if same_value and instruction.op == "sub"
+                 else _logic_flags(_CLASSICAL_REGISTER_MASK) if complementary and instruction.op == "add"
+                 else _binary_alu_flags(instruction.op, left, right, value))
+        if flags is None:
+            flags = (_arithmetic_bounds_flags(instruction.op, left_bounds, right_bounds) or {}
+                     if instruction.op in {"add", "sub"} else {})
+            flags.update(arithmetic_bit_flags)
+            flags.update(_result_bounds_flags((value.value, value.value) if isinstance(value, Concrete) else bounds))
+            if instruction.op in {"and", "or", "xor"}:
+                flags.update(cf=False, of=False)
+            elif shift_flags is not None:
+                flags.update(shift_flags)
+        _set_alu_flags(state, instruction, flags or None)
+        left_word = left.value & _CLASSICAL_REGISTER_MASK if isinstance(left, Concrete) else None
+        right_word = right.value & _CLASSICAL_REGISTER_MASK if isinstance(right, Concrete) else None
+        value_origin = None
+        if (same_value and instruction.op in {"and", "or"}
+                or right_word == 0 and instruction.op in {"add", "sub", "or", "xor", "asl", "asr", "lsl", "lsr"}
+                or shift_counts == [0]
+                or right_word == _CLASSICAL_REGISTER_MASK and instruction.op == "and"):
+            value_origin = left_origin
+        elif (left_word == 0 and instruction.op in {"add", "or", "xor"}
+              or left_word == _CLASSICAL_REGISTER_MASK and instruction.op == "and"):
+            value_origin = right_origin
+        elif instruction.op == "xor" and right_word == _CLASSICAL_REGISTER_MASK:
+            value_origin = _complement_value_origin(left_origin)
+        elif instruction.op == "xor" and left_word == _CLASSICAL_REGISTER_MASK:
+            value_origin = _complement_value_origin(right_origin)
+        if arithmetic_origin is not None:
+            value_origin = arithmetic_origin
+        provenance = _binary_provenance(state, instruction, left_arg, right_arg, destination, value)
+        _schedule_register_write(state, instruction, destination, value, provenance, unsigned_bounds=bounds, known_bits=known_bits, value_origin=value_origin)
     elif instruction.op in {"cmp", "test"} and len(instruction.args) >= 2:
         left_arg, right_arg = _docs_ordered_binary_args(instruction, state)
         left = resolve_arg_value(left_arg, scope)
         right = resolve_arg_value(right_arg, scope)
+        relation = _operand_value_relation(left_arg, left, right_arg, right, state)
         if instruction.op == "cmp":
-            flags = _sub_flags(left.value, right.value) if isinstance(left, Concrete) and isinstance(right, Concrete) else None
+            flags = _comparison_flags(left_arg, left, right_arg, right, state)
         else:
-            value = _binary_classical_value("and", left, right)
-            flags = _logic_flags(value.value) if isinstance(value, Concrete) else None
+            value = Concrete(0) if relation is True else _binary_classical_value("and", left, right)
+            bounds = _unsigned_operand_bounds(left_arg, left, state) if relation is False else None
+            if bounds is None:
+                left_bounds = _unsigned_operand_bounds(left_arg, left, state)
+                right_bounds = _unsigned_operand_bounds(right_arg, right, state)
+                if left_bounds is not None and right_bounds is not None:
+                    left_ones, left_zeros = _operand_known_bits(left_arg, left, state)
+                    right_ones, right_zeros = _operand_known_bits(right_arg, right, state)
+                    bounds = (left_ones & right_ones,
+                              min(left_bounds[1], right_bounds[1], ~(left_zeros | right_zeros) & _CLASSICAL_REGISTER_MASK))
+            flags = (_logic_flags(value.value) if isinstance(value, Concrete)
+                     else {**_result_bounds_flags(bounds), "cf": False, "of": False})
         _set_alu_flags(state, instruction, flags)
     elif instruction.op in {"mulu16", "muls16", "mulu32", "muls32", "mulu32l", "mulu32h", "muls32l", "muls32h"}:
-        _set_alu_flags(state, instruction, None)
+        width = 16 if instruction.op.endswith("16") else 32
+        full_product = instruction.op in {"mulu32", "muls32"}
+        left, right = [resolve_arg_value(arg, scope) for arg in instruction.args[:2]]
+        signed = instruction.op.startswith("muls") and not instruction.op.endswith("32l")
+        operand_bounds = [_multiply_operand_bounds(arg, item, state, width, signed)
+                          for arg, item in zip(instruction.args, (left, right))]
+        operands = [low if low == high else None for low, high in operand_bounds]
+        if 0 in operands:
+            product = 0
+        elif all(item is not None for item in operands):
+            product = operands[0] * operands[1]
+        else:
+            product = None
+        value = (Concrete(((product >> 32) if instruction.op.endswith("h") else product) & _CLASSICAL_REGISTER_MASK)
+                 if product is not None else Unknown(f"{instruction.op} result"))
+        if product is None and instruction.op.endswith("32l"):
+            value = left if right == Concrete(1) else right if left == Concrete(1) else value
+        relation = _operand_value_relation(instruction.args[0], left, instruction.args[1], right, state)
+        product_origin = (_arithmetic_value_origin(
+            "multiply_low", _operand_value_origin(instruction.args[0], left, state),
+            _operand_value_origin(instruction.args[1], right, state),
+        ) if width == 32 and not instruction.op.endswith("h") else None)
+        product_bounds = _multiply_bounds(*operand_bounds, relation, -1 if signed else (1 << width) - 1)
+        low_bounds = _word_interval(product_bounds)
+        high_bounds = _word_interval(tuple(endpoint >> 32 for endpoint in product_bounds))
+        if instruction.op.endswith("32l"):
+            signed_bounds = [_multiply_operand_bounds(arg, item, state, 32, True)
+                             for arg, item in zip(instruction.args, (left, right))]
+            alternate = _word_interval(_multiply_bounds(*signed_bounds, relation, -1))
+            if alternate is not None:
+                low_bounds = alternate if low_bounds is None else (max(low_bounds[0], alternate[0]), min(low_bounds[1], alternate[1]))
+        bounds = high_bounds if instruction.op.endswith("h") else low_bounds
+        if not full_product and bounds is not None and bounds[0] == bounds[1]:
+            value = Concrete(bounds[0])
+        known_bits = None
+        if not instruction.op.endswith("h"):
+            operand_bits = [_operand_known_bits(arg, item, state) for arg, item in zip(instruction.args, (left, right))]
+            if width == 16:
+                for index, (ones, zeros) in enumerate(operand_bits):
+                    ones, zeros = ones & 0xFFFF, zeros & 0xFFFF
+                    if not signed or zeros & 0x8000:
+                        zeros |= 0xFFFF0000
+                    elif ones & 0x8000:
+                        ones |= 0xFFFF0000
+                    operand_bits[index] = ones, zeros
+            zero_counts = [next((bit for bit in range(32) if not zeros & (1 << bit)), 32) for _, zeros in operand_bits]
+            prefix_counts = [next((bit for bit in range(32) if not (ones | zeros) & (1 << bit)), 32) for ones, zeros in operand_bits]
+            prefix_mask = (1 << min(prefix_counts)) - 1
+            prefix = (operand_bits[0][0] * operand_bits[1][0]) & prefix_mask
+            known_bits = prefix, (prefix_mask ^ prefix) | ((1 << min(32, sum(zero_counts))) - 1)
+            if relation is True:
+                known_bits = known_bits[0], known_bits[1] | 1
+            for index, operand in enumerate(operands):
+                word = operand & _CLASSICAL_REGISTER_MASK if operand is not None else 0
+                if word > 0 and word & (word - 1) == 0:
+                    shift = word.bit_length() - 1
+                    ones, zeros = operand_bits[1 - index]
+                    known_bits = (ones << shift) & _CLASSICAL_REGISTER_MASK, ((zeros << shift) | ((1 << shift) - 1)) & _CLASSICAL_REGISTER_MASK
+                    break
+            bounds = _refine_bounds_with_bits(bounds, known_bits)
+            if not full_product and bounds[0] == bounds[1]:
+                value = Concrete(bounds[0])
+        if not full_product and product_origin is not None:
+            bounds, known_bits = _origin_peer_facts(state, product_origin, bounds, known_bits)
+            if bounds is not None and bounds[0] == bounds[1]:
+                value = Concrete(bounds[0])
+        if full_product:
+            flags = (_logic_flags(0) if product == 0 else {"zf": False}
+                     if product is not None or product_bounds[0] > 0 or product_bounds[1] < 0 or known_bits[0] else None)
+        else:
+            flags = _logic_flags(value.value) if isinstance(value, Concrete) else {**_result_bounds_flags(bounds), "cf": False, "of": False}
+        _set_alu_flags(state, instruction, flags)
+        destinations = [_register_name(instruction.args[index], state) for index in sorted(_register_destination_argument_indexes(instruction.op))
+                        if index < len(instruction.args)]
         for destination_index in sorted(_register_destination_argument_indexes(instruction.op)):
             if destination_index >= len(instruction.args):
                 continue
             destination = _register_name(instruction.args[destination_index], state)
             if destination is None:
                 continue
-            value = Unknown(f"{instruction.op} result")
-            provenance = _register_provenance(
-                state,
-                destination,
-                expression=f"{instruction.op} result",
-                value=value,
-                steps=[_provenance_step(instruction, f"{instruction.op} result", value)],
-            )
-            _schedule_register_write(state, instruction, destination, value, provenance)
+            result = value
+            result_bounds = bounds
+            if full_product:
+                result = (Concrete((product >> (32 if destination_index == 3 else 0)) & _CLASSICAL_REGISTER_MASK)
+                          if product is not None and len(set(destinations)) == len(destinations)
+                          else Unknown(f"{instruction.op} result"))
+                if len(set(destinations)) != len(destinations):
+                    result_bounds = None
+                else:
+                    result_bounds = high_bounds if destination_index == 3 else bounds
+                if result_bounds is not None and result_bounds[0] == result_bounds[1]:
+                    result = Concrete(result_bounds[0])
+            provenance = _binary_provenance(state, instruction, instruction.args[0], instruction.args[1], destination, result)
+            result_bits = known_bits if not full_product or destination_index == 2 and len(set(destinations)) == len(destinations) else None
+            result_origin = product_origin if not full_product or destination_index == 2 and len(set(destinations)) == len(destinations) else None
+            _schedule_register_write(state, instruction, destination, result, provenance, unsigned_bounds=result_bounds,
+                                     known_bits=result_bits, value_origin=result_origin)
 
 
 def _execute_feedback_register_write(
@@ -4042,6 +6037,8 @@ def _execute_latched(state: AnalysisState, instruction: Instr, symbols: SymbolTa
         field_name = "phase"
         value = resolve_arg_value(instruction.args[0], scope) if instruction.args else Concrete(0)
         state.latched_state.phase = value
+        if instruction.op == "reset_ph":
+            state.pending_phase_reset = True
     elif instruction.op == "set_ph_delta" and instruction.args:
         field_name = "phase_delta"
         value = resolve_arg_value(instruction.args[0], scope)
@@ -4064,6 +6061,13 @@ def _execute_latched(state: AnalysisState, instruction: Instr, symbols: SymbolTa
         if instruction.op == "set_cond":
             value = tuple(value)
             state.conditional_enable = value[0]
+            state.conditional_mask = value[1]
+            state.conditional_operator = value[2]
+            state.conditional_enable_bounds = _unsigned_operand_bounds(instruction.args[0], value[0], state)
+            state.conditional_operator_bounds = _unsigned_operand_bounds(instruction.args[2], value[2], state)
+            state.conditional_enable_known_bits = _operand_known_bits(instruction.args[0], value[0], state)
+            state.conditional_operator_known_bits = _operand_known_bits(instruction.args[2], value[2], state)
+            state.conditional_else_duration = value[3]
 
     if field_name is not None:
         if field_name not in {"set_cond", "set_time_ref"}:
@@ -4099,6 +6103,7 @@ def _execute_rt_instruction(
     q1_t0: Value,
     q1_t1: Value,
     rt_packet_id: str | None,
+    q1_issue_event: TimelineEvent,
 ) -> None:
     spec = get_instruction_spec(instruction.op)
     scope = _scope(symbols, state)
@@ -4109,21 +6114,55 @@ def _execute_rt_instruction(
     duration_arg_index = rt_duration_arg_for_instruction(spec, instruction)
 
     if state.conditional_enable != Concrete(0):
-        # Q1 still issues the command, but trigger state determines whether RT
-        # executes it or substitutes the else duration. Neither outcome is known.
-        state.conditional_time_unknown = True
-        duration = Unknown("conditional_execution")
-        t1 = add_values(t0, duration)
-        packet = _append_packet(state, instruction, duration, q1_t0, q1_t1, t0, t1, rt_packet_id)
-        _emit_event(
-            state, lane="rt.unknown", kind="unknown_region", t0=t0, t1=None,
-            duration=duration, label=f"conditional {instruction.op}", confidence="unknown",
-            source=instruction.source,
-            meta={"reason": "conditional_execution_unknown", "op": instruction.op,
-                  "rt_packet_id": packet.id, "output_state_unknown": spec.applies_latched_state},
+        # Execution truth and elapsed time are independent: only the selected
+        # duration matters once the predicate is known. Equal positive durations
+        # can also prove time while the execution decision remains unknown.
+        candidate = None
+        if (spec.category == "rt" and spec.timing_effect_status == "known"
+                and duration_arg_index is not None and duration_arg_index < len(instruction.args)):
+            candidate = resolve_arg_value(instruction.args[duration_arg_index], scope)
+        decision = _conditional_decision(
+            state.conditional_enable, state.conditional_mask, state.conditional_operator,
+            enable_bounds=state.conditional_enable_bounds, operator_bounds=state.conditional_operator_bounds,
+            enable_known_bits=state.conditional_enable_known_bits, operator_known_bits=state.conditional_operator_known_bits,
         )
-        state.rt_time_ns = t1
-        return
+        if decision is not None and candidate is not None:
+            selected_duration = candidate if decision else state.conditional_else_duration
+            timing_known = isinstance(selected_duration, Concrete) and selected_duration.value >= 0
+            q1_issue_event.meta.pop("conditional_execution_unknown", None)
+            q1_issue_event.meta.update(conditional_timing_known=timing_known, conditional_skipped=not decision)
+            if not decision:
+                duration = state.conditional_else_duration
+                t1 = add_values(t0, duration)
+                packet = _append_packet(state, instruction, duration, q1_t0, q1_t1, t0, t1, rt_packet_id)
+                meta = {"op": instruction.op, "rt_packet_id": packet.id, "conditional_skipped": True,
+                        "conditional_timing_known": timing_known, "output_state_unknown": False, "applied_state": {}}
+                packet.meta.update(meta)
+                _emit_event(state, lane="rt.branch", kind="conditional_skip", t0=t0, t1=t1,
+                            duration=duration, label=f"skip {instruction.op}", confidence=packet.confidence,
+                            source=instruction.source, meta=meta)
+                state.rt_time_ns = t1
+                return
+        else:
+            duration = Unknown("conditional_execution")
+            if _equal_conditional_durations(state, candidate):
+                duration = candidate
+                q1_issue_event.meta["conditional_timing_known"] = True
+            if not isinstance(duration, Concrete):
+                state.conditional_time_unknown = True
+            t1 = add_values(t0, duration)
+            packet = _append_packet(state, instruction, duration, q1_t0, q1_t1, t0, t1, rt_packet_id)
+            packet.meta.update(conditional_execution_unknown=True, output_state_unknown=spec.applies_latched_state)
+            _emit_event(
+                state, lane="rt.unknown", kind="unknown_region", t0=t0, t1=t1 if isinstance(duration, Concrete) else None,
+                duration=duration, label=f"conditional {instruction.op}", confidence="unknown",
+                source=instruction.source,
+                meta={"reason": "conditional_execution_unknown", "op": instruction.op,
+                      "rt_packet_id": packet.id, "output_state_unknown": spec.applies_latched_state,
+                      "conditional_timing_known": isinstance(duration, Concrete)},
+            )
+            state.rt_time_ns = t1
+            return
 
     if duration_arg_index is not None and duration_arg_index < len(instruction.args):
         duration_arg = instruction.args[duration_arg_index]
@@ -4193,7 +6232,7 @@ def _execute_rt_instruction(
         feedback_acq_channel_index = _feedback_acquisition_channel_arg_index(instruction.op)
         if feedback_acq_channel_index is not None and feedback_acq_channel_index < len(instruction.args):
             channel = _feedback_channel(instruction.args[feedback_acq_channel_index], scope)
-            if instruction.op in {"fb_acq_iq_id", "fb_acq_tb_id"} and channel == "0":
+            if channel == "0":
                 state.feedback_acq_channel = None
                 state.feedback_acq_data_type = None
             else:
@@ -4303,13 +6342,27 @@ def _emit_acquire_event(
         "rt_packet_id": packet_id,
     }
     if state.feedback_acq_channel is not None:
-        meta["feedback"] = {
+        feedback = {
             "direction": "send",
             "channel": state.feedback_acq_channel,
             "source": _feedback_acquisition_source(label, bin_index),
         }
         if state.feedback_acq_data_type is not None:
-            meta["feedback"]["data_type"] = state.feedback_acq_data_type
+            feedback["data_type"] = state.feedback_acq_data_type
+        if instruction.op == "acquire_timetags":
+            enabled = _arg_int(instruction.args[2], scope)
+            streaming = state.feedback_acq_data_type in {"high_resolution_time_tags", "low_latency_time_tags"}
+            if streaming and enabled == 1:
+                feedback["send_time_unknown"] = True
+                meta["feedback"] = feedback
+            elif not streaming and enabled == 0:
+                if _arg_int(instruction.args[3], scope) == 0:
+                    feedback["send_on"] = "command_start"
+                else:
+                    feedback["send_time_unknown"] = True
+                meta["feedback"] = feedback
+        else:
+            meta["feedback"] = feedback
     if applied_state:
         meta["applied_state"] = applied_state
     _emit_event(
@@ -4559,7 +6612,7 @@ def _loop_timing(
     rt_events = [
         event
         for event in events
-        if event.kind != "q1_issue" and event.t1 is not None
+        if event.kind != "q1_issue" and (event.t1 is not None or event.kind == "unknown_region")
     ]
     if not rt_events:
         if current_rt_time is not None:
@@ -4612,6 +6665,7 @@ def _advance_compact_loop_fallthrough_state(
     q1_body_period: Value,
     loop_q1_jump_runtime_ns: int,
     loop_q1_continue_runtime_ns: int,
+    rt_total: Concrete | None = None,
 ) -> None:
     if not isinstance(count, Concrete):
         state.rt_time_ns = Unknown(f"compact loop {loop_id} iteration count is not concrete")
@@ -4622,7 +6676,8 @@ def _advance_compact_loop_fallthrough_state(
 
     hidden_iterations = max(count.value - 1, 0)
     if isinstance(rt_period, Concrete):
-        state.rt_time_ns = add_values(state.rt_time_ns, multiply_value(rt_period, hidden_iterations))
+        hidden = subtract_values(rt_total, rt_period) if rt_total is not None else multiply_value(rt_period, hidden_iterations)
+        state.rt_time_ns = add_values(state.rt_time_ns, hidden)
     else:
         state.rt_time_ns = Unknown(f"compact loop {loop_id} RT period is not concrete")
     if isinstance(q1_body_period, Concrete):
@@ -4692,6 +6747,7 @@ def _consume_applied_state(state: AnalysisState) -> dict[str, Any]:
         applied["scope_enable"] = _plain_value(state.latched_state.scope_enable)
     pending.clear()
     state.latched_state.pending_event_ids.clear()
+    state.pending_phase_reset = False
     return applied
 
 
@@ -4706,7 +6762,7 @@ def _scope(symbols: SymbolTable, state: AnalysisState) -> SymbolTable:
             if _is_valid_register_arg(Arg("reg", name, name)):
                 scope[name] = state.registers.get(name, Unknown(name))
     for alias, register in state.register_aliases.items():
-        value = state.registers.get(register, Unknown(register))
+        value = scope.get(register, Unknown(register))
         scope[f"${alias}"] = value
         if not _is_valid_register_arg(Arg("reg", alias, alias)):
             scope[alias] = value
@@ -4722,6 +6778,15 @@ def _register_name(arg: Arg, state: AnalysisState) -> str | None:
     if not name.startswith("$") or len(name) <= 1:
         return None
     return state.register_aliases.get(name[1:])
+
+
+def _arg_register_references(arg: Arg, state: AnalysisState) -> set[str]:
+    references = {_register_name(arg, state)}
+    for name in _arg_symbol_lookup_names(arg):
+        if _is_valid_register_arg(Arg("reg", name.upper(), name)):
+            references.add(name.upper())
+        references.add(state.register_aliases.get(name.lstrip("$")))
+    return references - {None}
 
 
 def _arg_register_provenance(arg: Arg, state: AnalysisState) -> dict[str, Any] | None:
@@ -4757,7 +6822,7 @@ def _register_provenance(
     return {
         "register": register,
         "symbol": symbol,
-        "expression": expression,
+        "expression": expression if len(expression) <= 1024 else register,
         "value": value_to_json(value),
         "steps": steps,
     }
@@ -4879,6 +6944,24 @@ def _unary_classical_value(op: str, value: Value) -> Value:
 
 
 def _binary_classical_value(op: str, left: Value, right: Value) -> Value:
+    if op == "and" and any(isinstance(value, Concrete) and value.value & _CLASSICAL_REGISTER_MASK == 0 for value in (left, right)):
+        return Concrete(0)
+    if op == "or" and any(isinstance(value, Concrete) and value.value & _CLASSICAL_REGISTER_MASK == _CLASSICAL_REGISTER_MASK for value in (left, right)):
+        return Concrete(_CLASSICAL_REGISTER_MASK)
+    if op == "and":
+        if isinstance(left, Concrete) and left.value & _CLASSICAL_REGISTER_MASK == _CLASSICAL_REGISTER_MASK:
+            return right
+        if isinstance(right, Concrete) and right.value & _CLASSICAL_REGISTER_MASK == _CLASSICAL_REGISTER_MASK:
+            return left
+    if op in {"or", "xor"}:
+        if left == Concrete(0):
+            return right
+        if right == Concrete(0):
+            return left
+    if op in {"asl", "asr", "lsl", "lsr"} and right == Concrete(0):
+        return left
+    if op == "lsr" and right == Concrete(32):
+        return Concrete(0)
     if isinstance(left, Concrete) and isinstance(right, Concrete):
         if op in {"asl", "asr", "lsl", "lsr"}:
             return _shift_classical_value(op, left.value, right.value)
@@ -4915,6 +6998,8 @@ def _feedback_rt_event_kind_and_label(op: str) -> tuple[str, str]:
 
 
 def _feedback_acquisition_channel_arg_index(op: str) -> int | None:
+    if op in {"fb_llp_tags_id", "fb_llp_ttls_id", "fb_tdc_tags_id", "fb_tdc_tdelta_id"}:
+        return 0
     for argument_index, operand_role in _rt_index_operand_roles(op):
         if operand_role == "feedback_acquisition_channel":
             return argument_index
@@ -4926,6 +7011,14 @@ def _feedback_acquisition_data_type(op: str) -> str | None:
         return "iq_values"
     if op in {"fb_acq_tb_id", "fb_acq_tb_valid"}:
         return "thresholded_bits"
+    if op == "fb_llp_tags_id":
+        return "low_latency_time_tags"
+    if op == "fb_llp_ttls_id":
+        return "ttl_counts"
+    if op == "fb_tdc_tags_id":
+        return "high_resolution_time_tags"
+    if op == "fb_tdc_tdelta_id":
+        return "time_delta"
     return None
 
 

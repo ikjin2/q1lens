@@ -34,6 +34,8 @@ class SequencerConfig:
     module: str | None = None
     sequence_json: Path | None = None
     module_type: str | None = None
+    hardware_parameters: dict[str, int | str] = field(default_factory=dict)
+    sequencer_index: int | None = None
 
 
 @dataclass(frozen=True)
@@ -52,6 +54,7 @@ class AnalysisConfig:
     underflow_policy: str = "confidence_levels"
     execution_mode: str = "analysis"
     max_steps: int = 10_000
+    feedback_transport_delay_ns: int = 200
 
 
 @dataclass(frozen=True)
@@ -160,6 +163,13 @@ def load_project_config(project_file: str | Path) -> ProjectConfig:
     alignment_anchor_kinds = _load_alignment_anchor_kinds(data.get("alignment"), project_path, errors)
     view_config = _load_view_config(data.get("view"), project_path, errors)
     analysis_config = _load_analysis_config(data.get("analysis"))
+    if type(analysis_config.feedback_transport_delay_ns) is not int or analysis_config.feedback_transport_delay_ns < 0:
+        errors.append(Diagnostic(
+            severity="error", category="invalid_argument_value",
+            message="analysis.feedback_transport_delay_ns must be a nonnegative integer.",
+            source=_source_for_yaml_key(project_path, "feedback_transport_delay_ns"),
+            details={"field": "analysis.feedback_transport_delay_ns"},
+        ))
     if analysis_config.execution_mode not in {"analysis", "concrete", "simulation"}:
         errors.append(
             Diagnostic(
@@ -407,6 +417,34 @@ def _load_sequencers(
                 source=_source_for_yaml_key(project_path, "module_type"),
             ))
             module_type = None
+        hardware_parameters = item.get("hardware_parameters", {})
+        sequencer_index = item.get("sequencer_index")
+        if sequencer_index is not None and (type(sequencer_index) is not int or not 0 <= sequencer_index <= 5):
+            errors.append(Diagnostic(
+                severity="error", category="invalid_argument_value",
+                message=f"Sequencer {sequencer_id} sequencer_index must be an integer from 0 to 5.",
+                source=_source_for_yaml_key(project_path, "sequencer_index"),
+            ))
+            sequencer_index = None
+        if (not isinstance(hardware_parameters, dict)
+                or set(hardware_parameters) - {"integration_length_acq", "scope_acq_sequencer_select",
+                                               "scope_acq_trigger_mode_path0", "scope_acq_trigger_mode_path1"}
+                or ("integration_length_acq" in hardware_parameters
+                    and (type(hardware_parameters["integration_length_acq"]) is not int
+                         or hardware_parameters["integration_length_acq"] <= 0))
+                or ("scope_acq_sequencer_select" in hardware_parameters
+                    and (type(hardware_parameters["scope_acq_sequencer_select"]) is not int
+                         or not 0 <= hardware_parameters["scope_acq_sequencer_select"] <= 5))
+                or any(key in hardware_parameters and hardware_parameters[key] not in ("sequencer", "level")
+                       for key in ("scope_acq_trigger_mode_path0", "scope_acq_trigger_mode_path1"))):
+            errors.append(Diagnostic(
+                severity="error", category="invalid_argument_value",
+                message=(f"Sequencer {sequencer_id} hardware_parameters must be a mapping containing "
+                         "integration_length_acq (positive integer ns), scope_acq_sequencer_select (0–5), "
+                         "or scope_acq_trigger_mode_path0/path1 ('sequencer' or 'level')."),
+                source=_source_for_yaml_key(project_path, "hardware_parameters"),
+            ))
+            hardware_parameters = {}
         sequencers.append(
             SequencerConfig(
                 id=sequencer_id,
@@ -415,6 +453,8 @@ def _load_sequencers(
                 module=item.get("module"),
                 sequence_json=sequence_json,
                 module_type=module_type.strip().upper() if module_type is not None else None,
+                hardware_parameters=dict(hardware_parameters),
+                sequencer_index=sequencer_index,
             )
         )
 
@@ -471,6 +511,7 @@ def _load_analysis_config(data: Any) -> AnalysisConfig:
         underflow_policy=str(data.get("underflow_policy", "confidence_levels")),
         execution_mode=str(data.get("execution_mode", "analysis")),
         max_steps=data.get("max_steps", 10_000),
+        feedback_transport_delay_ns=data.get("feedback_transport_delay_ns", 200),
     )
 
 

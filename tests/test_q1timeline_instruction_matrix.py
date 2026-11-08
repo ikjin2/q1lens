@@ -18,7 +18,8 @@ from q1timeline.simulation.runtime import _SUPPORTED, simulate_programs
 
 
 BRANCHES = ("jz", "jnz", "jo", "jno", "js", "jns", "jg", "jge", "jl", "jle", "ja", "jae", "jb", "jbe")
-ALU = ("add", "sub", "and", "or", "xor", "asl", "asr", "lsl", "lsr", "mulu16", "muls16")
+ALU = ("add", "sub", "and", "or", "xor", "asl", "asr", "lsl", "lsr", "mulu16", "muls16",
+       "mulu32l", "mulu32h", "muls32l", "muls32h")
 
 # Explicit operand examples, not generated from the production signature table.
 # The table is used only as a coverage inventory guard, never as a numeric oracle.
@@ -116,7 +117,8 @@ def test_supported_signature_executes_or_explicitly_blocks_compiled_address_form
         assert state.registers["R5"] == Concrete(0xFFFFFFFE if args.startswith("1,") else 0xFFFFFFF7)
     if op in ALU:
         expected = {"add": 9, "sub": 7, "and": 0, "or": 9, "xor": 9,
-                    "asl": 16, "lsl": 16, "asr": 4, "lsr": 4, "mulu16": 8, "muls16": 8}[op]
+                    "asl": 16, "lsl": 16, "asr": 4, "lsr": 4, "mulu16": 8, "muls16": 8,
+                    "mulu32l": 8, "mulu32h": 0, "muls32l": 8, "muls32h": 0}[op]
         assert state.registers["R5"] == Concrete(expected)
     if op in {"fb_pop_data", "fb_pull_data"}:
         assert state.registers["R5"] == Concrete(42)
@@ -251,8 +253,8 @@ def test_unsupported_shift_counts_never_silently_mask_to_five_bits(op, shift, mo
 @pytest.mark.parametrize("instruction,expected", [
     ("reset_netzero", "blocked"), ("set_time_ref", "blocked"), ("sw_req 1", "blocked"),
     ("mulu32 R0,R1,R2,R3", "blocked"), ("acquire_ttl 0,0,1,4", "blocked"),
-    ("illegal", "error"), ("unknown_matrix_instruction", "error"), ("add R0,R1", "error"),
+    ("illegal", "error"), ("unknown_matrix_instruction", "completed"), ("add R0,R1", "completed"),
 ])
-def test_recognized_but_unimplemented_and_malformed_instructions_are_not_success(instruction, expected):
+def test_unimplemented_instructions_block_and_malformed_source_lines_are_excluded(instruction, expected):
     state = execute(f"move 1,R0\nmove 1,R1\nnop\n{instruction}\nstop")
     assert status(state) == expected

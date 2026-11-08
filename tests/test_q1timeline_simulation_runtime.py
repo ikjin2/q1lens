@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 
 import pytest
 
@@ -144,16 +145,40 @@ def test_scenario_feedback_does_not_invent_a_q1_producer() -> None:
     assert not events(state, "feedback_send")
 
 
-def test_feedback_pop_discards_preceding_fifo_entries_and_pull_reads_id_register() -> None:
+def test_feedback_pull_reads_fifo_id_and_data_without_filtering_by_destination_register() -> None:
     state, = run("move 5,R0\nnop\nwait 100\nfb_pull_data R0,R1\nnop\nstop", inputs={"feedback": [
         {"target": "seq", "time_ns": 0, "id": 9, "value": 99},
         {"target": "seq", "time_ns": 0, "id": 5, "value": -7},
     ]})
     assert status(state) == "completed"
-    assert state.registers == {"R0": Concrete(5), "R1": Concrete(0xFFFFFFF9)}
-    assert len(events(state, "feedback_discard")) == 1
+    assert state.registers == {"R0": Concrete(9), "R1": Concrete(99)}
+    assert not events(state, "feedback_discard")
     pull = next(event for event in events(state, "q1_issue") if event.meta["op"] == "fb_pull_data")
-    assert pull.meta["register_reads"]["R0"]["value"] == 5
+    assert "R0" not in pull.meta["register_reads"]
+    assert {write.register for write in state.register_history if write.source.line == 4} == {"R0", "R1"}
+
+
+@pytest.mark.parametrize("receive", ["fb_pop_data 16,R1", "fb_pull_data R0,R1"])
+@pytest.mark.parametrize("duration,expected_status", [(1000, "completed"), (100, "error")])
+def test_pop_and_pull_wait_for_full_linq_plus_site_delay_and_underflow_only_when_rt_work_runs_out(receive, duration, expected_status):
+    sender, receiver = run({
+        "sender": "wait_sync 4\nfb_com_data 16,7,4\nwait 1000\nstop",
+        "receiver": f"wait_sync 4\nwait {duration}\n{receive}\nnop\nstop",
+    }, routes=[{"source": "sender", "target": "receiver", "id": 16, "latency_ns": 580}])
+    assert status(receiver) == expected_status
+    if expected_status == "completed":
+        arrival = events(receiver, "feedback_receive")[0]
+        assert arrival.t0 == Concrete(784)  # 204 + 380 LINQ + 200 site transport.
+        issue = next(event for event in events(receiver, "q1_issue") if event.meta["op"].startswith("fb_"))
+        assert issue.t0 == arrival.t0
+        assert issue.meta["input_event_ids"] == [arrival.id]
+        assert receiver.registers["R1"] == Concrete(7)
+        if "pull" in receive:
+            assert receiver.registers["R0"] == Concrete(16)
+        assert not any(item.severity == "error" for item in receiver.diagnostics)
+    else:
+        assert receiver.diagnostics[-1].category == "rt_queue_underflow"
+        assert receiver.diagnostics[-1].severity == "error"
 
 
 def test_feedback_overflow_and_missing_input_do_not_succeed() -> None:
@@ -401,3 +426,32 @@ def test_phase_reset_remains_pending_during_wait_until_latch_updating_packet() -
     assert paths["q"][204] == pytest.approx(0.5)
     assert paths["i"][208] == pytest.approx(0.5)
     assert paths["q"][208] == pytest.approx(0, abs=1e-10)
+
+
+@pytest.mark.parametrize("setter,reset", [("reset_ph", True), ("reset_ph\nset_ph 0", True), ("set_ph 0", False)])
+def test_reset_token_preserves_physical_reset_semantics_after_phase_offset_writes(setter, reset) -> None:
+    state, = run(f"set_freq 4000000\nreset_ph\nupd_param 4\nwait 100\n{setter}\nupd_param 4\nplay 0,1,40\nstop",
+                physical={"sequencers": {"seq": {}}}, sequences={"seq": {"waveforms": {
+                    "i": {"index": 0, "data": [0.5] * 40}, "q": {"index": 1, "data": [0.0] * 40},
+                }}})
+    assert status(state) == "completed"
+    update = events(state, "upd_param")[1]
+    assert update.meta["captured_phase_reset"] is reset
+    assert bool(update.meta.get("phase_reset")) is reset
+    traces = {trace["path"]: trace["samples"] for trace in state.metadata["simulation"]["signals"]["traces"] if trace["stage"] == "nco"}
+    phase = 0.004 if reset else 0.108
+    expected = 0.5 * math.cos(2 * math.pi * phase), 0.5 * math.sin(2 * math.pi * phase)
+    assert traces["i"][308] == pytest.approx(expected[0])
+    assert traces["q"][308] == pytest.approx(expected[1])
+    assert state.pending_phase_reset is False
+
+
+def test_known_skipped_packet_consumes_the_reset_token_without_applying_it_in_simulation() -> None:
+    state, = run("reset_ph\nset_cond 1,0,0,40\nplay 0,1,100\nset_cond 0,0,0,4\nupd_param 4\nstop")
+    assert status(state) == "completed"
+    skip, = events(state, "conditional_skip")
+    update, = events(state, "upd_param")
+    assert skip.meta["captured_phase_reset"] is True
+    assert not skip.meta.get("phase_reset")
+    assert update.meta["captured_phase_reset"] is False
+    assert not update.meta.get("phase_reset")

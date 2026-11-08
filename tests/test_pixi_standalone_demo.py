@@ -254,6 +254,82 @@ for (const event of events.filter((item) => item.labelLayout.visible)) {
     )
 
 
+def test_acquisition_windows_share_one_thin_row_and_preserve_rt_timing() -> None:
+    run_standalone_demo_node(
+        """
+const assert = require("node:assert/strict");
+function acquire(id, sequencer, start, window, target = 0) {
+  return { id, kind: "acquire", sequencer_id: sequencer, lane: "rt.acquire",
+    t0: { value: start }, t1: { value: start + 4 },
+    meta: { acquisition_index: target, bin_index: target + 1, acquisition_window: window,
+      aligned_t0: start + 20, aligned_t1: start + 24 } };
+}
+const completed = {start_ns: 0, end_ns: 1000, configured_duration_ns: 1000,
+  effective_duration_ns: 1000, source: "hardware_parameters", status: "completed"};
+const interrupted = {start_ns: 1200, end_ns: 1500, configured_duration_ns: 1000,
+  effective_duration_ns: 300, source: "hardware_parameters", status: "interrupted", interrupted_by_event_id: "third"};
+const unknown = {start_ns: 1500, end_ns: null, configured_duration_ns: null,
+  effective_duration_ns: null, source: "unknown", status: "unknown"};
+const ir = {events: [acquire("first", "readout", 0, completed),
+  acquire("second", "readout", 1200, interrupted, 2), acquire("third", "readout", 1500, unknown, 4),
+  acquire("parallel", "other", 100, {...completed, start_ns: 100, end_ns: 3000}),
+  {id: "drive", kind: "play", sequencer_id: "drive", t0: {value: 0}, t1: {value: 100}}]};
+for (const mode of ["normal", "showcase", "debug"]) {
+  const layout = hooks.computeTimelineLayout(ir, {mode, width: 1000});
+  const rows = layout.lanes.filter((lane) => lane.lane === "physical.acquire");
+  assert.equal(rows.length, 2, "only acquiring sequencers get an ACQ row");
+  assert.equal(rows.find((lane) => lane.sequencerId === "readout").events.length, 3);
+  assert.ok(rows.every((lane) => lane.height === 26));
+  const rt = layout.events.find((event) => event.id === "first");
+  const band = layout.events.find((event) => event.id === "first:acquisition-window");
+  assert.equal(rt.t1Ns - rt.t0Ns, 4);
+  assert.equal(band.t1Ns - band.t0Ns, 1000);
+  assert.equal(band.t0Ns, 20, "physical windows use the same alignment as RT events");
+  assert.equal(band.sourceEvent.raw, ir.events[0]);
+  assert.equal(band.sourceEvent.id, "first", "bands retain the original Acquire selection");
+  assert.notEqual(band.y, rt.y);
+  const unknownBand = layout.events.find((event) => event.sourceEvent?.id === "third");
+  assert.equal(unknownBand.t0Ns, unknownBand.t1Ns, "unknown integration uses a marker, not RT wait duration");
+  assert.ok(layout.timeScale.tMaxNs > 3020, "the timeline includes integrations beyond the last RT event");
+}
+assert.ok(hooks.computeFullTimeExtent(ir, "normal").maxNs > 3020);
+const events = hooks.computeTimelineLayout(ir, {mode: "normal"}).events;
+const details = Object.fromEntries(hooks.acquisitionDetails(events.find((event) => event.id === "second")));
+assert.equal(details["RT wait"], "4 ns");
+assert.equal(details["Integration setting"], "1000 ns");
+assert.equal(details["Effective integration"], "300 ns");
+assert.equal(details["Integration status"], "interrupted");
+assert.equal(details["Interrupted by"], "third");
+assert.equal(Object.fromEntries(hooks.acquisitionDetails(events.find((event) => event.id === "third")))["Integration setting"], "unknown");
+"""
+    )
+
+
+def test_acquisition_feedback_uses_supplied_availability_and_hides_unknown_emission() -> None:
+    run_standalone_demo_node(
+        """
+const assert = require("node:assert/strict");
+const ir = {events: [
+  {id: "acq", kind: "acquire", sequencer_id: "readout", t0: {value: 0}, t1: {value: 4},
+    meta: {acquisition_window: {start_ns: 0, end_ns: 1000, status: "completed"}}},
+  {id: "pop", kind: "feedback_pop", sequencer_id: "drive", t0: {value: 1200}, t1: {value: 1204}},
+], feedback_flows: [
+  {id: "known", from_event_id: "acq", to_event_id: "pop", send_available_ns: 1000},
+  {id: "unknown", from_event_id: "acq", to_event_id: "pop", send_available_ns: null},
+  {id: "legacy", from_event_id: "acq", to_event_id: "pop"},
+]};
+const layout = hooks.computeTimelineLayout(ir, {mode: "normal", width: 1000});
+const flows = hooks.createFeedbackFlows(ir, layout);
+assert.deepEqual(flows.map((flow) => flow.id), ["known", "legacy"]);
+assert.equal(flows[0].emitNs, 1000);
+assert.equal(flows[1].emitNs, 4);
+const band = layout.events.find((event) => event.kind === "acquisition_window");
+assert.ok(Math.abs(flows[0].from.x - band.x - band.width) < 1e-8);
+assert.equal(flows[0].from.y, band.y);
+"""
+    )
+
+
 def test_badge_and_annotation_hit_targets_are_hoverable() -> None:
     run_standalone_demo_node(
         """

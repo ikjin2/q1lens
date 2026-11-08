@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "q1lens"
-version = "0.2.7"
-description = "Cross-layer scheduler and Q1ASM debugger for Qblox workflows"
+version = "0.2.8"
+description = "Visualize Q1ASM."
 readme = "README.md"
 authors = [
   { name = "Ik Kyeong Jin" },

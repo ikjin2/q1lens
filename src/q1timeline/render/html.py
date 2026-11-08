@@ -29,25 +29,6 @@ CONFIDENCE_LEGEND_ITEMS = [
     ("unknown", "unknown timing"),
     ("runtime_dependent", "runtime-dependent branch or trigger"),
 ]
-DIAGNOSTIC_OVERLAY_CATEGORIES = {
-    "alignment_missing",
-    "analysis_incomplete",
-    "definite_underflow",
-    "feedback_latency_violation",
-    "feedback_route_mismatch",
-    "loop_truncated",
-    "possible_underflow",
-    "register_not_ready",
-    "runtime_dependent_timing",
-    "symbolic_duration",
-    "sync_mismatch",
-    "unknown_duration",
-    "unresolved_branch",
-    "unresolved_symbol",
-}
-BROAD_INFO_DIAGNOSTIC_OVERLAY_CATEGORIES = {
-    "loop_truncated",
-}
 FEEDBACK_OVERLAY_CATEGORIES = {
     "feedback_latency_violation",
     "feedback_route_mismatch",
@@ -115,7 +96,21 @@ def render_html(
     events, lanes = _group_events(render_events, mode=default_mode)
     event_dom_ids = _event_dom_ids(events)
     diagnostics = ir.get("diagnostics", [])
-    diagnostic_overlays_by_event = _diagnostic_overlays_by_event(diagnostics, events, default_mode=default_mode)
+    skipped_lines = {(item["source"]["file"], item["source"]["line"]) for item in diagnostics
+                     if item.get("source") and item.get("details", {}).get("source_line_skipped")}
+    recovery_banner = (
+        f'<p class="diagnostics" role="status">Timeline excludes {len(skipped_lines)} invalid source '
+        f'line{"s" if len(skipped_lines) != 1 else ""}. Timing and state reflect the remaining lines.</p>'
+        if skipped_lines else ""
+    )
+    diagnostic_overlays_by_event = _diagnostic_overlays_by_event(diagnostics, events)
+    q1_errors_by_sequencer: dict[str, list[tuple[str, list[dict[str, Any]]]]] = {}
+    for event in events:
+        event_id = str(event["id"])
+        if event.get("kind") == "q1_issue" and event_id in diagnostic_overlays_by_event:
+            q1_errors_by_sequencer.setdefault(_sequencer_from_lane(event["lane"]), []).append(
+                (event_id, diagnostic_overlays_by_event[event_id])
+            )
     width = 1100
     lane_height = 34
     top = 72
@@ -142,8 +137,16 @@ def render_html(
         sequencer = _sequencer_from_lane(lane)
         if sequencer != current_sequencer:
             current_sequencer = sequencer
+            mark = ""
+            if q1_errors := q1_errors_by_sequencer.pop(sequencer, None):
+                ids = escape(" ".join(event_id for event_id, _ in q1_errors), quote=True)
+                errors = [item for _, items in q1_errors for item in items]
+                attributes = " ".join(_diagnostic_data_attributes(errors))
+                mark = (f'<tspan class="event q1-error-marker timeline-error-mark" dx="5" '
+                        f'data-event-id="{escape(q1_errors[0][0], quote=True)}" data-event-ids="{ids}" {attributes} '
+                        f'role="button" tabindex="0" aria-label="{len(errors)} Q1 error{"s" if len(errors) != 1 else ""}">!</tspan>')
             svg_parts.append(
-                f'<text class="sequencer-label" data-sequencer-label="{escape(sequencer, quote=True)}" x="40" y="{y + 15}">{escape(sequencer)}</text>'
+                f'<text class="sequencer-label" data-sequencer-label="{escape(sequencer, quote=True)}" x="40" y="{y + 15}">{escape(sequencer)}{mark}</text>'
             )
         lane_class = "lane debug-lane" if _is_debug_lane(lane) else "lane normal-lane"
         is_q1_issue_lane = _is_q1_issue_detail_lane(lane)
@@ -155,7 +158,7 @@ def render_html(
             if is_q1_issue_lane
             else ""
         )
-        lane_visibility = ' hidden style="display:none"' if is_q1_issue_lane else ""
+        lane_visibility = ' hidden style="display:none"' if is_q1_issue_lane and default_mode != "debug" else ""
         svg_parts.append(
             f'<g class="{lane_class}" data-lane="{escape(lane, quote=True)}" data-sequencer-id="{escape(sequencer_id, quote=True)}"{q1_issue_attrs}{lane_visibility}>'
         )
@@ -265,6 +268,7 @@ def render_html(
 </head>
 <body class="mode-{default_mode}" data-mode="{default_mode}">
   <main>
+    {recovery_banner}
     <section id="timeline-root" class="timeline" aria-label="Timeline">
       {''.join(svg_parts)}
     </section>
@@ -321,15 +325,17 @@ def _event_svg(
     confidence = event.get("confidence", "unknown")
     kind = event.get("kind", "event")
     display_label = _event_display_label(event)
-    inline_label = _event_inline_label(event, width)
+    event_diagnostics = diagnostic_overlays_by_event.get(str(event.get("id", "")), [])
+    label_offset = 8 if event_diagnostics else 0
+    inline_label = _event_inline_label(event, width - label_offset)
     label = escape(inline_label)
     event_id = escape(str(event.get("id", "")))
     dom_id = escape(_event_dom_id(str(event.get("id", "")), event_dom_ids))
-    event_diagnostics = diagnostic_overlays_by_event.get(str(event.get("id", "")), [])
     classes = _event_classes(event, confidence=confidence, kind=kind, selected=str(event.get("id")) == highlight_event_id)
     classes = _with_diagnostic_classes(classes, event_diagnostics)
-    label_markup = f'<text class="event-label" x="{x + INLINE_LABEL_X_PADDING:.2f}" y="{y + 15}">{label}</text>' if inline_label else ""
-    if width < MIN_INLINE_LABEL_WIDTH or not inline_label:
+    label_x = x + INLINE_LABEL_X_PADDING + label_offset
+    label_markup = f'<text class="event-label" x="{label_x:.2f}" y="{y + 15}">{label}</text>' if inline_label else ""
+    if width - label_offset < MIN_INLINE_LABEL_WIDTH or not inline_label:
         classes = f"{classes} lod-small label-hidden"
         label_markup = ""
     search_text = escape(_search_text(event), quote=True)
@@ -380,13 +386,28 @@ def _event_svg(
         data_attributes.append(f'data-diff-status="{escape(str(diff_status), quote=True)}"')
     data_attribute_text = " ".join(data_attributes)
     tooltip = escape(_tooltip_with_diagnostics(_tooltip(event), event_diagnostics))
-    diagnostic_badge = _diagnostic_badge_svg(event_diagnostics, x + max(8.0, width - 8.0), y + 4.0)
+    if kind == "underflow_warning":
+        if event.get("_diagnostic_target"):
+            return ""
+        return (
+            f'<g id="{dom_id}" class="{classes} timing-diagnostic" data-event-id="{event_id}" {data_attribute_text} '
+            f'data-diagnostic-placement="point" data-search="{search_text}" '
+            f'aria-label="{aria_label}" role="button" tabindex="0"><title>{tooltip}</title>'
+            f'<text class="timeline-error-mark" x="{x:.2f}" y="{y + 32}" text-anchor="middle" aria-hidden="true">!</text>'
+            '</g>'
+        )
+    error_ids = " ".join(str(item["underflow_event_id"]) for item in event_diagnostics if "underflow_event_id" in item)
+    mark = (
+        f'<text class="timeline-error-mark" x="{x + INLINE_LABEL_X_PADDING:.2f}" y="{y + 15}" aria-hidden="true">!</text>'
+        if event_diagnostics else ""
+    )
     return (
-        f'<g id="{dom_id}" class="{classes}" data-event-id="{event_id}" {data_attribute_text} data-search="{search_text}" aria-label="{aria_label}" tabindex="0">'
+        f'<g id="{dom_id}" class="{classes}" data-event-id="{event_id}" data-event-ids="{escape(error_ids, quote=True)}" '
+        f'{data_attribute_text} data-search="{search_text}" aria-label="{aria_label}" tabindex="0">'
         f"<title>{tooltip}</title>"
         f'<rect x="{x:.2f}" y="{y}" width="{width:.2f}" height="22" rx="3" />'
+        f"{mark}"
         f"{label_markup}"
-        f"{diagnostic_badge}"
         "</g>"
     )
 
@@ -431,8 +452,6 @@ def _loop_bracket_svgs(
     if diagnostic_attributes:
         diagnostic_attributes = f" {diagnostic_attributes}"
     badge_y = bracket_top - 9
-    start_badge = _diagnostic_badge_svg(loop_diagnostics, x_start + 10.0, badge_y)
-    end_badge = _diagnostic_badge_svg(loop_diagnostics, x_end + 10.0, badge_y)
     loop_attr = escape(loop_id, quote=True)
     title = escape(_tooltip_with_diagnostics(f"loop {loop_id}, repeat {count_label}", loop_diagnostics))
     aria_start = escape(f"loop {loop_id} starts, repeats {count_label}", quote=True)
@@ -455,7 +474,6 @@ def _loop_bracket_svgs(
         f'<line class="loop-bracket-cap loop-bracket-cap-top" x1="{x_start:.2f}" y1="{bracket_top:.2f}" x2="{x_start + cap:.2f}" y2="{bracket_top:.2f}" />'
         f'<line class="loop-bracket-cap loop-bracket-cap-bottom" x1="{x_start:.2f}" y1="{bracket_bottom:.2f}" x2="{x_start + cap:.2f}" y2="{bracket_bottom:.2f}" />'
         f'<text class="loop-bracket-id" x="{x_start + 12:.2f}" y="{bracket_top - 3:.2f}">{id_text}</text>'
-        f"{start_badge}"
         "</g>"
     )
     end = (
@@ -470,7 +488,6 @@ def _loop_bracket_svgs(
         f'<line class="loop-bracket-cap loop-bracket-cap-top" x1="{x_end:.2f}" y1="{bracket_top:.2f}" x2="{x_end - cap:.2f}" y2="{bracket_top:.2f}" />'
         f'<line class="loop-bracket-cap loop-bracket-cap-bottom" x1="{x_end:.2f}" y1="{bracket_bottom:.2f}" x2="{x_end - cap:.2f}" y2="{bracket_bottom:.2f}" />'
         f'<text class="loop-bracket-count" x="{x_end + 4:.2f}" y="{bracket_top - 3:.2f}">{count_text}</text>'
-        f"{end_badge}"
         "</g>"
     )
     return [start, end]
@@ -538,7 +555,6 @@ def _branch_marker_svgs(
         else ""
     )
     status_markup = _branch_marker_path_icon_svg(event, x_start + 10.0, center_y - 7.0)
-    diagnostic_badge = _diagnostic_badge_svg(marker_diagnostics, x_start + 10.0, center_y - 8.0)
     diamond = 6
     hitbox_x = x_start - 14
     hitbox_width = 56
@@ -567,7 +583,6 @@ def _branch_marker_svgs(
             f'{x_start - diamond:.2f},{center_y:.2f}" />'
             f"{status_markup}"
             f"{condition_markup}"
-            f"{diagnostic_badge}"
             "</g>"
         )
     ]
@@ -747,10 +762,26 @@ def _group_events(events: list[dict[str, Any]], *, mode: str) -> tuple[list[dict
     grouped_events: list[dict[str, Any]] = []
     lanes: list[str] = []
     for event in events:
-        if event.get("kind") in {"queue_depth", "slack"}:
+        if event.get("kind") == "underflow_warning" and (
+            event.get("meta", {}).get("eventual") or event.get("meta", {}).get("status") == "possible_underflow"
+        ):
+            continue
+        if event.get("kind") in {"queue_depth", "slack", "analysis_incomplete"}:
             continue
         sequencer = event.get("sequencer_id", "")
         lane = str(event.get("lane", ""))
+        diagnostic_target = None
+        if event.get("kind") == "underflow_warning":
+            meta = event.get("meta", {})
+            diagnostic_target = next((candidate for candidate in events
+                                      if meta.get("rt_packet_id") is not None
+                                      and candidate.get("sequencer_id") == sequencer
+                                      and str(candidate.get("lane", "")).startswith(("rt.", "branch_compare."))
+                                      and candidate.get("kind") in {"play", "wait", "acquire", "upd_param", "upd_thres", "wait_sync", "wait_trigger"}
+                                      and candidate.get("meta", {}).get("rt_packet_id") == meta["rt_packet_id"]
+                                      and all(candidate.get("meta", {}).get(key) == meta.get(key) for key in
+                                              ("branch_comparison_branch_id", "branch_comparison_path", "loop_preview", "loop_iteration_index", "diff_status"))), None)
+            lane = str(diagnostic_target["lane"]) if diagnostic_target else "rt.control"
         if mode == "normal":
             branch_comparison_lane = _normal_branch_comparison_lane(event)
             if branch_comparison_lane is not None:
@@ -772,6 +803,8 @@ def _group_events(events: list[dict[str, Any]], *, mode: str) -> tuple[list[dict
         copied = dict(event)
         copied["_base_lane"] = lane
         copied["lane"] = grouped
+        if diagnostic_target:
+            copied["_diagnostic_target"] = diagnostic_target
         grouped_events.append(copied)
     return grouped_events, lanes
 
@@ -1815,75 +1848,34 @@ def _is_normal_feedback_collapsed_kind(kind: Any) -> bool:
 def _diagnostic_overlays_by_event(
     diagnostics: Any,
     events: list[dict[str, Any]],
-    *,
-    default_mode: str,
 ) -> dict[str, list[dict[str, Any]]]:
     overlays: dict[str, list[dict[str, Any]]] = {}
-    if not isinstance(diagnostics, list):
-        return overlays
     event_by_id = {str(event.get("id", "")): event for event in events}
-    for diagnostic in diagnostics:
-        if not _is_timeline_overlay_diagnostic(diagnostic):
+    for event_id, event in event_by_id.items():
+        if event.get("kind") != "underflow_warning":
+            continue
+        target = str(event.get("_diagnostic_target", event)["id"])
+        overlays.setdefault(target, []).append({
+            "severity": "error", "category": "definite_underflow",
+            "message": _event_display_label(event), "underflow_event_id": event_id,
+        })
+    for diagnostic in diagnostics if isinstance(diagnostics, list) else []:
+        if not isinstance(diagnostic, dict) or diagnostic.get("severity") != "error":
             continue
         related_events = diagnostic.get("related_events", [])
         if not isinstance(related_events, list):
             continue
-        overlay_event_ids = _diagnostic_overlay_event_ids(
-            diagnostic,
-            [event_id for event_id in related_events if isinstance(event_id, str)],
-            event_by_id,
-            default_mode=default_mode,
-        )
-        for event_id in overlay_event_ids:
+        if any(event_by_id.get(str(event_id), {}).get("kind") == "underflow_warning" for event_id in related_events):
+            continue
+        if not related_events and isinstance(diagnostic.get("source"), dict):
+            source = diagnostic["source"]
+            related_events = [str(event["id"]) for event in events if event.get("kind") == "q1_issue"
+                              and source.get("file") and event.get("source", {}).get("file") == source["file"]
+                              and event.get("source", {}).get("line") == source.get("line")]
+        event_id = next((event_id for event_id in related_events if isinstance(event_id, str) and event_id in event_by_id), None)
+        if event_id:
             overlays.setdefault(event_id, []).append(diagnostic)
     return overlays
-
-
-def _diagnostic_overlay_event_ids(
-    diagnostic: dict[str, Any],
-    related_event_ids: list[str],
-    event_by_id: dict[str, dict[str, Any]],
-    *,
-    default_mode: str,
-) -> list[str]:
-    category = str(diagnostic.get("category", ""))
-    severity = str(diagnostic.get("severity", "info"))
-    if category in BROAD_INFO_DIAGNOSTIC_OVERLAY_CATEGORIES and severity in {"hint", "info"}:
-        representative = _representative_diagnostic_event_id(related_event_ids, event_by_id, default_mode=default_mode)
-        return [representative] if representative else []
-    return related_event_ids
-
-
-def _representative_diagnostic_event_id(
-    event_ids: list[str],
-    event_by_id: dict[str, dict[str, Any]],
-    *,
-    default_mode: str,
-) -> str | None:
-    for event_id in event_ids:
-        event = event_by_id.get(event_id)
-        if event and _is_preferred_diagnostic_overlay_event(event, default_mode=default_mode):
-            return event_id
-    return event_ids[0] if event_ids else None
-
-
-def _is_preferred_diagnostic_overlay_event(event: dict[str, Any], *, default_mode: str) -> bool:
-    kind = str(event.get("kind", ""))
-    if kind == "q1_issue":
-        return False
-    if default_mode == "normal":
-        lane = str(event.get("lane", ""))
-        if _is_debug_lane(lane):
-            return False
-        if _is_normal_feedback_collapsed_kind(kind):
-            return False
-    return True
-
-
-def _is_timeline_overlay_diagnostic(diagnostic: Any) -> bool:
-    if not isinstance(diagnostic, dict):
-        return False
-    return str(diagnostic.get("category", "")) in DIAGNOSTIC_OVERLAY_CATEGORIES
 
 
 def _feedback_flow_diagnostics(flow: dict[str, Any], diagnostics: Any) -> list[dict[str, Any]]:
@@ -1926,9 +1918,11 @@ def _diagnostic_data_attributes(diagnostics: list[dict[str, Any]]) -> list[str]:
         return []
     severity = _diagnostic_severity(diagnostics)
     categories = ",".join(_diagnostic_categories(diagnostics))
+    messages = "\n".join(str(item.get("message") or item.get("category", "")) for item in diagnostics)
     return [
         f'data-diagnostic-severity="{escape(severity, quote=True)}"',
         f'data-diagnostic-categories="{escape(categories, quote=True)}"',
+        f'data-diagnostic-message="{escape(messages, quote=True)}"',
     ]
 
 
@@ -1963,24 +1957,6 @@ def _tooltip_with_diagnostics(base_tooltip: str, diagnostics: list[dict[str, Any
     return "\n".join(lines)
 
 
-def _diagnostic_badge_svg(diagnostics: list[dict[str, Any]], x: float, y: float) -> str:
-    if not diagnostics:
-        return ""
-    severity = _diagnostic_severity(diagnostics)
-    categories = ",".join(_diagnostic_categories(diagnostics))
-    label = str(min(len(diagnostics), 9)) if len(diagnostics) > 1 else ("!" if severity in {"warning", "error"} else "i")
-    title = escape(_tooltip_with_diagnostics("Timeline diagnostic", diagnostics))
-    severity_class = escape(_class_token(severity), quote=True)
-    category_attr = escape(categories, quote=True)
-    return (
-        f'<g class="diagnostic-badge severity-{severity_class}" data-diagnostic-count="{len(diagnostics)}" '
-        f'data-diagnostic-categories="{category_attr}" transform="translate({x:.2f},{y:.2f})" '
-        f'role="button" tabindex="0" aria-label="{title}">'
-        f"<title>{title}</title>"
-        '<circle class="diagnostic-badge-dot" cx="0" cy="0" r="6" />'
-        f'<text class="diagnostic-badge-label" x="0" y="3">{escape(label)}</text>'
-        "</g>"
-    )
 
 
 def _class_token(value: Any) -> str:
@@ -2018,6 +1994,8 @@ def _json_script(value: dict[str, Any]) -> str:
 def _css() -> str:
     return """
 body { margin: 0; font-family: Arial, sans-serif; color: var(--vscode-foreground, #17202a); }
+body { --q1timeline-error-color: #b3242f; }
+body:is(.vscode-dark, .vscode-high-contrast) { --q1timeline-error-color: #ff8187; }
 body { --q1asm-q1-color: #245fa8; --q1asm-flow-color: #9a4c18; --q1asm-latched-color: #176b7e; --q1asm-rt-color: #27763c; --q1asm-sync-color: #7251a3; --q1asm-feedback-color: #ad316c; --q1asm-event-background: var(--vscode-editor-background, #ffffff); }
 body.vscode-light { color-scheme: light; }
 body.vscode-dark { color-scheme: dark; background: #1e1e1e !important; background-color: #1e1e1e !important; }
@@ -2085,7 +2063,8 @@ button[aria-pressed="true"] { background: #17202a; color: #fff; }
 .diagnostic-heading { display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px; }
 .diagnostic-source { margin-left: auto; color: var(--vscode-descriptionForeground, #4b5563); }
 .diagnostic-message { margin: 3px 0 0; }
-.severity-error strong { color: #c72c2c; }
+.diagnostic.severity-error :is(strong, .diagnostic-message),
+.diagnostic-error-message { color: var(--q1timeline-error-color); }
 .severity-warning strong { color: #a45516; }
 .related-events { margin-left: 6px; }
 .confidence-legend { margin: 16px 16px 0; padding: 10px 12px; border: 1px solid var(--vscode-panel-border, #d8dee6); }
@@ -2115,6 +2094,8 @@ body.vscode-high-contrast .event-inspector { border-color: var(--vscode-contrast
 .sequencer-label { fill: var(--vscode-foreground, #17202a); font-size: 12px; font-weight: 700; }
 .lane-rule, .grid { stroke: #d7dde4; stroke-width: 1; }
 .event rect { stroke: var(--q1asm-event-stroke, rgba(0, 0, 0, 0.38)); stroke-width: 1; fill: var(--q1asm-event-fill, #cdbb96); }
+.event.confidence-exact:not(:where(.kind-loop_block, .kind-loop_iteration_preview, .kind-control_flow_loop,
+  .kind-control_flow_branch, .branch-path-taken, .branch-path-fallthrough)) > rect { stroke: none; }
 body.vscode-high-contrast .event rect { stroke: var(--vscode-contrastActiveBorder, #ffffff); stroke-width: 2; }
 .event text { pointer-events: none; fill: var(--q1asm-event-label-color, #0f1720); font-size: 11px; }
 .event.is-selected rect { stroke: #111827; stroke-width: 2; }
@@ -2177,24 +2158,15 @@ body.vscode-high-contrast .event rect { stroke: var(--vscode-contrastActiveBorde
 .branch-marker.is-selected .branch-marker-path-icon,
 .branch-marker.is-related .branch-marker-path-icon { stroke: #1d4ed8; }
 .branch-marker.is-filtered { display: none; }
-.event.has-diagnostic rect { stroke: #d97706; stroke-width: 3; }
-.event.diagnostic-error rect { stroke: #dc2626; stroke-width: 3.2; }
-.event.diagnostic-info rect,
-.event.diagnostic-hint rect { stroke: #2563eb; stroke-width: 2.5; stroke-dasharray: 4 2; }
-.event.is-selected.has-diagnostic rect { stroke: #111827; stroke-width: 3.2; }
-.event.is-related.has-diagnostic rect { stroke: #2563eb; stroke-width: 3.2; }
-.branch-marker.has-diagnostic .branch-marker-diamond { stroke: #d97706; stroke-width: 3; }
-.branch-marker.diagnostic-error .branch-marker-diamond { stroke: #dc2626; stroke-width: 3.2; }
-.branch-marker.diagnostic-info .branch-marker-diamond,
-.branch-marker.diagnostic-hint .branch-marker-diamond { stroke: #2563eb; stroke-width: 2.6; }
-.diagnostic-badge { pointer-events: all; cursor: help; }
-.diagnostic-badge-dot { fill: #d97706; stroke: #ffffff; stroke-width: 1.4; }
-.diagnostic-badge.severity-error .diagnostic-badge-dot { fill: #dc2626; }
-.diagnostic-badge.severity-info .diagnostic-badge-dot,
-.diagnostic-badge.severity-hint .diagnostic-badge-dot { fill: #2563eb; }
-.diagnostic-badge text,
-.event .diagnostic-badge text,
-.branch-marker .diagnostic-badge text { fill: #ffffff; font-size: 9px; font-weight: 700; text-anchor: middle; paint-order: normal; stroke: none; pointer-events: none; }
+.event.diagnostic-error { --q1asm-event-fill: #f6d5d4; --q1asm-event-label-color: #662126; }
+body:is(.vscode-dark, .vscode-high-contrast) .event.diagnostic-error {
+  --q1asm-event-fill: #572b32;
+  --q1asm-event-label-color: #ffe8e7;
+}
+.timeline-error-mark,
+.event text.timeline-error-mark { fill: var(--q1timeline-error-color); font-size: 13px; font-weight: 700; }
+.timing-diagnostic text.timeline-error-mark { pointer-events: all; }
+body.mode-debug .q1-error-marker { display: none; }
 .control-flow-connector { fill: none; stroke: var(--q1asm-flow-color); stroke-width: 2; opacity: 0.78; pointer-events: none; }
 .control-flow-connector.is-related { stroke: #2563eb; stroke-width: 3; opacity: 1; }
 #control-flow-arrow path { fill: var(--q1asm-flow-color); }
@@ -2218,8 +2190,6 @@ body.vscode-high-contrast .event rect { stroke: var(--vscode-contrastActiveBorde
 .branch-path-fallthrough rect { stroke-width: 2; stroke-dasharray: 5 3; }
 .kind-loop_iteration_preview rect { stroke-dasharray: 4 2; }
 .kind-unknown_region rect { fill: #aab2bd; stroke-dasharray: 2 2; }
-.kind-underflow_warning rect { fill: #e26d6d; }
-.kind-analysis_incomplete rect { fill: #8a8f98; }
 .status-definite_underflow rect { fill: #c72c2c; }
 .status-possible_underflow rect { fill: #f08c3a; stroke-dasharray: 6 2; }
 .status-analysis_incomplete rect { fill: #8a8f98; stroke-dasharray: 5 3; }
@@ -2244,6 +2214,7 @@ body.mode-debug .debug-lane { display: inline; }
 .q1-issue-lane { display: none; }
 [data-lane-role="q1-issue"].q1-issue-expanded { display: inline; }
 .q1-issue-lane.q1-issue-expanded { display: inline; }
+body.mode-debug [data-lane-role="q1-issue"] { display: inline; }
 body.mode-normal .event.q1-dense-collapsed { display: none; }
 body.mode-normal .event.loop-collapsed { display: none; }
 body.mode-normal .event.normal-feedback-collapsed { display: none; }
@@ -2305,12 +2276,13 @@ function displayInspectorValue(value) {
   }
   return String(value);
 }
-function addInspectorField(fields, label, value) {
+function addInspectorField(fields, label, value, className) {
   const displayed = displayInspectorValue(value);
   if (!displayed) {
     return;
   }
-  fields.push(`<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(displayed)}</dd>`);
+  const attributes = className ? ` class="${className}"` : '';
+  fields.push(`<dt>${escapeHtml(label)}</dt><dd${attributes}>${escapeHtml(displayed)}</dd>`);
 }
 function displayResolvedValue(value) {
   if (value === undefined || value === null) {
@@ -2403,7 +2375,7 @@ function canShowNextLoopIteration(meta) {
   const cap = loopPreviewCap(meta);
   return visible < cap && (total === undefined || visible < total);
 }
-function renderInspector(eventId) {
+function renderInspector(eventId, diagnosticMessage) {
   if (!inspectorFields) {
     return;
   }
@@ -2424,6 +2396,9 @@ function renderInspector(eventId) {
     if (meta.slack_ns < 0) label += ` · ${-meta.slack_ns} ns late`;
   }
   addInspectorField(fields, 'Label', label);
+  for (const message of diagnosticMessage?.split('\\n') || []) {
+    addInspectorField(fields, 'Error', message, 'diagnostic-error-message');
+  }
   addInspectorField(fields, 'Sequencer', event.sequencer_id);
   addInspectorField(fields, 'Lane', event.lane);
   addInspectorField(fields, 'Time range', `${displayInspectorValue(event.t0)} -> ${displayInspectorValue(event.t1)}`);
@@ -2450,7 +2425,7 @@ function renderInspector(eventId) {
 function findEventNodeById(eventId) {
   const matches = [];
   for (const node of document.querySelectorAll('[data-event-id]')) {
-    if (node.dataset.eventId === String(eventId)) {
+    if (node.dataset.eventId === String(eventId) || (node.dataset.eventIds || '').split(' ').includes(String(eventId))) {
       matches.push(node);
     }
   }
@@ -2608,7 +2583,7 @@ function highlightRelatedControlFlow(eventNode) {
   }
   highlightRelatedControlFlowConnectors(eventNode);
 }
-function selectEventNode(eventNode) {
+function selectEventNode(eventNode, linkedEventId) {
   if (!eventNode) {
     querySelectorAllWithFallback(selectedTimelineEventSelector).forEach((node) => node.classList.remove('is-selected'));
     clearRelatedControlFlow();
@@ -2621,8 +2596,8 @@ function selectEventNode(eventNode) {
   querySelectorAllWithFallback(selectedTimelineEventSelector).forEach((node) => node.classList.remove('is-selected'));
   eventNode.classList.add('is-selected');
   highlightRelatedControlFlow(eventNode);
-  const eventId = eventNode.dataset.eventId;
-  renderInspector(eventId);
+  const eventId = linkedEventId || eventNode.dataset.eventId;
+  renderInspector(eventId, eventNode.dataset.diagnosticMessage);
   const details = document.getElementById('q1timeline-analysis-details');
   if (details) details.open = true;
   window.dispatchEvent(new CustomEvent('q1timeline:eventClick', { detail: { eventId } }));
@@ -2631,6 +2606,10 @@ function setMode(mode) {
   document.body.classList.toggle('mode-debug', mode === 'debug');
   document.body.classList.toggle('mode-normal', mode === 'normal');
   document.body.dataset.mode = mode;
+  for (const lane of document.querySelectorAll('[data-lane-role="q1-issue"]')) {
+    lane.hidden = mode !== 'debug';
+    lane.style.display = mode === 'debug' ? 'inline' : 'none';
+  }
   for (const button of modeButtons) {
     button.setAttribute('aria-pressed', String(button.dataset.mode === mode));
   }
@@ -2640,6 +2619,9 @@ function isTimelineEventVisible(eventNode) {
     return false;
   }
   if (eventNode.closest('.debug-lane') && document.body.dataset.mode === 'normal') {
+    return false;
+  }
+  if (eventNode.classList.contains('q1-error-marker') && document.body.dataset.mode === 'debug') {
     return false;
   }
   if (eventNode.classList.contains('q1-dense-collapsed') && document.body.dataset.mode === 'normal') {
@@ -2707,13 +2689,20 @@ for (const eventNode of timelineEventNodes()) {
   eventNode.addEventListener('click', () => {
     selectEventNode(eventNode);
   });
+  if (eventNode.getAttribute('role') === 'button') {
+    eventNode.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      event.preventDefault();
+      selectEventNode(eventNode);
+    });
+  }
 }
 for (const link of document.querySelectorAll('[data-related-event-id]')) {
   link.addEventListener('click', () => {
     const eventId = link.dataset.relatedEventId;
     const eventNode = findEventNodeById(eventId);
     if (eventNode) {
-      selectEventNode(eventNode);
+      selectEventNode(eventNode, eventId);
     }
   });
 }

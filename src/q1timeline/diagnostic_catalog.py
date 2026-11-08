@@ -87,10 +87,10 @@ DIAGNOSTIC_PRESENTATIONS: dict[str, dict[str, str]] = {
         "group": "Timing",
         "title": "Feedback receive is too early",
         "summary": (
-            "Channel {channel} is popped {missing_wait_ns} ns before the official LINQ {route} latency "
-            "for {data_type} data."
+            "{receive_op} on channel {channel} precedes estimated arrival by {missing_wait_ns} ns "
+            "({base_latency_ns} ns LINQ + {transport_delay_ns} ns configured transport delay)."
         ),
-        "fix": "Insert at least {missing_wait_ns} ns before this fb_pop_data, or move the receive later.",
+        "fix": "Cover the {missing_wait_ns} ns feedback wait with queued RT work, or move this pop/pull later to avoid RT underflow.",
     },
     "feedback_route_mismatch": {
         "group": "Timing",

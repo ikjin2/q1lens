@@ -3,11 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Any, Literal
 
-from q1timeline.analysis.interpreter import AnalysisState
+from q1timeline.analysis.interpreter import AnalysisState, _physical_read_register, _register_write_operands
 from q1timeline.analysis.queue_timing import ASSUMED_INITIAL_BUFFER_NS, POSSIBLE_INITIAL_BUFFER_NS, replay_queues
 from q1timeline.analysis.values import Concrete, Unknown, subtract_values
 from q1timeline.diagnostics import Diagnostic
 from q1timeline.diagnostic_catalog import underflow_label
+from q1timeline.q1asm.instruction_table import get_instruction_spec, rt_duration_arg_for_instruction
 
 
 UnderflowStatus = Literal[
@@ -44,6 +45,16 @@ def analyze_underflows(
     SYNQ dwell remains uncertain; original Q1/RT coordinates stay unchanged.
     """
     prepared = {state.sequencer_id: _queue_packets(state) for state in states}
+    cadences = {}
+    all_path_safety = {}
+    if len(states) == 1:
+        state = states[0]
+        safety = _all_path_queue_safety(state, queue_depth_limit)
+        if safety is not None:
+            all_path_safety[state.sequencer_id] = safety
+        certification = _infinite_wait_cadence(state, prepared[state.sequencer_id])
+        if certification is not None:
+            prepared[state.sequencer_id], cadences[state.sequencer_id] = certification
     streams = {}
     for name, (packets, reason, boundary_packet) in prepared.items():
         streams[name] = list(packets)
@@ -65,7 +76,7 @@ def analyze_underflows(
         "buffer_duration": "one_time_cumulative_q1_supply_gap_credit; never_replenished",
         "same_time_order": "enqueue_before_dequeue",
         "sync": "all_supplied_sequencers; earliest_release_to_maximum_prefetch",
-        "unknown_branches": "incomplete",
+        "unknown_branches": "all_feasible_paths_verified" if all_path_safety else "incomplete",
         "wait_trigger": "external_arrival_unknown",
         "alignment": "queue_model_separate_from_display_coordinates",
     }
@@ -74,9 +85,15 @@ def analyze_underflows(
         low, high = earliest[name], prefetched[name]
         _packets, reason, boundary_packet = prepared[name]
         failure = high.failure if low.failure and high.failure else None
+        cadence = cadences.get(name)
+        safety = all_path_safety.get(name)
+        eventual = cadence is not None and cadence["q1_period_ns"] > cadence["rt_period_ns"] and failure is None
         replay = high if low.failure else low
-        if failure:
+        if failure or eventual:
             status = "definite_underflow"
+        elif safety is not None:
+            status = "not_detected_under_current_assumptions"
+            reason = None
         elif reason or low.incomplete_reason or high.incomplete_reason:
             status = "analysis_incomplete"
             reason = reason or low.incomplete_reason or high.incomplete_reason
@@ -90,11 +107,18 @@ def analyze_underflows(
             status = "not_detected_under_current_assumptions"
         initial_buffer = {
             "assumed_ns": ASSUMED_INITIAL_BUFFER_NS, "possible_ns": POSSIBLE_INITIAL_BUFFER_NS,
-            "required_ns": replay.required_buffer_ns,
-            "status": "exhausted" if failure else "tentative" if status == "possibly_safe_with_initial_buffer"
+            "required_ns": None if eventual else replay.required_buffer_ns,
+            **({"required_unbounded": True} if eventual else {}),
+            "status": "exhausted" if failure or eventual else "tentative" if status == "possibly_safe_with_initial_buffer"
                       else "incomplete" if status == "analysis_incomplete" else "assumed",
         }
+        if safety is not None:
+            initial_buffer.update(required_ns=max(safety.values()), required_basis="all_feasible_paths")
         state.metadata["underflow"] = {"assumptions": assumptions, "status": status, "initial_buffer": initial_buffer}
+        if safety is not None:
+            state.metadata["underflow"]["all_paths_safe"] = {"required_buffer_by_path_ns": safety}
+        if cadence is not None:
+            state.metadata["underflow"]["infinite_cadence"] = cadence
         for record in replay.records:
             packet = record.packet
             _emit_queue_depth(state, packet_id=packet.id, t0=packet.rt_t0,
@@ -108,6 +132,21 @@ def analyze_underflows(
             _emit_slack(state, packet_id=packet.id, slack_ns=failure.slack_ns, t0=packet.rt_t0, source=packet.source)
             _emit_underflow_warning(state, packet_id=packet.id, slack_ns=failure.slack_ns,
                                     t0=packet.rt_t0, source=packet.source, assumptions=assumptions, status=status)
+        elif eventual:
+            loop = next(event for event in state.events if event.id == cadence["loop_event_id"])
+            event = replace(_event_like(
+                state, lane="debug.underflow", kind="underflow_warning", t0=Unknown("eventual RT underflow time"),
+                source=loop.source, label="Eventual RT underflow",
+                meta={"status": status, "eventual": True, "analysis_scope": "rt_queue", **cadence, "assumptions": assumptions},
+            ), t1=None, duration=Concrete(0))
+            state.events.append(event)
+            state.diagnostics.append(Diagnostic(
+                severity="error", category="definite_underflow",
+                message=(f"Infinite loop eventually exhausts any finite initial buffer: Q1 supplies one packet every "
+                         f"{cadence['q1_period_ns']} ns while RT consumes it every {cadence['rt_period_ns']} ns. "
+                         "The exact failure iteration and time are not determined."),
+                source=loop.source, related_events=[loop.id], details=event.meta,
+            ))
         elif status == "possibly_safe_with_initial_buffer":
             state.diagnostics.append(Diagnostic(
                 severity="info", category="initial_rt_buffer_estimate",
@@ -122,10 +161,72 @@ def analyze_underflows(
     return results
 
 
+def _all_path_queue_safety(state: AnalysisState, queue_depth_limit: int):
+    if set(state.queue_alternatives) != {"taken", "fallthrough"}:
+        return None
+    required = {}
+    for path, alternative in state.queue_alternatives.items():
+        packets, reason, _boundary = _queue_packets(alternative)
+        if (not alternative.stopped or reason is not None
+                or any(packet.op in {"wait_sync", "wait_trigger"} for packet in packets)):
+            return None
+        amounts = []
+        for initial in (ASSUMED_INITIAL_BUFFER_NS, POSSIBLE_INITIAL_BUFFER_NS):
+            replay = replay_queues({state.sequencer_id: packets}, queue_depth_limit=queue_depth_limit,
+                                   initial_buffer_ns=initial)[state.sequencer_id]
+            if replay.failure is not None or replay.incomplete_reason is not None:
+                return None
+            amounts.append(replay.required_buffer_ns)
+        required[path] = max(amounts)
+    return required
+
+
+def _infinite_wait_cadence(state: AnalysisState, prepared):
+    packets, reason, _boundary = prepared
+    loops = [event for event in state.events if event.kind == "loop_block"]
+    if (reason != "compact_loop_timing_unexpanded" or len(loops) != 1 or not packets
+            or any(packet.op in {"wait_sync", "wait_trigger"} for packet in packets)
+            or any(item.severity == "error" and item.category != "definite_underflow"
+                   or item.category == "register_not_ready" for item in state.diagnostics)):
+        return None
+    loop = loops[0]
+    meta = loop.meta
+    edge_instruction = state.instructions_by_pc.get(meta.get("end_pc"))
+    body = [instruction for pc, instruction in state.instructions_by_pc.items()
+            if meta.get("start_pc", -1) <= pc < meta.get("end_pc", -1)]
+    waits = [item for item in body if item.op == "wait"]
+    by_id = {event.id: event for event in state.events}
+    issues = [by_id[key] for key in meta.get("first_iteration_event_ids", [])
+              if key in by_id and by_id[key].kind == "q1_issue"]
+    edge = by_id.get(meta.get("loop_q1_issue_event_id"))
+    if (meta.get("count") != "forever" or edge_instruction is None or edge_instruction.op != "jmp"
+            or len(waits) != 1 or any(item.op not in {"nop", "wait"} for item in body)
+            or not issues or edge is None or not isinstance(edge.t1, Concrete)
+            or any(not isinstance(issue.t0, Concrete) or issue.meta.get("conditional_active") for issue in issues)):
+        return None
+    body_packet_ids = {issue.meta.get("rt_packet_id") for issue in issues}
+    body_packets = [packet for packet in packets if packet.id in body_packet_ids]
+    if len(body_packets) != 1 or body_packets[0] != packets[-1]:
+        return None
+    packet = body_packets[0]
+    q1_period = edge.t1.value - min(issue.t0.value for issue in issues)
+    duration = packet.duration.value if isinstance(packet.duration, Concrete) else None
+    if q1_period <= 0 or type(duration) is not int or not 0 < duration <= 65535:
+        return None
+    second = replace(packet, id=f"{packet.id}:cadence1", q1_issue_t0=Concrete(packet.q1_issue_t0.value + q1_period),
+                     q1_issue_t1=Concrete(packet.q1_issue_t1.value + q1_period),
+                     rt_t0=Concrete(packet.rt_t0.value + duration), rt_t1=Concrete(packet.rt_t1.value + duration))
+    cadence = {"loop_event_id": loop.id, "q1_period_ns": q1_period, "rt_period_ns": duration,
+               "tail_status": "sustainable" if q1_period <= duration else "eventual_underflow"}
+    return (packets + [second], None, None), cadence
+
+
 def _queue_packets(state: AnalysisState):
     """Expand constant loop timing; stop before an unmodeled timing boundary."""
     packets = list(state.rt_packets)
-    if not packets:
+    if not packets and not any(get_instruction_spec(item.op).emits_rt_packet
+                               or get_instruction_spec(item.op).category == "unknown"
+                               for item in state.instructions_by_pc.values()):
         return [], None, None
     cutoff = None
     reason = None
@@ -133,14 +234,25 @@ def _queue_packets(state: AnalysisState):
         if event.kind != "q1_issue" or not isinstance(event.t0, Concrete):
             continue
         boundary_reason = None
-        if event.meta.get("conditional_execution_unknown"):
+        spec = get_instruction_spec(event.meta.get("op", ""))
+        if (spec.category == "unknown"
+                or spec.timing_effect_status != "known" and spec.op != "set_cond"):
+            boundary_reason = "unmodeled_timing_effect"
+        elif event.meta.get("conditional_execution_unknown") and not event.meta.get("conditional_timing_known"):
             boundary_reason = "conditional_execution_unknown"
         elif event.meta.get("op") in {"fb_pop_data", "fb_pull_data"}:
             boundary_reason = "feedback_arrival_unknown"
-        elif event.meta.get("branch_decision") == "runtime_dependent":
+        elif event.meta.get("branch_decision") == "runtime_dependent" and not event.meta.get("branch_join_proven"):
             boundary_reason = "runtime_branch_unknown"
+        elif event.meta.get("reason") in {
+            "invalid_loop_count", "register_branch_target", "undefined_label", "unknown_numeric_branch_target",
+            "unsupported_backward_conditional_branch", "unsupported_backward_numeric_branch", "unsupported_forward_loop",
+        }:
+            boundary_reason = event.meta["reason"]
         if boundary_reason and (cutoff is None or event.t0.value < cutoff):
             cutoff, reason = event.t0.value, boundary_reason
+    if not packets:
+        return [], reason, None
     events_by_id = {event.id: event for event in state.events}
     for loop in (event for event in state.events if event.kind == "loop_block"):
         meta = loop.meta
@@ -155,30 +267,93 @@ def _queue_packets(state: AnalysisState):
         packet_ids = {event.meta.get("rt_packet_id") for event in body}
         loop_packets = [packet for packet in packets if packet.id in packet_ids]
         count, period = meta.get("count"), meta.get("period", {}).get("value")
+        if count == 1:
+            # The real first iteration is already in the packet stream.
+            continue
         instructions = [instruction for pc, instruction in state.instructions_by_pc.items()
                         if meta.get("start_pc", -1) <= pc < meta.get("end_pc", -1)]
-        # Register-dependent waits or internal control flow can change the next
-        # iteration's timing. UI preview copies are not evidence of execution.
-        repeatable = all(instruction.op in {"wait", "upd_param", "play", "nop", "set_mrk",
-                         "set_awg_gain", "set_awg_offs", "set_freq", "reset_ph", "set_ph", "set_ph_delta"}
-                         and all(arg.kind != "reg" for arg in instruction.args) for instruction in instructions)
+        # Replay needs invariant durations and fixed instruction costs. Output
+        # payloads may change without changing either timing quantity.
+        constant_ops = {"wait", "upd_param", "play", "nop", "set_mrk",
+                        "set_awg_gain", "set_awg_offs", "set_freq", "reset_ph", "set_ph", "set_ph_delta"}
+        written_registers = {meta.get("counter_reg")}
+        for instruction in instructions:
+            written_registers.update(_register_write_operands(instruction, state))
+        repeatable = True
+        affine_packets = meta.get("rt_packet_affine", {})
+        affine_period = meta.get("period_affine", {})
+        affine = (bool(affine_packets) and all(packet.id in affine_packets for packet in loop_packets)
+                  and all(type(affine_period.get(key)) is int for key in ("intercept", "slope")))
+        periods = meta.get("iteration_durations")
+        evaluated_packets = meta.get("rt_packet_durations", {})
+        evaluated = (isinstance(count, int) and isinstance(periods, list) and 1 < len(periods) <= count
+                     and (len(periods) == count or meta.get("repeat_last_iteration") is True)
+                     and all(type(value) is int and value >= 0 for value in periods)
+                     and all(isinstance(evaluated_packets.get(packet.id), list)
+                             and len(evaluated_packets[packet.id]) == len(periods)
+                             and all(type(value) is int and 0 <= value <= 65535 for value in evaluated_packets[packet.id])
+                             for packet in loop_packets)
+                     and all(sum(evaluated_packets[packet.id][index] for packet in loop_packets) == value
+                             for index, value in enumerate(periods)))
+        for instruction in instructions:
+            spec = get_instruction_spec(instruction.op)
+            if spec.category == "classical" and len({signature.q1_time_ns for signature in spec.signatures}) == 1:
+                if meta.get("counter_reg") not in _register_write_operands(instruction, state):
+                    continue
+            elif instruction.op in constant_ops:
+                duration_index = rt_duration_arg_for_instruction(spec, instruction)
+                if duration_index is None:
+                    continue
+                if duration_index >= len(instruction.args):
+                    repeatable = False
+                    break
+                arg = instruction.args[duration_index]
+                if (instruction.pc in meta.get("invariant_duration_pcs", [])
+                        or _physical_read_register(arg, state) not in written_registers):
+                    continue
+            repeatable = False
+            break
         if (not isinstance(count, int) or count < 1 or not isinstance(period, int) or
-                not repeatable or any(event.kind == "loop_block" for event in body) or
+                not (repeatable or affine or evaluated) or any(event.kind == "loop_block" for event in body) or
                 len(packets) + len(loop_packets) * (count-1) > 10000):
-            cutoff, reason = start, "compact_loop_timing_unexpanded"
+            edge = events_by_id.get(meta.get("loop_q1_issue_event_id"))
+            hidden_start = max(event.t1.value for event in q1)
+            if edge is not None and isinstance(edge.t1, Concrete):
+                hidden_start = max(hidden_start, edge.t1.value)
+            if cutoff is None or hidden_start < cutoff:
+                cutoff, reason = hidden_start, "compact_loop_timing_unexpanded"
             continue
         q1_period = max(event.t1.value for event in q1)-start + meta.get("loop_q1_jump_runtime_ns", 24)
+        evaluated_elapsed = periods[0] if evaluated else 0
         for iteration in range(1, count):
+            prefix_slope = 0
+            evaluated_prefix = 0
             for packet in loop_packets:
                 if not all(isinstance(value, Concrete) for value in
                            (packet.q1_issue_t0, packet.q1_issue_t1, packet.rt_t0, packet.rt_t1)):
                     cutoff, reason = start, "unknown_rt_timing"
                     break
-                packets.append(replace(packet, id=f"{packet.id}:iteration{iteration}",
+                duration = packet.duration
+                offset = iteration * period
+                if affine:
+                    coefficients = affine_packets[packet.id]
+                    duration = Concrete(coefficients["intercept"] + coefficients["slope"] * iteration)
+                    offset = (iteration * affine_period["intercept"]
+                              + affine_period["slope"] * iteration * (iteration - 1) // 2 + prefix_slope * iteration)
+                    prefix_slope += coefficients["slope"]
+                if evaluated:
+                    index = min(iteration, len(periods) - 1)
+                    duration = Concrete(evaluated_packets[packet.id][index])
+                    rt_t0 = Concrete(loop.t0.value + evaluated_elapsed + evaluated_prefix)
+                    evaluated_prefix += duration.value
+                else:
+                    rt_t0 = Concrete(packet.rt_t0.value + offset)
+                packets.append(replace(packet, id=f"{packet.id}:iteration{iteration}", duration=duration,
                     q1_issue_t0=Concrete(packet.q1_issue_t0.value+iteration*q1_period),
                     q1_issue_t1=Concrete(packet.q1_issue_t1.value+iteration*q1_period),
-                    rt_t0=Concrete(packet.rt_t0.value+iteration*period),
-                    rt_t1=Concrete(packet.rt_t1.value+iteration*period)))
+                    rt_t0=rt_t0, rt_t1=Concrete(rt_t0.value + duration.value)))
+            if evaluated:
+                evaluated_elapsed += periods[min(iteration, len(periods) - 1)]
     packets.sort(key=lambda packet: packet.q1_issue_t0.value if isinstance(packet.q1_issue_t0, Concrete) else float("inf"))
     known = []
     for packet in packets:
@@ -276,7 +451,8 @@ def _emit_underflow_warning(
 
 
 def _emit_analysis_incomplete(state: AnalysisState, assumptions: dict[str, object], *, packet=None, reason="unknown_rt_timing") -> None:
-    source = packet.source if packet is not None else state.rt_packets[0].source if state.rt_packets else None
+    source = (packet.source if packet is not None else state.rt_packets[0].source if state.rt_packets
+              else next(event.source for event in reversed(state.events) if event.kind == "q1_issue"))
     t0 = packet.rt_t0 if packet is not None and isinstance(packet.rt_t0, Concrete) else Concrete(0)
     meta: dict[str, Any] = {
         "status": "analysis_incomplete",
@@ -400,7 +576,7 @@ def _preview_underflow_status(
     return "not_detected_under_current_assumptions"
 
 
-def _event_like(state: AnalysisState, *, lane: str, kind: str, t0: Concrete, source, label: str, meta: dict):
+def _event_like(state: AnalysisState, *, lane: str, kind: str, t0: Concrete | Unknown, source, label: str, meta: dict):
     from q1timeline.analysis.interpreter import TimelineEvent
 
     return TimelineEvent(

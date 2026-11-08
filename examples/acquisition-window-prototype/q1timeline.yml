@@ -1,0 +1,26 @@
+sequencers:
+  - id: readout
+    name: Readout · 1000 ns integration
+    file: readout.q1asm
+    module: QRM0
+    module_type: QRM
+    hardware_parameters:
+      integration_length_acq: 1000
+  - id: parallel
+    name: Parallel readout · 800 ns integration
+    file: parallel.q1asm
+    module: QRM0
+    module_type: QRM
+    hardware_parameters:
+      integration_length_acq: 800
+  - id: unknown
+    name: Readout · integration not supplied
+    file: unknown.q1asm
+    module: QRM1
+    module_type: QRM
+
+alignment:
+  mode: first_wait_sync
+
+analysis:
+  execution_mode: concrete

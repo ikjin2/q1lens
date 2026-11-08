@@ -66,7 +66,7 @@
       q1: [], rt: [], registers: new Map(), registerWrites: new Map(), pending: new Map(), applied: new Map(),
       awg: new Map(), acquisitions: [], bins: new Map(), binOrder: [],
       queue: [], stalls: [], rtWaits: [], communications: [], acquisitionResults: new Map(), resultEvents: [],
-      q1Risks: [], rtRisks: [], outputRisks: [], warnings: new Set(), steps: [], range: { min: 0, max: 0 },
+      q1Risks: [], rtRisks: [], outputRisks: [], phaseRisks: [], warnings: new Set(), steps: [], range: { min: 0, max: 0 },
     };
   }
 
@@ -153,6 +153,8 @@
         series.rt.push(entry);
         lastRtTime = end ?? time;
       }
+      if (meta.nco_phase_uncertain) series.phaseRisks.push({time, event, inclusive: true, message: "NCO phase is uncertain."});
+      else if (meta.phase_reset) series.phaseRisks.push({time, event});
       const applied = meta.applied_state || (event.kind === "latched_state_applied" && meta.field ? { [meta.field]: meta.value } : {});
       for (const [field, value] of Object.entries(applied)) {
         const packetKey = `${meta.rt_packet_id || event.id}:${field}`;
@@ -174,7 +176,15 @@
       }
       if (event.kind === "play") append(series.awg, meta.path ?? 0, entry);
       if (event.kind === "acquire") {
-        series.acquisitions.push(entry);
+        const window = meta.acquisition_window;
+        const integrationEnd = Number.isFinite(window?.end_ns) && window.status !== "unknown"
+          ? window.end_ns + time - numericValue(event.t0) : undefined;
+        series.acquisitions.push({ ...entry, end: window ? integrationEnd : end,
+          integrationUnknown: window ? integrationEnd === undefined : !index.simulation[event.sequencer_id] });
+        if (integrationEnd !== undefined) {
+          series.steps.push(integrationEnd);
+          series.range.max = Math.max(series.range.max, integrationEnd);
+        }
         const acquisitionIndex = numericValue(meta.acquisition_index);
         const binIndex = numericValue(meta.bin_index);
         if (acquisitionIndex !== undefined && binIndex !== undefined) {
@@ -201,6 +211,15 @@
         if (event.kind === "branch_region") {
           const issue = (issuesBySource.get(sourceKey(event.source)) || [])[0];
           addRisk(series, event, eventTime(index, issue, basis, "t1"), "q1", message, true);
+        }
+      }
+      if (end !== undefined && meta.latched_state_at_join) {
+        for (const [field, value] of Object.entries(meta.latched_state_at_join)) {
+          if ((meta.pending_fields_at_join || []).includes(field)) continue;
+          const item = record(event, end, value);
+          item.branchJoinSources = meta.latched_sources_at_join?.[field];
+          item.resolvedRiskEventId = event.id;
+          append(series.applied, field, item);
         }
       }
     }
@@ -236,7 +255,7 @@
       series.steps.push(time);
     }
     const sort = (items) => items.sort((left, right) => left.time - right.time);
-    for (const key of ["q1", "rt", "acquisitions", "q1Risks", "rtRisks", "outputRisks", "queue", "stalls", "rtWaits", "communications", "resultEvents"]) sort(series[key]);
+    for (const key of ["q1", "rt", "acquisitions", "q1Risks", "rtRisks", "outputRisks", "phaseRisks", "queue", "stalls", "rtWaits", "communications", "resultEvents"]) sort(series[key]);
     for (const key of ["registers", "pending", "applied", "awg", "acquisitionResults"]) for (const items of series[key].values()) sort(items);
     for (const bin of series.bins.values()) {
       sort(bin.history);
@@ -426,6 +445,7 @@
     const entry = latest(items, time);
     if (risk && (!entry || entry.time < risk.time || (risk.inclusive && entry.time === risk.time))) return { event: null, status: "unknown" };
     if (!entry) return { event: null, status: "not-started" };
+    if (entry.integrationUnknown) return { event: entry.event, time: entry.time, status: "unknown" };
     const op = (entry.event.meta || {}).op || entry.event.kind;
     const status = op === "stop" && time >= (entry.end ?? entry.time) ? "stopped" : entry.end !== undefined && time < entry.end ? "active" : "last-command";
     return { event: entry.event, time: entry.time, status };
@@ -458,7 +478,7 @@
 
   function valueAt(items, time, risk) {
     const item = latest(items || [], time);
-    if (risk && (!item || item.time < risk.time || (risk.inclusive && item.time === risk.time))) return { value: null, display: "unknown", known: false, time: risk.time, source: risk.event.source, eventId: risk.event.id, confidence: "unknown", meta: { invalidated: true, reason: risk.message } };
+    if (risk && (!item || item.time < risk.time || (risk.inclusive && item.time === risk.time && item.resolvedRiskEventId !== risk.event.id))) return { value: null, display: "unknown", known: false, time: risk.time, source: risk.event.source, eventId: risk.event.id, confidence: "unknown", meta: { invalidated: true, reason: risk.message } };
     return item ? { ...item, changed: item.time === time } : null;
   }
 
@@ -481,6 +501,7 @@
     const q1Risk = latest(series.q1Risks, time);
     const rtRisk = latest(series.rtRisks, time);
     const outputRisk = latest(series.outputRisks, time);
+    const phaseStatus = latest(series.phaseRisks, time);
     const warnings = new Set(series.warnings);
     if (q1Risk) warnings.add(q1Risk.message);
     if (rtRisk) warnings.add(rtRisk.message);
@@ -492,7 +513,9 @@
     const fields = new Set(["frequency", "phase", "phase_delta", "awg_gain", "awg_offset", "marker", ...series.pending.keys(), ...series.applied.keys()]);
     const parameters = Array.from(fields, (field) => {
       const pending = valueAt(series.pending.get(field), time, q1Risk);
-      return { field, pending: pending && (pending.consumedAt === undefined || pending.consumedAt > time) ? pending : null, applied: valueAt(series.applied.get(field), time, outputRisk) };
+      const phaseRisk = field === "phase" && phaseStatus?.message ? phaseStatus : undefined;
+      const risk = phaseRisk && (!outputRisk || phaseRisk.time >= outputRisk.time) ? phaseRisk : outputRisk;
+      return { field, pending: pending && (pending.consumedAt === undefined || pending.consumedAt > time) ? pending : null, applied: valueAt(series.applied.get(field), time, risk) };
     });
     const total = upperBound(series.binOrder, time);
     const offset = Math.max(0, Math.floor(Number(binOptions.offset) || 0));

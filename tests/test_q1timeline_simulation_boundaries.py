@@ -220,12 +220,13 @@ def test_condition_uses_all_selected_trigger_bits(addresses, expected, operator)
 
 
 @pytest.mark.parametrize("enabled", [0, 1])
-def test_negative_condition_else_duration_is_rejected_before_rt_execution(enabled: int) -> None:
+def test_negative_condition_else_duration_is_excluded_before_rt_execution(enabled: int) -> None:
     state, = run(f"set_cond {enabled},0,0,-1\nupd_param 4\nset_cond 0,0,0,4\nupd_param 4\nstop")
-    assert status(state) == "error"
+    assert status(state) == "completed"
     assert any(diagnostic.category == "invalid_argument_value"
                and diagnostic.details.get("operand_role") == "else_duration" for diagnostic in state.diagnostics)
-    assert not state.rt_packets
+    assert all(packet.source.line != 1 for packet in state.rt_packets)
+    assert len(events(state, "upd_param")) == 2
     assert all(event.t1.value >= event.t0.value for event in state.events)
 
 

@@ -46,12 +46,14 @@ function loadInstructionRuntime(options: { count?: number; clientWidth?: number;
     return stage;
   }
   const names = ["clamp", "instructionPlotWidth", "setInstructionView", "fitInstructionSelection", "handleInstructionWheel", "installTimelineMouseInteractions", "renderSharedTimelineIfAvailable", "applyTimelineEventFilter", "setTimelineLayout", "timelineControlChipLeft"];
-  const noops = ["renderTimelineLayoutToggle", "renderTimelineWindowStatus", "renderTimeBasisToggle", "installSharedQ1IssueControls", "syncSharedSequencerFoldControls", "installTimelineControlChips", "applySharedSelection", "renderWaitFolds", "renderPlaybackFolds", "renderHardwareCursor"];
+  const noops = ["renderTimelineLayoutToggle", "renderTimelineWindowStatus", "renderTimeBasisToggle", "installSharedQ1IssueControls", "installRtPreparationMarkers", "syncSharedSequencerFoldControls", "installTimelineControlChips", "applySharedSelection", "renderWaitFolds", "renderPlaybackFolds", "positionTimelineFoldToggles", "renderHardwareCursor"];
   return Function("createStage", "adapter", "count", `
     let stage = createStage(count);
     let instructionView = { cellWidth: 112, leftOrdinal: 0 };
     let timelineLayout = "instruction", timelineTimeBasis = "local", sharedTimelineActive = false;
     let activeTimelineControlChip, rtDetailsByEvent = new Map();
+    let timelineCommandWidths = [];
+    const timelineTimeScales = new Map();
     let selectedTimelineEventId = "rt-4";
     const selectedSourceEventIds = new Set(["rt-4", "q1-9"]);
     const expandedQ1IssueSequencers = new Set();

@@ -250,7 +250,7 @@ def test_threshold_pull_router_uses_fb_pull_data_for_threshold_result(analyze_tu
     flows = ir["feedback_flows"]
     diagnostics = {diagnostic["category"] for diagnostic in ir["diagnostics"]}
 
-    assert flows == [
+    assert [{key: value for key, value in flow.items() if key != "timing"} for flow in flows] == [
         {
             "id": "feedback-flow-0",
             "from_event_id": "qrm_threshold_router:e9",

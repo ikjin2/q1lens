@@ -82,7 +82,7 @@ interface PythonChoice extends vscodeTypes.QuickPickItem {
   action?: "browse" | "enter" | "vscode";
 }
 
-export function registerEnvironmentCommands(context: vscodeTypes.ExtensionContext): void {
+export function registerEnvironmentCommands(context: vscodeTypes.ExtensionContext): { checkStartupEnvironment(): Promise<void> } {
   const vscode = require("vscode") as typeof vscodeTypes;
   const output = vscode.window.createOutputChannel("Q1Lens Python Environment");
   const selectLabel = "Select Python Environment";
@@ -112,6 +112,23 @@ export function registerEnvironmentCommands(context: vscodeTypes.ExtensionContex
       catch (error) { return { ...details, resource, pythonPath: "", pythonArgs: [] as string[], source: "vscode" as const,
         sourceLabel: "VS Code selected interpreter", resolutionError: error instanceof Error ? error.message : String(error) }; }
     }));
+  }
+
+  async function checkStartupEnvironment(): Promise<void> {
+    const resource = targetResource();
+    if (vscode.workspace.isTrusted === false || resource?.scheme !== "file" || extname(resource.fsPath).toLowerCase() === ".ipynb") return;
+    const request = beginPythonEnvironmentCheck();
+    const kind = extname(resource.fsPath).toLowerCase() === ".q1asm" ? "q1asm" : "qbs";
+    try {
+      const selected = (await environments(resource)).find((environment) => environment.label === (kind === "q1asm" ? "Q1ASM" : "QBS"))!;
+      if (selected.resolutionError) throw new Error(selected.resolutionError);
+      const report = await probePythonEnvironment(selected.pythonPath, selected.pythonArgs, {
+        cwd: workingDirectory(resource), env: selected.env,
+      }).finally(() => { if ("assertCurrentSelection" in selected) selected.assertCurrentSelection?.(); });
+      publishPythonEnvironment({ ...selected, report, kind }, request);
+    } catch (error) {
+      output.appendLine(`Startup Python environment check: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   async function checkEnvironment(retryCommand?: string, target?: vscodeTypes.Uri, retryTarget?: vscodeTypes.Uri) {
@@ -281,4 +298,5 @@ export function registerEnvironmentCommands(context: vscodeTypes.ExtensionContex
     vscode.commands.registerCommand("q1lens.checkEnvironment", checkEnvironment),
     vscode.commands.registerCommand("q1lens.selectPythonEnvironment", selectEnvironment),
   );
+  return { checkStartupEnvironment };
 }

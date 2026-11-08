@@ -1,0 +1,10 @@
+# Integration is configured outside Q1ASM: integration_length_acq = 1000 ns.
+wait_sync 4
+wait 96
+acquire 0,0,4     # Starts at 100 ns; the next Acquire ends it at 700 ns.
+wait 596
+acquire 1,2,4     # Different acquisition/bin, same integrator; ends at 1700 ns.
+wait 1296
+acquire 0,3,4     # Another bin in acquisition 0; ends at 3000 ns.
+wait 1196
+stop

@@ -61,12 +61,55 @@ def test_underflow_labels_hide_queue_samples_and_slack_and_show_positive_latenes
     assert 'data-event-id="normal"' not in html
     assert 'data-event-id="late"' not in html
     assert 'aria-label="RT underflow · 24 ns late' in html
-    assert 'aria-label="Possible RT underflow · 8 ns late' in html
+    assert 'data-event-id="possible"' not in html
+    assert re.search(r'data-event-id="warning"[^>]*data-diagnostic-placement="point"[^>]*>.*?<text class="timeline-error-mark"[^>]*>!</text>', html, re.S)
     assert json.dumps(events) == before
     presentation = describe_diagnostic({"category": "definite_underflow", "details": {"slack_ns": -24}})
     assert presentation["title"] == "RT underflow"
     assert "24 ns late" in presentation["summary"]
     assert "slack" not in presentation["summary"]
+
+
+@pytest.mark.parametrize("mode", ["normal", "debug"])
+def test_eventual_underflow_proof_has_a_diagnostic_without_a_timed_failure_block(mode):
+    from q1timeline.analysis.api import analyze_text
+    ir = analyze_text("body: wait 4\njmp @body\n")
+    warning = next(event for event in ir["events"] if event["kind"] == "underflow_warning")
+    loop = next(event for event in ir["events"] if event["kind"] == "loop_block")
+    diagnostic = next(item for item in ir["diagnostics"] if item["category"] == "definite_underflow")
+    assert warning["t0"]["kind"] == "unknown"
+    assert diagnostic["related_events"] == [loop["id"]]
+    html = render_html(ir, default_mode=mode)
+    assert f'data-event-id="{warning["id"]}"' not in html
+    assert "Infinite loop eventually exhausts any finite initial buffer" in html
+
+
+@pytest.mark.parametrize("mode", ["normal", "debug"])
+def test_errors_fill_commands_and_group_hidden_q1_errors(mode: str) -> None:
+    def event(event_id, kind, start, end, lane, meta=None):
+        return {"id": event_id, "kind": kind, "label": kind, "sequencer_id": "seq0", "lane": lane,
+                "t0": _ns(start), "t1": _ns(end), "duration": _ns(end - start), "confidence": "exact",
+                "source": {"file": "seq0.q1asm", "line": 1}, "meta": meta or {}}
+
+    events = [event("q1", "q1_issue", 0, 4, "debug.q1_issue", {"op": "add"}),
+              event("play", "play", 100, 120, "rt.path0", {"rt_packet_id": "p0"}),
+              event("warning", "underflow_warning", 100, 100, "debug.underflow", {"rt_packet_id": "p0"}),
+              event("unknown", "analysis_incomplete", 120, 120, "debug.underflow")]
+    diagnostics = [{"severity": "error", "category": "register_not_ready", "message": "Register is not ready.", "related_events": ["q1"]},
+                   {"severity": "error", "category": "definite_underflow", "message": "RT underflow.", "related_events": ["warning", "q1"]}]
+    before = json.dumps(events)
+    html = render_html({"version": "0.1.0", "events": events, "diagnostics": diagnostics}, default_mode=mode)
+    svg = re.search(r'<svg class="timeline-svg"[\s\S]*?</svg>', html).group()
+    assert 'data-event-id="warning"' not in svg
+    assert 'data-event-id="unknown"' not in svg
+    assert re.search(r'class="[^"]*diagnostic-error[^"]*" data-event-id="play" data-event-ids="warning"', svg)
+    assert re.search(r'class="[^"]*diagnostic-error[^"]*" data-event-id="q1"', svg)
+    assert svg.count('class="event q1-error-marker timeline-error-mark"') == 1
+    assert svg.count('aria-hidden="true">!</text>') == 2
+    assert 'data-diagnostic-placement=' not in svg
+    assert " / debug.underflow" not in svg
+    assert '>Issues<' not in html
+    assert json.dumps(events) == before
 
 
 def test_svg_command_families_cover_all_supported_instructions() -> None:
@@ -137,6 +180,9 @@ def test_svg_families_follow_source_commands_and_preserve_synthetic_overlays() -
 
     for event_id, _kind, _raw, _meta, family in cases:
         match = re.search(rf'class="([^"]+)" data-event-id="{event_id}"', html)
+        if event_id == "incomplete":
+            assert match is None
+            continue
         assert match is not None, event_id
         family_classes = [name for name in match[1].split() if name.startswith("command-family-")]
         assert family_classes == ([f"command-family-{family}"] if family else []), event_id
@@ -162,11 +208,12 @@ def test_svg_command_palette_uses_family_hues_without_kind_fill_overrides() -> N
     for kind in ["play", "wait", "acquire", "upd_param", "feedback_pop", "control_flow_loop"]:
         assert not re.search(rf"\.kind-{kind} rect\s*\{{[^}}]*fill:", html)
     assert not re.search(r"\.branch-path-(?:taken|fallthrough) rect\s*\{[^}]*fill:", html)
-    assert ".kind-underflow_warning rect { fill: #e26d6d; }" in html
-    assert ".event.diagnostic-error rect { stroke: #dc2626;" in html
+    assert ".event text.timeline-error-mark { fill: var(--q1timeline-error-color);" in html
+    assert ".diagnostic-error-message { color: var(--q1timeline-error-color);" in html
+    assert ".event.diagnostic-error { --q1asm-event-fill: #f6d5d4;" in html
 
 
-def test_svg_labels_match_command_accents_without_recoloring_diagnostics() -> None:
+def test_svg_error_fill_keeps_the_command_label_and_selection() -> None:
     rows = [
         ("play", "play", {}),
         ("underflow", "underflow_warning", {"status": "definite_underflow"}),
@@ -188,15 +235,12 @@ def test_svg_labels_match_command_accents_without_recoloring_diagnostics() -> No
     assert play is not None
     assert {"command-family-rt", "is-selected", "has-diagnostic", "diagnostic-error"} <= set(play[1].split())
     assert '<text class="event-label"' in play[2]
-    assert 'class="diagnostic-badge severity-error"' in play[2]
     assert "--q1asm-event-label-color: var(--q1asm-command-color);" in html
     assert re.search(r"\.event text\s*\{[^}]*fill: var\(--q1asm-event-label-color, #0f1720\)", html)
     assert "var(--q1asm-command-color) 15%" in html
-    assert ".event.is-selected.has-diagnostic rect { stroke: #111827;" in html
-    assert re.search(r"\.event \.diagnostic-badge text,[\s\S]*?\{ fill: #ffffff;", html)
-    for event_id in ["underflow", "incomplete"]:
-        overlay = re.search(rf'class="([^"]+)" data-event-id="{event_id}"', html)
-        assert overlay is not None and "command-family-" not in overlay[1]
+    assert ".event.is-selected rect { stroke: #111827;" in html
+    assert re.search(r'class="timeline-error-mark"[^>]*>!</text>', play[2])
+    assert 'data-event-id="incomplete"' not in html
     assert ".status-definite_underflow rect { fill: #c72c2c; }" in html
     assert ".status-analysis_incomplete rect { fill: #8a8f98; stroke-dasharray: 5 3; }" in html
 
@@ -588,7 +632,7 @@ def test_q1_issue_block_labels_use_the_command_after_source_labels() -> None:
         assert not re.search(r'<text class="event-label"[^>]*>entry', event[1])
 
 
-def test_debug_mode_marks_q1_issue_lane_as_disclosure_lane() -> None:
+def test_debug_mode_shows_q1_issue_lane_with_its_source_role() -> None:
     html = render_html(
         {
             "version": "0.1.0",
@@ -614,7 +658,7 @@ def test_debug_mode_marks_q1_issue_lane_as_disclosure_lane() -> None:
 
     assert 'data-lane="sequencer:seq0 / debug.q1_issue"' in html
     assert re.search(
-        r'<g class="[^"]*q1-issue-lane[^"]*"[^>]*data-lane="sequencer:seq0 / debug.q1_issue"[^>]*data-lane-role="q1-issue"[^>]*data-parent-lane="sequencer:seq0"[^>]*hidden[^>]*style="display:none"',
+        r'<g class="[^"]*q1-issue-lane[^"]*"[^>]*data-lane="sequencer:seq0 / debug.q1_issue"[^>]*data-lane-role="q1-issue"[^>]*data-parent-lane="sequencer:seq0">',
         html,
     )
     assert re.search(r'<text class="lane-label"[^>]*>Q1 core</text>', html)
@@ -785,7 +829,7 @@ def test_short_rt_command_labels_fit_in_zoomed_widths() -> None:
     assert re.search(r'id="event-seq0-upd"[\s\S]*?<text class="event-label"[^>]*>upd</text>', html)
 
 
-def test_diagnostic_badges_are_focusable_hover_targets() -> None:
+def test_timing_info_stays_in_diagnostics() -> None:
     html = render_html(
         {
             "version": "0.1.0",
@@ -816,11 +860,8 @@ def test_diagnostic_badges_are_focusable_hover_targets() -> None:
         default_mode="normal",
     )
 
-    assert 'class="diagnostic-badge severity-info"' in html
-    assert 'role="button"' in html
-    assert 'tabindex="0"' in html
-    assert re.search(r"\.diagnostic-badge\s*\{[^}]*pointer-events:\s*all;", html)
-    assert re.search(r"\.diagnostic-badge\s*\{[^}]*cursor:\s*help;", html)
+    assert "Timing depends on trigger arrival." in html
+    assert 'data-diagnostic-categories="runtime_dependent_timing"' not in html
 
 
 def test_auxiliary_panels_collapse_details_while_errors_remain_visible() -> None:
@@ -953,7 +994,7 @@ def test_feedback_balance_item_shows_discarded_payloads() -> None:
     assert "discarded payloads=1" in html
 
 
-def test_loop_truncated_info_badges_are_represented_once_per_diagnostic() -> None:
+def test_loop_truncated_info_stays_in_diagnostics() -> None:
     html = render_html(
         {
             "version": "0.1.0",
@@ -1010,10 +1051,8 @@ def test_loop_truncated_info_badges_are_represented_once_per_diagnostic() -> Non
         default_mode="normal",
     )
 
-    assert html.count('class="diagnostic-badge severity-info"') == 1
-    assert 'id="event-seq0-wait-a"' in html
-    assert re.search(r'id="event-seq0-wait-a"[\s\S]*class="diagnostic-badge severity-info"', html)
-    assert not re.search(r'id="event-seq0-wait-b"[\s\S]*class="diagnostic-badge severity-info"', html)
+    assert "Loop L0 shown as compact block with iteration 0 preview only." in html
+    assert 'data-diagnostic-categories="loop_truncated"' not in html
 
 
 def test_flow_and_branch_labels_use_compact_visible_text_with_full_tooltips() -> None:

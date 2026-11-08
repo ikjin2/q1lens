@@ -181,7 +181,7 @@ describe("Q1 timeline branch comparison lanes", () => {
       const model = buildModel(ir, { layout });
       const cross = model.annotations.find((item: any) => item.id === "shared-to-jump");
       const inline = model.annotations.find((item: any) => item.id === "jump-local");
-      const receiver = model.lanes.find((lane: any) => lane.blocks.some((block: any) => block.eventId === "jump-receive"));
+      const receiver = model.lanes.find((lane: any) => lane.blocks.some((block: any) => block.eventId === "jump-send"));
       assert.equal(cross.type, "feedback-cross");
       assert.equal(cross.fromLaneId, "sequencer:Control");
       assert.equal(cross.toLaneId, receiver.id);

@@ -147,6 +147,19 @@ describe("Q1 timeline RT block values", () => {
     assert.deepEqual(items.get("restored").parameters[0], {name: "frequency", valueDisplay: "200", changed: false});
   });
 
+  it("invalidates a changing-period loop at its proven end before later settings apply", () => {
+    const events = [
+      ...command("first", "play", 0, {}, {}, {applied_state: {frequency: 100}}),
+      event("loop", "loop_block", 0, {count: 3, total_duration: value(24_000),
+        first_iteration_event_ids: ["first", "first-issue"], uncertain_latched_fields: ["frequency"]},
+      {duration: value(12_000), t1: value(12_000)}),
+      ...command("restored", "upd_param", 24_000, {}, {}, {applied_state: {frequency: 200}}),
+      ...command("after", "wait", 40_000, {}, {}),
+    ];
+    assert.deepEqual(details(events).get("after").parameters,
+      [{name: "frequency", valueDisplay: "200", changed: false}]);
+  });
+
   it("does not guess changes across unknown register values or unresolved output execution", () => {
     const events = [
       ...command("before", "play", 0, {}, {R0: unknown}, {applied_state: {frequency: 100}}),
@@ -179,6 +192,43 @@ describe("Q1 timeline RT block values", () => {
     for (const id of ["wait", "retained"]) assert.deepEqual(items.get(id).parameters, [
       {name: "phase", valueDisplay: "100", changed: false}, {name: "frequency", valueDisplay: "100", changed: false},
     ]);
+  });
+
+  it("restores common active settings at a branch join while keeping pending settings unapplied", () => {
+    const events = [
+      ...command("before", "play", 0, {}, {}, {applied_state: {frequency: 100, marker: 1}}),
+      event("branch", "unknown_region", 4, {output_state_unknown: true, branch_timing_known: true,
+        latched_state_at_join: {frequency: 200, marker: 1, awg_gain: [2, 3]}, pending_fields_at_join: ["frequency"]},
+      {t1: value(12)}),
+      ...command("inside", "wait", 8, {}, {}),
+      ...command("after", "wait", 12, {}, {}),
+      ...command("apply", "upd_param", 16, {}, {}, {applied_state: {frequency: 200}}),
+    ];
+    const items = details(events);
+    assert.deepEqual(items.get("inside").parameters, []);
+    assert.deepEqual(items.get("after").parameters, [
+      {name: "marker", valueDisplay: "1", changed: false}, {name: "awg_gain", valueDisplay: "2, 3", changed: false},
+    ]);
+    assert.equal(items.get("apply").parameters.find((item: any) => item.name === "frequency").valueDisplay, "200");
+  });
+
+  it("retains known settings while physical NCO phase is uncertain and restores phase only after reset", () => {
+    const events = [
+      ...command("before", "play", 0, {}, {}, {applied_state: {frequency: 100, phase: 0}}),
+      ...command("uncertain", "play", 4, {}, {}, {nco_phase_uncertain: true, output_state_unknown: true,
+        applied_state: {frequency: 200, phase: 0, marker: 1}}),
+      ...command("set-phase", "play", 8, {}, {}, {nco_phase_uncertain: true, output_state_unknown: true,
+        applied_state: {phase: 50}}),
+      ...command("reset", "play", 12, {}, {}, {phase_reset: true, applied_state: {phase: 0}}),
+    ];
+    const items = details(events);
+    for (const id of ["uncertain", "set-phase"]) {
+      const parameters = items.get(id).parameters;
+      assert.equal(parameters.find((item: any) => item.name === "frequency").valueDisplay, "200");
+      assert.match(parameters.find((item: any) => item.name === "phase").valueDisplay, /\?/);
+      assert.equal(parameters.find((item: any) => item.name === "marker").valueDisplay, "1");
+    }
+    assert.equal(items.get("reset").parameters.find((item: any) => item.name === "phase").valueDisplay, "0");
   });
 
   it("marks unresolved control flow as unknown while preserving held values at a blocked playback boundary", () => {

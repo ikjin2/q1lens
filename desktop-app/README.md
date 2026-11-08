@@ -58,6 +58,14 @@ the previous project and timeline.
 feedback paths. **Debug** expands instruction issue, queue, and slack lanes.
 The timeline can scroll vertically when there are more lanes than fit on screen.
 
+For an integration-window prototype, open
+[`examples/acquisition-window-prototype/q1timeline.yml`](../examples/acquisition-window-prototype/q1timeline.yml).
+Acquiring sequencers have one additional ACQ row showing configured integration
+windows, early termination by the next Acquire, or an unknown-length marker.
+RT instruction waits remain separate. Select a window to inspect its configured
+and effective length. This prototype reads saved hardware parameters from YAML;
+it does not query live QCoDeS instruments.
+
 Playback is a visual inspection aid: at 1×, the displayed full time extent takes
 15 seconds to traverse. Nanosecond labels come from analysis, not wall-clock
 hardware execution. The app does not control hardware.

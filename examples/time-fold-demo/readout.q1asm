@@ -1,0 +1,15 @@
+# Three 1 us integration windows, separated by independently expandable gaps.
+# Open Q1Lens Preview, then click the 8 us and 4 us tabs above the timeline.
+# The tabs exclude the 16 ns of context kept at each end of a quiet interval.
+wait_sync 4
+wait 96
+
+acquire 0,0,4     # Integration: 100-1100 ns.
+wait 9028        # Next acquisition at 9132 ns; the middle 8 us is compressed.
+
+acquire 0,1,4     # Integration: 9132-10132 ns.
+wait 5028        # Next acquisition at 14164 ns; the middle 4 us is compressed.
+
+acquire 0,2,4     # Integration: 14164-15164 ns.
+wait 996
+stop

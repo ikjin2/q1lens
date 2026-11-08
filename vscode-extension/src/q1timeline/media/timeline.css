@@ -1,11 +1,51 @@
 body {
   --q1timeline-feedback-accent: var(--q1asm-feedback-color, #ad316c);
+  --q1timeline-error-color: #b3242f;
+}
+
+body:is(.vscode-dark, .vscode-high-contrast) {
+  --q1timeline-error-color: #ff8187;
 }
 
 body.vscode-dark {
   background: #1e1e1e !important;
   background-color: #1e1e1e !important;
 }
+
+body:not(.instruction-view) #timeline-root,
+body:not(.instruction-view) #timeline-root .shared-timeline-stage { overflow-x: hidden; }
+
+body:not(.instruction-view) #timeline-root .timeline-lanes { min-width: 0; }
+body:not(.instruction-view) #timeline-root .timeline-row { grid-template-columns: 168px minmax(0, var(--timeline-time-width, 1fr)); }
+body:not(.instruction-view) #timeline-root .ruler { width: var(--timeline-time-width, auto); }
+body:not(.instruction-view) #timeline-root .timeline-connector-layer {
+  right: auto;
+  width: var(--timeline-time-width, calc(100% - 168px));
+}
+
+.shared-timeline-stage .tick.is-end span {
+  position: absolute;
+  right: 0;
+  padding-left: 0;
+  padding-right: 5px;
+}
+
+.shared-timeline-stage .timeline-block.q1timeline-command-name {
+  z-index: 4;
+  overflow: visible;
+}
+
+.shared-timeline-stage .timeline-block.q1timeline-command-name .block-label {
+  position: relative;
+  z-index: 4;
+  display: block;
+  flex: 0 0 auto;
+  max-width: calc(100% - 4px);
+  padding-inline: 2px;
+  font-size: 11px;
+}
+
+.shared-timeline-stage .timeline-block.q1timeline-command-point .block-label { max-width: none; }
 
 .shared-timeline-stage .hardware-time-cursor {
   position: absolute;
@@ -17,88 +57,76 @@ body.vscode-dark {
   pointer-events: none;
 }
 
-.shared-timeline-stage .q1timeline-wait-fold {
+.shared-timeline-stage .q1timeline-wait-fold,
+.shared-timeline-stage .q1timeline-playback-fold {
   position: absolute;
   top: 0;
   bottom: 0;
   z-index: 3;
   box-sizing: border-box;
+  border-inline: 1px solid var(--vscode-panel-border);
+  background: color-mix(in srgb, var(--vscode-descriptionForeground) 9%, var(--vscode-editor-background));
   pointer-events: none;
 }
 
 .shared-timeline-stage .q1timeline-playback-fold {
-  position: absolute;
-  box-sizing: border-box;
-  top: 0;
-  bottom: 0;
-  z-index: 3;
-  border-inline: 1px dashed var(--vscode-charts-green, #78a65a);
-  pointer-events: none;
+  border-inline-style: dashed;
 }
 
-.q1timeline-playback-fold button {
-  position: absolute;
-  top: 7px;
-  left: 50%;
-  transform: translateX(-50%);
-  padding: 0 2px;
-  height: 22px;
-  max-width: 100%;
-  box-sizing: border-box;
-  white-space: nowrap;
-  overflow: hidden;
-  border: 0;
-  border-radius: 2px;
-  background: transparent;
-  color: var(--vscode-foreground);
-  font-size: 13px;
-  font-weight: 800;
-  letter-spacing: 2px;
-  cursor: pointer;
-  pointer-events: auto;
+.shared-timeline-stage .timeline-lanes {
+  isolation: isolate;
 }
 
-.ruler .q1timeline-playback-fold button {
-  top: 21px;
-  height: 18px;
+.shared-timeline-stage .timeline-lanes .q1timeline-wait-fold,
+.shared-timeline-stage .timeline-lanes .q1timeline-playback-fold {
+  z-index: -1;
+}
+
+.shared-timeline-stage .ruler.has-time-folds {
+  height: 48px;
 }
 
 .shared-timeline-stage .q1timeline-fold-toggle {
   position: absolute;
-  top: 7px;
+  top: 22px;
   left: 50%;
   transform: translateX(-50%);
   width: max-content;
-  max-width: 100%;
-  height: 22px;
+  height: 21px;
   box-sizing: border-box;
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   align-items: center;
   justify-content: center;
-  gap: 0;
-  padding: 0 2px;
-  border: 0;
-  border-radius: 2px;
-  background: transparent;
-  color: var(--vscode-editor-foreground, #3c2859);
-  font-size: 10px;
-  line-height: 10px;
+  gap: 4px;
+  padding: 0 6px;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 4px;
+  background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+  color: var(--vscode-editor-foreground);
+  font: inherit;
+  font-size: 11px;
+  line-height: 18px;
   white-space: nowrap;
   pointer-events: auto;
   cursor: pointer;
 }
 
-.shared-timeline-stage .q1timeline-fold-slashes {
-  font-weight: 800;
-  font-size: 13px;
-  letter-spacing: 2px;
-  color: inherit;
+.shared-timeline-stage .q1timeline-fold-icon,
+.shared-timeline-stage .q1timeline-fold-icon svg {
+  display: block;
+  width: 14px;
+  height: 14px;
+  flex: 0 0 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
-.shared-timeline-stage .is-expanded .q1timeline-fold-toggle:hover {
-  border-color: var(--vscode-focusBorder, #007acc);
-  background: var(--vscode-editorHoverWidget-background, #f0ebf7);
+.shared-timeline-stage .q1timeline-fold-toggle:hover {
+  border-color: var(--vscode-descriptionForeground);
 }
 
 .shared-timeline-stage .q1timeline-fold-toggle:focus-visible {
@@ -106,48 +134,27 @@ body.vscode-dark {
   outline-offset: 2px;
 }
 
-.shared-timeline-stage .ruler .q1timeline-fold-toggle {
-  top: 21px;
-  width: max-content;
-  height: 18px;
-  flex-direction: row;
-  gap: 5px;
-  padding: 0 5px;
-}
-
-.shared-timeline-stage .ruler .q1timeline-wait-fold .q1timeline-fold-toggle {
-  max-width: 100%;
-  overflow: hidden;
-}
-
-.shared-timeline-stage .ruler .q1timeline-wait-fold:not(.is-expanded) .q1timeline-fold-toggle {
-  width: max-content;
-  padding: 0 2px;
-}
-
-.shared-timeline-stage .q1timeline-wait-fold:not(.is-expanded) .q1timeline-fold-duration {
-  display: none;
-}
-
 .shared-timeline-stage .q1timeline-wait-fold.is-expanded {
-  border-inline: 1px solid var(--vscode-charts-purple, #7955ad);
-  background: color-mix(in srgb, var(--vscode-charts-purple, #7955ad) 5%, transparent);
+  border-inline-style: dashed;
+  background: color-mix(in srgb, var(--vscode-descriptionForeground) 4%, transparent);
 }
 
 .shared-timeline-stage .is-expanded .q1timeline-fold-toggle {
-  left: 50%;
-  transform: translateX(-50%);
-  width: max-content;
-  max-width: 100%;
-  flex-direction: row;
-  padding: 0 6px;
-  border: 1px solid var(--vscode-charts-purple, #7955ad);
-  background: var(--vscode-editor-background, #fff);
+  background: var(--vscode-editor-background);
 }
 
-.shared-timeline-stage .is-expanded .q1timeline-fold-duration {
-  overflow: hidden;
-  text-overflow: ellipsis;
+.shared-timeline-stage .ruler .q1timeline-wait-fold,
+.shared-timeline-stage .ruler .q1timeline-playback-fold {
+  border: 0;
+  background: transparent;
+}
+
+.shared-timeline-stage .q1timeline-fold-toggle.is-crowded {
+  padding-inline: 3px;
+}
+
+.shared-timeline-stage .q1timeline-fold-toggle.is-crowded .q1timeline-fold-duration {
+  display: none;
 }
 
 #q1timeline-wait-fold-button[aria-pressed="true"] {
@@ -563,15 +570,6 @@ body.mode-normal .shared-q1-issue-toggle {
   border-left: 2px solid currentColor;
 }
 
-.q1timeline-rt-disclosure {
-  flex: 0 0 auto;
-  margin-right: 3px;
-}
-
-.timeline-block[aria-expanded="true"] .q1timeline-rt-disclosure {
-  transform: rotate(90deg);
-}
-
 .q1timeline-assumptions-toggle {
   flex: 0 0 auto;
   margin-left: auto;
@@ -596,27 +594,6 @@ body.mode-normal .shared-q1-issue-toggle {
   padding: 7px;
   text-align: left;
   justify-items: start;
-}
-
-.shared-timeline-stage .timeline-block.q1timeline-timing-warning {
-  top: 0;
-  z-index: 9;
-  display: grid;
-  place-items: center;
-  width: 16px;
-  height: 16px;
-  min-width: 16px;
-  padding: 0;
-  border: 1px solid var(--vscode-errorForeground, #f48771);
-  border-radius: 3px;
-  background: var(--vscode-editor-background);
-  color: var(--vscode-errorForeground, #f48771);
-  font-weight: bold;
-}
-
-.shared-timeline-stage .q1timeline-timing-warning.is-incomplete {
-  border-color: var(--vscode-charts-yellow, #cca700);
-  color: var(--vscode-charts-yellow, #cca700);
 }
 
 .shared-timeline-stage .lane-track {
@@ -679,9 +656,10 @@ body.mode-normal .shared-q1-issue-toggle {
   pointer-events: auto;
 }
 
-.shared-timeline-stage .timeline-loop-range.is-playback-loop {
+.shared-timeline-stage .timeline-loop-range.is-playback-loop,
+.shared-timeline-stage .timeline-loop-range.q1timeline-control-loop-lane {
   pointer-events: auto;
-  z-index: 4;
+  z-index: 5;
 }
 
 .shared-timeline-stage .timeline-loop-range.is-playback-loop .loop-range-label,
@@ -881,6 +859,16 @@ body.vscode-dark .event.kind-unknown_region > rect {
   opacity: 0.72;
 }
 
+body:not(.vscode-high-contrast, .vscode-high-contrast-light)
+  .shared-timeline-stage .timeline-block:not(.timeline-block-branch_effect) {
+  border-color: transparent;
+}
+
+body:not(.vscode-high-contrast, .vscode-high-contrast-light)
+  .shared-timeline-stage .timeline-block.timeline-issue-marker:not(.is-parameter-apply) {
+  box-shadow: none;
+}
+
 .shared-timeline-stage .timeline-block.is-instruction-related {
   outline: 1px solid var(--vscode-focusBorder);
   outline-offset: 1px;
@@ -896,6 +884,13 @@ body.vscode-dark .event.kind-unknown_region > rect {
 }
 
 .shared-timeline-stage .feedback-inline-capsule {
+  color: var(--q1timeline-feedback-accent, var(--vscode-descriptionForeground));
+  background: transparent;
+  border-color: transparent;
+}
+
+.shared-timeline-stage .feedback-inline-capsule.is-active,
+.shared-timeline-stage .feedback-inline-capsule.is-selected {
   color: var(--q1timeline-feedback-accent, var(--vscode-descriptionForeground));
   background: transparent;
   border-color: transparent;
@@ -934,13 +929,13 @@ body.vscode-dark .shared-timeline-stage .feedback-endpoint.is-selected {
   color: color-mix(in srgb, var(--q1timeline-feedback-accent) 82%, var(--vscode-focusBorder));
 }
 
-body.vscode-dark .shared-timeline-stage .feedback-inline-capsule .feedback-mini-track {
-  height: 2px;
+body.vscode-dark .shared-timeline-stage .feedback-inline-route {
+  --feedback-line-width: 1.5px;
   opacity: 1;
 }
 
 body.vscode-dark .shared-timeline-stage .feedback-inline-capsule .feedback-mini-arrow {
-  border-left-color: var(--q1timeline-feedback-accent);
+  fill: var(--q1timeline-feedback-accent);
 }
 
 body.vscode-dark .shared-timeline-stage .feedback-connector {
@@ -995,4 +990,200 @@ body.vscode-dark .shared-timeline-stage .feedback-bridge-arrowhead {
   flex-basis: 100%;
   font-size: 11px;
   color: var(--vscode-descriptionForeground);
+}
+
+.shared-timeline-stage .q1timeline-rt-prep {
+  margin-left: 4px;
+  padding: 0 3px;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--vscode-descriptionForeground, #777);
+  font: inherit;
+  font-size: 9px;
+  cursor: pointer;
+}
+
+.shared-timeline-stage .q1timeline-rt-prep:hover,
+.shared-timeline-stage .q1timeline-rt-prep.is-selected {
+  border-color: var(--vscode-focusBorder, #007fd4);
+  color: var(--vscode-foreground, #333);
+}
+
+.shared-timeline-stage {
+  --q1timeline-acquisition-accent: #087f91;
+}
+
+body.vscode-dark .shared-timeline-stage,
+body.vscode-high-contrast .shared-timeline-stage {
+  --q1timeline-acquisition-accent: #56c9dc;
+}
+
+.shared-timeline-stage .timeline-row-runtime,
+.shared-timeline-stage .lane-track-runtime,
+.shared-timeline-stage .timeline-row-branch-runtime,
+.shared-timeline-stage .lane-track-branch-runtime {
+  min-height: calc(30px + var(--timeline-feedback-offset, 0px));
+}
+
+.shared-timeline-stage .lane-track-runtime > .timeline-block:not(.timeline-diagnostic),
+.shared-timeline-stage .lane-track-branch-runtime > .timeline-block:not(.timeline-diagnostic) {
+  top: calc(4px + var(--timeline-loop-offset, 0px));
+}
+
+.shared-timeline-stage .lane-track .timeline-block.has-error:not(.diagnostic-point) {
+  min-width: 8px;
+  gap: 3px;
+  background: #f6d5d4;
+  color: #662126;
+}
+
+.shared-timeline-stage .lane-track .timeline-block.has-error:is(.is-tiny, .is-compact) {
+  padding-inline: 1px;
+}
+
+body:is(.vscode-dark, .vscode-high-contrast) .shared-timeline-stage .lane-track .timeline-block.has-error:not(.diagnostic-point) {
+  background: #572b32;
+  color: #ffe8e7;
+}
+
+.shared-timeline-stage .timeline-block.has-error .block-label,
+.shared-timeline-stage .timeline-block.has-error .block-detail {
+  color: inherit;
+}
+
+.shared-timeline-stage .timeline-block.has-error .block-label {
+  flex-shrink: 1;
+}
+
+.diagnostic.severity-error :is(strong, .diagnostic-message),
+.diagnostic-error-message {
+  color: var(--q1timeline-error-color);
+}
+
+.shared-timeline-stage .timeline-row-acquisition,
+.shared-timeline-stage .lane-track-acquisition {
+  min-height: 22px;
+}
+
+.shared-timeline-stage .timeline-row-acquisition.has-scope,
+.shared-timeline-stage .lane-track-acquisition.has-scope {
+  min-height: 42px;
+}
+
+.shared-timeline-stage .timeline-row-acquisition .lane-label {
+  color: var(--vscode-descriptionForeground);
+}
+
+.shared-timeline-stage .timeline-block.acquisition-window {
+  container-type: inline-size;
+  top: calc(1px + var(--timeline-acquisition-offset, 0px) + var(--timeline-loop-offset, 0px));
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  outline: none;
+  background: transparent;
+  color: var(--vscode-editor-foreground);
+}
+
+.shared-timeline-stage .acquisition-bracket {
+  position: absolute;
+  top: 11px;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: var(--q1timeline-acquisition-accent);
+  opacity: 0.75;
+  pointer-events: none;
+}
+
+.shared-timeline-stage .acquisition-bracket::before,
+.shared-timeline-stage .acquisition-bracket::after {
+  content: "";
+  position: absolute;
+  bottom: 0;
+  width: 1px;
+  height: 8px;
+  background: var(--q1timeline-acquisition-accent);
+}
+
+.shared-timeline-stage .acquisition-bracket::before { left: 0; }
+.shared-timeline-stage .acquisition-bracket::after { right: 0; }
+.shared-timeline-stage .acquisition-window[data-start-clipped="true"] .acquisition-bracket::before,
+.shared-timeline-stage .acquisition-window[data-end-clipped="true"] .acquisition-bracket::after { display: none; }
+
+.shared-timeline-stage .acquisition-interrupted .acquisition-bracket::after,
+.shared-timeline-stage .acquisition-retriggered .acquisition-bracket::after {
+  width: 2px;
+  background: var(--vscode-editorWarning-foreground, #b57800);
+}
+
+.shared-timeline-stage .timeline-block.acquisition-window .block-label {
+  position: absolute;
+  left: 50%;
+  top: 11px;
+  transform: translate(-50%, -50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  box-sizing: border-box;
+  padding: 0 4px;
+  overflow: hidden;
+  background: var(--vscode-editor-background);
+  color: var(--vscode-editor-foreground);
+  font-size: 11px;
+  line-height: 16px;
+  pointer-events: none;
+}
+
+.shared-timeline-stage .acquisition-mode-icon,
+.shared-timeline-stage .acquisition-mode-icon svg {
+  display: block;
+  flex: 0 0 12px;
+  width: 12px;
+  height: 12px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  color: inherit;
+}
+
+.shared-timeline-stage .acquisition-window:is(:hover, .is-selected, [aria-selected="true"]) .acquisition-bracket {
+  height: 2px;
+  opacity: 1;
+}
+
+.shared-timeline-stage .acquisition-window:is(:hover, .is-selected, [aria-selected="true"]) .acquisition-mode-icon {
+  color: var(--q1timeline-acquisition-accent);
+}
+
+.shared-timeline-stage .timeline-block.acquisition-window:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
+}
+
+.shared-timeline-stage .acquisition-time-folded {
+  z-index: 4;
+  overflow: visible;
+}
+
+.shared-timeline-stage .acquisition-time-folded .acquisition-duration { display: none; }
+.shared-timeline-stage .acquisition-time-folded .block-label { max-width: none; }
+
+.shared-timeline-stage .timeline-block.acquisition-unknown { min-width: 26px; }
+.shared-timeline-stage .acquisition-unknown .block-label { gap: 2px; padding: 0 2px; }
+.shared-timeline-stage .acquisition-unknown .acquisition-bracket { width: 1px; height: 8px; top: 4px; }
+.shared-timeline-stage .acquisition-unknown .acquisition-bracket::before,
+.shared-timeline-stage .acquisition-unknown .acquisition-bracket::after { display: none; }
+
+@container (max-width: 72px) {
+  .acquisition-window:not(.acquisition-unknown) .acquisition-duration { display: none; }
+}
+
+@container (max-width: 18px) {
+  .acquisition-window:not(.acquisition-unknown, .acquisition-time-folded) .block-label { display: none !important; }
 }

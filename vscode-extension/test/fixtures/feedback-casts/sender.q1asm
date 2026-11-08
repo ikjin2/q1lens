@@ -1,0 +1,8 @@
+# Explicit simulated route delays; these are not hardware latency measurements.
+wait_sync 4
+fb_com_data 16,7,4
+fb_com_data 32,9,4
+fb_com_data 4,11,4
+wait 2000
+fb_pop_data 4,R0
+stop

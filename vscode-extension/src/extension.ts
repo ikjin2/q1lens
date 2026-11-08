@@ -9,7 +9,7 @@ import { registerPythonEnvironmentStatus } from "./pythonEnvironmentStatus";
 
 export function activate(context: vscode.ExtensionContext): void {
   registerPythonEnvironmentStatus(context);
-  registerEnvironmentCommands(context);
+  const environment = registerEnvironmentCommands(context);
   const q1timeline = registerQ1Timeline(context);
   registerCommands(context, { openQ1TimelineTarget: q1timeline.openTarget });
   registerSidebar(context);
@@ -32,6 +32,7 @@ export function activate(context: vscode.ExtensionContext): void {
       }),
     ),
   );
+  void environment.checkStartupEnvironment();
 }
 
 export function deactivate(): void {

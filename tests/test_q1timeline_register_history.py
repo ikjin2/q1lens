@@ -69,7 +69,7 @@ def test_runtime_and_unmodeled_register_results_remain_nonconcrete() -> None:
     assert _writes(ir, "R1")[0]["value"]["kind"] == "unknown"
 
 
-def test_compact_loop_invalidates_skipped_arithmetic_and_restores_counter_at_completion() -> None:
+def test_compact_loop_keeps_an_unknown_history_gap_then_restores_proven_affine_values() -> None:
     ir = analyze_text(
         "move 3,R0\nmove 0,R1\nnop\nbody: add R1,1,R1\nnop\n"
         "loop R0,@body\nmove R1,R2\nnop\nstop"
@@ -80,9 +80,13 @@ def test_compact_loop_invalidates_skipped_arithmetic_and_restores_counter_at_com
     assert counter[-1]["time"]["value"] == 112
     arithmetic = _writes(ir, "R1")
     assert arithmetic[1]["value"]["value"] == 1
-    assert arithmetic[-1]["meta"]["invalidated"] is True
-    assert arithmetic[-1]["time"]["value"] == 52
-    assert _writes(ir, "R2")[0]["value"]["kind"] == "unknown"
+    invalidated = next(write for write in arithmetic if write["meta"].get("invalidated"))
+    assert invalidated["value"]["kind"] == "unknown"
+    assert invalidated["time"]["value"] == 52
+    assert arithmetic[-1]["meta"]["affine"] is True
+    assert arithmetic[-1]["value"]["value"] == 3
+    assert arithmetic[-1]["time"]["value"] == 112
+    assert _writes(ir, "R2")[0]["value"]["value"] == 3
 
 
 def test_one_iteration_loop_keeps_body_value_and_records_zero_counter() -> None:

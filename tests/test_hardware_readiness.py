@@ -192,6 +192,14 @@ def test_symbolic_later_acquisition_suppresses_scope_absence_hint() -> None:
     )
 
 
+@pytest.mark.parametrize("operator, expected_hint", [(0, True), (1, False)])
+def test_known_skipped_acquisition_does_not_count_as_scope_activity(operator: int, expected_hint: bool) -> None:
+    ir = analyze_text(f"set_scope_en 1\nupd_param 4\nset_cond 1,0,{operator},20\nacquire 0,0,40\nstop\n",
+                      file="scope.q1asm", hardware_readiness=True)
+
+    assert any(item["category"] == "scope_without_acquisition" for item in ir["diagnostics"]) is expected_hint
+
+
 @pytest.mark.parametrize("final_scope, expected_hint", [("1", True), ("0", False), ("R1", False)])
 def test_scope_hint_uses_latest_applied_value_after_symbolic_setting(
     final_scope: str, expected_hint: bool,

@@ -41,7 +41,9 @@ def test_default_analysis_retains_compact_loop_behavior() -> None:
     assert "execution" not in ir
     assert any(event["kind"] == "loop_block" for event in ir["events"])
     result = [write for write in ir["register_history"] if write["register"] == "R2"][-1]
-    assert result["value"]["kind"] == "unknown"
+    assert result["value"]["kind"] == "concrete" and result["value"]["value"] == 3
+    assert any(write["meta"].get("invalidated") for write in ir["register_history"])
+    assert any(write["register"] == "R1" and write["meta"].get("affine") for write in ir["register_history"])
 
 
 def test_document_execution_reports_independent_partial_results() -> None:

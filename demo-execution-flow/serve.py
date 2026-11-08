@@ -52,7 +52,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(403, {"error": "Use the local demo address."})
             return
         name = urlsplit(self.path).path.lstrip("/") or "index.html"
-        types = {"index.html": "text/html", "style.css": "text/css", "app.js": "text/javascript", "history.js": "text/javascript", "data.js": "text/javascript"}
+        types = {"index.html": "text/html", "style.css": "text/css", "timeline.css": "text/css", "instructionColors.js": "text/javascript", "app.js": "text/javascript", "history.js": "text/javascript", "views.js": "text/javascript", "data.js": "text/javascript"}
         if name not in types:
             self.send_json(404, {"error": "Not found."})
             return
@@ -89,8 +89,10 @@ def main():
     build.OUTPUT.mkdir(parents=True, exist_ok=True)
     data = build.build_data()
     (build.OUTPUT / "data.js").write_text("window.EXECUTION_FLOW_DATA = " + json.dumps(data, ensure_ascii=False) + ";\n", encoding="utf-8")
-    for name in ("index.html", "style.css", "history.js", "app.js"):
+    for name in ("index.html", "style.css", "history.js", "views.js", "app.js"):
         shutil.copyfile(build.DEMO / name, build.OUTPUT / name)
+    for source, name in [("renderer.css", "timeline.css"), ("instructionColors.js", "instructionColors.js")]:
+        shutil.copyfile(build.ROOT / "vscode-extension/src/shared/timeline" / source, build.OUTPUT / name)
     with HTTPServer(("127.0.0.1", args.port), Handler) as server:
         print(f"Execution Flow: http://127.0.0.1:{server.server_port}", flush=True)
         server.serve_forever()

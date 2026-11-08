@@ -32,12 +32,3 @@ print(sys.executable)
 In the Command Palette, run **Q1Lens: Select Python Environment** → **Enter Python path…** and paste that path.
 
 Run **Q1Lens: Show Python Environment** to confirm the selection.
-
-## Timeline recovery
-
-Invalid Q1ASM lines are excluded from the timeline, and the remaining instructions
-retain their normal stop, branch, and loop behavior. Errors keep their original
-source locations. A notice explains that timing and hardware state reflect the
-remaining lines. This also applies to playback and simulation; runtime limits and
-unavailable inputs can still stop execution. CLI analysis still returns a nonzero
-status for source errors, and `--q1asm-strict` retains strict validation.

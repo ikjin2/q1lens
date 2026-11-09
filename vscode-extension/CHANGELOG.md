@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.9
+
+- Run Q1ASM with draft DEF values, sweep one or two inputs, and inspect register results, Q1 time, and replayable cases. Add statistics-only sweeps and formulas over saved cases.
+- Start simulation after RT queue prefill by default, preserve explicit fixed-start scenarios, and support triggers timed relative to the receiver's RT start.
+- Compare execution and skip outcomes for active `set_cond` conditions, including recalculated RT timing.
+- Keep executed loops folded while stepping through register changes, with separate controls for expanding repeated commands.
+- Show an explicitly marked acquisition-duration estimate from `acquire` when saved integration settings are unavailable.
+- Pair with Python package 0.2.9.
+
 ## 0.2.8
 
 - Use one LINQ arrival estimate for feedback markers and early pop/pull warnings, with data-type and route-specific base delays and a configurable 200 ns non-self transport allowance.

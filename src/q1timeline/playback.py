@@ -16,7 +16,7 @@ from typing import Any
 
 from q1timeline.analysis import interpreter as core
 from q1timeline.analysis.alignment import align_timelines
-from q1timeline.analysis.playback_loops import ExecutedStep, observed_loops
+from q1timeline.analysis.playback_loops import ExecutedStep
 from q1timeline.analysis.playback_timing import annotate_playback_queue_timing
 from q1timeline.analysis.values import Concrete, Unknown, add_values, resolve_arg_value, value_to_json
 from q1timeline.ir.serialize import timeline_ir_from_states
@@ -271,10 +271,7 @@ class PlaybackSession:
                 return self._block(runner, instruction, "Compiled instruction addresses are unknown for this expanded program.")
         event_start = len(state.events)
         rt_start = state.rt_time_ns
-        continuation = instruction.op == "jmp" and any(
-            isinstance(value, Concrete) and value.value == instruction.pc + 1
-            for value in [*state.registers.values(), *(write.value for write in state.pending_register_writes)]
-        )
+        continuation = core._has_jump_continuation(state, instruction)
         state.next_pc = instruction.pc + 1
         state.current_resolved_args = core._resolved_args_for_instruction(instruction, scope, state)
         diagnostic_start = len(state.diagnostics)
@@ -318,14 +315,8 @@ class PlaybackSession:
         # Unknown values may propagate; invalid instructions never become executed steps.
         if any(item.severity == "error" for item in state.diagnostics[diagnostic_start:]):
             return self._block(runner, instruction, "Instruction validation failed.", error=True)
-        runner.trace.append(ExecutedStep(
-            instruction.pc, None if state.stopped else state.next_pc,
-            event_start, len(state.events), state.q1_issue_index, rt_start, state.rt_time_ns,
-            branch_taken, branch_target, instruction.op == "jmp",
-            instruction.op == "jmp" and core._register_name(instruction.args[0], state) is not None,
-            continuation,
-            instruction.op in {"cmp", "test", "nop"} or (spec.category == "branch" and instruction.op != "loop"),
-        ))
+        runner.trace.append(core._executed_step(state, instruction, event_start, rt_start,
+                                                branch_taken, branch_target, continuation))
         state.executed_pcs.add(instruction.pc)
         state.q1_issue_index += 1
         state.metadata["execution"]["steps"] = state.q1_issue_index
@@ -545,44 +536,9 @@ class PlaybackSession:
         loops = []
         for runner in self.runners:
             state = runner.state
-            observed = observed_loops(state.sequencer_id, runner.trace, stopped=state.stopped)
-            events = list(state.events)
-            loop_summaries = {}
-            for loop in observed:
-                first, last = loop["ranges"][0], loop["ranges"][-1]
-                members = [event.id for event in state.events[first[0]:last[1]]]
-                first_ids = [event.id for event in state.events[first[0]:first[1]]]
-                durations = [core.subtract_values(end, start) for _, _, start, end in loop["ranges"]]
-                period = durations[0] if all(item == durations[0] for item in durations) else Unknown("Observed iteration durations differ")
-                count = len(loop["ranges"])
-                start_source = state.instructions_by_pc[loop["start_pc"]].source
-                end_source = state.instructions_by_pc[loop["end_pc"]].source
-                meta = {
-                    "loop_id": loop["loop_id"], "playback": True,
-                    "count": count if loop["complete"] else f">={count}", "completed_iterations": count,
-                    "complete": loop["complete"], "period": value_to_json(period),
-                    "first_iteration_end": value_to_json(first[3]),
-                    "first_iteration_event_ids": first_ids, "playback_event_ids": members,
-                    "hidden_event_ids": members[len(first_ids):], "loop_preview_key": loop["loop_id"],
-                    "shown_iterations": [0], "visible_iteration_count": 1,
-                    "source_start": core._source_to_json(start_source), "source_end": core._source_to_json(end_source),
-                }
-                loop_summaries[loop["loop_id"]] = meta
-                events.append(core.TimelineEvent(
-                    loop["loop_id"], state.sequencer_id, "rt.loop", "loop_block", first[2], last[3],
-                    core.subtract_values(last[3], first[2]), f"loop x{meta['count']}",
-                    "assumed" if any(event.confidence == "assumed" for event in state.events[first[0]:last[1]]) else "exact", start_source, meta,
-                ))
-                loops.append({"sequencer_id": state.sequencer_id, **meta})
-            parents: list[dict] = []
-            for loop in observed:
-                start, end = loop["ranges"][0][0], loop["ranges"][-1][1]
-                while parents and end > parents[-1]["ranges"][-1][1]:
-                    parents.pop()
-                for parent in parents:
-                    if start >= parent["ranges"][0][1]:
-                        loop_summaries[parent["loop_id"]]["hidden_event_ids"].append(loop["loop_id"])
-                parents.append(loop)
+            summaries = core._observed_loop_events(state, runner.trace, mode="playback")
+            events = [*state.events, *summaries]
+            loops.extend({"sequencer_id": state.sequencer_id, **event.meta} for event in summaries)
             metadata = dict(state.metadata)
             metadata.update(self.sequencer_metadata.get(state.sequencer_id, {}))
             metadata["hardware_parameters"] = dict(self.hardware_parameters.get(state.sequencer_id, {}))

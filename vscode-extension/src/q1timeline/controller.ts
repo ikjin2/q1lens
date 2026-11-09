@@ -35,6 +35,7 @@ const {
 const updatePolicy = require("./updatePolicy");
 const { parseWebviewMessage } = require("./webviewMessageValidation");
 const { PlaybackClient } = require("./playbackClient");
+const { DefRuns } = require("./defRuns");
 const { rawExternalInputs, readProjectExternalInputs, writeProjectExternalInputs } = require("./externalInputs");
 const { q1timelineProjectOutputDir } = require("./register");
 
@@ -161,6 +162,7 @@ export function injectWebviewAssetTags(html, webview, context, nonce) {
   const hardwareCssUri = versionedWebviewAssetUri(webviewAssetUri(webview, context, "src", "q1timeline", "media", "hardwareView.css"), nonce);
   const hardwareStateUri = versionedWebviewAssetUri(webviewAssetUri(webview, context, "src", "q1timeline", "media", "hardwareState.js"), nonce);
   const hardwareViewUri = versionedWebviewAssetUri(webviewAssetUri(webview, context, "src", "q1timeline", "media", "hardwareView.js"), nonce);
+  const defRunsUri = versionedWebviewAssetUri(webviewAssetUri(webview, context, "src", "q1timeline", "media", "defRuns.js"), nonce);
   const jsUri = versionedWebviewAssetUri(webviewAssetUri(webview, context, "src", "q1timeline", "media", "timeline.js"), nonce);
   const linkTag = `<link rel="stylesheet" href="${sharedCssUri}">\n<link rel="stylesheet" href="${cssUri}">\n<link rel="stylesheet" href="${hardwareCssUri}">`;
   const nonceAttribute = nonce ? ` nonce="${nonce}"` : "";
@@ -170,6 +172,7 @@ export function injectWebviewAssetTags(html, webview, context, nonce) {
     `<script${nonceAttribute} src="${adapterJsUri}"></script>`,
     `<script${nonceAttribute} src="${hardwareStateUri}"></script>`,
     `<script${nonceAttribute} src="${hardwareViewUri}"></script>`,
+    `<script${nonceAttribute} src="${defRunsUri}"></script>`,
     `<script${nonceAttribute} src="${jsUri}"></script>`,
   ].join("\n");
   html = clearSharedTimelineRoot(html);
@@ -770,6 +773,7 @@ export class TimelineController {
     this.externalInputsSaving = false;
     this.executionState = { status: "idle", can_resume: true, steps: 0 };
     this.parameterOverrides = new Map();
+    this.defRuns = new DefRuns(this);
     this.pendingTarget = undefined;
     this.pendingBranchSelection = undefined;
     this.projectRelatedPaths = new Set();
@@ -849,6 +853,16 @@ export class TimelineController {
       );
     }
     this.rememberSourceViewColumn(vscode.window.activeTextEditor);
+    if (typeof vscode.workspace.onDidChangeConfiguration === "function") {
+      context.subscriptions.push(vscode.workspace.onDidChangeConfiguration((event) => {
+        if (["q1lens.q1timeline.executionMode", "q1lens.q1timeline.maxSteps", "q1lens.q1timeline.analyzer",
+          "q1lens.q1timeline.hardwareReadiness", "q1lens.q1timeline.pythonPath", "q1lens.q1timeline.pythonArgs",
+          "q1lens.pythonPath", "q1lens.pythonArgs", "q1lens.pythonEnvironment"].some((key) => event.affectsConfiguration(key))) {
+          this.pythonEnvironment = undefined;
+          this.defRuns.invalidate();
+        }
+      }));
+    }
   }
 
   setProjectUri(uri) {
@@ -865,6 +879,7 @@ export class TimelineController {
       this.analysisQueuedRefreshPolicy = undefined;
       this.analysisRequestId += 1;
       this.invalidateSourceAnalysis();
+      this.defRuns.invalidate(true);
       this.webviewReady = false;
       this.lastAnalyzerTimelineIr = undefined;
       this.comparisonBaselineWarningPath = undefined;
@@ -1175,6 +1190,7 @@ export class TimelineController {
           this.changeTimer = undefined;
         }
         this.resetPlayback();
+        this.defRuns.invalidate(true);
         this.cancelSourceRangeZoom();
         this.pendingBranchSelection = undefined;
         this.webviewReady = false;
@@ -1515,6 +1531,11 @@ export class TimelineController {
       });
   }
 
+  defRunPython(options, signal) {
+    return this.pythonEnvironment || ensureFilePythonEnvironment(vscode, this.singleFileUri || this.projectUri,
+      "q1asm", this.output, { cwd: options.cwd, env: options.env, signal });
+  }
+
   pauseExecution() {
     this.playbackRunning = false;
   }
@@ -1837,6 +1858,7 @@ export class TimelineController {
       return;
     }
     this.parameterOverrides.set(name, value);
+    this.defRuns.invalidate();
     this.lastAnalyzerTimelineIr = undefined;
     const summary = this.parameterOverrideSummary();
     this.output.appendLine(`q1timeline analysis parameter overrides: ${summary}`);
@@ -1850,6 +1872,7 @@ export class TimelineController {
       return;
     }
     this.parameterOverrides.clear();
+    this.defRuns.invalidate();
     this.lastAnalyzerTimelineIr = undefined;
     this.output.appendLine("q1timeline analysis parameter overrides cleared.");
     vscode.window.showInformationMessage("Q1Lens analysis parameter overrides cleared.");
@@ -1894,6 +1917,7 @@ export class TimelineController {
       this.parameterOverrides.set(message.name, value);
       this.output.appendLine(`q1timeline analysis parameter override: ${message.name}=${value}`);
     }
+    this.defRuns.invalidate();
     this.lastAnalyzerTimelineIr = undefined;
     const attemptedValue = this.parameterOverrides.get(message.name);
     await this.runAnalysis({
@@ -3167,6 +3191,10 @@ export class TimelineController {
       this.refreshPreview();
       return;
     }
+    if (parsedMessage.type === "defRun") {
+      await this.defRuns.handle(parsedMessage);
+      return;
+    }
     if (parsedMessage.type === "executionControl") {
       if (parsedMessage.action === "pause") this.pauseExecution();
       else await this.runPlayback();
@@ -3194,6 +3222,7 @@ export class TimelineController {
     }
     if (parsedMessage.type === "webviewReady") {
       this.webviewReady = true;
+      this.defRuns.publish();
       this.output.appendLine("q1timeline webview script ready.");
       if (this.pendingTarget?.zoomToRange && this.pendingTarget.awaitingWebviewReady) {
         await this.revealPendingTarget();
@@ -3267,7 +3296,7 @@ export class TimelineController {
 
   async openSourceForEvent(eventId, options = {}) {
     let source = lookupSourceForEvent(this.timelineIr, eventId);
-    if (!source) {
+    if (!source || source.file === "<simulation>") {
       this.output.appendLine(`q1timeline eventClick source not found: ${eventId}`);
       return;
     }
@@ -3281,9 +3310,10 @@ export class TimelineController {
           normalizedFsPath(this.resolveSourcePath(start.file)) === normalizedFsPath(this.resolveSourcePath(end.file))) {
         source = start;
         sourceRange = { startLine: Math.min(start.line, end.line), endLine: Math.max(start.line, end.line) };
+        const repeatedMembers = event.meta.playback_event_ids || event.meta.hidden_event_ids;
         const members = new Set([
           ...(Array.isArray(event.meta.first_iteration_event_ids) ? event.meta.first_iteration_event_ids : []),
-          ...(Array.isArray(event.meta.playback_event_ids) ? event.meta.playback_event_ids : []),
+          ...(Array.isArray(repeatedMembers) ? repeatedMembers : []),
         ]);
         const eventsById = new Map(this.timelineIr.events.map((candidate) => [String(candidate.id), candidate]));
         for (const memberId of members) {
@@ -3522,6 +3552,7 @@ export class TimelineController {
 
   invalidateSourceAnalysis() {
     this.resetPlayback();
+    this.defRuns?.invalidate();
     this.diagnosticsManager.invalidateSuggestedEdits();
     this.sourceRevision += 1;
     this.pendingBranchSelection = undefined;
@@ -3685,6 +3716,7 @@ export class TimelineController {
     this.analysisEnvironmentCheck?.abort();
     this.analysisQueued = false;
     this.resetPlayback();
+    this.defRuns.invalidate(true);
     this.cancelSourceRangeZoom();
     this.pendingBranchSelection = undefined;
     this.webviewReady = false;

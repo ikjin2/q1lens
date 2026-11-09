@@ -13,7 +13,9 @@ import heapq
 from typing import Any
 
 from q1timeline.analysis import interpreter as core
+from q1timeline.analysis.queue_timing import ASSUMED_INITIAL_BUFFER_NS, POSSIBLE_INITIAL_BUFFER_NS
 from q1timeline.analysis.values import Concrete, Unknown, resolve_arg_value, resolve_def_values, symbol_table_from_params, value_to_json
+from q1timeline.diagnostics import Diagnostic
 from q1timeline.q1asm.ast import Instr, Program, SourceLocation
 from q1timeline.q1asm.instruction_table import get_instruction_spec, rt_duration_arg_for_instruction
 
@@ -46,7 +48,10 @@ class _Sequencer:
     queue: deque = field(default_factory=deque)
     reserved: int = 0
     q1_done: bool = False
+    rt_started: bool = False
     rt_done: bool = False
+    rt_prefill_since: int | None = None
+    rt_prefill_ns: int = 0
     failed: bool = False
     waiting: str | None = None
     waiting_since: int = 0
@@ -55,6 +60,9 @@ class _Sequencer:
     trigger_counts: dict[int, int] = field(default_factory=dict)
     latch_enabled: bool = False
     condition: tuple[int, int, int, int] = (0, 0, 0, 4)
+    condition_branch_id: str | None = None
+    condition_issue_id: str | None = None
+    condition_controls: dict[str, core.TimelineEvent] = field(default_factory=dict)
     rt_settings: dict[str, Any] = field(default_factory=dict)
     rt_wait: tuple | None = None
     phase_reset: bool = False
@@ -73,6 +81,8 @@ def simulate_programs(
     simulation: dict | None = None, sequences: dict[str, dict] | None = None,
     strict_q1asm: bool = False,
     branch_choices: Mapping[tuple[str, int, int], bool] | None = None,
+    prepared_programs: Mapping[str, core.PreparedDefProgram] | None = None,
+    branch_assumptions: Mapping[str, str] | None = None,
 ) -> list[core.AnalysisState]:
     """Run a scenario, optionally selecting a conditional branch occurrence.
 
@@ -108,47 +118,107 @@ def simulate_programs(
             raise ValueError(f"Branch choice {key!r} does not identify a conditional branch")
     config = validate_simulation(simulation, sequencer_ids=set(programs))
     memories = {name: (sequences or {}).get(name, {}) for name in programs}
-    signals = SignalModel(config["physical"], memories) if config["physical"] else None
-    engine = _Runtime(programs, params or {}, max_steps, config, signals, strict_q1asm, choices)
-    states = engine.run()
-    unused = set(choices) - engine.applied_branch_choices
-    if unused:
-        raise ValueError(f"Branch choices were not reached: {sorted(unused)!r}")
+    assumptions = core._normalise_branch_assumptions(branch_assumptions)
+
+    def run(paths: Mapping[str, str]) -> list[core.AnalysisState]:
+        signals = SignalModel(config["physical"], memories) if config["physical"] else None
+        engine = _Runtime(programs, params or {}, max_steps, config, signals, strict_q1asm, choices,
+                          prepared_programs or {}, paths)
+        states = engine.run()
+        unused = set(choices) - engine.applied_branch_choices
+        if unused:
+            raise ValueError(f"Branch choices were not reached: {sorted(unused)!r}")
+        return states
+
+    states = run(assumptions)
+    controls = {event.meta["branch_id"]: event for state in states for event in state.events
+                if event.meta.get("rt_condition_control")}
+    comparison_ids = [branch_id for branch_id in controls if assumptions.get(branch_id) == "both"]
+    if comparison_ids:
+        recorded_events = [list(state.events) for state in states]
+        for branch_id in comparison_ids:
+            execute = run({**assumptions, branch_id: "taken"})
+            skip = run({**assumptions, branch_id: "fallthrough"})
+            _append_condition_comparison(states, recorded_events, execute, skip, branch_id)
+    for branch_id, control in controls.items():
+        path = assumptions.get(branch_id, "collapsed")
+        if path == "both":
+            control.meta["comparison_paths"] = ["taken", "fallthrough"]
+        control.meta["assumed_branch_path"] = path
     return states
+
+
+def _append_condition_comparison(
+    states: list[core.AnalysisState], recorded_events: list[list[core.TimelineEvent]],
+    execute: list[core.AnalysisState], skip: list[core.AnalysisState], branch_id: str,
+) -> None:
+    # Keep the input-driven run for Hardware and compare the suffix from the first differing event.
+    tails: dict[str, list[core.TimelineEvent]] = {"taken": [], "fallthrough": []}
+    for recorded, executed, skipped in zip(recorded_events, execute, skip):
+        common = zip(recorded, executed.events, skipped.events)
+        prefix = min(len(recorded), len(executed.events), len(skipped.events))
+        for index, (actual, true_event, false_event) in enumerate(common):
+            if actual != true_event or actual != false_event:
+                prefix = index
+                break
+        tails["taken"].extend(executed.events[prefix:])
+        tails["fallthrough"].extend(skipped.events[prefix:])
+    by_sequencer = {state.sequencer_id: state for state in states}
+    for path, tail in tails.items():
+        event_ids = {event.id: f"{event.id}:condition-{path}:{branch_id}" for event in tail}
+        copies = core._branch_comparison_events(tail, branch_id=branch_id, path=path, event_ids=event_ids)
+        for original, copy in zip(tail, copies):
+            meta = copy.meta
+            for key in ("source_event_id", "rt_condition_issue_event_id"):
+                if key in meta:
+                    meta[key] = event_ids.get(meta[key], meta[key])
+            if "input_event_ids" in meta:
+                meta["input_event_ids"] = [event_ids.get(event_id, event_id) for event_id in meta["input_event_ids"]]
+            meta["branch_comparison_kind"] = "rt_condition"
+            by_sequencer[copy.sequencer_id].events.append(replace(
+                copy, label=original.label,
+                confidence="assumed" if copy.confidence == "exact" else copy.confidence,
+            ))
 
 
 class _Runtime:
     def __init__(self, programs: dict[str, Program], params: dict, max_steps: int, config: dict, signals: Any, strict_q1asm: bool,
-                 branch_choices: dict[tuple[str, int, int], bool]):
+                 branch_choices: dict[tuple[str, int, int], bool], prepared_programs: Mapping[str, core.PreparedDefProgram],
+                 branch_assumptions: Mapping[str, str]):
         self.config, self.signals, self.max_steps = config, signals, max_steps
         self.branch_choices = branch_choices
+        self.branch_assumptions = branch_assumptions
         self.applied_branch_choices: set[tuple[str, int, int]] = set()
         self.capacity = config["queue_capacity"]
         self.feedback_capacity = config["feedback_queue_capacity"]
-        self.startup = config["startup_delay_ns"]
+        self.startup = config.get("startup_delay_ns")
         self.max_time = config["max_time_ns"]
         self.now = 0
         self.serial = 0
         self.events: list[tuple] = []
         self.sequencers: dict[str, _Sequencer] = {}
         self.sync_waiters: dict[str, tuple] = {}
+        self.rt_start_triggers: dict[str, list[dict]] = {}
         self.used_acquisition_inputs: set[int] = set()
         for name, program in programs.items():
+            prepared = prepared_programs.get(name)
             state = core.AnalysisState(
                 sequencer_id=name, labels=program.labels,
-                instructions_by_pc={instruction.pc: instruction for instruction in program.instructions},
-                register_aliases=core._register_aliases(program.defs), execution_mode="concrete",
+                instructions_by_pc=prepared.instructions_by_pc if prepared else {instruction.pc: instruction for instruction in program.instructions},
+                register_aliases=prepared.register_aliases if prepared else core._register_aliases(program.defs), execution_mode="concrete",
                 strict_q1asm=strict_q1asm,
+                record_trace=prepared is None,
+                bound_instructions=prepared.bindings if prepared else {},
             )
             state.diagnostics.extend(program.diagnostics)
             if strict_q1asm:
                 core._diagnose_strict_q1asm_placeholder_defs(state, program.defs)
-            symbols = symbol_table_from_params(params)
+            symbols = dict(prepared.param_symbols) if prepared else symbol_table_from_params(params)
             defs = {key: arg for key, arg in program.defs.items() if arg.kind != "reg"}
             resolved = resolve_def_values(defs, symbols, state.diagnostics, labels=program.labels)
             state.symbol_origins = core._symbol_origins(params, symbols, defs, resolved)
             symbols.update(resolved)
-            core._diagnose_program(state, symbols, program)
+            core._diagnose_program(state, symbols, program, prepared=prepared)
             state.has_expanded_instructions = any(
                 instruction.op in {"loop", "jlt"} or (instruction.op == "jge" and len(instruction.args) == 3)
                 for instruction in state.instructions_by_pc.values()
@@ -157,7 +227,8 @@ class _Runtime:
                 "mode": "simulation", "status": "completed", "steps": 0, "max_steps": max_steps,
                 "timing_model": "event_driven", "address_model": "source_instruction_index",
                 "assumptions": [
-                    f"RT startup delay {self.startup} ns is a scenario parameter, not measured hardware latency.",
+                    "Q1 prefills the RT queue before it starts, with an assumed 1 ms window and a tentative 2 ms upper limit."
+                    if self.startup is None else f"RT startup delay {self.startup} ns is an explicit scenario parameter.",
                     "Same-time events run in input, enqueue/completion, RT, then Q1 order; remaining ties use scheduling order.",
                     "All supplied sequencers participate in wait_sync; synchronization transport latency is zero.",
                     "Trigger counters start disabled, use threshold one without inversion, and require set_latch_en.",
@@ -173,10 +244,15 @@ class _Runtime:
                 self.fail(seq, status, errors[0].message)
             else:
                 self.schedule(0, 3, name, "q1")
-                self.schedule(self.startup, 2, name, "rt")
+                if self.startup is not None:
+                    self.schedule(self.startup, 2, name, "rt")
         for kind in ("feedback", "triggers"):
             for index, item in enumerate(config.get("inputs", {}).get(kind, [])):
-                self.schedule(item["time_ns"], 0, item["target"], kind, {**item, "input_index": index})
+                data = {**item, "input_index": index}
+                if "rt_time_ns" in item:
+                    self.rt_start_triggers.setdefault(item["target"], []).append(data)
+                else:
+                    self.schedule(item["time_ns"], 0, item["target"], kind, data)
 
     def schedule(self, time: int, phase: int, name: str, action: str, data: Any = None) -> None:
         self.serial += 1
@@ -189,12 +265,13 @@ class _Runtime:
         return instruction.source if instruction else SourceLocation("<simulation>", 1, 1, "")
 
     def emit(self, seq: _Sequencer, kind: str, time: int, *, end: int | None = None,
-             instruction: Instr | None = None, meta: dict | None = None, lane: str = "rt.simulation") -> core.TimelineEvent:
+             instruction: Instr | None = None, source: SourceLocation | None = None,
+             meta: dict | None = None, lane: str = "rt.simulation") -> core.TimelineEvent:
         end = time if end is None else end
         return core._emit_event(
             seq.state, lane=lane, kind=kind, t0=Concrete(time), t1=Concrete(end),
             duration=Concrete(end-time), label=kind.replace("_", " "), confidence="exact",
-            source=instruction.source if instruction else self.source(seq), meta=meta,
+            source=instruction.source if instruction else source or self.source(seq), meta=meta,
         )
 
     def fail(self, seq: _Sequencer, status: str, reason: str, instruction: Instr | None = None, *, category: str | None = None) -> None:
@@ -209,13 +286,15 @@ class _Runtime:
 
     def close_waits(self, seq: _Sequencer) -> None:
         if seq.waiting is not None:
-            self.emit(seq, "q1_stall", seq.waiting_since, end=self.now,
-                      meta={"reason": seq.waiting, "pending": True}, lane="debug.q1_stall")
+            if seq.state.record_trace:
+                self.emit(seq, "q1_stall", seq.waiting_since, end=self.now,
+                          meta={"reason": seq.waiting, "pending": True}, lane="debug.q1_stall")
             seq.waiting = None
         if seq.rt_wait is not None:
-            kind, command, started = seq.rt_wait
-            self.emit(seq, kind, started, end=self.now, instruction=command.instruction,
-                      meta={"pending": True, "rt_packet_id": seq.state.rt_packets[command.packet_index].id})
+            if seq.state.record_trace:
+                kind, command, started = seq.rt_wait
+                self.emit(seq, kind, started, end=self.now, instruction=command.instruction,
+                          meta={"pending": True, "rt_packet_id": seq.state.rt_packets[command.packet_index].id})
             seq.rt_wait = None
             self.sync_waiters.pop(seq.state.sequencer_id, None)
 
@@ -224,6 +303,8 @@ class _Runtime:
             time, _phase, _serial, name, action, data = heapq.heappop(self.events)
             seq = self.sequencers[name]
             if seq.failed or (seq.q1_done and seq.rt_done and seq.acquisition is None):
+                continue
+            if action == "rt_prefill_deadline" and seq.rt_started:
                 continue
             if time > self.max_time:
                 self.now = self.max_time
@@ -237,18 +318,28 @@ class _Runtime:
             elif action == "enqueue":
                 seq.reserved -= 1
                 seq.queue.append(data)
-                self.emit(seq, "rt_queue_enqueue", time, instruction=data.instruction, meta={
-                    "depth": len(seq.queue), "capacity": self.capacity,
-                    "rt_packet_id": seq.state.rt_packets[data.packet_index].id,
-                }, lane="debug.rt_queue")
+                if seq.state.record_trace:
+                    self.emit(seq, "rt_queue_enqueue", time, instruction=data.instruction, meta={
+                        "depth": len(seq.queue), "capacity": self.capacity,
+                        "rt_packet_id": seq.state.rt_packets[data.packet_index].id,
+                    }, lane="debug.rt_queue")
+                if self.startup is None and not seq.rt_started:
+                    if len(seq.queue) == self.capacity:
+                        self.start_buffered_rt(seq)
+                    elif seq.rt_prefill_since is None:
+                        seq.rt_prefill_since = time
+                        self.schedule(time + POSSIBLE_INITIAL_BUFFER_NS, 2, name, "rt_prefill_deadline")
             elif action == "q1_stop":
                 seq.q1_done = True
+                self.start_buffered_rt(seq)
             elif action == "register_ready":
                 if data in seq.state.pending_register_writes:
                     seq.state.pending_register_writes.remove(data)
                     core._apply_register_write(seq.state, data, time=Concrete(time))
             elif action == "rt":
                 self.rt(seq)
+            elif action == "rt_prefill_deadline":
+                self.start_buffered_rt(seq)
             elif action == "feedback":
                 self.feedback(seq, data)
             elif action == "triggers":
@@ -270,18 +361,26 @@ class _Runtime:
             seq.state.stopped = True
             seq.state.metadata["simulation"] = {
                 "queue_capacity": self.capacity, "feedback_queue_capacity": self.feedback_capacity,
-                "startup_delay_ns": self.startup, "max_time_ns": self.max_time,
+                "max_time_ns": self.max_time,
                 "routes": self.config.get("routes", []), "trigger_routes": self.config.get("trigger_routes", []),
                 "acquisition_iq_scale": self.config.get("acquisition_iq_scale", {}),
                 "end_time_ns": self.now, "acquisitions": seq.acquisitions, "signals": signals.get(name, {}),
                 "physical_enabled": self.signals is not None,
             }
+            if self.startup is None:
+                seq.state.metadata["simulation"]["initial_buffer"] = {
+                    "assumed_ns": ASSUMED_INITIAL_BUFFER_NS, "possible_ns": POSSIBLE_INITIAL_BUFFER_NS,
+                    "prefill_ns": seq.rt_prefill_ns,
+                }
+            else:
+                seq.state.metadata["simulation"]["startup_delay_ns"] = self.startup
         return [seq.state for seq in self.sequencers.values()]
 
     def resume_q1(self, seq: _Sequencer) -> None:
         if seq.waiting is None or seq.failed:
             return
-        self.emit(seq, "q1_stall", seq.waiting_since, end=self.now, meta={"reason": seq.waiting}, lane="debug.q1_stall")
+        if seq.state.record_trace:
+            self.emit(seq, "q1_stall", seq.waiting_since, end=self.now, meta={"reason": seq.waiting}, lane="debug.q1_stall")
         seq.waiting = None
         self.schedule(self.now, 3, seq.state.sequencer_id, "q1")
 
@@ -296,13 +395,15 @@ class _Runtime:
                 item.details.get("source_line_skipped") for item in state.diagnostics
             ):
                 seq.q1_done = True
+                self.start_buffered_rt(seq)
                 return
             self.fail(seq, "error", "Execution reached a PC without an instruction or stop.")
             return
         if state.metadata["execution"]["steps"] >= self.max_steps:
             self.fail(seq, "step_limit", f"Reached the {self.max_steps} instruction limit.", instruction)
             return
-        spec, invalid, diagnostic_start = core._validate_instruction(state, instruction, seq.symbols)
+        binding = state.bound_instructions.get(instruction.pc)
+        spec, invalid, diagnostic_start = core._validate_instruction(state, instruction, seq.symbols, binding)
         if not core._concrete_instruction_ready(state, instruction, seq.symbols, spec, invalid, diagnostic_start, supported_ops=_SUPPORTED):
             self.close_waits(seq)
             seq.failed = True
@@ -323,20 +424,26 @@ class _Runtime:
                 matching_index = next((index for index, item in enumerate(seq.feedback) if item["id"] == id_value.value), len(seq.feedback))
             feedback = seq.feedback[matching_index] if matching_index < len(seq.feedback) else None
             discarded = seq.feedback[:matching_index]
-            if discarded:
+            if discarded and state.record_trace:
                 self.emit(seq, "feedback_discard", self.now, instruction=instruction,
                     meta={"requested_id": id_value.value, "input_event_ids": [item["event_id"] for item in discarded]}, lane="rt.feedback")
             del seq.feedback[:matching_index + (feedback is not None)]
             if feedback is None:
                 seq.waiting, seq.waiting_since = "feedback_input", self.now
+                self.start_buffered_rt(seq)
                 return
         state.next_pc = state.pc + 1
-        register_metadata = core._register_issue_metadata(state, instruction, scope)
-        before = dict(state.alu_flags) if state.alu_flags is not None else None
-        state.current_resolved_args = core._resolved_args_for_instruction(instruction, scope, state)
+        register_metadata = None
+        before = None
+        if state.record_trace:
+            register_metadata = core._register_issue_metadata(state, instruction, scope)
+            before = dict(state.alu_flags) if state.alu_flags is not None else None
+            state.current_resolved_args = core._resolved_args_for_instruction(instruction, scope, state)
         event_start = len(state.events)
         pending_start = len(state.pending_register_writes)
-        duration = spec.q1_time_model(core._instruction_for_q1_timing(instruction, state, seq.symbols))
+        duration = binding.duration_ns if binding is not None else None
+        if duration is None:
+            duration = spec.q1_time_model(core._instruction_for_q1_timing(instruction, state, seq.symbols))
         state.q1_time_ns = Concrete(self.now + duration)
         packet_id = f"{state.sequencer_id}:p{len(state.rt_packets)}" if spec.emits_rt_packet else None
         if instruction.op in {"mulu16", "muls16"}:
@@ -375,18 +482,33 @@ class _Runtime:
             for argument, result in values:
                 register = core._register_name(argument, state)
                 value = Concrete(result & 0xFFFFFFFF)
-                provenance = core._register_provenance(state, register, expression=f"feedback id {feedback['id']}", value=value,
-                    steps=[core._provenance_step(instruction, f"feedback id {feedback['id']}", value)])
-                provenance["input_event_id"] = feedback["event_id"]
+                provenance = {}
+                if state.record_trace:
+                    provenance = core._register_provenance(state, register, expression=f"feedback id {feedback['id']}", value=value,
+                        steps=[core._provenance_step(instruction, f"feedback id {feedback['id']}", value)])
+                    provenance["input_event_id"] = feedback["event_id"]
                 core._schedule_register_write(state, instruction, register, value, provenance)
-        issue = core._emit_q1_issue(
-            state, instruction, Concrete(self.now), state.q1_time_ns, packet_id,
-            register_metadata=register_metadata,
-        )
+        issue = None
+        if state.record_trace or spec.emits_rt_packet or (instruction.op == "stop" and state.latched_state.pending_since):
+            issue = core._emit_q1_issue(
+                state, instruction, Concrete(self.now), state.q1_time_ns, packet_id,
+                register_metadata=register_metadata,
+            )
+        if instruction.op == "set_cond":
+            seq.condition_branch_id = seq.condition_issue_id = None
+            if seq.condition[0]:
+                occurrence = seq.branch_occurrences.get(instruction.pc, 0) + 1
+                seq.branch_occurrences[instruction.pc] = occurrence
+                seq.condition_branch_id = f"{state.sequencer_id}:set_cond:{instruction.pc}:{occurrence}"
+                if issue is not None:
+                    seq.condition_issue_id = issue.id
+                    seq.condition_controls[issue.id] = issue
+                    issue.meta.update(branch_id=seq.condition_branch_id, branch_decision="runtime_dependent")
         for event in state.events[event_start:]:
             if event.kind == "latched_state_pending":
                 seq.setter_ids[event.meta["field"]] = event.id
-                event.meta["q1_issue_event_id"] = issue.id
+                if issue is not None:
+                    event.meta["q1_issue_event_id"] = issue.id
         if spec.category == "branch":
             occurrence = seq.branch_occurrences.get(instruction.pc, 0) + 1
             seq.branch_occurrences[instruction.pc] = occurrence
@@ -398,15 +520,18 @@ class _Runtime:
                     "branch_id": f"{state.sequencer_id}:simulation:{instruction.pc}:{occurrence}",
                     "assumed_branch_path": "taken" if choice else "fallthrough", "assumption_source": "user",
                 })
-            core._execute_concrete_branch(state, instruction, issue, seq.symbols,
+            core._execute_concrete_branch(state, instruction, issue, seq.symbols, q1_t0=Concrete(self.now),
                                           defer_register_write=True, forced_decision=choice)
-            issue.meta["branch_occurrence"] = occurrence
-        issue.meta.update(source_pc=instruction.pc, execution_index=state.q1_issue_index,
-                          flags_before=before, flags_after=dict(state.alu_flags) if state.alu_flags is not None else None)
-        if feedback is not None:
-            issue.meta["input_event_ids"] = [feedback["event_id"]]
+            if issue is not None:
+                issue.meta["branch_occurrence"] = occurrence
+        if state.record_trace:
+            issue.meta.update(source_pc=instruction.pc, execution_index=state.q1_issue_index,
+                              flags_before=before, flags_after=dict(state.alu_flags) if state.alu_flags is not None else None)
+            if feedback is not None:
+                issue.meta["input_event_ids"] = [feedback["event_id"]]
         for pending in state.pending_register_writes[pending_start:]:
             ready_time = state.q1_time_ns.value + (0 if instruction.op == "loop" else 4)
+            pending.meta["scheduled_ready_ns"] = ready_time
             self.schedule(ready_time, 1, state.sequencer_id, "register_ready", pending)
         state.current_resolved_args = []
         state.executed_pcs.add(state.pc)
@@ -425,6 +550,9 @@ class _Runtime:
             packet = core.RtPacket(packet_id, state.sequencer_id, instruction.source, instruction.op, Concrete(rt_duration),
                                    Concrete(self.now), state.q1_time_ns, None, None, "exact",
                                    {"operand_snapshot": args, "applied_state": settings, "q1_issue_event_id": issue.id})
+            if seq.condition_branch_id:
+                packet.meta.update(rt_condition_branch_id=seq.condition_branch_id,
+                                   rt_condition_issue_event_id=seq.condition_issue_id)
             if spec.applies_latched_state:
                 packet.meta["captured_phase_reset"] = seq.phase_reset
             state.rt_packets.append(packet)
@@ -447,6 +575,27 @@ class _Runtime:
         return {key: core._plain_value(getattr(state.latched_state, attr)) for key, attr in names.items()
                 if getattr(state.latched_state, attr) is not None}
 
+    def start_buffered_rt(self, seq: _Sequencer) -> None:
+        if self.startup is not None or seq.rt_started:
+            return
+        if not seq.queue:
+            seq.rt_done = seq.q1_done
+            return
+        first_enqueue = seq.rt_prefill_since if seq.rt_prefill_since is not None else self.now
+        seq.rt_prefill_ns = self.now - first_enqueue
+        if seq.rt_prefill_ns > ASSUMED_INITIAL_BUFFER_NS:
+            seq.state.diagnostics.append(Diagnostic(
+                severity="info", category="initial_rt_buffer_estimate", source=seq.queue[0].instruction.source,
+                message="The simulated RT queue prefill uses the tentative window above 1 ms, up to 2 ms.",
+            ))
+        seq.rt_started = True
+        self.schedule(self.now, 2, seq.state.sequencer_id, "rt")
+
+    def underflow(self, seq: _Sequencer) -> None:
+        if seq.state.record_trace:
+            self.emit(seq, "underflow_warning", self.now, meta={"simulated": True, "depth": 0, "queue_capacity": self.capacity})
+        self.fail(seq, "error", f"RT queue underflow at {self.now} ns.", category="rt_queue_underflow")
+
     def rt(self, seq: _Sequencer) -> None:
         if seq.rt_done or seq.rt_wait is not None:
             return
@@ -455,23 +604,37 @@ class _Runtime:
             if seq.q1_done and seq.reserved == 0:
                 seq.rt_done = True
                 state.rt_time_ns = Concrete(self.now)
-                self.emit(seq, "stop", self.now, lane="rt.control")
+                if state.record_trace:
+                    self.emit(seq, "stop", self.now, lane="rt.control")
                 try:
                     if self.signals is not None:
                         self.signals.apply(state.sequencer_id, self.now, "stop", [], {**seq.rt_settings, "_updated_fields": []})
                 except ValueError as error:
                     self.fail(seq, "error", f"Signal model: {error}")
             else:
-                self.emit(seq, "underflow_warning", self.now, meta={"simulated": True, "depth": 0, "queue_capacity": self.capacity})
-                self.fail(seq, "error", f"RT queue underflow at {self.now} ns.", category="rt_queue_underflow")
+                self.underflow(seq)
+            return
+        triggers = self.rt_start_triggers.pop(state.sequencer_id, [])
+        if triggers:
+            for trigger in triggers:
+                self.schedule(self.now + trigger["rt_time_ns"], 0, state.sequencer_id, "triggers", trigger)
+            # Same-time trigger arrivals run before the first RT command.
+            self.schedule(self.now, 2, state.sequencer_id, "rt")
             return
         command = seq.queue.popleft()
-        self.emit(seq, "rt_queue_dequeue", self.now, instruction=command.instruction,
-                  meta={"depth": len(seq.queue), "capacity": self.capacity, "rt_packet_id": state.rt_packets[command.packet_index].id}, lane="debug.rt_queue")
+        if state.record_trace:
+            self.emit(seq, "rt_queue_dequeue", self.now, instruction=command.instruction,
+                      meta={"depth": len(seq.queue), "capacity": self.capacity, "rt_packet_id": state.rt_packets[command.packet_index].id}, lane="debug.rt_queue")
         if seq.waiting == "queue_full":
             self.resume_q1(seq)
         condition = command.condition
-        if condition[0] and not self.condition(seq, condition):
+        condition_meta = state.rt_packets[command.packet_index].meta
+        condition_branch_id = condition_meta.get("rt_condition_branch_id")
+        control = seq.condition_controls.get(condition_meta.get("rt_condition_issue_event_id"))
+        if control is not None:
+            control.meta["rt_condition_control"] = True
+        choice = self.branch_assumptions.get(condition_branch_id)
+        if condition[0] and (choice == "fallthrough" or choice != "taken" and not self.condition(seq, condition)):
             self.finish_rt(seq, command, self.now, condition[3], skipped=True)
         elif command.instruction.op == "wait_sync":
             seq.rt_wait = ("sync_wait", command, self.now)
@@ -597,7 +760,8 @@ class _Runtime:
 
     def trigger(self, seq: _Sequencer, data: dict) -> None:
         address = data["address"]
-        event = self.emit(seq, "trigger_receive", self.now, meta=data, lane="rt.trigger")
+        event = self.emit(seq, "trigger_receive", self.now, source=SourceLocation("<simulation>", 1, 1, ""),
+                          meta=data, lane="rt.trigger")
         if seq.latch_enabled:
             seq.trigger_counts[address] = seq.trigger_counts.get(address, 0) + 1
         token = {**data, "event_id": event.id, "time_ns": self.now}

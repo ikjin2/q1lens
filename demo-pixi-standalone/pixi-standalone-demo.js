@@ -518,7 +518,8 @@
       const end = Number.isFinite(window.end_ns) ? Math.max(start, window.end_ns + offset) : start;
       return {
         ...event, id: `${event.id}:acquisition-window`, kind: "acquisition_window", lane: "physical.acquire",
-        label: `acq ${acquisitionTarget(event.meta.acquisition_index)} · bin ${acquisitionTarget(event.meta.bin_index)}`,
+        label: Number.isFinite(window.end_ns) && window.source === "instruction_duration_fallback" ? `≈ ${numberText(end - start)} ns`
+          : `acq ${acquisitionTarget(event.meta.acquisition_index)} · bin ${acquisitionTarget(event.meta.bin_index)}`,
         meta: { ...event.meta, acquisition_window: window }, sourceEvent: event,
         t0Ns: start, t1Ns: end, durationNs: end - start,
       };
@@ -596,8 +597,9 @@
           return null;
         }
         const hasAvailability = Object.prototype.hasOwnProperty.call(flow, "send_available_ns");
+        const window = from.meta.acquisition_window;
         if (hasAvailability && !Number.isFinite(flow.send_available_ns) ||
-            !hasAvailability && from.kind === "acquire" && from.meta.acquisition_window?.status === "unknown") {
+            !hasAvailability && from.kind === "acquire" && (window?.status === "unknown" || window?.source === "instruction_duration_fallback")) {
           return null;
         }
         const emitNs = hasAvailability ? flow.send_available_ns : from.t1Ns;
@@ -771,6 +773,7 @@
   function drawAcquisitionWindow(PIXI, root, g, event) {
     const window = event.meta.acquisition_window;
     const unknown = window.end_ns === null;
+    const assumed = !unknown && window.source === "instruction_duration_fallback";
     const color = unknown ? colors.muted : colors.kind.acquire;
     roundedRect(g, event.x, event.y + 5, event.width, event.height, 3, color, unknown ? 0.12 : 0.28);
     strokeRect(g, event.x, event.y + 5, event.width, event.height, 3, color, 1, 0.85);
@@ -778,9 +781,10 @@
       const end = event.x + event.width;
       line(g, end, event.y + 3, end, event.y + event.height + 7, colors.warning, 3, 1);
     }
-    if (unknown || event.labelLayout.visible) {
-      const label = makeText(PIXI, unknown ? "?" : event.labelLayout.text, 10, unknown ? colors.muted : colors.text, 500);
-      label.x = unknown ? event.x + 1 : event.labelLayout.x;
+    if (unknown || assumed || event.labelLayout.visible) {
+      const marker = unknown ? "?" : assumed && !event.labelLayout.visible ? "≈" : null;
+      const label = makeText(PIXI, marker || event.labelLayout.text, 10, unknown ? colors.muted : colors.text, 500);
+      label.x = marker ? event.x + 1 : event.labelLayout.x;
       label.y = event.labelLayout.y;
       root.addChild(label);
     }
@@ -1325,10 +1329,11 @@
     const event = hit.event;
     const source = event.source || {};
     const acquisition = Object.fromEntries(acquisitionDetails(event));
+    const assumed = event.meta.acquisition_window?.source === "instruction_duration_fallback";
     els.inspector.innerHTML = [
       ...(event.kind === "acquire" ? [
         field("Effective integration", acquisition["Effective integration"] === "unknown" ? "Unknown integration length" :
-          `${acquisition["Effective integration"]} / ${acquisition["Integration setting"]} configured`),
+          assumed ? acquisition["Effective integration"] : `${acquisition["Effective integration"]} / ${acquisition["Integration setting"]} configured`),
         field("Integration status", event.meta.acquisition_window?.status === "interrupted" ? "Interrupted by next Acquire" :
           event.meta.acquisition_window?.status === "completed" ? "Completed" : "Unknown"),
         field("RT wait", acquisition["RT wait"]),
@@ -1351,19 +1356,22 @@
       return [];
     }
     const window = event.meta.acquisition_window || {};
+    const assumed = window.source === "instruction_duration_fallback";
     const ns = (value) => Number.isFinite(value) ? `${numberText(value)} ns` : "unknown";
     const offset = event.t0Ns - event.localT0Ns;
     const start = Number.isFinite(window.start_ns) ? window.start_ns + offset : null;
     const end = Number.isFinite(window.end_ns) ? window.end_ns + offset : null;
     return [
       ["RT wait", ns(event.durationNs)],
-      ["Integration setting", ns(window.configured_duration_ns)],
-      ["Effective integration", ns(window.effective_duration_ns)],
+      ...(!assumed ? [["Integration setting", ns(window.configured_duration_ns)]] : []),
+      ["Effective integration", assumed && Number.isFinite(window.effective_duration_ns)
+        ? `${ns(window.effective_duration_ns)} (assumed)` : ns(window.effective_duration_ns)],
       ["Integration status", window.status || "unknown"],
       ...(window.interrupted_by_event_id ? [["Interrupted by", window.interrupted_by_event_id]] : []),
       ["Integration window", `${ns(start)} → ${ns(end)}`],
       ["Acquisition target", `index ${acquisitionTarget(event.meta.acquisition_index)} · bin ${acquisitionTarget(event.meta.bin_index)}`],
-      ["Integration source", window.source === "hardware_parameters" ? "hardware parameters · integration_length_acq" : window.source || "unknown"],
+      ["Integration source", assumed ? "Assumed from RT duration"
+        : window.source === "hardware_parameters" ? "hardware parameters · integration_length_acq" : window.source || "unknown"],
     ];
   }
 

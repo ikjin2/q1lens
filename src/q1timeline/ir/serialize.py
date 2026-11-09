@@ -118,7 +118,6 @@ def timeline_ir_from_states(
         if diagnostics is not None
         else [diagnostic for state in states for diagnostic in state.diagnostics]
     )
-    source_map = _source_map(events)
     simulated = bool(states) and all("simulation" in state.metadata for state in states)
     if simulated:
         feedback_flows = _simulation_feedback_flows(events)
@@ -145,6 +144,8 @@ def timeline_ir_from_states(
         alignment=alignment,
         diagnostics=serialized_diagnostics,
     )
+    # These annotations summarize events already counted by the timing analyses.
+    events.extend(_event_to_dict(event) for state in states for event in state.observed_loop_events)
     ir = {
         "version": TIMELINE_IR_SCHEMA_VERSION,
         "project": _jsonable(project or {}),
@@ -169,7 +170,7 @@ def timeline_ir_from_states(
             for write in state.register_history
         ],
         "diagnostics": serialized_diagnostics,
-        "source_map": source_map,
+        "source_map": _source_map(events),
         "feedback_flows": feedback_flows,
         "feedback_balance": feedback_balance,
         "critical_path": critical_path,
@@ -754,8 +755,8 @@ def _feedback_send_available_time(event: dict[str, Any]) -> int | None:
         if feedback.get("send_on") == "command_start":
             aligned_t0 = _aligned_event_time(event)
             return aligned_t0 if aligned_t0 is not None else _concrete_event_time(event, "t0")
-        window = event.get("meta", {}).get("acquisition_window")
-        if window is not None:
+        window = meta.get("acquisition_window")
+        if window is not None and window.get("source") == "hardware_parameters":
             end = window.get("end_ns")
             if window.get("status") == "unknown" or not isinstance(end, int):
                 return None

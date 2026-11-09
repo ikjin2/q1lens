@@ -91,7 +91,7 @@ def analyze_documents(
                     for file, text in validated_documents.items()}
         scenario = validate_simulation(simulation, programs)
         states = simulate_programs(programs, params=params, max_steps=max_steps,
-                                   simulation=scenario, sequences=sequences)
+                                   simulation=scenario, sequences=sequences, branch_assumptions=branch_assumptions)
     else:
         states = [
             _analyze_program_text(
@@ -141,6 +141,7 @@ def _analyze_program_text(
             {sequencer_id: parse_q1asm(text, file=file)}, params=params, max_steps=max_steps,
             simulation=validate_simulation(simulation, [sequencer_id]),
             sequences={sequencer_id: sequence} if sequence is not None else None,
+            branch_assumptions=branch_assumptions,
         )[0]
     state = interpret_program(
         parse_q1asm(text, file=file),

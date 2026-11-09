@@ -1,0 +1,7 @@
+analysis:
+  execution_mode: analysis
+sequencers:
+  - id: sum
+    file: sum.q1asm
+params:
+  file: params.json

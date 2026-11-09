@@ -195,7 +195,7 @@
           series.warnings.add("Some acquisition targets are unresolved.");
         }
       }
-      if (event.kind === "loop_block" && !meta.playback && meta.count !== 1) {
+      if (event.kind === "loop_block" && !meta.playback && !meta.observed && meta.count !== 1) {
         const firstIds = meta.first_iteration_event_ids || [];
         const firstIssues = firstIds.map((id) => index.eventsById.get(String(id))).filter((item) => item && item.kind === "q1_issue");
         const issueEnds = firstIssues.map((item) => eventTime(index, item, basis, "t1")).filter(Number.isFinite);
@@ -463,11 +463,14 @@
     if (!config) return null;
     const alignment = index.alignment[sequencerId] || {};
     const unavailable = basis === "aligned" && (alignment.unaligned || alignment.confidence === "unknown" || (alignment.offset !== undefined && numericValue(alignment.offset) === undefined));
+    const offset = basis === "aligned" ? numericValue(alignment.offset) ?? 0 : 0;
+    const end = numericValue(config.end_time_ns);
     const queue = latest(series.queue, time);
     const stall = latest(series.stalls, time);
     const count = upperBound(series.communications, time);
     return {
-      config, localTime: unavailable ? undefined : time - (basis === "aligned" ? numericValue(alignment.offset) ?? 0 : 0),
+      config, localTime: unavailable ? undefined : time - offset,
+      endTime: unavailable || end === undefined ? undefined : end + offset,
       queue: { depth: unavailable ? undefined : queue ? numericValue(queue.event.meta.depth) : 0, capacity: queue && queue.event.meta.capacity || config.queue_capacity, event: queue && queue.event },
       stall: stall && (time < stall.end || (stall.event.meta || {}).pending) ? stall : null,
       communications: { count, total: series.communications.length, entries: series.communications.slice(Math.max(0, count - 10), count), next: series.communications[count] || null },

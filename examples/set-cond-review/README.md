@@ -29,12 +29,13 @@
 
 | RT 시각 | 예상 결과 |
 | --- | --- |
-| 200–204 ns | 첫 `upd_param`: marker=1, frequency=1 MHz 적용 |
-| 204–208 ns | `set_latch_en`: trigger counter 활성화 |
-| 208–248 ns | 첫 조건부 `upd_param 16`: 조건이 거짓이므로 **40 ns 건너뜀**. marker=1, frequency=1 MHz 유지 |
-| 230 ns | YAML에 지정한 address 1 trigger 도착. 이미 건너뛰는 명령은 계속 건너뜀 |
-| 248–264 ns | 두 번째 `upd_param 16`: 조건을 다시 평가해 참. marker=3, frequency=2 MHz 적용 |
-| 264–280 ns | 조건 해제 후 마지막 update: marker=2, frequency=3 MHz 적용 |
+| 0–4 ns | 첫 `upd_param`: marker=1, frequency=1 MHz 적용 |
+| 4–8 ns | `set_latch_en`: trigger counter 활성화 |
+| 8–48 ns | 첫 조건부 `upd_param 16`: 조건이 거짓이므로 **40 ns 건너뜀**. marker=1, frequency=1 MHz 유지 |
+| 30 ns | 주소 1 trigger 도착. 이미 건너뛰는 명령은 계속 건너뜀 |
+| 48–64 ns | 두 번째 `upd_param 16`: 조건을 다시 평가해 참. marker=3, frequency=2 MHz 적용 |
+| 64–80 ns | 조건 해제 후 마지막 update: marker=2, frequency=3 MHz 적용 |
+| 80 ns | RT 종료 |
 
 `move 7,R0`은 Q1 명령이므로 조건에 관계없이 실행되어 R0=7이 됩니다.
 Skipped 블록의 captured 값이 실제 applied 값으로 보이면 안 됩니다.
@@ -42,13 +43,17 @@ Hardware의 frequency 원시값은 **4000000 → 8000000 → 12000000**입니다
 [`set_freq`의 단위가 0.25 Hz](https://docs.qblox.com/en/main/products/qblox_instruments/q1/index.html#set-freq)이므로
 각각 1, 2, 3 MHz에 해당합니다.
 
-`q1timeline.yml`의 trigger `time_ns`를 **260**으로 바꾸면 두 조건부 update가
-모두 건너뛰어지고, 마지막 update만 **288–304 ns**에 실행됩니다.
-trigger 시간을 **220**으로 바꾸면 기본값 230과 같은 결과입니다.
+`q1timeline.yml`의 trigger `rt_time_ns`는 RT 시작을 0 ns로 잡습니다.
+기본값은 **30 ns**입니다. 이를 **60**으로 바꾸면 두 조건부 update를 모두
+건너뛰고, 마지막 update만 **88–104 ns**에 실행됩니다.
 
-여기서 startup 200 ns와 trigger 시각은 시나리오 입력입니다. 장비의 초기
-prefill 시간을 측정하거나 확정한 값이 아닙니다. trigger threshold=1,
-반전 없음이라는 현재 시뮬레이터 가정을 사용합니다.
+Q1이 큐를 채운 뒤 RT가 시작합니다. 타임라인은 첫 RT 명령을 0 ns에 정렬합니다.
+이 예제는 trigger threshold=1과 반전 없음이라는 시뮬레이터 가정을 사용합니다.
+
+`set_cond`의 조건 선택 버튼에서 **실행**, **건너뜀**, 또는 **Compare both**를
+고를 수 있습니다. 비교는 선택한 `set_cond`가 적용되는 명령의 조건을 각각 참과
+거짓으로 고정하고, 그 뒤의 RT 시간도 다시 계산합니다. **트리거 입력대로**를
+선택하면 입력에 따라 각 RT 명령의 조건을 다시 평가합니다.
 
 ## 3. 루프 속 조건 변경과 미정 시간
 
@@ -65,8 +70,8 @@ R0=1이 됩니다. 첫 반복의 8 ns를 그대로 두 번 더해 정확한 시�
 
 YAML의 `execution_mode`를 **simulation**으로 바꾸고 저장하면 trigger 입력이
 없으므로 두 번째 반복은 20 ns 건너뜁니다. 이 모델에서 RT는
-**200–208 ns 실행 → 208–228 ns 건너뜀 → 228–232 ns wait**, 총 232 ns에
-끝납니다. 다시 `analysis`로 돌리면 보수적인 정적 표시와 비교할 수 있습니다.
+정렬된 RT 시간으로 **0–8 ns 실행 → 8–28 ns 건너뜀 → 28–32 ns wait**
+순서입니다. 다시 `analysis`로 돌리면 보수적인 정적 표시와 비교할 수 있습니다.
 
 ## 4. 잘못된 else_duration 거부
 

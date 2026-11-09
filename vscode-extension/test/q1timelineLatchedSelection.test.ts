@@ -166,6 +166,9 @@ describe("Q1 timeline latched selection", () => {
     assert.deepEqual(selection(index, "setter1"), { relatedEventIds: ["first"], appliedEventIds: ["first"] });
     assert.deepEqual(selection(index, "setter2"), { relatedEventIds: ["second"], appliedEventIds: ["second"] });
     assert.deepEqual(selection(index, "first"), { relatedEventIds: ["setter1"], appliedEventIds: ["first"] });
+    assert.equal(index.get("overwritten").rtNavigationEventId, undefined);
+    assert.equal(index.get("setter1").rtNavigationEventId, "first");
+    assert.equal(index.get("setter2").rtNavigationEventId, "second");
     for (const id of ["wait", "skip", "flagged-skip", "later", "set1", "set2"]) assert.deepEqual(selection(index, id), empty);
   });
 

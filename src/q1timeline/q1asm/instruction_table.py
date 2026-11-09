@@ -53,7 +53,8 @@ class InstructionSpec:
 
 def get_instruction_spec(op: str) -> InstructionSpec:
     normalized = op.lower()
-    return INSTRUCTION_TABLE.get(normalized, _unknown_spec(normalized))
+    spec = INSTRUCTION_TABLE.get(normalized)
+    return spec if spec is not None else _unknown_spec(normalized)
 
 
 def rt_duration_arg(op: str) -> int | None:

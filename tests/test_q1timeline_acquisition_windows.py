@@ -70,13 +70,16 @@ def test_sequencers_have_independent_acquisition_engines():
     assert [event["meta"]["acquisition_window"]["end_ns"] for event in windows] == [1000, 120]
 
 
-def test_missing_setting_and_weighted_acquire_do_not_reuse_instruction_duration():
-    missing = acquires(timeline_ir_from_states([state("acquire 0,0,4\nstop\n", duration=None)]))[0]
+def test_missing_setting_uses_instruction_duration_but_weighted_stays_unknown():
+    missing = acquires(timeline_ir_from_states([state("acquire 0,0,24\nstop\n", duration=None)]))[0]
+    assert missing["meta"]["acquisition_window"] == {
+        "start_ns": 0, "end_ns": 24, "configured_duration_ns": None,
+        "effective_duration_ns": 24, "source": "instruction_duration_fallback", "status": "completed",
+    }
     weighted = acquires(timeline_ir_from_states([state("acquire_weighed 0,0,0,1,4\nstop\n")]))[0]
-    for event in (missing, weighted):
-        window = event["meta"]["acquisition_window"]
-        assert window["status"] == window["source"] == "unknown"
-        assert window["end_ns"] is window["effective_duration_ns"] is None
+    window = weighted["meta"]["acquisition_window"]
+    assert window["status"] == window["source"] == "unknown"
+    assert window["end_ns"] is window["effective_duration_ns"] is None
 
 
 def test_weighted_command_interrupts_previous_normal_acquire():
@@ -106,9 +109,10 @@ def test_feedback_availability_uses_integration_end_and_alignment():
     assert diagnostic["details"]["required_latency_ns"] == 160
     assert ir["feedback_flows"][0]["send_available_ns"] == 1008
     result.metadata["hardware_parameters"] = {}
-    unknown = timeline_ir_from_states([result])
-    assert "send_available_ns" not in unknown["feedback_flows"][0]
-    assert not any(item["category"] == "feedback_latency_violation" for item in unknown["diagnostics"])
+    assumed = timeline_ir_from_states([result])
+    assert "send_available_ns" not in assumed["feedback_flows"][0]
+    assert assumed["feedback_flows"][0]["timing"]["send_available_ns"] is None
+    assert not any(item["category"] == "feedback_latency_violation" for item in assumed["diagnostics"])
 
 
 def test_project_cli_and_playback_preserve_hardware_parameter(tmp_path: Path):

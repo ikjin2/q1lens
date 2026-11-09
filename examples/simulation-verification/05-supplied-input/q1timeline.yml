@@ -3,6 +3,7 @@ analysis:
 alignment:
   mode: none
 simulation:
+  startup_delay_ns: 200  # The supplied trace starts at acquisition time 204 ns.
   physical:
     sample_period_ns: 1
     seed: 17

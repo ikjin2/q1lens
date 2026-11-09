@@ -103,7 +103,7 @@ for (const blocked of [false, true]) {
   fs.writeFileSync(path.join(directory, "early.q1asm"), "move 7,R0\nwait 8\nwait_sync 4\nwait 8\nstop\n");
   fs.writeFileSync(path.join(directory, "late.q1asm"), `move 9,R0\nwait 28\n${blocked ? "" : "wait_sync 4\n"}wait 8\nstop\n`);
   const project = path.join(directory, "q1timeline.yml"), file = path.join(directory, "timeline_ir.json");
-  fs.writeFileSync(project, "analysis:\n  execution_mode: simulation\nsequencers:\n  - id: early\n    module: QCM0\n    file: early.q1asm\n  - id: late\n    module: QCM0\n    file: late.q1asm\n");
+  fs.writeFileSync(project, "analysis:\n  execution_mode: simulation\nsimulation:\n  startup_delay_ns: 200\nsequencers:\n  - id: early\n    module: QCM0\n    file: early.q1asm\n  - id: late\n    module: QCM0\n    file: late.q1asm\n");
   const args = ["-m", "q1lens", "q1timeline", "analyze", "--project", project, "--out", file, "--format", "vscode-json", "--summary-only", "--no-render"];
   const result = spawnSync(python, args, {
     cwd: repo, encoding: "utf8", timeout: 60000, maxBuffer: 20 * 1024 * 1024,

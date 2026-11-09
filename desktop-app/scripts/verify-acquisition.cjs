@@ -18,7 +18,8 @@ const output = path.join(root, 'output/playwright');
     [[100, 700, 600, 'interrupted'], [700, 1700, 1000, 'completed'], [2000, 3000, 1000, 'completed']]);
   assert.deepEqual(acquires('parallel').map(event => [event.meta.acquisition_window.start_ns, event.meta.acquisition_window.end_ns]),
     [[300, 1100], [1500, 2300]]);
-  assert.ok(acquires('unknown').every(event => event.meta.acquisition_window.end_ns === null));
+  assert.ok(acquires('unknown').every(event => event.meta.acquisition_window.effective_duration_ns === 4 &&
+    event.meta.acquisition_window.source === 'instruction_duration_fallback'));
   assert.ok(ir.events.filter(event => event.kind === 'acquire').every(event => event.duration.value === 4));
 
   const env = { ...process.env };
@@ -72,7 +73,7 @@ const output = path.join(root, 'output/playwright');
     const offset = acquires('readout')[0].meta.aligned_t0 - acquires('readout')[0].t0.value;
     assert.deepEqual(initial.acquisitionRows[0].windows.map(window => [window.startNs, window.endNs]),
       [[100 + offset, 700 + offset], [700 + offset, 1700 + offset], [2000 + offset, 3000 + offset]]);
-    assert.ok(initial.acquisitionRows[2].windows.every(window => window.endNs === null && window.status === 'unknown'));
+    assert.ok(initial.acquisitionRows[2].windows.every(window => window.endNs - window.startNs === 4));
     evidence.initial = initial;
     checks.push('native project open analyzes real YAML; seven acquisitions occupy exactly three ACQ rows');
     await page.screenshot({ path: path.join(output, 'acquisition-overview.png') });
@@ -91,12 +92,11 @@ const output = path.join(root, 'output/playwright');
     assert.match(details, /Integration status\s+Completed/i);
     evidence.completedInspector = details;
     details = await selectWindow('unknown', 0);
-    assert.match(details, /Effective integration\s+Unknown integration length/i);
-    assert.match(details, /Integration status\s+Unknown/i);
-    assert.doesNotMatch(details, /Effective integration\s+4 ns/);
-    await page.screenshot({ path: path.join(output, 'acquisition-unknown.png') });
-    evidence.unknownInspector = details;
-    checks.push('mouse selection resolves original Acquire; inspector distinguishes 4 ns wait, configured/effective integration and unknown');
+    assert.match(details, /Effective integration\s+4 ns \(assumed\)/i);
+    assert.match(details, /Integration source\s+Assumed from RT duration/i);
+    await page.screenshot({ path: path.join(output, 'acquisition-assumed.png') });
+    evidence.assumedInspector = details;
+    checks.push('mouse selection resolves original Acquire; inspector distinguishes 4 ns wait, configured integration and assumed integration');
 
     for (const [button, mode] of [['showcase-mode', 'showcase'], ['debug-mode', 'debug'], ['normal-mode', 'normal']]) {
       await page.locator(`#${button}`).click();

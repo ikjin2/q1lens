@@ -61,7 +61,14 @@ def test_cli_uses_project_concrete_mode_and_retains_execution_summary(tmp_path: 
     assert ir["execution"]["seq0"]["status"] == "completed"
     assert ir["execution"]["seq0"]["max_steps"] == 100
     assert summary["execution"] == ir["execution"]
-    assert [event["duration"]["value"] for event in ir["events"] if event["kind"] == "wait"] == [4, 8, 12]
+    waits = [event for event in ir["events"] if event["kind"] == "wait"]
+    assert [event["duration"]["value"] for event in waits] == [4, 8, 12]
+    loop, = [event for event in ir["events"] if event["kind"] == "loop_block"]
+    assert loop["meta"]["count"] == 3
+    assert loop["meta"]["period"]["kind"] == "unknown"
+    assert loop["meta"]["first_iteration_end"] == waits[0]["t1"]
+    assert loop["t1"] == waits[-1]["t1"]
+    assert all(event["id"] in loop["meta"]["hidden_event_ids"] for event in waits[1:])
 
 
 def test_cli_execution_flags_override_project(tmp_path: Path) -> None:

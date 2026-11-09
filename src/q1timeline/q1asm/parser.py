@@ -14,6 +14,13 @@ _REGISTER_RE = re.compile(r"^R(?:0[xX][0-9A-Fa-f]+|0|[1-9]\d*)$", re.IGNORECASE)
 _INTEGER_RE = re.compile(r"^-?(?:0[xX][0-9A-Fa-f]+|0|[1-9]\d*)$")
 
 
+def parse_integer_literal(raw: str) -> int:
+    """Parse one integer operand using the Q1ASM literal grammar."""
+    if not _INTEGER_RE.fullmatch(raw):
+        raise ValueError(f"Invalid Q1ASM integer literal: {raw!r}")
+    return _parse_int(raw)
+
+
 def parse_q1asm(text: str, *, file: str = "<string>") -> Program:
     defs: dict[str, Arg] = {}
     labels: dict[str, int] = {}
@@ -431,7 +438,7 @@ def _parse_arg(
         return None
     if _INTEGER_RE.match(raw):
         try:
-            return Arg(kind="imm", value=_parse_int(raw), raw=raw)
+            return Arg(kind="imm", value=parse_integer_literal(raw), raw=raw)
         except ValueError:
             pass
     if _looks_like_malformed_integer(raw):

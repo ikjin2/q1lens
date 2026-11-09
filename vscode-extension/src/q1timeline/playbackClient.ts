@@ -5,6 +5,7 @@ const MAX_RESPONSE_BYTES = 50 * 1024 * 1024;
 
 class PlaybackClient {
   constructor(command, args, options = {}) {
+    this.label = options.label || "Playback";
     this.pending = new Map();
     this.nextId = 1;
     this.buffer = "";
@@ -18,7 +19,7 @@ class PlaybackClient {
       });
       this.child.on("error", (error) => this.fail(error));
       this.child.on("close", (code, signal) => this.fail(new Error(
-        `Playback process exited (${signal || code}).`
+        `${this.label} process exited (${signal || code}).`
       )));
       this.child.stdin.on("error", (error) => this.fail(error));
       this.child.stdout.on("error", (error) => this.fail(error));
@@ -46,7 +47,7 @@ class PlaybackClient {
     }
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => this.fail(new Error(
-        `Playback request ${id} timed out after ${timeoutMs} ms.`
+        `${this.label} request ${id} timed out after ${timeoutMs} ms.`
       )), timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
       try {
@@ -67,32 +68,32 @@ class PlaybackClient {
       const line = this.buffer.slice(0, end);
       this.buffer = this.buffer.slice(end + 1);
       if (Buffer.byteLength(line, "utf8") > MAX_RESPONSE_BYTES) {
-        this.fail(new Error("Playback response exceeded the 50 MiB limit."));
+        this.fail(new Error(`${this.label} response exceeded the 50 MiB limit.`));
         return;
       }
       let response;
       try {
         response = JSON.parse(line);
       } catch {
-        this.fail(new Error("Invalid JSON from playback process."));
+        this.fail(new Error(`Invalid JSON from ${this.label.toLowerCase()} process.`));
         return;
       }
       const pending = response && !Array.isArray(response) && this.pending.get(response.id);
       if (!pending) {
-        this.fail(new Error("Unexpected playback response ID."));
+        this.fail(new Error(`Unexpected ${this.label.toLowerCase()} response ID.`));
         return;
       }
       this.pending.delete(response.id);
       clearTimeout(pending.timer);
       if (response.error !== undefined) {
         pending.reject(new Error(typeof response.error === "string"
-          ? response.error : response.error?.message || "Playback request failed."));
+          ? response.error : response.error?.message || `${this.label} request failed.`));
       } else {
         pending.resolve(response);
       }
     }
     if (Buffer.byteLength(this.buffer, "utf8") > MAX_RESPONSE_BYTES) {
-      this.fail(new Error("Playback response exceeded the 50 MiB limit."));
+      this.fail(new Error(`${this.label} response exceeded the 50 MiB limit.`));
     }
   }
 
@@ -116,7 +117,7 @@ class PlaybackClient {
   }
 
   dispose() {
-    this.fail(new Error("Playback client disposed."));
+    this.fail(new Error(`${this.label} client disposed.`));
   }
 }
 

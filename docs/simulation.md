@@ -8,7 +8,7 @@ Select `analysis.execution_mode: simulation` in `q1timeline.yml`, or pass
 The simulator uses Q1Lens instruction semantics and a shared discrete-event clock.
 It has no q1simulator dependency. Register writes become readable after their
 modeled latency, packets capture operands/settings when issued, full queues stall
-Q1, and missing RT work produces an underflow. `stop` stops Q1 and drains the RT
+Q1, and uncovered RT supply gaps produce underflow. `stop` stops Q1 and drains the RT
 queue. All project sequencers participate in the modeled `wait_sync` barrier.
 The trace records flags, branches, iterations, reads, writes and their provenance.
 
@@ -30,11 +30,20 @@ The timeline shows lateness as a positive duration, such as `24 ns late`.
 Unknown branches, inputs, or unfinished
 traces remain incomplete; neither buffer scenario verifies hardware behavior.
 
-The event-driven simulator instead uses its explicit `startup_delay_ns` scenario,
-which defaults to 200 ns. Its RT consumer starts at that time on the shared clock,
-measured from Q1 start. This scenario parameter is not a measured initial buffer
-duration. Physical simulations need sample periods and budgets that cover their
-full scenario window.
+By default the simulator lets Q1 prefill the RT queue. The prefill window opens
+at the first RT enqueue. RT starts when the queue fills, Q1 finishes, Q1 blocks
+on feedback, or the tentative 2 ms prefill window expires. Prefill beyond 1 ms
+produces an informational diagnostic. Once RT starts, it executes at the programmed
+cadence and reports underflow if its queue empties while Q1 is still running.
+Scheduled inputs with `time_ns` use the shared simulation clock. For a trigger
+relative to its receiver's first RT instruction, use `rt_time_ns` in place of
+`time_ns`. Align on `rt_queue_dequeue` with `first_anchor` to show RT start at
+0 ns. The Q1 lane labels the prefill assumption.
+
+Set `startup_delay_ns` to run a fixed-start scenario with immediate underflow
+when the RT queue is empty. The default time limit is 3 ms for buffered runs and
+1 ms for fixed-start runs. Physical simulations need sample periods and budgets
+that cover their full scenario window.
 
 ## Scenario configuration
 
@@ -47,7 +56,6 @@ alignment:
 simulation:
   queue_capacity: 32
   feedback_queue_capacity: 32
-  startup_delay_ns: 200
   max_time_ns: 1000000
   routes:
     - {source: sender, target: receiver, id: 16, latency_ns: 150}

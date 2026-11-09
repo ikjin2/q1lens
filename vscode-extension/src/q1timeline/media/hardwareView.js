@@ -587,7 +587,6 @@
       if (reason && !value.includes(String(reason))) parts.push(String(reason));
       if (register.time !== undefined) parts.push(`${hasRegisterWrite(register) && !meta.invalidated ? "readable at" : "state unknown since"} ${display(register.time)} ns (${state.basis})`);
       else parts.push("no register write at this time");
-      if (state.basis === "aligned" && register.localTime !== undefined) parts.push(`local Q1 ${register.localTime} ns`);
       if (Array.isArray(meta.branch_assumptions) && meta.branch_assumptions.length) parts.push(`assumptions: ${meta.branch_assumptions.map((entry) => `${entry.branch_id}: ${entry.assumed_branch_path}`).join(", ")}`);
       if (register.source && register.source.file) parts.push(`${register.source.file}:${register.source.line || 1}`);
       if (register.changed) parts.push("changed now");
@@ -686,7 +685,8 @@
       }
       const queue = simulation.queue;
       const stall = simulation.stall;
-      text(values["simulation-queue"], `RT queue ${display(queue.depth)} / ${display(queue.capacity)} packets${stall ? ` · Q1 stalled: ${statusLabel(stall.event.meta.reason)} (${stall.time}–${stall.end} ns)` : ""}. Startup ${display(simulation.config.startup_delay_ns)} ns · simulation end ${display(simulation.config.end_time_ns)} ns (local).`);
+      const startup = simulation.config.initial_buffer ? "RT queue prefill" : `Startup ${display(simulation.config.startup_delay_ns)} ns`;
+      text(values["simulation-queue"], `RT queue ${display(queue.depth)} / ${display(queue.capacity)} packets${stall ? ` · Q1 stalled: ${statusLabel(stall.event.meta.reason)} (${stall.time}–${stall.end} ns)` : ""}. ${startup} · simulation end ${display(simulation.endTime)} ns.`);
       const stages = index.signalStages.get(state.sequencerId) || new Map();
       if (!stages.has(state.signalStage)) state.signalStage = stages.keys().next().value;
       html(controls["signal-stage"], [...stages.keys()].map((stage) => `<option value="${escapeHtml(stage)}">${escapeHtml(statusLabel(stage))}</option>`).join(""));
@@ -711,7 +711,7 @@
         cursor.setAttribute("visibility", Number.isFinite(cursorX) && cursorX >= 0 && cursorX <= 600 ? "visible" : "hidden");
         cursor.setAttribute("x1", String(Number.isFinite(cursorX) ? cursorX : 0));
         cursor.setAttribute("x2", String(Number.isFinite(cursorX) ? cursorX : 0));
-        html(values["signal-values"], signal.values.map((entry) => `<p><strong>${escapeHtml(entry.path.toUpperCase())}: ${escapeHtml(display(entry.value))}</strong>${entry.sampleTime === undefined ? signal.localTime === undefined ? " · alignment unavailable" : " · outside available trace" : ` · sample ${entry.sampleTime} ns`}<br>${escapeHtml(inputSource(entry.source))}</p>`).join(""));
+        html(values["signal-values"], signal.values.map((entry) => `<p><strong>${escapeHtml(entry.path.toUpperCase())}: ${escapeHtml(display(entry.value))}</strong>${entry.sampleTime === undefined ? signal.localTime === undefined ? " · alignment unavailable" : " · outside available trace" : ` · sample ${entry.sampleTime + signal.offset} ns`}<br>${escapeHtml(inputSource(entry.source))}</p>`).join(""));
       } else {
         text(values["signal-chart"], "No physical signal trace was exported for this sequencer.");
         signalChartKey = undefined;
@@ -817,7 +817,9 @@
       const acquisitionStatus = !snapshot.acquisition.event ? "No resolved acquire" : snapshot.acquisition.status === "active"
         ? "Integrating" : snapshot.acquisition.status === "unknown" ? "Integration length unknown"
         : integration?.status === "interrupted" ? "Interrupted" : "Last acquire command";
-      setBlock("acquisition", acquisitionStatus, snapshot.acquisition.status === "active", eventLabel(snapshot.acquisition.event));
+      const assumed = integration?.source === "instruction_duration_fallback" && integration.status !== "unknown";
+      setBlock("acquisition", assumed ? `${acquisitionStatus} (assumed)` : acquisitionStatus,
+        snapshot.acquisition.status === "active", eventLabel(snapshot.acquisition.event));
       setBlock("bins", `${snapshot.bins.total} targets`, snapshot.acquisition.status === "active", snapshot.simulation ? "Acquisition targets, completed I/Q and threshold results, with input provenance." : "Acquisition targets and their write history; measured results are unavailable.");
       for (const core of ["q1", "rt"]) {
         text(values[`${core}-event`], `${snapshot[core].status} · ${eventLabel(snapshot[core].event)}`);

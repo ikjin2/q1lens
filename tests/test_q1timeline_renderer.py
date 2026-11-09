@@ -14,6 +14,19 @@ def _ns(value: int) -> dict:
     return {"kind": "concrete", "value": value}
 
 
+def test_rt_ruler_starts_after_q1_prep_and_queue_telemetry_is_not_a_lane() -> None:
+    from q1timeline.analysis.api import analyze_text
+
+    ir = analyze_text("set_mrk 1\nupd_param 4\nstop", execution_mode="simulation",
+                      alignment_mode="first_anchor", alignment_anchor_kinds=["upd_param"])
+    html = render_html(ir, default_mode="debug")
+    assert 'data-time-min="-12"' in html
+    assert 'data-lane-role="q1-issue"' in html
+    assert re.findall(r'class="tick-label"[^>]*>(-?\d+) ns</text>', html) == ["0", "1", "2", "3", "4"]
+    assert ' / debug.rt_queue' not in html
+    assert {"rt_queue_enqueue", "rt_queue_dequeue"} <= {event["kind"] for event in ir["events"]}
+
+
 def test_diagnostics_are_outside_details_with_compact_paths_and_no_repeated_codes_or_fixes() -> None:
     html = render_html({"version": "0.1.0", "events": [], "diagnostics": [{
         "severity": "warning", "category": "analysis_incomplete",

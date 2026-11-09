@@ -75,6 +75,7 @@ function loadSelectionRuntime(merged = false) {
       if (selector === '.event.is-selected, .event[aria-selected="true"], .shared-timeline-stage .timeline-block[aria-selected="true"]') {
         return nodes.filter((node) => node.classList.contains("is-selected") || node.attributes["aria-selected"] === "true");
       }
+      if (selector === ".shared-timeline-stage .timeline-block[data-event-id]") return nodes;
       assert.equal(selector, ".event[data-event-id]", "Related selection must target event blocks, leaving LINQ connectors alone");
       return nodes;
     },
@@ -99,7 +100,8 @@ function loadSelectionRuntime(merged = false) {
     const window = { q1timelineTimelineAdapter: {
       buildQ1TimelineSelectionIndex(ir) { builds += 1; return adapter.buildQ1TimelineSelectionIndex(ir); },
     }, dispatchEvent(event) { clickEvents.push(event.detail); } };
-    ${["currentTimelineSelectionIndex", "syncTimelineRelatedSelection", "eventIsQ1Issue", "prioritizedHighlightEventIds", "sourceNavigationEvent", "selectEventNode"]
+    ${["currentTimelineSelectionIndex", "syncTimelineRelatedSelection", "eventIsQ1Issue", "prioritizedHighlightEventIds", "sourceNavigationEvent",
+      "setterApplicationEventIds", "eventNodeMatchesId", "selectEventNode"]
       .map((name) => functionSource(script, name)).join("\n")}
     return {
       select: syncTimelineRelatedSelection,
@@ -132,29 +134,30 @@ describe("Q1 timeline related selection", () => {
     assert.equal(runtime.builds(), 1);
   });
 
-  it("navigates Q1 settings to the next RT instruction independently of their parameter application", () => {
+  it("navigates Q1 setters to the RT instructions that apply them", () => {
     const runtime = loadSelectionRuntime();
-    assert.equal(runtime.navigate("setter-2"), "replay");
+    assert.equal(runtime.navigate("setter-2"), "play-2");
     assert.equal(runtime.navigate("wait-issue"), "wait");
     assert.equal(runtime.navigate("wait"), "wait");
-    assert.equal(runtime.preparation("setter-1"), true);
+    assert.equal(runtime.preparation("setter-1"), false);
     assert.equal(runtime.navigate("setter-1"), "play-path-0");
   });
 
   it("moves the hardware cursor to the mapped RT start when a Q1 block is selected while preserving its source selection", () => {
     const runtime = loadSelectionRuntime();
     for (const id of ["setter-2", "play-issue-1"]) {
+      const inspectorId = id === "setter-2" ? "play-2" : id;
       runtime.click(id);
       assert.equal(runtime.hardwareSelections.at(-1), runtime.navigate(id));
       assert.equal(runtime.selectedEventId(), id);
-      assert.equal(runtime.inspectedEventIds.at(-1), id);
+      assert.equal(runtime.inspectedEventIds.at(-1), inspectorId);
       assert.deepEqual(runtime.clickEvents.at(-1), { eventId: id });
 
       const calls = runtime.hardwareSelections.length;
       runtime.click(id, { syncHardware: false, notify: false });
       assert.equal(runtime.hardwareSelections.length, calls, "Hardware-driven selection must preserve the replay cursor");
       assert.equal(runtime.selectedEventId(), id);
-      assert.equal(runtime.inspectedEventIds.at(-1), id);
+      assert.equal(runtime.inspectedEventIds.at(-1), inspectorId);
     }
   });
 

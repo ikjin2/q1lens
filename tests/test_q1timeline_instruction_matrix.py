@@ -126,7 +126,7 @@ def test_supported_signature_executes_or_explicitly_blocks_compiled_address_form
         assert next(event for event in state.events if event.kind == "feedback_send").meta["value"] == 8
     if op.startswith("acquire"):
         result = next(event for event in state.events if event.kind == "acquisition_result")
-        assert (result.t0, result.meta["i"], result.meta["q"]) == (Concrete(204), 2, -1)
+        assert (result.t0, result.meta["i"], result.meta["q"]) == (Concrete(52), 2, -1)
 
 
 @pytest.mark.parametrize("mode", ["concrete", "simulation"])
@@ -225,9 +225,9 @@ def test_weighted_aliases_and_operand_forms_share_independent_integral(op, regis
     }}, simulation={"physical": {"sequencers": {"s": {"input": {"kind": "constant", "i": 0.5, "q": 0.25}}}}})
     assert status(state) == "completed"
     result = next(event for event in state.events if event.kind == "acquisition_result")
-    assert (result.t0, result.meta["i"], result.meta["q"], result.meta["bin_index"]) == (Concrete(204), 0, 1, 1)
+    assert (result.t0, result.meta["i"], result.meta["q"], result.meta["bin_index"]) == (Concrete(28), 0, 1, 1)
     assert result.meta["weights"] == [0, 1]
-    assert state.rt_time_ns == Concrete(220)
+    assert state.rt_time_ns == Concrete(44)
     assert next(event for event in state.events if event.kind == "acquire").meta["op"] == op
 
 

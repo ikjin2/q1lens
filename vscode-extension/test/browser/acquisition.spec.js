@@ -86,11 +86,14 @@ test("real extension assets show conditional ACQ rows, original source selection
   await expect(rows).toHaveCount(3);
   await page.getByRole("button", { name: "Normal view", exact: true }).click();
   await expect(rows).toHaveCount(3);
-  const unknown = page.locator('[data-lane="sequencer:unknown:acquisition"] .timeline-block').first();
-  await expect(unknown).toHaveText("?");
-  await expect(unknown.locator(".block-label")).toBeVisible();
-  await unknown.click();
-  await expect(page.locator("#event-inspector-fields")).toContainText("Unknown integration length");
+  const assumed = page.locator('[data-lane="sequencer:unknown:acquisition"] .timeline-block').first();
+  await expect(assumed).toHaveClass(/acquisition-assumed/);
+  await expect(assumed.locator(".acquisition-duration")).toHaveText("≈ 4 ns");
+  await expect(assumed.locator(".acquisition-bracket")).toHaveCSS("border-top-style", "dashed");
+  await expect(assumed).toHaveAttribute("aria-label", /4 ns \(assumed from RT duration\)/);
+  await assumed.click();
+  await expect(page.locator("#event-inspector-fields")).toContainText("4 ns (assumed)");
+  await expect(page.locator("#event-inspector-fields")).toContainText("Assumed from RT duration");
 });
 
 test("saved integration settings and feedback setup alone do not create an ACQ row", async ({ page }) => {

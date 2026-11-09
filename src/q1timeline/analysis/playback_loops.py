@@ -23,7 +23,7 @@ class ExecutedStep:
     guard_only: bool = False
 
 
-def observed_loops(sequencer_id: str, trace: list[ExecutedStep], *, stopped: bool) -> list[dict]:
+def observed_loops(sequencer_id: str, trace: list[ExecutedStep], *, stopped: bool, mode: str) -> list[dict]:
     if not trace:
         return []
     entries: dict[int, list[int]] = {}
@@ -128,7 +128,7 @@ def observed_loops(sequencer_id: str, trace: list[ExecutedStep], *, stopped: boo
             first = trace[spans[0][0]]
             tail = trace[spans[0][1] - 1]
             result.append({
-                "loop_id": f"{sequencer_id}:playback-loop:{first.issue_index}:{tail.pc}",
+                "loop_id": f"{sequencer_id}:{mode}-loop:{first.issue_index}:{tail.pc}",
                 "start_pc": header, "end_pc": tail.pc, "complete": complete,
                 "ranges": [(trace[start].event_start, trace[end - 1].event_end,
                             trace[start].rt_start, trace[end - 1].rt_end) for start, end in spans],

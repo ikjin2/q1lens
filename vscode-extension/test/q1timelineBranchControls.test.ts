@@ -27,9 +27,9 @@ function graph(sequencer = "seq", target = "pulse") {
 }
 function load(events: any[], sequencers = [graph()], playback?: any) {
   const script = readFileSync(join(__dirname, "..", "src/q1timeline/media/timeline.js"), "utf8");
-  const names = ["eventHasBranchControl", "branchAssumptionLabel", "normalizedSource", "sameSourceLine", "controlFlowGraphSequencers",
+  const names = ["eventHasBranchControl", "branchAssumptionLabel", "branchAssumptionDisplay", "normalizedSource", "sameSourceLine", "controlFlowGraphSequencers",
     "controlFlowGraphNode", "branchControlMeta", "branchPathDescriptor", "branchComparisonSupported", "renderBranchControls"];
-  return Function("timelineIr", `
+  return Function("timelineIr", "window", `
     const actions = [], messages = [], status = [];
     const timelineExecutionState = timelineIr.playback || {status: "idle"};
     const document = { createElement: () => ({}) };
@@ -45,10 +45,25 @@ function load(events: any[], sequencers = [graph()], playback?: any) {
         return {actions, messages, status, restoredFocus: () => restoredFocus};
       }
     };
-  `)({ events, control_flow_graph: { sequencers }, ...(playback ? {playback} : {}) });
+  `)({ events, control_flow_graph: { sequencers }, ...(playback ? {playback} : {}) }, {
+    q1timelineTimelineAdapter: require("../src/q1timeline/media/timelineAdapter.js"),
+  });
 }
 
 describe("Q1 branch controls", () => {
+  it("offers execute, skip and comparison for an active RT condition", () => {
+    const condition = event("set-cond", {op: "set_cond", rt_condition_control: true, assumed_branch_path: "taken"});
+    const disabled = event("disabled", {op: "set_cond"});
+    const runtime = load([condition, disabled], []);
+    assert.equal(runtime.eligible(condition), true);
+    assert.equal(runtime.eligible(disabled), false);
+    const result = runtime.render(condition);
+    assert.deepEqual(result.actions.map((action: any) => action.label), ["Execute", "Skip", "Compare both", "Use trigger input"]);
+    assert.equal(result.actions[0].options.active, true);
+    result.actions[2].click();
+    assert.deepEqual(result.messages, [{type: "setBranchAssumption", branchId: "branch", path: "both", eventId: "set-cond"}]);
+  });
+
   it("does not give every instruction inside a compared path a branch selector", () => {
     const issue = event("branch");
     const setter = event("setter", {op: "set_awg_offs", branch_comparison_branch_id: "branch", branch_comparison_path: "taken"});

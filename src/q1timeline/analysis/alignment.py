@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from itertools import chain
 
 from q1timeline.analysis.interpreter import AnalysisState, Confidence, TimelineEvent
 from q1timeline.analysis.values import Concrete, Value, add_values, multiply_value
@@ -195,7 +196,7 @@ def _apply_alignment_metadata(
     if anchor_kinds:
         alignment_metadata["anchor_kinds"] = list(anchor_kinds)
     state.metadata["alignment"] = alignment_metadata
-    for event in state.events:
+    for event in chain(state.events, getattr(state, "observed_loop_events", ())):
         event.meta["local_t0"] = _plain_time(event.t0)
         event.meta["aligned_t0"] = _plain_time(add_values(event.t0, offset))
         if event.t1 is not None:

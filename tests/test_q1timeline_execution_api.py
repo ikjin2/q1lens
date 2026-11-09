@@ -46,6 +46,23 @@ def test_default_analysis_retains_compact_loop_behavior() -> None:
     assert any(write["register"] == "R1" and write["meta"].get("affine") for write in ir["register_history"])
 
 
+@pytest.mark.parametrize(("max_steps", "count", "complete"), [(100, 3, True), (11, ">=2", False)])
+def test_concrete_rt_loop_from_backward_conditional_branch(max_steps: int, count: int | str, complete: bool) -> None:
+    ir = analyze_text(
+        "move 3,R0\nnop\nbody: play 0,1,100\nsub R0,1,R0\nnop\njnz @body\nstop",
+        execution_mode="concrete", max_steps=max_steps,
+    )
+    loop, = [event for event in ir["events"] if event["kind"] == "loop_block"]
+    assert loop["meta"]["count"] == count
+    assert loop["meta"]["complete"] is complete
+    assert loop["t1"]["value"] == (300 if complete else 200)
+
+
+def test_concrete_does_not_group_identical_commands_at_distinct_source_locations() -> None:
+    ir = analyze_text("wait 100\nwait 100\nwait 100\nstop", execution_mode="concrete")
+    assert not any(event["kind"] == "loop_block" for event in ir["events"])
+
+
 def test_document_execution_reports_independent_partial_results() -> None:
     ir = analyze_documents({
         "complete.q1asm": "move 9,R0\nnop\nstop\n",

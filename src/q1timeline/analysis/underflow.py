@@ -119,17 +119,19 @@ def analyze_underflows(
             state.metadata["underflow"]["all_paths_safe"] = {"required_buffer_by_path_ns": safety}
         if cadence is not None:
             state.metadata["underflow"]["infinite_cadence"] = cadence
-        for record in replay.records:
-            packet = record.packet
-            _emit_queue_depth(state, packet_id=packet.id, t0=packet.rt_t0,
-                              source=packet.source, depth=record.depth)
-            _emit_slack(state, packet_id=packet.id, slack_ns=record.dequeue_ns-record.enqueue_ns,
-                        t0=packet.rt_t0, source=packet.source)
-            state.events[-1].meta.update(enqueue_ns=record.enqueue_ns, dequeue_ns=record.dequeue_ns)
+        if state.record_trace:
+            for record in replay.records:
+                packet = record.packet
+                _emit_queue_depth(state, packet_id=packet.id, t0=packet.rt_t0,
+                                  source=packet.source, depth=record.depth)
+                _emit_slack(state, packet_id=packet.id, slack_ns=record.dequeue_ns-record.enqueue_ns,
+                            t0=packet.rt_t0, source=packet.source)
+                state.events[-1].meta.update(enqueue_ns=record.enqueue_ns, dequeue_ns=record.dequeue_ns)
         if failure:
             packet = failure.packet
-            _emit_queue_depth(state, packet_id=packet.id, t0=packet.rt_t0, source=packet.source, depth=0)
-            _emit_slack(state, packet_id=packet.id, slack_ns=failure.slack_ns, t0=packet.rt_t0, source=packet.source)
+            if state.record_trace:
+                _emit_queue_depth(state, packet_id=packet.id, t0=packet.rt_t0, source=packet.source, depth=0)
+                _emit_slack(state, packet_id=packet.id, slack_ns=failure.slack_ns, t0=packet.rt_t0, source=packet.source)
             _emit_underflow_warning(state, packet_id=packet.id, slack_ns=failure.slack_ns,
                                     t0=packet.rt_t0, source=packet.source, assumptions=assumptions, status=status)
         elif eventual:

@@ -45,6 +45,7 @@ def test_nested_config_accepts_declared_fields_without_mutating_input() -> None:
 
 def run(source: str | dict[str, str], *, sequences=None, **config):
     documents = source if isinstance(source, dict) else {"seq": source}
+    config = {"startup_delay_ns": 200, **config}  # Keep the clock used by the boundary inputs.
     return simulate_programs({name: parse_q1asm(text, file=name) for name, text in documents.items()}, simulation=config, sequences=sequences)
 
 

@@ -109,12 +109,15 @@ describe("Q1 timeline branch comparison lanes", () => {
 
   it("hides prefixed debug events in Normal and keeps them in the matching comparison in Debug", () => {
     const ir = comparison();
-    ir.events.push(pathEvent("jump-debug", "rt_queue", "taken", 8, 4, {}, "debug.rt_queue"));
+    ir.events.push(pathEvent("jump-debug", "q1_stall", "taken", 8, 4, {}, "debug.q1_stall"));
+    ir.events.push(pathEvent("jump-queue", "rt_queue_enqueue", "taken", 8, 0, {}, "debug.rt_queue"));
     ir.events.push(pathEvent("jump-depth", "queue_depth", "taken", 8, 4, {}, "debug.queue_depth"));
     for (const layout of ["time", "instruction"]) {
       assert.equal(blocks(buildModel(ir, { layout, mode: "normal" })).some((block: any) => block.id === "jump-debug"), false);
       const debug = buildModel(ir, { layout, mode: "debug" });
       assert.equal(blocks(debug).some((block: any) => block.id === "jump-depth"), false);
+      assert.equal(blocks(debug).some((block: any) => block.id === "jump-queue"), false);
+      assert.equal(debug.lanes.some((lane: any) => lane.id.includes("debug.rt_queue")), false);
       const lane = debug.lanes.find((candidate: any) => candidate.blocks.some((block: any) => block.id === "jump-debug"));
       assert.ok(lane);
       assert.equal(lane.branchComparisonPath, "taken");
@@ -135,6 +138,15 @@ describe("Q1 timeline branch comparison lanes", () => {
         assert.deepEqual(pathLanes(model), []);
         assert.equal(blocks(model).some((block: any) => block.id === "current-rt"), assumedPath !== "collapsed");
       }
+    }
+  });
+
+  it("labels set_cond comparison rows as execute and skip in both layouts", () => {
+    const events = [pathEvent("execute", "upd_param", "taken", 8, 16, {branch_comparison_kind: "rt_condition"}),
+      pathEvent("skip", "conditional_skip", "fallthrough", 8, 40, {branch_comparison_kind: "rt_condition"})];
+    for (const layout of ["time", "instruction"]) {
+      const model = buildModel({events}, {layout});
+      assert.deepEqual(pathLanes(model).map((lane: any) => lane.label), ["Execute · RT", "Skip · RT"]);
     }
   });
 

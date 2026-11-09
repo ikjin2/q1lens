@@ -24,9 +24,15 @@ def acquisition_windows(state: AnalysisState) -> dict[str, dict[str, Any]]:
     barriers = [event for event in state.events if event.kind in {"unknown_region", "branch_region"}]
     windows = {}
     for index, event in enumerate(acquisitions):
-        duration = configured if _op(event, ops) == "acquire" else None
+        duration = None
+        source = "hardware_parameters"
+        if _op(event, ops) == "acquire":
+            duration = configured
+            if duration is None and isinstance(event.duration, Concrete) and event.duration.value > 0:
+                duration = event.duration.value
+                source = "instruction_duration_fallback"
         next_event = acquisitions[index + 1] if index + 1 < len(acquisitions) else None
-        windows[event.id] = _window(state, event, next_event, duration, barriers)
+        windows[event.id] = _window(state, event, next_event, duration, barriers, source=source)
     return windows
 
 
@@ -59,12 +65,14 @@ def scope_acquisition_windows(state: AnalysisState) -> dict[str, dict[str, Any]]
 
 
 def _window(state: AnalysisState, event: TimelineEvent, next_event: TimelineEvent | None,
-            duration: int | None, barriers: list[TimelineEvent]) -> dict[str, Any]:
+            duration: int | None, barriers: list[TimelineEvent], *,
+            source: str = "hardware_parameters") -> dict[str, Any]:
     start = event.t0.value if isinstance(event.t0, Concrete) else None
     window: dict[str, Any] = {
         "start_ns": start, "end_ns": None,
-        "configured_duration_ns": duration, "effective_duration_ns": None,
-        "source": "hardware_parameters" if duration is not None else "unknown", "status": "unknown",
+        "configured_duration_ns": duration if source == "hardware_parameters" else None,
+        "effective_duration_ns": None,
+        "source": source if duration is not None else "unknown", "status": "unknown",
     }
     if start is None or duration is None or not _unambiguous(event):
         return window

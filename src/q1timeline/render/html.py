@@ -120,7 +120,12 @@ def render_html(
     t_min, t_max = _time_extent(events, time_basis=time_basis)
     local_min, local_max = _time_extent(events, time_basis="local")
     aligned_min, aligned_max = _time_extent(events, time_basis="aligned")
-    ticks = _ticks(t_min, t_max)
+    q1_start = min((_event_time_number(event, "t0", fallback=t_max + 1, time_basis=time_basis)
+                    for event in events if event.get("kind") == "q1_issue"), default=t_max + 1)
+    rt_start = min((_event_time_number(event, "t0", fallback=t_max + 1, time_basis=time_basis)
+                    for event in events if re.match(r"(?:branch_compare\.(?:taken|fallthrough)\.)?rt\.", event["_base_lane"])),
+                   default=t_max + 1)
+    ticks = _ticks(rt_start if q1_start < rt_start <= t_max else t_min, t_max)
     svg_parts = [
         f'<svg class="timeline-svg" viewBox="0 0 {width} {height}" role="img" aria-label="Shared x-axis timeline" data-time-min="{t_min}" data-time-max="{t_max}" data-time-basis="{time_basis}" data-local-time-min="{local_min}" data-local-time-max="{local_max}" data-aligned-time-min="{aligned_min}" data-aligned-time-max="{aligned_max}" data-plot-left="{left}" data-plot-right="{width - 24}">',
         '<defs><marker id="feedback-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" /></marker><marker id="control-flow-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" /></marker></defs>',
@@ -163,7 +168,18 @@ def render_html(
             f'<g class="{lane_class}" data-lane="{escape(lane, quote=True)}" data-sequencer-id="{escape(sequencer_id, quote=True)}"{q1_issue_attrs}{lane_visibility}>'
         )
         if lane != sequencer:
-            svg_parts.append(f'<text class="lane-label" x="16" y="{y + 20}">{escape(_lane_display_label(lane))}</text>')
+            label = _lane_display_label(lane)
+            if is_q1_issue_lane:
+                simulation = (ir.get("simulation") or {}).get(sequencer_id)
+                if simulation is not None:
+                    buffer = simulation.get("initial_buffer", {})
+                    assumed, possible = buffer.get("assumed_ns"), buffer.get("possible_ns")
+                else:
+                    underflow = ir.get("assumptions", {}).get("underflow", {})
+                    assumed, possible = underflow.get("initial_buffer_assumed_ns"), underflow.get("initial_buffer_possible_ns")
+                if isinstance(assumed, int) and isinstance(possible, int):
+                    label += f" · {assumed / 1e6:g}–{possible / 1e6:g} ms buffer"
+            svg_parts.append(f'<text class="lane-label" x="16" y="{y + 20}">{escape(label)}</text>')
         svg_parts.append(f'<line class="lane-rule" x1="{left}" y1="{y + 10}" x2="{width - 24}" y2="{y + 10}" />')
         lane_events = sorted(
             [event for event in events if event.get("lane") == lane],
@@ -385,6 +401,14 @@ def _event_svg(
     if diff_status:
         data_attributes.append(f'data-diff-status="{escape(str(diff_status), quote=True)}"')
     data_attribute_text = " ".join(data_attributes)
+    if kind == "trigger_receive":
+        title = escape(f"Trigger address {meta.get('address', 'unknown')} · {t0} ns")
+        return (
+            f'<g id="{dom_id}" class="{classes}" data-event-id="{event_id}" {data_attribute_text} '
+            f'data-search="{search_text}" aria-label="{title}" role="button" tabindex="0"><title>{title}</title>'
+            f'<circle cx="{x:.2f}" cy="{y + 11}" r="3" fill="var(--vscode-editorInfo-foreground, #3794ff)" />'
+            '</g>'
+        )
     tooltip = escape(_tooltip_with_diagnostics(_tooltip(event), event_diagnostics))
     if kind == "underflow_warning":
         if event.get("_diagnostic_target"):
@@ -453,11 +477,13 @@ def _loop_bracket_svgs(
         diagnostic_attributes = f" {diagnostic_attributes}"
     badge_y = bracket_top - 9
     loop_attr = escape(loop_id, quote=True)
-    title = escape(_tooltip_with_diagnostics(f"loop {loop_id}, repeat {count_label}", loop_diagnostics))
-    aria_start = escape(f"loop {loop_id} starts, repeats {count_label}", quote=True)
-    aria_end = escape(f"loop {loop_id} ends, repeats {count_label}", quote=True)
-    id_text = escape(loop_id)
-    count_text = escape(count_label)
+    observed = meta.get("observed")
+    loop_name = "loop" if observed else f"loop {loop_id}"
+    title = escape(_tooltip_with_diagnostics(f"{loop_name}, repeat {count_label}", loop_diagnostics))
+    aria_start = escape(f"{loop_name} starts, repeats {count_label}", quote=True)
+    aria_end = escape(f"{loop_name} ends, repeats {count_label}", quote=True)
+    id_text = escape("loop" if observed else loop_id)
+    count_text = escape(f"\u00d7{count_label}" if observed else count_label)
     start_hitbox_x = x_start - 10
     end_hitbox_x = x_end - 20
 
@@ -770,6 +796,8 @@ def _group_events(events: list[dict[str, Any]], *, mode: str) -> tuple[list[dict
             continue
         sequencer = event.get("sequencer_id", "")
         lane = str(event.get("lane", ""))
+        if re.fullmatch(r"(?:branch_compare\.(?:taken|fallthrough)\.)?debug\.rt_queue", lane):
+            continue
         diagnostic_target = None
         if event.get("kind") == "underflow_warning":
             meta = event.get("meta", {})
@@ -2402,6 +2430,13 @@ function renderInspector(eventId, diagnosticMessage) {
   addInspectorField(fields, 'Sequencer', event.sequencer_id);
   addInspectorField(fields, 'Lane', event.lane);
   addInspectorField(fields, 'Time range', `${displayInspectorValue(event.t0)} -> ${displayInspectorValue(event.t1)}`);
+  const integration = meta.acquisition_window;
+  if (event.kind === 'acquire' && integration) {
+    const duration = integration.effective_duration_ns;
+    addInspectorField(fields, 'Effective integration', !Number.isFinite(duration) ? 'Unknown integration length'
+      : integration.source === 'instruction_duration_fallback' ? `${duration} ns (assumed from RT duration)`
+      : `${duration} ns / ${integration.configured_duration_ns} ns configured`);
+  }
   addInspectorField(fields, 'Source', source.file ? `${source.file.replace(/\\\\/g, '/').split('/').pop()}:${source.line || 1}` : 'unavailable');
   addInspectorField(fields, 'Confidence', event.confidence);
   addInspectorField(fields, 'Q1 core', event.kind === 'q1_issue' ? `${displayInspectorValue(event.t0)} -> ${displayInspectorValue(event.t1)}` : meta.q1_issue_event_id);

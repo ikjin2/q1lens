@@ -136,9 +136,10 @@
     const meta = event.meta || {};
     const path = meta.branch_comparison_path;
     const comparison = path === "taken" || path === "fallthrough";
-    const branch = comparison ? { branchComparisonPath: path, branchComparisonId: String(meta.branch_comparison_branch_id || "") } : {};
+    const branch = comparison ? { branchComparisonPath: path, branchComparisonId: String(meta.branch_comparison_branch_id || ""),
+      ...(meta.branch_comparison_kind ? { branchComparisonKind: meta.branch_comparison_kind } : {}) } : {};
     const base = comparison ? `${parent}:branch:${branch.branchComparisonId}:${path}` : parent;
-    const prefix = path === "taken" ? "Jump" : "Continue";
+    const prefix = branchComparisonLabel(path, meta.branch_comparison_kind);
     const lane = eventLaneName(event);
     if (event.kind === "q1_issue") {
       return {
@@ -182,8 +183,13 @@
     };
   }
 
+  function branchComparisonLabel(path, kind) {
+    return kind === "rt_condition" ? (path === "taken" ? "Execute" : "Skip") : (path === "taken" ? "Jump" : "Continue");
+  }
+
   function shouldIncludeEvent(event, options) {
     const lane = eventLaneName(event);
+    if (lane === "debug.rt_queue") return false;
     if (["feedback_pop", "feedback_send", "feedback_receive"].includes(event.kind)) return false;
     if (event.kind === "underflow_warning") return !event.meta?.eventual && event.meta?.status !== "possible_underflow";
     if (event.kind === "analysis_incomplete") return false;
@@ -244,13 +250,17 @@
     return String((event && event.kind) || "event");
   }
 
-  function eventTitle(event, start, end) {
+  function eventTitle(event, start, end, options) {
     if (event.kind === "underflow_warning") return underflowLabel(event);
+    if (event.kind === "trigger_receive") return `Trigger address ${event.meta?.address ?? "unknown"} · ${start} ns`;
+    const aligned = options.timeBasis === "aligned";
+    const from = aligned && Number.isFinite(event.meta?.aligned_t0) ? `${event.meta.aligned_t0} ns` : displayValue(event.t0, start);
+    const endFallback = event.meta?.conditional_time_unknown ? "unknown" : end;
+    const to = aligned && Number.isFinite(event.meta?.aligned_t1) ? `${event.meta.aligned_t1} ns` : displayValue(event.t1, endFallback);
     if (event && event.kind === "branch_region") {
-      return `Branch effect (${branchPathLabel(event)}) | ${displayValue(event.t0, start)} -> ${displayValue(event.t1, end)}`;
+      return `Branch effect (${branchPathLabel(event)}) | ${from} -> ${to}`;
     }
-    const endFallback = event.meta && event.meta.conditional_time_unknown ? "unknown" : end;
-    return event.title || `${event.label || event.kind || event.id} | ${displayValue(event.t0, start)} -> ${displayValue(event.t1, endFallback)}`;
+    return event.title || `${event.label || event.kind || event.id} | ${from} -> ${to}`;
   }
 
   function eventBlock(event, options = {}) {
@@ -271,13 +281,14 @@
       commandToken: instructionColors.eventCommandToken(event),
       detail,
       kind: String(event.kind || "event"),
+      ...(event.kind === "trigger_receive" ? { pointMarker: true } : {}),
       visualKind: eventVisualKind(event),
       accentColor: instructionColors.commandAccentColor(instructionColors.eventCommandToken(event)),
       start,
       duration,
       connectionStartKnown: Number.isFinite(rawStart) || Boolean(rawStart && typeof rawStart === "object" &&
         (!rawStart.kind || rawStart.kind === "concrete") && Number.isFinite(rawStart.value ?? rawStart.value_ns)),
-      title: eventTitle(event, start, end),
+      title: eventTitle(event, start, end, options),
       search: [
         event.id,
         event.kind,
@@ -319,7 +330,7 @@
   function acquisitionLane(event, options) {
     const parent = eventLane(event, options);
     return { ...parent, id: `${parent.id}:acquisition`, label: parent.branchComparisonPath
-      ? `${parent.branchComparisonPath === "taken" ? "Jump" : "Continue"} · Acquisition` : "Acquisition",
+      ? `${branchComparisonLabel(parent.branchComparisonPath, parent.branchComparisonKind)} · Acquisition` : "Acquisition",
       kind: "acquisition", role: "acquisition", parentGroupId: parent.parentGroupId || parent.id };
   }
 
@@ -327,14 +338,17 @@
     const window = acquisitionWindow(event, options, scope ? "scope_acquisition_window" : "acquisition_window");
     const block = eventBlock(event, options);
     const mode = scope ? "scope" : acquisitionMode(event);
+    const assumed = window.source === "instruction_duration_fallback" && window.end !== undefined;
     const target = `acq ${displayValue(event.meta?.acquisition_index, "?")} · bin ${displayValue(event.meta?.bin_index, "?")}`;
     const duration = window.end === undefined ? 0 : Math.max(0, window.end - window.start);
     const label = window.end === undefined ? "?" : duration < 1000 ? `${duration} ns` : `${Number((duration / 1000).toFixed(3))} μs`;
+    const length = window.end === undefined ? "Unknown length" : assumed ? `${duration} ns (assumed from RT duration)`
+      : `${window.effective_duration_ns} ns / ${window.configured_duration_ns} ns configured`;
     return { ...block, id: `${event.id}${scope ? ":scope" : ""}:acquisition-window`, kind: "acquisition_window", visualKind: "acquisition_window",
       start: window.start, duration,
-      label, detail: "", accentColor: undefined, acquisitionMode: mode, acquisitionTrack: scope ? 1 : 0,
-      classNames: `${block.classNames} acquisition-window acquisition-${window.status}`,
-      title: `${scope ? `Scope · paths ${(window.paths || []).join(", ")}` : `${mode} · ${target}`} | ${window.end === undefined ? "Unknown length" : `${window.effective_duration_ns} ns / ${window.configured_duration_ns} ns configured`} | ${window.status}` };
+      label: assumed ? `≈ ${label}` : label, detail: "", accentColor: undefined, acquisitionMode: mode, acquisitionTrack: scope ? 1 : 0,
+      classNames: `${block.classNames} acquisition-window acquisition-${window.status}${assumed ? " acquisition-assumed" : ""}`,
+      title: `${scope ? `Scope · paths ${(window.paths || []).join(", ")}` : `${mode} · ${target}`} | ${length} | ${window.status}` };
   }
 
   function playMergeTimeKey(event, options) {
@@ -479,7 +493,7 @@
     }
     const window = fromEvent.kind === "acquire" && fromEvent.meta?.acquisition_window
       ? acquisitionWindow(fromEvent, options) : undefined;
-    if (options.layout !== "instruction" && window?.status === "unknown") return undefined;
+    if (options.layout !== "instruction" && (window?.status === "unknown" || window?.source === "instruction_duration_fallback")) return undefined;
     const fromEdge = fromEvent.kind === "acquire" ? "t1" : "t0";
     const offset = (event) => eventTimeValue(options.alignment?.[event.sequencer_id]?.offset, 0);
     const fromTime = Number.isFinite(flow.timing?.send_available_ns)
@@ -550,11 +564,22 @@
     return String(count) === "forever" ? "forever" : `x${count}`;
   }
 
-  function loopAnnotation(event, options) {
+  function isExecutedLoop(event, playback = true) {
+    return event?.kind === "loop_block" && Boolean(event.meta?.observed || playback && event.meta?.playback);
+  }
+
+  function collapsedExecutedLoopIds(events, expanded, playback) {
+    return new Set(events.filter((event) => isExecutedLoop(event, playback) &&
+      !expanded.has(String(event.meta.loop_preview_key || event.meta.loop_id || event.id)))
+      .flatMap((event) => event.meta.hidden_event_ids || []));
+  }
+
+  function loopAnnotation(event, options, omitted) {
     const start = eventEdgeTime(event, "t0", options);
     const end = eventEdgeTime(event, "t1", options, start);
     const meta = event && event.meta && typeof event.meta === "object" ? event.meta : {};
-    const loopId = meta.playback ? "loop" : String(meta.loop_id || event.id || "loop");
+    const executed = isExecutedLoop(event);
+    const loopId = executed ? "loop" : String(meta.loop_id || event.id || "loop");
     const count = loopCountLabel(event);
     const firstIterationEventIds = Array.isArray(meta.first_iteration_event_ids)
       ? meta.first_iteration_event_ids.map((eventId) => String(eventId))
@@ -566,8 +591,8 @@
       eventId: String(event.id),
       eventIds: [String(event.id), ...firstIterationEventIds],
       start,
-      end,
-      label: meta.playback ? count.replace(/^x/, "×") : [loopId, count].filter(Boolean).join(" "),
+      end: omitted ? Math.max(start, end - (omitted.end - omitted.start)) : end,
+      label: executed ? count.replace(/^x/, "×") : [loopId, count].filter(Boolean).join(" "),
       title: String(event.label || `loop ${loopId}`),
       domain: {
         eventId: event.id,
@@ -815,13 +840,21 @@
       if (previous.has(key)) for (const entry of entries) entry.rtPreparation = true;
     }
     // Q1 setup points to the next RT command; trailing instructions keep their preceding RT target.
+    const parameterSetters = new Set(events.filter((event) => event.kind === "latched_state_pending" &&
+      !["condition", "set_cond", "set_time_ref"].includes(event.meta?.field)).map((event) => String(event.meta?.q1_issue_event_id)));
     const next = new Map();
     for (const issue of issues.slice().reverse()) {
       const entry = index.get(String(issue.id));
       const key = scope(issue);
       const own = [...entry.rtEventIds].find((id) => rtCommands.has(id));
       if (own) next.set(key, own);
-      if (next.has(key)) entry.rtNavigationEventId = next.get(key);
+      const applied = [...entry.appliedEventIds].find((id) => rtCommands.has(id));
+      if (applied) {
+        entry.rtNavigationEventId = applied;
+        entry.rtPreparation = false;
+      } else if (parameterSetters.has(String(issue.id))) {
+        entry.rtNavigationEventId = undefined;
+      } else if (next.has(key)) entry.rtNavigationEventId = next.get(key);
     }
     return new Map(Array.from(index, ([id, entry]) => [id, {
       relatedEventIds: [...entry.relatedEventIds], appliedEventIds: [...entry.appliedEventIds], rtEventIds: [...entry.rtEventIds],
@@ -1053,17 +1086,10 @@
   function buildQ1TimelineSharedModel(timelineIr, options = {}) {
     const mode = options.mode === "debug" ? "debug" : "normal";
     const allEvents = Array.isArray(timelineIr && timelineIr.events) ? timelineIr.events : [];
-    const expandedPlaybackLoops = new Set(options.expandedPlaybackLoops || []);
-    const hiddenPlaybackEventIds = new Set();
-    if (timelineIr && timelineIr.playback) {
-      for (const event of allEvents) {
-        const meta = event.meta || {};
-        if (event.kind === "loop_block" && meta.playback && !expandedPlaybackLoops.has(String(meta.loop_preview_key || meta.loop_id || event.id))) {
-          for (const id of meta.hidden_event_ids || []) hiddenPlaybackEventIds.add(String(id));
-        }
-      }
-    }
-    const events = allEvents.filter((event) => !hiddenPlaybackEventIds.has(String(event.id)) &&
+    const playback = Boolean(timelineIr?.playback);
+    const expandedLoops = new Set(options.expandedPlaybackLoops || []);
+    const hidden = collapsedExecutedLoopIds(allEvents, expandedLoops, playback);
+    const events = allEvents.filter((event) => !hidden.has(String(event.id)) &&
       (options.layout === "instruction" || !event.meta?.conditional_time_unknown ||
         Number.isFinite(eventEdgeTime(event, "t0", options, Number.NaN))));
     const eventById = new Map(events.map((event) => [String(event.id), event]));
@@ -1087,6 +1113,16 @@
         return laneById.get(lane.id);
       }
       const created = { ...lane, blocks: [] };
+      if (lane.kind === "q1-issue") {
+        const simulation = timelineIr?.simulation?.[lane.sequencer];
+        const underflow = timelineIr?.assumptions?.underflow;
+        const assumed = simulation ? simulation.initial_buffer?.assumed_ns : underflow?.initial_buffer_assumed_ns;
+        const possible = simulation ? simulation.initial_buffer?.possible_ns : underflow?.initial_buffer_possible_ns;
+        if (Number.isFinite(assumed) && Number.isFinite(possible)) {
+          created.label += ` · ${assumed / 1e6}–${possible / 1e6} ms buffer`;
+          created.labelTitle = `Initial RT buffer assumption: ${assumed / 1e6} ms, tentatively up to ${possible / 1e6} ms.`;
+        }
+      }
       if (lane.parentGroupId && !laneById.has(lane.parentGroupId)) {
         ensureLane({
           id: lane.parentGroupId,
@@ -1105,10 +1141,11 @@
         continue;
       }
       if (event.kind === "loop_block") {
-        if (instruction || (event.meta || {}).branch_comparison_path || (event.meta || {}).playback) ensureLane(eventLane(event, adapterOptions));
-        const annotation = loopAnnotation(event, adapterOptions);
+        if (instruction || event.meta?.branch_comparison_path || isExecutedLoop(event)) ensureLane(eventLane(event, adapterOptions));
+        const omitted = isExecutedLoop(event, playback) && collapsedLoopInterval(event, expandedLoops, playback);
+        const annotation = loopAnnotation(event, adapterOptions, omitted);
         annotations.push(annotation);
-        maxTime = Math.max(maxTime, annotation.end);
+        maxTime = Math.max(maxTime, eventEdgeTime(event, "t1", adapterOptions, annotation.end));
         continue;
       }
       if (event.kind === "loop_iteration_preview") {
@@ -1158,7 +1195,9 @@
         const event = eventById.get(block.eventId);
         block.issueMarker = true;
         block.rtEventIds = rtEventIds;
-        block.title = `Issue ${block.label} | Q1 instruction start: ${displayValue(event.t0 ?? event.t0_ns, "unknown")} (local) | Select to trace RT execution`;
+        const issueStart = adapterOptions.timeBasis === "aligned" && Number.isFinite(event.meta?.aligned_t0)
+          ? `${event.meta.aligned_t0} ns` : displayValue(event.t0 ?? event.t0_ns, "unknown");
+        block.title = `Issue ${block.label} | Q1 instruction start: ${issueStart} | Select to trace RT execution`;
       }
     }
 
@@ -1300,74 +1339,74 @@
     };
   }
 
+  function exactTime(value) {
+    const time = value?.kind === "concrete" ? value.value : value;
+    return Number.isFinite(time) ? time : NaN;
+  }
+
   function staticLoopHiddenInterval(event) {
     const meta = event.meta || {};
     if (event.kind !== "loop_block" || event.confidence !== "exact" ||
       !["first_iteration_only", "requested_iterations"].includes(meta.preview_policy)) return undefined;
-    const concrete = (value) => typeof value === "number" && Number.isFinite(value) ? value :
-      value?.kind === "concrete" && typeof value.value === "number" && Number.isFinite(value.value) ? value.value : NaN;
-    const count = concrete(meta.count);
-    const period = concrete(meta.period);
-    const total = meta.total_duration === undefined ? count * period : concrete(meta.total_duration);
+    const count = exactTime(meta.count);
+    const period = exactTime(meta.period);
+    const total = meta.total_duration === undefined ? count * period : exactTime(meta.total_duration);
     const visible = Math.max(Number(meta.visible_iteration_count) || 1,
       ...(meta.shown_iterations || [0]).filter((index) => Number.isInteger(index) && index >= 0).map((index) => index + 1));
-    const start = concrete(event.t0) + visible * period;
-    const end = concrete(event.t0) + total;
+    const start = exactTime(event.t0) + visible * period;
+    const end = exactTime(event.t0) + total;
     return Number.isInteger(count) && Number.isInteger(visible) && count > visible && period >= 0 && total > 0 &&
-      Number.isFinite(start) && Number.isFinite(end) && Number.isFinite(concrete(event.t1)) ? { start, end } : undefined;
+      Number.isFinite(start) && Number.isFinite(end) && Number.isFinite(exactTime(event.t1)) ? { start, end } : undefined;
+  }
+
+  function collapsedLoopInterval(event, expanded, playback) {
+    if (event.kind !== "loop_block") return undefined;
+    const meta = event.meta || {};
+    const key = String(meta.loop_preview_key || meta.loop_id || event.id);
+    if (expanded.has(key)) return undefined;
+    if (isExecutedLoop(event, playback)) {
+      const start = exactTime(meta.first_iteration_end);
+      const end = exactTime(event.t1);
+      return meta.hidden_event_ids?.length && end > start ? { start, end, key } : undefined;
+    }
+    const omitted = !playback && staticLoopHiddenInterval(event);
+    return omitted ? { ...omitted, key } : undefined;
   }
 
   function buildTimelineTimeScale(timelineIr, options = {}) {
-    const concrete = (value) => typeof value === "number" && Number.isFinite(value) ? value :
-      value?.kind === "concrete" && typeof value.value === "number" && Number.isFinite(value.value) ? value.value : NaN;
     const edge = (event, name) => {
-      const local = concrete(event[name]);
+      const local = exactTime(event[name]);
       if (options.timeBasis !== "aligned") return local;
       const aligned = event.meta && event.meta[`aligned_${name}`];
-      return aligned !== undefined ? concrete(aligned) : local + concrete(timelineIr.alignment?.[event.sequencer_id]?.offset ?? 0);
+      return aligned !== undefined ? exactTime(aligned) : local + exactTime(timelineIr.alignment?.[event.sequencer_id]?.offset ?? 0);
     };
     const intervals = [];
     const expanded = new Set(options.expandedPlaybackLoops || []);
     const events = timelineIr && timelineIr.events || [];
+    const playback = Boolean(timelineIr?.playback);
     const sequencers = new Set([...(timelineIr?.sequencers || []).map((sequencer) => String(sequencer.id)), ...events.map((event) => String(event.sequencer_id))]);
     const offsets = [...sequencers].map((id) => timelineIr.alignment && timelineIr.alignment[id]);
     const sharedClock = [...sequencers].every((id) => timelineIr.execution?.[id]?.timing_model === "event_driven");
     const commonClock = sequencers.size <= 1 || [...sequencers].every((id) => events.some((event) => String(event.sequencer_id) === id)) && offsets.every((alignment) => alignment && alignment.confidence === "exact" &&
-      !alignment.unaligned && Number.isFinite(concrete(alignment.offset)) &&
+      !alignment.unaligned && Number.isFinite(exactTime(alignment.offset)) &&
       (alignment.mode === "first_wait_sync" || String(alignment.mode).startsWith("manual:") || alignment.mode === "none" && sharedClock)) &&
-      (options.timeBasis === "aligned" || new Set(offsets.map((alignment) => concrete(alignment.offset))).size === 1);
-    const hidden = new Set(events.filter((event) => event.kind === "loop_block" && event.meta?.playback &&
-      !expanded.has(String(event.meta.loop_preview_key || event.meta.loop_id || event.id))).flatMap((event) => event.meta.hidden_event_ids || []));
+      (options.timeBasis === "aligned" || new Set(offsets.map((alignment) => exactTime(alignment.offset))).size === 1);
+    const hidden = collapsedExecutedLoopIds(events, expanded, playback);
     const activity = events.filter((event) => !hidden.has(String(event.id)) &&
       !["wait", "wait_sync", "wait_trigger", "loop_block", "branch_region", "loop_iteration_preview", "control_flow_loop", "control_flow_branch", "latched_state_pending", "queue_depth", "slack", "analysis_incomplete"].includes(event.kind) &&
       // Analytical Q1 timestamps use an independent clock, not the RT interval being folded.
       (event.kind !== "q1_issue" || timelineIr.execution?.[event.sequencer_id]?.timing_model !== "analytical" &&
         (event.meta?.playback_feedback_id || event.meta?.playback_branch_id)));
     for (const event of events) {
+      const omitted = commonClock && collapsedLoopInterval(event, expanded, playback);
+      if (!omitted) continue;
       const meta = event.meta || {};
-      const key = String(meta.loop_preview_key || meta.loop_id || event.id);
-      if (!commonClock || event.kind !== "loop_block" || expanded.has(key)) continue;
-      let firstEnd;
-      let localEnd;
-      if (timelineIr.playback) {
-        if (!meta.playback || !meta.hidden_event_ids?.length) continue;
-        firstEnd = concrete(meta.first_iteration_end);
-        localEnd = concrete(event.t1);
-      } else {
-        const omitted = staticLoopHiddenInterval(event);
-        if (!omitted) continue;
-        firstEnd = omitted.start;
-        localEnd = omitted.end;
-      }
-      const times = [event.t0, event.t1, firstEnd, localEnd];
-      if (options.timeBasis === "aligned") times.push(...[meta.aligned_t0, meta.aligned_t1].filter((time) => time !== undefined));
-      if (times.some((time) => typeof time !== "number" && (!time || time.kind !== "concrete"))) continue;
-      const localStart = eventTimeValue(event.t0, Number.NaN);
-      const offset = edge(event, "t0") - localStart;
-      const start = firstEnd + offset;
-      const end = localEnd + offset;
+      if (options.timeBasis === "aligned" && meta.aligned_t1 !== undefined && !Number.isFinite(exactTime(meta.aligned_t1))) continue;
+      const offset = edge(event, "t0") - exactTime(event.t0);
+      const start = omitted.start + offset;
+      const end = omitted.end + offset;
       if (Number.isFinite(start) && Number.isFinite(end) && end > start) {
-        let parts = [{ start, end, loopKeys: [key] }];
+        let parts = [{ start, end, loopKeys: [omitted.key] }];
         for (const item of activity) {
           const from = edge(item, "t0");
           const to = edge(item, "t1");
@@ -1538,8 +1577,7 @@
     if (options.timeBasis !== "aligned" && new Set(offsets.values()).size > 1) return scale;
     const playback = Boolean(timelineIr.playback);
     const expandedLoops = new Set(options.expandedPlaybackLoops || []);
-    const hidden = new Set(playback ? events.filter((event) => event.kind === "loop_block" && event.meta?.playback &&
-      !expandedLoops.has(String(event.meta.loop_preview_key || event.meta.loop_id || event.id))).flatMap((event) => event.meta.hidden_event_ids || []) : []);
+    const hidden = collapsedExecutedLoopIds(events, expandedLoops, playback);
     const ignoredKinds = new Set(["queue_depth", "slack", "analysis_incomplete", "latched_state_pending", "rt_queue_enqueue", "rt_queue_dequeue", "q1_stall", "loop_iteration_preview", "control_flow_loop", "control_flow_branch"]);
     if (!playback) ignoredKinds.add("q1_issue");
     else {
@@ -1559,15 +1597,20 @@
         !identityFilter(parameters.fir) || !parameters.iir || !identityFilter(parameters.iir.a) || !identityFilter(parameters.iir.b))) return scale;
       const offset = options.timeBasis === "aligned" ? offsets.get(id) : 0;
       const records = [];
+      const omitted = [];
       for (const event of events) {
+        if (String(event.sequencer_id) !== id) continue;
+        // Repeated iterations have their own fold, even when state is unchanged.
+        const interval = collapsedLoopInterval(event, expandedLoops, playback);
+        if (interval) omitted.push({ start: interval.start + offset, end: interval.end + offset });
         // An enabled or unresolved static condition can change subsequent RT timing.
         const unresolvedCondition = event.kind === "latched_state_pending" && event.meta &&
           event.meta.field === "set_cond" && event.meta.conditional_enabled !== false;
-        if (String(event.sequencer_id) !== id || (ignoredKinds.has(event.kind) && !unresolvedCondition)) continue;
+        if (ignoredKinds.has(event.kind) && !unresolvedCondition) continue;
         // Hidden repetitions have their own loop fold. Including their waits here
         // would merge across the visible first wait's end and erase its end cap.
-        if (playback && (hidden.has(String(event.id)) || event.kind === "q1_issue" &&
-          !event.meta?.playback_feedback_id && !event.meta?.playback_branch_id)) continue;
+        if (hidden.has(String(event.id)) || isExecutedLoop(event, playback) || playback && event.kind === "q1_issue" &&
+          !event.meta?.playback_feedback_id && !event.meta?.playback_branch_id) continue;
         const localStart = concreteTime(event.t0 ?? event.t0_ns);
         const localEnd = concreteTime(event.t1 ?? event.t1_ns);
         if (localStart === undefined || localEnd === undefined || localEnd < localStart) return scale;
@@ -1591,7 +1634,7 @@
         const waits = merge(records.filter(({ event }) => waitKinds.has(event.kind)).map(({ start, end }) => ({ start, end })));
         const activity = records.filter(({ event }) => !waitKinds.has(event.kind)).map(({ start, end }) => ({ start, end }));
         activity.push(...windows.map(({ end }) => ({ start: end, end })));
-        const unchanged = subtract(waits, activity);
+        const unchanged = subtract(subtract(waits, activity), omitted);
         common = common === undefined ? unchanged : intersect(common, unchanged);
         if (!common.length) return scale;
         continue;
@@ -1644,7 +1687,8 @@
         } else if (event.kind === "acquire") {
           const acquisition = acquisitionEnds.get(meta.rt_packet_id);
           const configuredWindows = [meta.acquisition_window, meta.scope_acquisition_window].filter(Boolean);
-          if (configuredWindows.length && configuredWindows.every((window) => Number.isFinite(window.end_ns) && window.status !== "unknown")) {
+          if (configuredWindows.length && configuredWindows.every((window) => Number.isFinite(window.end_ns) &&
+              window.status !== "unknown" && window.source !== "instruction_duration_fallback")) {
             // Acquiring is a constant mode between its boundaries. Keep the RT
             // command and every integration/scope end visible, but fold its interior.
             blocked.push({ start, end });
@@ -1657,13 +1701,6 @@
           blocked.push({ start, end: knownKinds.has(event.kind) || annotation ? end : Infinity });
         }
       }
-      // Omitted static iterations have their own loop fold. Preserve the last
-      // visible wait's end instead of letting one unchanged gap swallow it.
-      const omitted = records.flatMap(({ event }) => {
-        const key = String(event.meta?.loop_preview_key || event.meta?.loop_id || event.id);
-        const interval = !expandedLoops.has(key) && staticLoopHiddenInterval(event);
-        return interval ? [{ start: interval.start + offset, end: interval.end + offset }] : [];
-      });
       const unchanged = subtract(subtract(observed, blocked), omitted);
       common = common === undefined ? unchanged : intersect(common, unchanged);
       if (!common.length) return scale;
@@ -1694,12 +1731,14 @@
   const api = {
     acquisitionWindow,
     acquisitionMode,
+    branchComparisonLabel,
     buildQ1TimelineSharedModel,
     buildQ1TimelineSelectionIndex,
     buildTimelineTimeScale,
     buildWaitTimeScale,
     eventLabelToken,
     eventTimeValue,
+    isExecutedLoop,
     underflowLabel,
   };
 

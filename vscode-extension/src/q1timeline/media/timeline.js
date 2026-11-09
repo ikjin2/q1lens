@@ -174,17 +174,20 @@
   function appendAcquisitionInspectorFields(fields, event) {
     if (event.kind !== "acquire") return;
     const window = windowAcquisition(event);
+    const assumed = window.source === "instruction_duration_fallback";
     const ns = (value) => Number.isFinite(value) ? `${value} ns` : "unknown";
     const mode = globalThis.q1timelineTimelineAdapter.acquisitionMode(event);
     addInspectorField(fields, "Acquisition mode", ({ integration: "Integration", weighted: "Weighted integration",
       ttl: "TTL counts", timetags: "Timetags", digital: "Digital" })[mode]);
     addInspectorField(fields, "Effective integration", window.end === undefined ? "Unknown integration length"
+      : assumed ? `${ns(window.effective_duration_ns)} (assumed)`
       : `${ns(window.effective_duration_ns)} / ${ns(window.configured_duration_ns)} configured`);
     addInspectorField(fields, "Integration status", window.status === "interrupted" ? "Interrupted by next Acquire" : window.status);
     addInspectorField(fields, "RT wait", ns(eventTime(event, "t1") - eventTime(event, "t0")));
     addInspectorField(fields, "Integration window", `${ns(window.start)} → ${ns(window.end)}`);
     addInspectorField(fields, "Acquisition target", `index ${displayInspectorValue(event.meta?.acquisition_index)} · bin ${displayInspectorValue(event.meta?.bin_index)}`);
-    addInspectorField(fields, "Integration source", window.source === "hardware_parameters" ? "hardware parameters · integration_length_acq" : "unknown");
+    addInspectorField(fields, "Integration source", assumed ? "Assumed from RT duration"
+      : window.source === "hardware_parameters" ? "hardware parameters · integration_length_acq" : "unknown");
     if (event.meta?.scope_acquisition_window) {
       const scope = globalThis.q1timelineTimelineAdapter.acquisitionWindow(event, { timeBasis: timelineTimeBasis }, "scope_acquisition_window");
       addInspectorField(fields, "Scope window", `${ns(scope.start)} → ${ns(scope.end)}`);
@@ -222,7 +225,7 @@
     addInspectorField(fields, "Time range", `${displayInspectorValue(eventTime(event, "t0"))} -> ${displayInspectorValue(eventTime(event, "t1"))}`);
     addInspectorField(fields, "Source", source.file ? `${source.file.replace(/\\/g, "/").split("/").pop()}:${source.line || 1}` : "unavailable");
     addInspectorField(fields, "Confidence", event.confidence);
-    addInspectorField(fields, "Q1 core", event.kind === "q1_issue" ? `${displayInspectorValue(event.t0)} -> ${displayInspectorValue(event.t1)}` : meta.q1_issue_event_id);
+    addInspectorField(fields, "Q1 issue", meta.q1_issue_event_id);
     addInspectorField(fields, "RT packet", meta.rt_packet_id);
     addInspectorField(fields, "Queue depth", meta.estimated_depth ?? meta.depth);
       addInspectorField(fields, "Late by", event.kind === "underflow_warning" && meta.slack_ns < 0 ? `${-meta.slack_ns} ns` : "");
@@ -253,6 +256,16 @@
     }
     selectedTimelineEventId = eventId;
     selectedSourceEventIds.clear();
+    const selectedEvent = timelineEventsById.get(String(eventId));
+    const applied = setterApplicationEventIds(selectedEvent);
+    if (applied.length) {
+      for (const node of document.querySelectorAll(".shared-timeline-stage .timeline-block[data-event-id]")) {
+        if (isTimelineEventVisible(node) && [eventId, ...applied].some((id) => eventNodeMatchesId(node, id))) {
+          node.classList.add("is-selected");
+          node.setAttribute("aria-selected", "true");
+        }
+      }
+    }
     const relatedEventIds = syncTimelineRelatedSelection(eventId);
     const hadFocus = eventNode && document.activeElement === eventNode;
     if (expandQ1IssueLanesForHighlight(relatedEventIds) && hadFocus) {
@@ -264,7 +277,7 @@
       hardwareView.selectEvent(navigationEvent?.id || eventId);
     }
     syncSharedAnnotationSelection(eventId);
-    renderSharedEventInspector(eventId, eventNode?.dataset.diagnosticMessage);
+    renderSharedEventInspector(applied[0] || eventId, eventNode?.dataset.diagnosticMessage);
     syncTimelineZoomActionState();
     if (options.notify !== false) {
       openAnalysisDetails();
@@ -380,6 +393,10 @@
     return timelineEventsById.get(targetId) || event;
   }
 
+  function setterApplicationEventIds(event) {
+    return event?.kind === "q1_issue" ? currentTimelineSelectionIndex().get(String(event.id))?.appliedEventIds || [] : [];
+  }
+
   function installRtPreparationMarkers() {
     const groups = new Map();
     for (const [id, entry] of currentTimelineSelectionIndex()) {
@@ -474,8 +491,9 @@
   }
 
   function visiblePlaybackEvent(event) {
-    if (!event || !timelineIr.playback) return event;
-    const loops = (timelineIr.events || []).filter((item) => item.kind === "loop_block" && item.meta?.playback &&
+    if (!event || (!timelineIr.execution && !timelineIr.playback)) return event;
+    const loops = (timelineIr.events || []).filter((item) => item.kind === "loop_block" &&
+      (item.meta?.observed || timelineIr.playback && item.meta?.playback) &&
       !expandedPlaybackLoops.has(String(item.meta.loop_preview_key || item.meta.loop_id || item.id)));
     const containers = loops.filter((item) => (item.meta.hidden_event_ids || []).includes(String(event.id)));
     const loop = containers.find((item) => !loops.some((parent) => (parent.meta.hidden_event_ids || []).includes(String(item.id)))) || containers[0];
@@ -504,6 +522,10 @@
 
   function branchAssumptionDisplay(meta) {
     const path = branchAssumptionLabel(meta);
+    if (meta?.rt_condition_control) {
+      if (path === "taken" || path === "fallthrough") return window.q1timelineTimelineAdapter.branchComparisonLabel(path, "rt_condition");
+      return path === "both" ? "Execute / Skip" : "Use trigger input";
+    }
     if (path === "taken") {
       return "true (jump target)";
     }
@@ -527,6 +549,7 @@
 
   function eventHasBranchControl(event) {
     const meta = event && event.meta && typeof event.meta === "object" ? event.meta : {};
+    if (meta.op === "set_cond") return meta.rt_condition_control === true && !meta.branch_comparison_path;
     if (timelineIr.playback && meta.playback_branch_id && branchControlMeta(event).op === "jmp") return false;
     return Boolean(event && ["branch_region", "q1_issue"].includes(event.kind) && (meta.branch_id || meta.playback_branch_id));
   }
@@ -631,28 +654,32 @@
 
   function renderBranchControls(popover, event) {
     const meta = branchControlMeta(event);
+    const rtCondition = meta.rt_condition_control === true;
     const playback = Boolean(timelineIr.playback && meta.playback_branch_id);
     const branchId = String(playback ? meta.playback_branch_id : meta.branch_id || meta.branch_comparison_branch_id || "");
     const assumed = branchAssumptionLabel(meta);
     const resolved = meta.branch_decision === "concrete" && typeof meta.branch_taken === "boolean";
     const active = (resolved || playback) && typeof meta.branch_taken === "boolean" ? (meta.branch_taken ? "taken" : "fallthrough") : assumed;
-    const jump = branchPathDescriptor(event, "taken");
-    const next = branchPathDescriptor(event, "fallthrough");
+    const jump = rtCondition ? null : branchPathDescriptor(event, "taken");
+    const next = rtCondition ? null : branchPathDescriptor(event, "fallthrough");
     popover.classList.add("q1timeline-branch-popover");
     popover.setAttribute("role", "dialog");
-    popover.setAttribute("aria-label", "Branch paths");
+    popover.setAttribute("aria-label", rtCondition ? "Conditional RT execution" : "Branch paths");
     const status = document.createElement("div");
     status.className = "q1timeline-branch-status";
     status.textContent = playback && meta.branch_decision === "default" ? "Default path" : playback && meta.branch_decision === "assumed" ? "Chosen path" : resolved ? "Calculated path" : assumed === "both" ?
       (Array.isArray(meta.comparison_paths) ? "Comparing both paths" : "Comparison unavailable") :
       assumed === "taken" || assumed === "fallthrough" ? "Assumed path" : "Choose a path";
     if (playback && meta.branch_decision === "default") status.title = "Condition unknown. Continue is assumed until you choose another path.";
+    if (rtCondition) status.textContent = branchAssumptionDisplay(meta);
     popover.append(status);
     const choose = (path) => {
       vscode.postMessage({ type: playback ? "setExecutionBranch" : "setBranchAssumption", branchId, path, eventId: String(event.id) });
       closeTimelineControlPopover(true);
     };
-    for (const [path, label] of [["taken", `Jump · ${jump.label}`], ["fallthrough", `Continue · ${next.label}`]]) {
+    const paths = rtCondition ? ["taken", "fallthrough"].map(path => [path, window.q1timelineTimelineAdapter.branchComparisonLabel(path, "rt_condition")]) :
+      [["taken", `Jump · ${jump.label}`], ["fallthrough", `Continue · ${next.label}`]];
+    for (const [path, label] of paths) {
       addTimelineControlAction(popover, path, label, () => choose(path), {
         text: true, active: active === path,
         disabled: playback ? timelineExecutionState.status === "running" : resolved || meta.branch_decision !== "runtime_dependent",
@@ -660,11 +687,12 @@
       });
     }
     if (!playback && !resolved && meta.branch_decision === "runtime_dependent") {
-      if (branchComparisonSupported(meta, jump)) {
+      if (rtCondition || branchComparisonSupported(meta, jump)) {
         addTimelineControlAction(popover, "both", "Compare both", () => choose("both"), { text: true, active: active === "both" });
       }
-      addTimelineControlAction(popover, "collapsed", "Collapse", () => choose("collapsed"), { text: true, active: active === "collapsed" });
+      addTimelineControlAction(popover, "collapsed", rtCondition ? "Use trigger input" : "Collapse", () => choose("collapsed"), { text: true, active: active === "collapsed" });
     }
+    if (rtCondition) return;
     addTimelineControlAction(popover, "zoom", "Zoom around branch", () => {
       zoomTimelineToEvent(event);
       closeTimelineControlPopover(true);
@@ -897,7 +925,7 @@
     popover.setAttribute("aria-label", "RT block values");
     const heading = document.createElement("div");
     heading.className = "q1timeline-rt-details-heading";
-    const raw = event.source?.raw || "";
+    const raw = event.kind === "trigger_receive" ? "" : event.source?.raw || "";
     heading.textContent = raw.slice(0, window.q1asmInstructionColors.sourceCodeEnd(raw)).trim() || event.label || event.kind;
     const close = document.createElement("button");
     close.type = "button";
@@ -910,7 +938,7 @@
     const meta = event.meta || {};
     const scope = [];
     if (meta.loop_iteration_index !== undefined) scope.push(`Iteration ${Number(meta.loop_iteration_index) + 1}`);
-    if (meta.branch_comparison_path) scope.push(meta.branch_comparison_path === "taken" ? "Jump" : "Continue");
+    if (meta.branch_comparison_path) scope.push(window.q1timelineTimelineAdapter.branchComparisonLabel(meta.branch_comparison_path, meta.branch_comparison_kind));
     if (event.confidence === "assumed" || meta.assumed_branch_path || meta.feedback_assumptions?.length) scope.push("Assumed execution");
     if (scope.length) {
       const context = document.createElement("p");
@@ -1051,7 +1079,7 @@
           openTimelineControlPopover(chip, item, feedback ? "feedback" : "branch");
         }, { text: true });
       }
-    } else if (actionKind === "loop" && meta.playback) {
+    } else if (actionKind === "loop" && window.q1timelineTimelineAdapter.isExecutedLoop(event)) {
       popover.classList.add("q1timeline-playback-loop-popover");
       const loopKey = String(meta.loop_preview_key || meta.loop_id || event.id);
       const expanded = expandedPlaybackLoops.has(loopKey);
@@ -1143,7 +1171,7 @@
     }
     domEvent.preventDefault();
     domEvent.stopPropagation();
-    selectEventNode(node, { notify: false });
+    selectEventNode(node, { notify: false, syncHardware: !meta.observed });
     openTimelineControlPopover(node, event, "loop");
   }
 
@@ -1152,8 +1180,12 @@
     for (const node of loopNodes) {
       const event = timelineEventsById.get(String(node.dataset.eventId));
       const meta = event && event.meta && typeof event.meta === "object" ? event.meta : {};
+      const executed = window.q1timelineTimelineAdapter.isExecutedLoop(event);
+      const expanded = executed && expandedPlaybackLoops.has(String(meta.loop_preview_key || meta.loop_id || event.id));
+      const label = node.querySelector(".loop-range-label");
+      if (label) label.hidden = expanded;
       node.classList.remove("q1timeline-control-loop-lane");
-      node.classList.toggle("is-playback-loop", Boolean(meta.playback));
+      node.classList.toggle("is-playback-loop", executed);
       delete node.dataset.controlChipId;
       node.removeAttribute("role");
       node.removeAttribute("aria-haspopup");
@@ -1169,8 +1201,9 @@
         node.setAttribute("role", "button");
         node.setAttribute("aria-haspopup", "menu");
         node.setAttribute("aria-expanded", "false");
-        node.setAttribute("aria-label", meta.playback ? "Executed loop options" : "Loop preview options");
-        node.title = meta.playback ? `${meta.count} executed iterations. Click to expand or collapse.` : node.getAttribute("aria-label");
+        node.setAttribute("aria-label", executed ? "Executed loop options" : "Loop preview options");
+        node.title = expanded ? "Click to collapse executed iterations." :
+          executed ? `${meta.count} executed iterations. Click to expand.` : node.getAttribute("aria-label");
         node.tabIndex = 0;
       }
       if (node.dataset.timelineControlLoopInstalled !== "true") {
@@ -1191,20 +1224,30 @@
     closeTimelineControlPopover();
     document.querySelectorAll(".q1timeline-control-chip").forEach((node) => node.remove());
     const branchNodes = Array.from(document.querySelectorAll(".shared-timeline-stage .timeline-block[data-event-id]"));
+    const visibleIds = new Set(branchNodes.filter(isTimelineEventVisible).map((node) => String(node.dataset.eventId)));
+    const shownConditions = new Set();
     const chipStackCounts = new Map();
     const hiddenControls = new Map();
     for (const node of branchNodes) {
       if (node.dataset.diagnosticPlacement || node.dataset.blockId?.endsWith(":acquisition-window")) continue;
-      const event = timelineEventsById.get(String(node.dataset.eventId));
+      const blockEvent = timelineEventsById.get(String(node.dataset.eventId));
+      const conditionId = blockEvent?.meta?.rt_condition_issue_event_id;
+      const condition = !blockEvent?.meta?.branch_comparison_path && conditionId && !visibleIds.has(String(conditionId))
+        ? timelineEventsById.get(String(conditionId)) : undefined;
+      const event = condition?.meta?.rt_condition_control ? condition : blockEvent;
       const actionKind = eventHasFeedbackControl(event) ? "feedback" : event && eventHasBranchControl(event) ? "branch" : undefined;
       if (actionKind) {
         if (!isTimelineEventVisible(node)) {
-          if (event.kind === "q1_issue") {
+          if (event.kind === "q1_issue" && !event.meta.rt_condition_control) {
             const sequencer = String(event.sequencer_id);
             if (!hiddenControls.has(sequencer)) hiddenControls.set(sequencer, []);
             hiddenControls.get(sequencer).push(String(event.id));
           }
           continue;
+        }
+        if (event.meta?.rt_condition_control) {
+          if (shownConditions.has(event.id)) continue;
+          shownConditions.add(event.id);
         }
         const stackKey = timelineControlChipStackKey(node);
         const stackIndex = chipStackCounts.get(stackKey) || 0;
@@ -1269,7 +1312,7 @@
       label: `${formatWindowValue(tick)} ns`,
     }));
     const width = timelineTimeScale()?.plotWidth;
-    if (!width) return ticks;
+    if (!width || !ticks.length) return ticks;
     const result = [];
     const last = ticks[ticks.length - 1];
     const lastLeft = last.leftPercent / 100 * width - (last.leftPercent > 90 ? last.label.length * 6 : 0);
@@ -1489,6 +1532,7 @@
     for (const gap of timelineTimeScale()?.gaps || []) {
       if (!gap.loopKeys?.length || gap.end <= current.min || gap.start >= current.max) continue;
       const loop = loops.get(gap.loopKeys[0]);
+      const executed = window.q1timelineTimelineAdapter.isExecutedLoop(loop);
       for (const track of tracks) {
         const marker = document.createElement("span");
         marker.className = "q1timeline-playback-fold";
@@ -1510,9 +1554,9 @@
           label.textContent = formatFoldDuration(gap.end - gap.start);
           button.append(icon, label);
           const interval = `${formatWindowValue(gap.start)}..${formatWindowValue(gap.end)} ns`;
-          button.title = `Repeated iterations folded: ${interval}. ${loop?.meta.playback ? "Click to expand." : "Click for loop preview options."}`;
-          button.setAttribute("aria-label", loop?.meta.playback ? `Expand repeated interval ${interval}` : `Loop preview options for repeated interval ${interval}`);
-          if (loop && !loop.meta.playback) {
+          button.title = `Repeated iterations folded: ${interval}. ${executed ? "Click to expand." : "Click for loop preview options."}`;
+          button.setAttribute("aria-label", executed ? `Expand repeated interval ${interval}` : `Loop preview options for repeated interval ${interval}`);
+          if (loop && !executed) {
             button.dataset.controlChipId = `loop:${loop.id}`;
             button.setAttribute("aria-haspopup", "menu");
             button.setAttribute("aria-expanded", "false");
@@ -1520,7 +1564,7 @@
           button.addEventListener("pointerdown", (event) => event.stopPropagation());
           button.addEventListener("click", (event) => {
             event.stopPropagation();
-            if (loop && !loop.meta.playback) {
+            if (loop && !executed) {
               openTimelineControlPopover(button, loop, "loop");
               return;
             }
@@ -1560,10 +1604,12 @@
       renderSharedEventInspector(null);
       return;
     }
-    const selectedNode = selectedTimelineEventId ? findVisibleEventNodeByIds([selectedTimelineEventId]) : undefined;
+    const selectedEvent = timelineEventsById.get(String(selectedTimelineEventId));
+    const applied = setterApplicationEventIds(selectedEvent);
+    const selectedNode = selectedTimelineEventId ? findVisibleEventNodeByIds([selectedTimelineEventId, ...applied]) : undefined;
     if (selectedNode) {
       selectEventNode(selectedNode, { notify: false, syncHardware: false,
-        ...(selectedNode.dataset.rtPreparation === "true" ? { eventId: selectedTimelineEventId } : {}) });
+        ...(applied.length || selectedNode.dataset.rtPreparation === "true" ? { eventId: selectedTimelineEventId } : {}) });
       return;
     }
     syncTimelineRelatedSelection(undefined);
@@ -1605,6 +1651,7 @@
       timelineCommandWidths = [];
       for (const lane of model.lanes.filter((lane) => ["runtime", "branch-runtime", "runtime-path"].includes(lane.kind))) {
         for (const block of lane.blocks.filter((block) => !block.diagnosticPlacement && !["underflow_warning", "analysis_incomplete", "unknown_region"].includes(block.kind))) {
+          if (block.pointMarker) continue;
           block.commandLabel = block.commandToken || block.label;
           block.classNames += " q1timeline-command-name";
           if (!block.duration) block.classNames += " q1timeline-command-point";
@@ -1856,11 +1903,9 @@
       addInspectorField(fields, "Sequencer", event.sequencer_id);
       addInspectorField(fields, "Lane", event.lane);
       addInspectorField(fields, "Time range", `${displayInspectorValue(eventTime(event, "t0"))} -> ${displayInspectorValue(eventTime(event, "t1"))}`);
-      addInspectorField(fields, "Local time", `${displayInspectorValue(concreteTime(event.t0))} -> ${displayInspectorValue(concreteTime(event.t1))}`);
-      addInspectorField(fields, "Aligned time", meta.aligned_t0 !== undefined || meta.aligned_t1 !== undefined ? `${displayInspectorValue(meta.aligned_t0)} -> ${displayInspectorValue(meta.aligned_t1)}` : "");
       addInspectorField(fields, "Source", source.file ? `${source.file}:${source.line || 1}` : "unavailable");
       addInspectorField(fields, "Confidence", event.confidence);
-      addInspectorField(fields, "Q1 core", event.kind === "q1_issue" ? `${displayInspectorValue(event.t0)} -> ${displayInspectorValue(event.t1)}` : meta.q1_issue_event_id);
+      addInspectorField(fields, "Q1 issue", meta.q1_issue_event_id);
       addInspectorField(fields, "RT packet", meta.rt_packet_id);
       addInspectorField(fields, "Queue depth", meta.estimated_depth ?? meta.depth);
       addInspectorField(fields, "Late by", event.kind === "underflow_warning" && meta.slack_ns < 0 ? `${-meta.slack_ns} ns` : "");
@@ -2921,6 +2966,11 @@
   function renderModeToggle(mode) {
     ensureToolbarNode();
     const currentMode = mode === "debug" ? "debug" : "normal";
+    if (rtTimeOriginEnabled() && currentMode !== currentTimelineMode()) {
+      timelineWindow = undefined;
+      timelineSelectionRange = undefined;
+      timelineTimeScales.clear();
+    }
     toggleClass(document.body, "mode-debug", currentMode === "debug");
     toggleClass(document.body, "mode-normal", currentMode === "normal");
     document.body.dataset.mode = currentMode;
@@ -2947,6 +2997,8 @@
   }
 
   function renderTimeBasisToggle() {
+    const group = document.getElementById("q1timeline-time-basis-toggle");
+    if (group && rtTimeOriginEnabled()) group.style.display = "none";
     for (const button of document.querySelectorAll("[data-time-basis]")) {
       const basis = button.getAttribute("data-time-basis");
       const enabled = basis === "local" || hasAlignedTimelineTimes();
@@ -3272,6 +3324,7 @@
   }
 
   function initialTimelineTimeBasis() {
+    if (rtTimeOriginEnabled()) return "aligned";
     const persistedState = readPersistedWebviewState();
     const savedBasis = persistedState && persistedState.timelineTimeBasis;
     if (savedBasis === "local") {
@@ -3283,9 +3336,17 @@
     return hasAlignedTimelineTimes() ? "aligned" : "local";
   }
 
+  function rtTimeOriginEnabled() {
+    const anchors = timelineIr.project?.alignment_anchor_kinds;
+    return timelineIr.project?.alignment_mode === "first_anchor" && anchors?.length === 1 && anchors[0] === "rt_queue_dequeue";
+  }
+
   function fullTimelineWindow() {
     const svg = timelineSvg();
     const geometry = timelineGeometry(svg);
+    if (rtTimeOriginEnabled() && currentTimelineMode() === "normal" && geometry.min < 0 && geometry.max > 0) {
+      return { min: 0, max: geometry.max };
+    }
     return { min: geometry.min, max: geometry.max };
   }
 
@@ -3457,17 +3518,30 @@
   }
 
   function visibleTimelineTicks(window) {
-    const scale = timelineTimeScale();
-    if (!scale || !scale.gaps.some((gap) => gap.start < window.max && gap.end > window.min)) {
-      return timelineTicks(window.min, window.max);
+    let min = window.min;
+    if (currentTimelineMode() === "normal" && !rtTimeOriginEnabled()) {
+      let q1Start = Infinity;
+      let rtStart = Infinity;
+      for (const event of timelineEventsById.values()) {
+        const start = eventTime(event, "t0");
+        if (!Number.isFinite(start)) continue;
+        if (event.kind === "q1_issue") q1Start = Math.min(q1Start, start);
+        else if (/^(?:branch_compare\.(?:taken|fallthrough)\.)?rt\./.test(event.lane)) rtStart = Math.min(rtStart, start);
+      }
+      if (q1Start < rtStart && Number.isFinite(rtStart)) min = Math.max(min, rtStart);
     }
-    const display = timelineDisplayWindow(window);
+    if (min >= window.max) return min === window.max ? [min] : [];
+    const scale = timelineTimeScale();
+    if (!scale || !scale.gaps.some((gap) => gap.start < window.max && gap.end > min)) {
+      return timelineTicks(min, window.max);
+    }
+    const display = timelineDisplayWindow({ min, max: window.max });
     const edgeSpacing = (display.max - display.min) * 0.01;
     const ticks = timelineTicks(display.min, display.max).map(realTimelineTime).filter((time) =>
       displayTimelineTime(time) > display.min + edgeSpacing && displayTimelineTime(time) < display.max - edgeSpacing &&
       !scale.gaps.some((gap) => time > gap.start && time < gap.end)
     );
-    return [window.min, ...ticks, window.max];
+    return [min, ...ticks, window.max];
   }
 
   function setTimelineDisplayWindow(min, max) {
@@ -4436,6 +4510,7 @@
   }
 
   function setTimelineTimeBasis(basis) {
+    if (rtTimeOriginEnabled()) return;
     if (basis !== "aligned" && basis !== "local") {
       return;
     }
@@ -4872,6 +4947,12 @@
   }
 
   ensureToolbarNode();
+  if (state.parameterProjectFile && window.q1lensDefRuns) {
+    const saved = readPersistedWebviewState().defRuns;
+    window.q1lensDefRuns.mount(document.getElementById("q1timeline-layout-toggle"), vscode, state.parameterProjectFile,
+      saved?.project === state.parameterProjectFile ? saved.view : {},
+      (view) => writePersistedWebviewState({ defRuns: { project: state.parameterProjectFile, view } }), initialUnsavedChanges);
+  }
   renderInitialBufferSummary();
   installExternalInputs();
   renderExecutionControls();
@@ -5034,13 +5115,15 @@
     }
     const highlightEventIds = prioritizedHighlightEventIds(event.data.highlightEventIds || []);
     expandQ1IssueLanesForHighlight(highlightEventIds);
-    const highlightedEvent = sourceNavigationEvent(highlightedEventForIds(highlightEventIds));
+    const sourceEvent = highlightedEventForIds(highlightEventIds);
+    const setterId = setterApplicationEventIds(sourceEvent).length ? String(sourceEvent.id) : undefined;
+    const highlightedEvent = sourceNavigationEvent(sourceEvent);
     const visibleEvent = visiblePlaybackEvent(highlightedEvent);
     zoomTimelineToHighlightedEvent(visibleEvent);
     const target = findVisibleEventNodeByIds(visibleEvent ? [visibleEvent.id, ...highlightEventIds] : highlightEventIds);
     if (target) {
       selectEventNode(target, { notify: false, syncHardware: visibleEvent === highlightedEvent,
-        ...(target.dataset.rtPreparation === "true" ? { eventId: String(highlightedEvent.id) } : {}) });
+        ...(setterId || target.dataset.rtPreparation === "true" ? { eventId: setterId || String(highlightedEvent.id) } : {}) });
       if (visibleEvent !== highlightedEvent && highlightedEvent) {
         if (hardwareView) hardwareView.selectEvent(highlightedEvent.id);
         renderSharedEventInspector(highlightedEvent.id);
@@ -5048,7 +5131,7 @@
       target.scrollIntoView({ block: "center", inline: "center" });
     } else {
       if (highlightedEvent) {
-        selectEventNode(undefined, { eventId: String(highlightedEvent.id), notify: false, syncHardware: false });
+        selectEventNode(undefined, { eventId: setterId || String(highlightedEvent.id), notify: false, syncHardware: false });
       }
       const ids = new Set(highlightEventIds);
       document.querySelectorAll("[data-event-id]").forEach((node) => {

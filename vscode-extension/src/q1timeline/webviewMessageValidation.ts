@@ -7,10 +7,41 @@ function hasOnlyKeys(message, keys) {
 
 const VALID_BRANCH_ASSUMPTION_PATHS = new Set(["collapsed", "taken", "fallthrough", "both"]);
 
+function parseDefRunMessage(message) {
+  const { action, project, revision, sequencer, uri, registers, observe_time, overrides, axes, token, sweepId, caseId, statistics_only } = message;
+  const literal = (value) => typeof value === "string" && value.length <= 16384;
+  const base = ["type", "action", "project"];
+  const target = ["revision", "sequencer", "uri"];
+  if (typeof project !== "string" || !project) return { valid: false };
+  if (["info", "cancel"].includes(action) && hasOnlyKeys(message, base)) return { ...message, valid: true };
+  if (action === "case" && typeof sweepId === "string" && Number.isSafeInteger(caseId) && caseId > 0 &&
+      hasOnlyKeys(message, [...base, "sweepId", "caseId"])) return { ...message, valid: true };
+  if (![revision, sequencer, uri].every((value) => typeof value === "string" && value.length > 0)) return { valid: false };
+  const validAxes = Array.isArray(axes) && axes.length >= 1 && axes.length <= 2 && axes.every((axis) =>
+    axis && typeof axis === "object" && hasOnlyKeys(axis, ["name", "min", "max", "step"]) &&
+    [axis.name, axis.min, axis.max, axis.step].every(literal));
+  const validStatistics = statistics_only === undefined || typeof statistics_only === "boolean";
+  if (action === "plan" && validAxes && validStatistics && Number.isSafeInteger(token) &&
+      hasOnlyKeys(message, [...base, ...target, "axes", "token", "statistics_only"])) return { ...message, valid: true };
+  const validObservations = Array.isArray(registers) && registers.length <= 64 &&
+    registers.every((name) => typeof name === "string" && /^R(?:\d|[1-5]\d|6[0-3])$/.test(name)) &&
+    new Set(registers).size === registers.length && typeof observe_time === "boolean";
+  if (!["run", "sweep"].includes(action) || !validObservations ||
+      !overrides || typeof overrides !== "object" || Array.isArray(overrides) || !Object.values(overrides).every(literal)) {
+    return { valid: false };
+  }
+  const keys = [...base, ...target, "registers", "observe_time", "overrides"];
+  const valid = action === "run" ? hasOnlyKeys(message, keys) : (registers.length > 0 || observe_time) &&
+    validAxes && validStatistics && hasOnlyKeys(message, [...keys, "axes", "statistics_only"]);
+  return valid ? { ...message, valid: true } : { valid: false };
+}
+
 function parseWebviewMessage(message) {
   if (!message || typeof message !== "object" || Array.isArray(message)) {
     return { valid: false, reason: "message must be an object" };
   }
+
+  if (message.type === "defRun") return parseDefRunMessage(message);
 
   if (
     message.type === "eventClick" &&

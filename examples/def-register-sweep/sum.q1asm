@@ -1,0 +1,10 @@
+.DEF X 0
+.DEF Y 10
+move $X,R0
+move $Y,R1
+nop
+add R0,R1,R2
+nop
+nop
+nop
+stop

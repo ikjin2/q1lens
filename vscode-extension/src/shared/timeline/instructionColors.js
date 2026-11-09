@@ -55,6 +55,7 @@
 
   function eventCommandToken(event) {
     if (["loop_block", "loop_iteration_preview", "branch_region"].includes(event && event.kind)) return "loop";
+    if (event?.kind === "trigger_receive") return "trigger receive";
     const op = String((event && event.meta && event.meta.op) || "").trim();
     if (op) return op;
     const raw = commandToken(event && event.source && event.source.raw);

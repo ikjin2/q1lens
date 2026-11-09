@@ -40,6 +40,32 @@ function assertTargets(events: ReturnType<typeof event>[], expected: Record<stri
 }
 
 describe("Q1 timeline issue markers", () => {
+  it("marks a simulated trigger arrival with its address and displayed time", () => {
+    const stop = { file: "Control.q1asm", line: 19, column: 1, raw: "stop" };
+    const model = buildModel({ events: [
+      event("trigger", "trigger_receive", 90, { address: 1, aligned_t0: 30, aligned_t1: 30 }, { source: stop }),
+      event("end", "stop", 140, { aligned_t0: 80, aligned_t1: 80 }, { source: stop }),
+    ] }, { layout: "time", timeBasis: "aligned" });
+    const [trigger, end] = blocks(model);
+    assert.equal(trigger.start, 30);
+    assert.equal(trigger.pointMarker, true);
+    assert.equal(trigger.title, "Trigger address 1 · 30 ns");
+    assert.equal(end.title, "stop | 80 ns -> 80 ns");
+  });
+
+  it("shows the initial buffer only in the Q1 lane label", () => {
+    const events = [event("issue", "q1_issue", 0, { op: "wait" }), event("rt", "wait", 4)];
+    const options = { mode: "debug" };
+    const baseline = buildModel({ events }, options);
+    const buffered = buildModel({ events, simulation: { Control: {
+      initial_buffer: { assumed_ns: 1_000_000, possible_ns: 2_000_000, used_ns: 0 },
+    } } }, options);
+    assert.equal(buffered.lanes.find((lane: any) => lane.kind === "q1-issue").label, "Q1 core · 1–2 ms buffer");
+    assert.deepEqual(blocks(buffered), blocks(baseline));
+    assert.deepEqual(buffered.annotations, baseline.annotations);
+    assert.deepEqual(buffered.viewport, baseline.viewport);
+  });
+
   it("marks only issues with RT commands, preserving setter and Q1-only labels", () => {
     const events = [
       event("setter", "q1_issue", 0, { op: "set_freq" }),
@@ -144,12 +170,13 @@ describe("Q1 timeline issue markers", () => {
     for (const layout of ["time", "instruction"]) {
       for (const timeBasis of ["local", "aligned"]) {
         const model = buildModel(ir, { layout, timeBasis, expandedQ1IssueSequencers: ["Control"] });
-        const metadata = blocks(model).map(({ start: _start, duration: _duration, ...rest }) => rest);
+        const metadata = blocks(model).map(({ start: _start, duration: _duration, title: _title, ...rest }) => rest);
         if (baseline === undefined) baseline = metadata;
         else assert.deepEqual(metadata, baseline);
         const issue = blocks(model).find((block) => block.eventId === "issue");
         assert.equal(issue.issueMarker, true);
         assert.deepEqual(issue.rtEventIds, ["rt"]);
+        assert.match(issue.title, new RegExp(`start: ${timeBasis === "aligned" ? 1004 : 4} ns`));
         if (layout === "time") assert.equal(issue.start, timeBasis === "aligned" ? 1004 : 4);
       }
     }

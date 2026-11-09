@@ -423,7 +423,7 @@
     node.dataset.connectionStartKnown = String(block.connectionStartKnown !== false);
     node.dataset.search = String(block.search || `${block.label || ""} ${block.detail || ""}`.toLowerCase());
     node.style.left = `${style.leftPercent}%`;
-    node.style.width = block.diagnosticPlacement === "point" ? "10px" :
+    node.style.width = block.diagnosticPlacement === "point" || block.pointMarker ? "10px" :
       block.issueMarker ? `min(24px, ${style.widthPercent}%)` : `${style.widthPercent}%`;
     if (block.accentColor) {
       node.classList.add("has-command-color");
@@ -448,6 +448,9 @@
     if (block.diagnosticPlacement) {
       node.classList.add("timeline-diagnostic", `diagnostic-${block.diagnosticPlacement}`);
       node.dataset.diagnosticPlacement = block.diagnosticPlacement;
+      node.setAttribute("aria-label", node.title);
+    } else if (block.pointMarker) {
+      node.classList.add("timeline-point-marker");
       node.setAttribute("aria-label", node.title);
     } else if (block.issueMarker) {
       node.classList.add("timeline-issue-marker");
@@ -537,6 +540,7 @@
       row.style.display = "none";
     }
     const label = element("div", "lane-label");
+    if (lane.labelTitle) label.title = lane.labelTitle;
     label.appendChild(element("span", "lane-label-text", lane.label));
     if (lane.q1Errors?.length) {
       const mark = element("button", "event q1-error-marker timeline-error-mark", "!");

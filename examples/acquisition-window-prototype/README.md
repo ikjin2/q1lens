@@ -12,12 +12,13 @@ or its integration window to inspect the same source instruction.
 | --- | --- | --- |
 | `readout` | 1000 ns | First acquisition ends after 600 ns when the next Acquire starts. Different acquisition and bin indices share one ACQ row. |
 | `parallel` | 800 ns | Independent windows overlap in time with the other sequencer. |
-| `unknown` | Not supplied | Acquisition starts are visible; an integration end is not invented from the 4 ns RT wait. |
+| `unknown` | Not supplied | Each acquisition shows a 4 ns integration assumed from the RT instruction duration. |
 
 `sequencers[].hardware_parameters.integration_length_acq` is an explicit saved
 setup value in nanoseconds. In this prototype, enter the same value used for the
 QCoDeS setter; the app does not connect to a live instrument or inspect notebook
 setter calls. Edit the YAML and use **Reanalyze** to try another length.
+The saved value takes precedence over the displayed assumption.
 
 From `desktop-app`, run `npm run build` followed by
 `node scripts/verify-acquisition.cjs` to check the real Python-to-Electron flow.

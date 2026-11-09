@@ -12,6 +12,7 @@ from q1timeline.simulation.runtime import simulate_programs
 
 def run(source: str | dict[str, str], *, sequences=None, **config):
     documents = source if isinstance(source, dict) else {"seq": source}
+    config = {"startup_delay_ns": 200, **config}  # These scenarios use a fixed shared clock.
     return simulate_programs({name: parse_q1asm(text, file=name) for name, text in documents.items()}, simulation=config, sequences=sequences)
 
 
@@ -21,6 +22,42 @@ def events(state, kind):
 
 def status(state):
     return state.metadata["execution"]["status"]
+
+
+def test_buffered_rt_has_no_startup_event_or_cost_for_q1_only_work() -> None:
+    q1_only, = simulate_programs({"seq": parse_q1asm("move 7,R0\nnop\nstop")})
+    assert status(q1_only) == "completed"
+    assert not any(event.lane.startswith("rt.") for event in q1_only.events)
+    assert q1_only.metadata["simulation"]["initial_buffer"]["prefill_ns"] == 0
+
+    late, = simulate_programs({"seq": parse_q1asm("fb_pop_data 5,R0\nwait 4\nstop")}, simulation={
+        "inputs": {"feedback": [{"target": "seq", "time_ns": 2_100_000, "id": 5, "value": 7}]},
+    })
+    assert status(late) == "completed"
+    assert events(late, "rt_queue_enqueue")[0].t0 == Concrete(2_100_008)
+    assert events(late, "wait")[0].t0 == Concrete(2_100_012)
+    assert late.metadata["simulation"]["initial_buffer"]["prefill_ns"] == 4
+
+
+def test_default_initial_buffer_prefills_instead_of_pausing_rt() -> None:
+    programs = {"seq": parse_q1asm("wait 4\n" + "nop\n" * 10 + "wait 4\nstop")}
+    state, = simulate_programs(programs)
+    assert status(state) == "completed"
+    assert [(event.t0.value, event.t1.value) for event in events(state, "wait")] == [(52, 56), (56, 60)]
+    assert state.metadata["simulation"]["initial_buffer"]["prefill_ns"] == 48
+
+    limited, = simulate_programs(programs, simulation={"queue_capacity": 1})
+    assert status(limited) == "error"
+    assert events(limited, "underflow_warning")[0].t0 == Concrete(8)
+
+
+def test_rt_relative_trigger_at_zero_arrives_at_first_rt_command() -> None:
+    state, = run("wait_trigger 1,4\nstop", startup_delay_ns=8, inputs={"triggers": [
+        {"target": "seq", "rt_time_ns": 0, "address": 1},
+    ]})
+    assert status(state) == "completed"
+    assert events(state, "trigger_receive")[0].t0 == Concrete(8)
+    assert state.rt_time_ns == Concrete(12)
 
 
 def test_finite_queue_stalls_q1_and_dequeues_at_rt_cadence() -> None:

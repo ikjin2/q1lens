@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { cpSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { basename, delimiter, join, resolve } from "node:path";
+import { createServer } from "node:net";
 import { runTests } from "@vscode/test-electron";
 
 async function main(): Promise<void> {
@@ -14,7 +15,7 @@ async function main(): Promise<void> {
   mkdirSync(outputPath, { recursive: true });
   const workspacePath = mkdtempSync(join(outputPath, "workspace-"));
   const userDataPath = mkdtempSync(join(outputPath, "profile-"));
-  for (const example of ["two-qubit-entangling", "simulation-verification"]) {
+  for (const example of ["two-qubit-entangling", "simulation-verification", "def-register-sweep"]) {
     cpSync(join(repositoryPath, "examples", example), join(workspacePath, "examples", example), {
       recursive: true,
       filter: (source) => ![".q1timeline", ".qbs_timeline", ".verification", "__pycache__"].includes(basename(source)),
@@ -31,11 +32,19 @@ async function main(): Promise<void> {
   const workspaceFile = join(outputPath, `${basename(workspacePath)}.code-workspace`);
   writeFileSync(workspaceFile, JSON.stringify({ folders: [{ path: workspacePath }], settings }, null, 2));
 
+  const debugPort = await new Promise<number>((resolvePort, reject) => {
+    const server = createServer().once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (address && typeof address === "object") server.close(() => resolvePort(address.port));
+    });
+  });
   await runTests({
     ...(process.env.Q1LENS_VSCODE_TEST_VERSION ? { version: process.env.Q1LENS_VSCODE_TEST_VERSION } : {}),
     extensionDevelopmentPath,
     extensionTestsPath,
-    launchArgs: ["--disable-extensions", "--user-data-dir", userDataPath, workspaceFile],
+    launchArgs: ["--disable-extensions", "--user-data-dir", userDataPath, `--remote-debugging-port=${debugPort}`, workspaceFile],
+    extensionTestsEnv: { Q1LENS_DEF_WEBVIEW_CDP_PORT: String(debugPort) },
   });
 }
 

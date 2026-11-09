@@ -664,7 +664,7 @@ def _analyze_command(args: argparse.Namespace) -> int:
             states = simulate_programs(
                 simulation_programs, params=params, max_steps=max_steps,
                 simulation=config.simulation, sequences=simulation_sequences,
-                strict_q1asm=args.q1asm_strict,
+                strict_q1asm=args.q1asm_strict, branch_assumptions=branch_assumptions,
             )
         except ValueError as exc:
             if args.format == "vscode-json":

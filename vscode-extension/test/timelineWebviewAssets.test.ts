@@ -236,7 +236,7 @@ function loadQ1TimelineZoomRuntime(script: string, events: any[], options: any =
   const full = options.full || { min: 0, max: 40_160_000 };
   let savedState = options.state || {};
   const sources = [
-    "concreteTime", "eventTime", "normalizedSource", "sameSourceLine", "loopPreviewEventIds", "initialTimelineWindow", "fullTimelineWindow",
+    "concreteTime", "eventTime", "normalizedSource", "sameSourceLine", "loopPreviewEventIds", "initialTimelineWindow", "fullTimelineWindow", "rtTimeOriginEnabled",
     "currentTimelineWindow", "timelineExtentMatches", "persistedTimelineWindowFor",
     "readPersistedWebviewState", "writePersistedWebviewState", "writeTimelineWindowState",
     "snapTimelineNs", "clamp", "timelineWindowForRange", "setTimelineWindow",
@@ -258,8 +258,9 @@ function loadQ1TimelineZoomRuntime(script: string, events: any[], options: any =
     getState: () => savedState,
     setState: (state: any) => { savedState = state; },
   };
-  return Function("events", "full", "basis", "vscode", "scale", `
+  return Function("events", "full", "basis", "vscode", "scale", "project", "mode", `
     const window = {};
+    const timelineIr = { project };
     const timelineEventsById = new Map(events.map(event => [String(event.id), event]));
     let timelineTimeBasis = basis;
     let timelineLayout = "time";
@@ -272,6 +273,7 @@ function loadQ1TimelineZoomRuntime(script: string, events: any[], options: any =
     const document = { querySelector: () => track, querySelectorAll: () => [track] };
     function timelineSvg() {}
     function timelineGeometry() { return full; }
+    function currentTimelineMode() { return mode; }
     function timelineTimeScale() { return scale; }
     const visiblePlaybackEvent = event => event;
     function applyTimelineScale() {}
@@ -294,7 +296,7 @@ function loadQ1TimelineZoomRuntime(script: string, events: any[], options: any =
       selection: () => timelineSelectionRange,
       state: () => vscode.getState(),
     };
-  `)(events, full, options.basis || "local", vscode, options.scale);
+  `)(events, full, options.basis || "local", vscode, options.scale, options.project, options.mode || "normal");
 }
 
 describe("timeline webview assets", () => {
@@ -1510,7 +1512,7 @@ describe("timeline webview assets", () => {
     const script = readFileSync(join(__dirname, "..", "src", "q1timeline", "media", "timeline.js"), "utf-8");
     const sources = [
       "readPersistedWebviewState", "writePersistedWebviewState", "hasAlignedTimelineTimes",
-      "initialTimelineTimeBasis", "setTimelineTimeBasis", "initializeHardwareView",
+      "rtTimeOriginEnabled", "initialTimelineTimeBasis", "setTimelineTimeBasis", "initializeHardwareView",
     ].map((name) => {
       const source = extractFunctionSource(script, name);
       assert.ok(source, `Missing ${name}`);
@@ -1616,7 +1618,8 @@ describe("timeline webview assets", () => {
     assert.match(script, /function zoomTimelineToHighlightedEvent\(event\)/);
     assert.match(script, /const highlightEventIds = prioritizedHighlightEventIds\(event\.data\.highlightEventIds \|\| \[\]\)/);
     assert.match(script, /expandQ1IssueLanesForHighlight\(highlightEventIds\)/);
-    assert.match(script, /const highlightedEvent = sourceNavigationEvent\(highlightedEventForIds\(highlightEventIds\)\)/);
+    assert.match(script, /const sourceEvent = highlightedEventForIds\(highlightEventIds\)/);
+    assert.match(script, /const highlightedEvent = sourceNavigationEvent\(sourceEvent\)/);
     assert.match(script, /zoomTimelineToHighlightedEvent\(visibleEvent\)/);
   });
 
@@ -2319,6 +2322,27 @@ describe("timeline webview assets", () => {
     assert.deepEqual(runtime.currentTimelineWindow(), { min: 0, max: 1 });
     runtime.setTimelineWindow(40_160_001, 40_160_002);
     assert.deepEqual(runtime.currentTimelineWindow(), { min: 40_159_999, max: 40_160_000 });
+  });
+
+  it("shows the Q1 preparation time only in Debug when aligned to RT start", () => {
+    const script = readFileSync(join(__dirname, "..", "src", "q1timeline", "media", "timeline.js"), "utf-8");
+    const events = [
+      { id: "q1", kind: "q1_issue", lane: "debug.q1_issue", meta: { aligned_t0: -60 } },
+      { id: "queue", kind: "rt_queue_enqueue", lane: "debug.rt_queue", meta: { aligned_t0: -48 } },
+      { id: "rt", kind: "upd_param", lane: "rt.upd_param", meta: { aligned_t0: 0 } },
+    ];
+    const full = { min: -60, max: 80 };
+    const scale = { gaps: [], plotWidth: 1000, toDisplay: (time: number) => time, fromDisplay: (time: number) => time };
+    const project = { alignment_mode: "first_anchor", alignment_anchor_kinds: ["rt_queue_dequeue"] };
+    const options = { full, scale, basis: "aligned", project };
+    const runtime = loadQ1TimelineZoomRuntime(script, events, options);
+    assert.deepEqual(runtime.currentTimelineWindow(), { min: 0, max: 80 });
+    const ticks = runtime.sharedTimelineTicks();
+    assert.deepEqual(ticks[0], { leftPercent: 0, label: "0 ns" });
+    assert.equal(ticks.at(-1).label, "80 ns");
+    const debug = loadQ1TimelineZoomRuntime(script, events, { ...options, mode: "debug" });
+    assert.deepEqual(debug.currentTimelineWindow(), full);
+    assert.deepEqual(debug.sharedTimelineTicks()[0], { leftPercent: 0, label: "-60 ns" });
   });
 
   it("keeps folded-time navigation, ticks, source highlights, and hardware cursor in real nanoseconds", () => {

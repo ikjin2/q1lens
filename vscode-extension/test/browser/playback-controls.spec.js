@@ -649,6 +649,55 @@ test("hardware register writers keep the exact instruction inspector inside a co
   await page.screenshot({path: test.info().outputPath("register-first-loop-writer-inspector.png"), fullPage: true});
 });
 
+test("concrete counter preview folds RT repetitions and keeps all register changes before Run", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const ir = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", [
+    "-m", "q1lens", "q1timeline", "analyze", "--project", "examples/concrete-register-execution/q1timeline.yml",
+    "--out", test.info().outputPath("counter.json"), "--format", "vscode-json", "--include-timeline-ir", "--no-render",
+  ], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}})).timeline_ir;
+  expect(ir.execution.counter.mode).toBe("concrete");
+  await mount(page, "idle", ir, {hardwareState: {level: "detail", sequencerId: "counter", time: 16}}, {viewMode: "normal"});
+  const rt = page.locator(".timeline-row-runtime");
+  const loop = rt.getByRole("button", {name: "Executed loop options", exact: true});
+  await expect(page.getByRole("button", {name: "Run execution", exact: true})).toBeEnabled();
+  await expect(loop.locator(".loop-range-label")).toHaveText("×3");
+  const waits = rt.locator(ir.events.filter((event) => event.kind === "wait")
+    .map((event) => `.timeline-block[data-event-id="${event.id}"]`).join(", "));
+  await expect(waits).toHaveCount(1);
+  await expect(page.locator(".ruler .q1timeline-wait-fold")).toHaveCount(0);
+  const repeatFold = rt.locator(".q1timeline-playback-fold");
+  await expect(repeatFold).toHaveAttribute("data-time-start", "104");
+  await expect(repeatFold).toHaveAttribute("data-time-end", "304");
+  await expect(page.locator(".ruler .q1timeline-playback-fold .q1timeline-fold-duration")).toHaveText("200 ns");
+  const [waitBounds, loopBounds, foldBounds] = await Promise.all([
+    waits.boundingBox(), loop.boundingBox(), repeatFold.boundingBox(),
+  ]);
+  expect(loopBounds.x).toBeCloseTo(waitBounds.x, 0);
+  expect(loopBounds.x + loopBounds.width).toBeCloseTo(foldBounds.x, 0);
+
+  const register = page.locator('[data-register="R1"]');
+  await register.click();
+  await expect(register.locator("strong")).toHaveText("0");
+  const next = page.getByRole("button", {name: "Next change ›", exact: true});
+  for (const value of ["1", "2", "3"]) {
+    await next.click();
+    await expect(register.locator("strong")).toHaveText(value);
+  }
+  await expect(next).toBeDisabled();
+  await expect(waits).toHaveCount(1);
+  await loop.click();
+  await page.getByRole("button", {name: "Expand executed iterations", exact: true}).click();
+  await expect(waits).toHaveCount(3);
+  await expect(repeatFold).toHaveCount(0);
+  await expect(loop.locator(".loop-range-label")).toBeHidden();
+  await loop.click();
+  await page.getByRole("button", {name: "Collapse executed iterations", exact: true}).click();
+  await expect(waits).toHaveCount(1);
+  await expect(loop.locator(".loop-range-label")).toBeVisible();
+  await expect(register.locator("strong")).toHaveText("3");
+  expect(await page.evaluate(() => window.messages.filter((message) => message.type === "executionControl"))).toEqual([]);
+});
+
 test("keeps a source filter active across layout switches and wait folding", async ({page}) => {
   const repo = path.resolve(__dirname, "../../..");
   const {ir, html} = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
@@ -724,17 +773,19 @@ test("adaptive array source selection reveals wait 80 instead of the preceding t
   await page.screenshot({path: test.info().outputPath("adaptive-array-wait-source-selection.png"), fullPage: true});
 });
 
-test("source and Q1 commands navigate to the next RT start in both layouts", async ({page}) => {
+test("source and Q1 commands navigate to the related RT start in both layouts", async ({page}) => {
   const repo = path.resolve(__dirname, "../../..");
   const {ir, html} = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
     "import json", "from q1timeline.analysis.api import analyze_text", "from q1timeline.render.html import render_html",
-    'ir=analyze_text("move 1,R0\\nnop\\nwait 100\\nset_freq 100\\nadd R0,1,R0\\nnop\\nwait 80\\nstop\\n",file="setup.q1asm",sequencer_id="seq")',
+    'ir=analyze_text("move 1,R0\\nnop\\nwait 100\\nset_freq 100\\nadd R0,1,R0\\nnop\\nwait 80\\nupd_param 4\\nstop\\n",file="setup.q1asm",sequencer_id="seq")',
     "print(json.dumps({'ir':ir,'html':render_html(ir,default_mode='debug')}))",
   ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
   const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
     /type=["']application\/json["']/i.test(attributes) ? tag : "");
   await mount(page, "idle", ir, {expandedQ1IssueSequencers: ["seq"]}, {}, shell);
   const waits = ir.events.filter((item) => item.kind === "wait");
+  const application = ir.events.find((item) => item.kind === "upd_param");
+  const rtTarget = (line) => line === 4 ? application : waits[line >= 4 ? 1 : 0];
   const prep = page.getByRole("button", {name: "seq: RT preparation", exact: true});
   await expect(prep).toHaveText("prep");
   expect((await prep.boundingBox()).width).toBeLessThan(45);
@@ -745,7 +796,7 @@ test("source and Q1 commands navigate to the next RT start in both layouts", asy
       await page.evaluate((ids) => window.dispatchEvent(new MessageEvent("message", {
         data: {type: "highlightEventIds", highlightEventIds: ids},
       })), events.map((item) => item.id));
-      const target = line >= 4 ? waits[1] : waits[0];
+      const target = rtTarget(line);
       await expect(page.locator(`.timeline-block[data-event-id="${target.id}"]`)).toHaveAttribute("aria-selected", "true");
       await expect(prep).toHaveAttribute("aria-selected", "false");
       await expect(page.getByRole("spinbutton", {name: "Selected time in nanoseconds"})).toHaveValue(String(target.t0.value));
@@ -755,8 +806,8 @@ test("source and Q1 commands navigate to the next RT start in both layouts", asy
       const block = page.locator(`.timeline-block[data-event-id="${issue.id}"]`);
       await block.evaluate((node) => node.click());
       await expect(block).toHaveAttribute("aria-selected", "true");
-      await expect(page.locator("#event-inspector-fields")).toContainText(`setup.q1asm:${line}`);
-      await expect(page.getByRole("spinbutton", {name: "Selected time in nanoseconds"})).toHaveValue(String((line >= 4 ? waits[1] : waits[0]).t0.value));
+      await expect(page.locator("#event-inspector-fields")).toContainText(`setup.q1asm:${line === 4 ? application.source.line : line}`);
+      await expect(page.getByRole("spinbutton", {name: "Selected time in nanoseconds"})).toHaveValue(String(rtTarget(line).t0.value));
     }
   }
   const setupIds = ir.events.filter((item) => item.source?.line === 2).map((item) => item.id);
@@ -1345,7 +1396,8 @@ test("collapsed wait loop preserves the first wait's end before a distinct repea
   expect(folded.repeated.x).toBeCloseTo(folded.block.x + folded.block.width, 0);
   expect(folded.after.x).toBeCloseTo(folded.repeated.x + folded.repeated.width, 0);
   const loopBounds = await row.locator('.timeline-loop-range').boundingBox();
-  expect(folded.after.x).toBeCloseTo(loopBounds.x + loopBounds.width, 0);
+  expect(folded.block.x).toBeCloseTo(loopBounds.x, 0);
+  expect(folded.repeated.x).toBeCloseTo(loopBounds.x + loopBounds.width, 0);
   await expect(repeatFold).toHaveAttribute("data-time-start", String(waits[0].t1.value));
   await expect(repeatFold).toHaveAttribute("data-time-end", String(loop.t1.value));
   for (const wait of waits.slice(1)) await expect(row.locator(`.timeline-block[data-event-id="${wait.id}"]`)).toHaveCount(0);
@@ -1759,8 +1811,8 @@ test("actual golden-section execution folds fifteen observed wait iterations", a
   expect(repeatBounds.width).toBeLessThanOrEqual(100);
   expect(repeatBounds.width).toBeGreaterThanOrEqual(repeatTab.width);
   const repeatWidth = await page.locator('.ruler .q1timeline-playback-fold').evaluate(node => parseFloat(node.style.width));
-  expect(collapsed.loopWidth).toBeCloseTo(collapsed.firstWidth + repeatWidth, 2);
-  expect(collapsed.afterLeft).toBeCloseTo(collapsed.loopLeft + collapsed.loopWidth, 2);
+  expect(collapsed.loopWidth).toBeCloseTo(collapsed.firstWidth, 2);
+  expect(collapsed.afterLeft).toBeCloseTo(collapsed.loopLeft + collapsed.loopWidth + repeatWidth, 2);
   expect(collapsed.ticks.some((tick) => tick.time > loop.meta.first_iteration_end.value && tick.time < loop.t1.value)).toBe(false);
   const firstLeft = await page.locator(`.timeline-block[data-event-id="${firstWait.id}"]`).evaluate(node => parseFloat(node.style.left));
   const followingWidth = await page.locator(`.timeline-block[data-event-id="${followingWait.id}"]`).evaluate(node => parseFloat(node.style.width));
@@ -1782,6 +1834,7 @@ test("actual golden-section execution folds fifteen observed wait iterations", a
   await page.screenshot({path: test.info().outputPath("golden-loop-options.png"), fullPage: true});
   await expand.click();
   await expect(hidden).toHaveCount(1);
+  await expect(loopNode.locator(".loop-range-label")).toBeHidden();
   const expanded = await loopGeometry(page, loop.id, firstWait.id, followingWait.id);
   expect(expanded.loopWidth / expanded.firstWidth).toBeCloseTo(15, 2);
   expect(expanded.afterLeft).toBeCloseTo(expanded.loopLeft + expanded.loopWidth, 2);
@@ -1842,9 +1895,9 @@ test("loop and unchanged-interval toggles invalidate their scales independently"
   await expect(page.locator('.timeline-block[data-event-id="w1"]')).toHaveCount(0);
   await expect(page.locator('.ruler .q1timeline-playback-fold')).toHaveCount(1);
   const onlyLoop = await loopGeometry(page, "loop", "w0", "update");
-  expect(onlyLoop.loopWidth / onlyLoop.firstWidth).toBeGreaterThan(1);
   const repeated = await page.locator('.ruler .q1timeline-playback-fold').evaluate(node => parseFloat(node.style.width));
-  expect(onlyLoop.loopWidth).toBeCloseTo(onlyLoop.firstWidth + repeated, 2);
+  expect(onlyLoop.loopWidth).toBeCloseTo(onlyLoop.firstWidth, 2);
+  expect(onlyLoop.afterLeft).toBeCloseTo(onlyLoop.loopLeft + onlyLoop.loopWidth + repeated, 2);
   expect((await page.locator('.ruler .q1timeline-playback-fold').boundingBox()).width).toBeLessThanOrEqual(100);
   await toggle.click();
   expect(await loopGeometry(page, "loop", "w0", "update")).toEqual(foldedBoth);

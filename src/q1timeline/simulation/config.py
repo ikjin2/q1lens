@@ -18,10 +18,12 @@ def validate_simulation(config: dict[str, Any] | None, sequencer_ids: Iterable[s
     result = deepcopy(config)
     ids = set(sequencer_ids) if sequencer_ids is not None else None
     defaults = {"queue_capacity": 32, "feedback_queue_capacity": 32,
-                "startup_delay_ns": 200, "max_time_ns": 1_000_000}
+                "max_time_ns": 1_000_000 if "startup_delay_ns" in result else 3_000_000}
     for key, default in defaults.items():
         result.setdefault(key, default)
-        _integer(result[key], f"simulation.{key}", minimum=0 if key == "startup_delay_ns" else 1)
+        _integer(result[key], f"simulation.{key}", minimum=1)
+    if "startup_delay_ns" in result:
+        _integer(result["startup_delay_ns"], "simulation.startup_delay_ns", minimum=0)
     inputs = result.setdefault("inputs", {})
     if not isinstance(inputs, dict):
         raise ValueError("simulation.inputs must be a mapping")
@@ -36,14 +38,17 @@ def validate_simulation(config: dict[str, Any] | None, sequencer_ids: Iterable[s
                 raise ValueError(f"{field} must be a mapping")
             allowed = {
                 "feedback": {"target", "time_ns", "id", "value"},
-                "triggers": {"target", "time_ns", "address"},
+                "triggers": {"target", "time_ns", "rt_time_ns", "address"},
                 "acquisitions": {"sequencer", "acquisition_index", "bin_index", "i", "q", "thresholded"},
             }[kind]
             _known_fields(entry, field, allowed)
             target_field = "sequencer" if kind == "acquisitions" else "target"
             _sequencer(entry.get(target_field), f"{field}.{target_field}", ids)
             if kind != "acquisitions":
-                _integer(entry.get("time_ns"), f"{field}.time_ns", minimum=0)
+                if "time_ns" in entry and "rt_time_ns" in entry:
+                    raise ValueError(f"{field} must use either time_ns or rt_time_ns")
+                time_field = "rt_time_ns" if "rt_time_ns" in entry else "time_ns"
+                _integer(entry.get(time_field), f"{field}.{time_field}", minimum=0)
             if kind == "feedback":
                 _integer(entry.get("id"), f"{field}.id", minimum=1, maximum=255)
                 _integer(entry.get("value"), f"{field}.value", minimum=-(2**31), maximum=2**32 - 1)

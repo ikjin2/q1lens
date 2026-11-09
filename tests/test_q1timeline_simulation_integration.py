@@ -23,6 +23,7 @@ EXAMPLES = Path(__file__).parents[1] / "examples" / "simulation-verification"
     ({"inputs": {"feedback": [{"target": "missing", "time_ns": 0, "id": 1, "value": 0}]}}, "unknown sequencer"),
     ({"routes": [{"source": "a", "target": "a", "latency_ns": -1}]}, "latency_ns"),
     ({"inputs": {"triggers": [{"target": "a", "time_ns": 0, "address": 16}]}}, "address"),
+    ({"inputs": {"triggers": [{"target": "a", "time_ns": 0, "rt_time_ns": 0, "address": 1}]}}, "either time_ns or rt_time_ns"),
     ({"acquisition_iq_scale": {"a": 10**1000}}, "finite number"),
 ])
 def test_invalid_scenarios_are_rejected(config: dict, field: str) -> None:
@@ -35,7 +36,7 @@ def test_scenario_defaults_do_not_mutate_caller() -> None:
     normalized = validate_simulation(original, ["a"])
     assert original == {"inputs": {"feedback": []}}
     assert normalized["queue_capacity"] == 32
-    assert normalized["startup_delay_ns"] == 200
+    assert "startup_delay_ns" not in normalized
 
 
 def test_simulation_api_executes_shared_feedback_clock() -> None:
@@ -56,7 +57,8 @@ def test_simulation_api_executes_shared_feedback_clock() -> None:
 
 def test_simulation_api_exposes_queue_stalls_and_real_register_history() -> None:
     program = (EXAMPLES / "01-digital" / "counter.q1asm").read_text(encoding="utf-8")
-    ir = analyze_text(program, sequencer_id="counter", execution_mode="simulation", simulation={"queue_capacity": 2})
+    ir = analyze_text(program, sequencer_id="counter", execution_mode="simulation",
+                      simulation={"queue_capacity": 2, "startup_delay_ns": 200})
     assert ir["execution"]["counter"]["status"] == "completed"
     assert ir["simulation"]["counter"]["queue_capacity"] == 2
     assert any(event["kind"] == "q1_stall" for event in ir["events"])
@@ -78,6 +80,37 @@ def test_project_cli_and_watch_preserve_simulation_results(tmp_path: Path, capsy
     assert watched["sequencers"] == ir["sequencers"]
     assert watched["execution"] == ir["execution"]
     assert watched["simulation"] == ir["simulation"]
+
+
+def test_trigger_example_has_contiguous_rt_timing_and_a_separate_trigger(capsys) -> None:
+    project = EXAMPLES.parent / "set-cond-review" / "02-trigger-execution" / "q1timeline.yml"
+    assert main(["analyze", "--project", str(project), "--format", "vscode-json", "--include-timeline-ir", "--no-render"]) == 0
+    ir = json.loads(capsys.readouterr().out)["timeline_ir"]
+    events = [event for event in ir["events"] if event["kind"] in
+              {"upd_param", "set_latch_en", "conditional_skip", "trigger_receive", "stop"}]
+    assert [(event["kind"], event["meta"]["aligned_t0"], event["meta"]["aligned_t1"]) for event in events] == [
+        ("upd_param", 0, 4), ("set_latch_en", 4, 8), ("conditional_skip", 8, 48),
+        ("trigger_receive", 30, 30), ("upd_param", 48, 64), ("upd_param", 64, 80), ("stop", 80, 80),
+    ]
+    assert events[3]["source"]["raw"] == ""
+    assert events[3]["meta"]["rt_time_ns"] == 30
+
+
+@pytest.mark.parametrize("choice,ends", [("taken", {None: 56}), ("fallthrough", {None: 104}),
+                                         ("both", {None: 80, "taken": 56, "fallthrough": 104})])
+def test_trigger_example_can_override_and_compare_the_selected_condition(capsys, choice, ends) -> None:
+    project = EXAMPLES.parent / "set-cond-review" / "02-trigger-execution" / "q1timeline.yml"
+    assert main(["analyze", "--project", str(project), "--format", "vscode-json", "--include-timeline-ir", "--no-render"]) == 0
+    ir = json.loads(capsys.readouterr().out)["timeline_ir"]
+    control, = [event for event in ir["events"] if event["meta"].get("rt_condition_control")]
+    assert control["source"]["line"] == 7
+    args = ["analyze", "--project", str(project), "--format", "vscode-json", "--include-timeline-ir", "--no-render",
+            "--branch-assumption", f"{control['meta']['branch_id']}={choice}"]
+    assert main(args) == 0
+    ir = json.loads(capsys.readouterr().out)["timeline_ir"]
+    assert {event["meta"].get("branch_comparison_path"): event["meta"]["aligned_t0"]
+            for event in ir["events"] if event["kind"] == "stop"} == ends
+    assert len({event["id"] for event in ir["events"]}) == len(ir["events"])
 
 
 def test_invalid_project_scenario_becomes_configuration_diagnostic(tmp_path: Path) -> None:

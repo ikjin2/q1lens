@@ -30,6 +30,7 @@ const { ensureFilePythonEnvironment } = require("../fileEnvironment");
 const {
   lookupEventIdsForSourceLine,
   lookupEventIdsForSourceRange,
+  lookupSourceForExternalArrival,
   lookupSourceForEvent,
 } = require("./sourceMapLookup");
 const updatePolicy = require("./updatePolicy");
@@ -1563,7 +1564,7 @@ export class TimelineController {
       const address = match?.resolved_address ?? Number(parameter?.value_json);
       return { ...trigger, ...(Number.isInteger(address) && address >= 1 && address <= 15 ? { resolved_address: address } : {}) };
     });
-    return { triggers, overridden: Boolean(this.externalInputsOverride), canSave: !this.singleFileMode &&
+    return { ...rawExternalInputs(inputs), triggers, overridden: Boolean(this.externalInputsOverride), canSave: !this.singleFileMode &&
       (!this.externalInputsOverride || this.externalInputsValidatedRevision === this.sourceRevision),
       ...(this.externalInputsError ? { error: this.externalInputsError } : {}) };
   }
@@ -3165,7 +3166,7 @@ export class TimelineController {
     if (!parsedMessage.valid) {
       this.logMalformedWebviewMessage(message);
       if (message?.type === "setExternalInputs") {
-        this.postExternalInputsState("Check trigger IDs, addresses, targets and increasing nonnegative event times.");
+        this.postExternalInputsState("Check trigger sources and LINQ receiver schedules for valid targets, IDs, times and values.");
       }
       return;
     }
@@ -3209,7 +3210,7 @@ export class TimelineController {
       return;
     }
     if (parsedMessage.type === "setExternalInputs" || parsedMessage.type === "resetExternalInputs") {
-      await this.setExternalInputs(parsedMessage.type === "resetExternalInputs" ? null : { triggers: parsedMessage.triggers });
+      await this.setExternalInputs(parsedMessage.type === "resetExternalInputs" ? null : rawExternalInputs(parsedMessage));
       return;
     }
     if (parsedMessage.type === "saveExternalInputs") {
@@ -3297,6 +3298,9 @@ export class TimelineController {
   async openSourceForEvent(eventId, options = {}) {
     let source = lookupSourceForEvent(this.timelineIr, eventId);
     if (!source || source.file === "<simulation>") {
+      source = lookupSourceForExternalArrival(this.timelineIr, eventId);
+    }
+    if (!source || source.file === "<simulation>") {
       this.output.appendLine(`q1timeline eventClick source not found: ${eventId}`);
       return;
     }
@@ -3334,7 +3338,7 @@ export class TimelineController {
 
   async openSourceForDiagnostic(diagnosticIndex) {
     const item = this.analyzerDiagnostics[diagnosticIndex];
-    if (!item || !item.source) {
+    if (!item?.source?.file || item.source.file === "<simulation>") {
       return;
     }
     return this.openSourceLocation(item.source);
@@ -3345,12 +3349,15 @@ export class TimelineController {
       String(candidate.id || `${candidate.from_event_id}->${candidate.to_event_id}`) === flowId);
     if (!flow) return;
     const isCurrent = this.beginSourceNavigation();
-    const eventIds = role === "source" ? [flow.from_event_id]
-      : role === "target" ? [flow.to_event_id] : [flow.from_event_id, flow.to_event_id];
+    const targetEventId = flow.consumer_event_id || flow.to_event_id;
+    const sourceEventIds = Array.isArray(flow.source_event_ids) && flow.source_event_ids.length
+      ? flow.source_event_ids : [flow.from_event_id];
+    const eventIds = role === "source" ? sourceEventIds
+      : role === "target" ? [targetEventId] : [...sourceEventIds, targetEventId];
     const sourcesByPath = new Map();
     for (const eventId of eventIds) {
       const source = lookupSourceForEvent(this.timelineIr, eventId);
-      if (!source?.file) continue;
+      if (!source?.file || source.file === "<simulation>") continue;
       const key = normalizedFsPath(this.resolveSourcePath(source.file));
       if (!sourcesByPath.has(key)) sourcesByPath.set(key, { source, lines: new Set() });
       sourcesByPath.get(key).lines.add(Math.max(0, Number(source.line || 1) - 1));

@@ -43,6 +43,19 @@ def test_nco_keeps_phase_continuous_when_frequency_changes():
     assert samples(model, "nco", "q") == pytest.approx([0, math.sqrt(0.125), 0.5, 0.5], abs=1e-12)
 
 
+def test_only_sampled_effects_require_integer_time_and_unrendered_history():
+    model = SignalModel({"sequencers": {"drive": {"input": {"kind": "constant", "i": 0.5}}}}, {"drive": sequence()})
+    model.export(4)
+    assert model.apply("drive", 1 + 1 / 128, "upd_param", [4], {"frequency": 1, "_updated_fields": ["digital"]}) == []
+    assert model.apply("drive", 1 + 1 / 128, "stop", [], {}) == []
+    with pytest.raises(ValueError, match="already sampled history"):
+        model.apply("drive", 2, "upd_param", [4], {"frequency": 1})
+    with pytest.raises(ValueError, match="RT signal time must be an integer"):
+        model.apply("drive", 4 + 1 / 128, "upd_param", [4], {"frequency": 1})
+    with pytest.raises(ValueError, match="acquisition start must be an integer"):
+        model.acquire("drive", 4 + 1 / 128, 4, 0, 0)
+
+
 def test_phase_delta_is_only_applied_on_updated_packets_and_reset_resets_all():
     model = SignalModel({"sequencers": {"drive": {"offset": [0.5, 0]}}}, {"drive": sequence()})
     model.apply("drive", 0, "upd_param", [1], {"phase_delta": 250_000_000, "_updated_fields": ["phase_delta"]})

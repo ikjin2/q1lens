@@ -1,6 +1,11 @@
 (function q1timelineAdapterFactory(root) {
   const instructionColors = typeof module !== "undefined" && module.exports
     ? require("../../shared/timeline/instructionColors.js") : root.q1asmInstructionColors;
+  const arrivalPointKinds = new Set(["trigger_receive", "feedback_rejected"]);
+
+  function isTimelinePoint(event) {
+    return arrivalPointKinds.has(event.kind) || Boolean(event.meta?.comparison_terminal);
+  }
   function topLevelAddends(expression) {
     const text = String(expression || "");
     const addends = [];
@@ -58,6 +63,15 @@
     return fallback;
   }
 
+  function concreteTime(value) {
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (value && typeof value === "object" && (!value.kind || value.kind === "concrete")) {
+      const number = value.value ?? value.value_ns;
+      if (typeof number === "number" && Number.isFinite(number)) return number;
+    }
+    return undefined;
+  }
+
   function eventEdgeTime(event, edge, options, fallback = 0) {
     const meta = event && event.meta && typeof event.meta === "object" ? event.meta : {};
     if (options && options.timeBasis === "aligned") {
@@ -92,11 +106,31 @@
       ? `${label} · ${-meta.slack_ns} ns late` : label;
   }
 
+  function networkConflictDisplayMessage(diagnostic, alignment, timeBasis) {
+    if (!["trigger_network_conflict", "trigger_network_possible_conflict"].includes(diagnostic.category)) return undefined;
+    const {network, launch_ticks: ticks} = diagnostic.details || {};
+    if (typeof network !== "string" || !Array.isArray(ticks) || ticks.length !== 2) return undefined;
+    const [first, second] = ticks;
+    if (!Number.isInteger(first) || (second !== null && !Number.isInteger(second))) return undefined;
+    const entries = Object.values(alignment || {});
+    const sharedOffset = entries[0]?.offset;
+    const offset = timeBasis === "aligned" && Number.isFinite(sharedOffset) &&
+      entries.every((entry) => entry?.clock === "shared_simulation" && entry.offset === sharedOffset) ? sharedOffset : 0;
+    const slot = (tick) => `${tick / 128 + offset} ns`;
+    if (second === null) {
+      return `Trigger network '${network}' could conflict with a request whose grid epoch is unknown. Known launch slot at ${slot(first)}.`;
+    }
+    const qualifier = diagnostic.category === "trigger_network_possible_conflict" ? "potentially " : "";
+    return `Trigger network '${network}' has ${qualifier}conflicting launch slots at ${slot(first)} and ${slot(second)}.`;
+  }
+
   function eventLabelToken(event, options = {}) {
     if (!event) {
       return "";
     }
     if (event.kind === "underflow_warning") return underflowLabel(event);
+    if (event.kind === "q1_stall") return "Q1 stall";
+    if (event.kind === "feedback_rejected") return "Rejected LINQ arrival";
     if (event.kind === "wait" && options.mode !== "debug") {
       return "wait";
     }
@@ -141,7 +175,7 @@
     const base = comparison ? `${parent}:branch:${branch.branchComparisonId}:${path}` : parent;
     const prefix = branchComparisonLabel(path, meta.branch_comparison_kind);
     const lane = eventLaneName(event);
-    if (event.kind === "q1_issue") {
+    if (event.kind === "q1_issue" || (event.kind === "q1_stall" && options.layout === "instruction")) {
       return {
         id: `${base}:q1_issue`,
         label: comparison ? `${prefix} · Q1` : "Q1 core",
@@ -165,9 +199,10 @@
       };
     }
     if (options.mode === "debug" && lane.startsWith("debug.") && event.kind !== "underflow_warning") {
+      const label = event.kind === "q1_stall" ? "Q1 stall" : lane === "debug.underflow" ? "RT underflow" : lane.replace(/^debug\./, "debug / ");
       return {
         id: `${base}:${lane}`,
-        label: `${comparison ? `${prefix} · ` : ""}${lane === "debug.underflow" ? "RT underflow" : lane.replace(/^debug\./, "debug / ")}`,
+        label: `${comparison ? `${prefix} · ` : ""}${label}`,
         kind: "debug",
         parentGroupId: parent,
         sequencer,
@@ -205,6 +240,127 @@
     return true;
   }
 
+  const primaryWaitKindByAuxiliary = new Map([["trigger_wait", "wait_trigger"], ["sync_wait", "wait_sync"]]);
+
+  function waitProjectionKey(event, kind, legacy) {
+    const meta = event.meta || {};
+    const scope = [event.sequencer_id, kind, meta.branch_comparison_kind, meta.branch_comparison_branch_id,
+      meta.branch_comparison_path, meta.loop_preview, meta.loop_iteration_index, meta.diff_status];
+    if (!legacy) {
+      return meta.rt_packet_id == null ? undefined : JSON.stringify([...scope, "packet", meta.rt_packet_id]);
+    }
+    const start = concreteTime(event.t0 ?? event.t0_ns);
+    const source = event.source;
+    if (Number.isFinite(start) && source?.file && Number.isInteger(source.line)) {
+      return JSON.stringify([...scope, "source", source.file, source.line, start]);
+    }
+  }
+
+  function completedWaitAliases(events) {
+    const candidates = new Map();
+    for (const event of events) {
+      if (!["wait_trigger", "wait_sync"].includes(event.kind) || event.meta?.pending) continue;
+      const end = concreteTime(event.t1 ?? event.t1_ns);
+      if (!Number.isFinite(end)) continue;
+      for (const legacy of [false, true]) {
+        const key = waitProjectionKey(event, event.kind, legacy);
+        if (key === undefined) continue;
+        if (!candidates.has(key)) candidates.set(key, []);
+        candidates.get(key).push({ id: String(event.id), end });
+      }
+    }
+    const aliases = new Map();
+    for (const event of events) {
+      const kind = primaryWaitKindByAuxiliary.get(event.kind);
+      if (!kind || event.meta?.pending) continue;
+      const legacy = event.meta?.rt_packet_id == null;
+      const key = waitProjectionKey(event, kind, legacy);
+      const end = legacy ? concreteTime(event.t1 ?? event.t1_ns) : undefined;
+      const matches = (candidates.get(key) || []).filter((candidate) => !legacy || end <= candidate.end);
+      if (matches.length !== 1) continue;
+      const primary = matches[0].id;
+      if (!aliases.has(primary)) aliases.set(primary, []);
+      aliases.get(primary).push(String(event.id));
+    }
+    return aliases;
+  }
+
+  function coincidentTriggerArrivals(events, options) {
+    const scope = (event) => [event.sequencer_id, event.meta?.branch_comparison_kind,
+      event.meta?.branch_comparison_branch_id, event.meta?.branch_comparison_path,
+      event.meta?.loop_preview, event.meta?.loop_iteration_index, event.meta?.diff_status];
+    const groups = new Map();
+    const consumed = new Set();
+    for (const event of events) {
+      if (event.kind === "wait_trigger" && Array.isArray(event.meta?.input_event_ids)) {
+        for (const id of event.meta.input_event_ids) consumed.add(JSON.stringify([...scope(event), String(id)]));
+      }
+      if (event.kind !== "trigger_receive" || !shouldIncludeEvent(event, options)) continue;
+      const time = concreteTime(event.t0 ?? event.t0_ns);
+      const meta = event.meta || {};
+      if (time === undefined || meta.rt_trigger_epoch || meta.conditional_time_unknown || meta.comparison_terminal) continue;
+      const key = JSON.stringify([...scope(event), eventLane(event, options).id, time]);
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(event);
+    }
+    const byEventId = new Map();
+    for (const arrivals of groups.values()) {
+      if (arrivals.length < 2) continue;
+      const matched = arrivals.filter((event) => consumed.has(JSON.stringify([...scope(event), String(event.id)])));
+      const group = { arrivals, primary: matched.length === 1 ? matched[0] : arrivals[0] };
+      for (const event of arrivals) byEventId.set(String(event.id), group);
+    }
+    return byEventId;
+  }
+
+  function q1OnlyLoopIds(eventById) {
+    const ids = new Set();
+    for (const event of eventById.values()) {
+      if (event.kind !== "loop_block") continue;
+      const meta = event.meta || {};
+      const start = concreteTime(event.t0);
+      if (meta.period?.kind !== "concrete" || concreteTime(meta.period) !== 0 ||
+          !Number.isFinite(start) || start !== concreteTime(event.t1) || Object.keys(meta.rt_packet_affine || {}).length) continue;
+      const members = meta.playback ? (meta.complete === true && meta.playback_event_ids) :
+        (meta.period_invariant === true && meta.first_iteration_event_ids);
+      if (!Array.isArray(members) || !members.length) continue;
+      const evidence = members.map((id) => eventById.get(String(id)));
+      const q1Ids = new Set(evidence.filter((item) => item?.kind === "q1_issue" && item.meta?.emits_rt_packet === false)
+        .map((item) => String(item.id)));
+      if (q1Ids.size && evidence.every((item) => item && item.sequencer_id === event.sequencer_id &&
+          item.meta?.rt_packet_id == null && (q1Ids.has(String(item.id)) || item.kind === "latched_state_pending" &&
+            q1Ids.has(String(item.meta?.q1_issue_event_id))))) ids.add(String(event.id));
+    }
+    return ids;
+  }
+
+  function visibleRtExtent(eventById, { timeBasis, feedbackFlows, alignment, excludedEventIds }) {
+    let min = Infinity;
+    let max = -Infinity;
+    const options = { mode: "normal", timeBasis, alignment };
+    for (const event of eventById.values()) {
+      if (excludedEventIds?.has(String(event.id)) || !eventLaneName(event).startsWith("rt.") || !shouldIncludeEvent(event, options) ||
+          event.kind === "loop_iteration_preview") continue;
+      const start = eventEdgeTime(event, "t0", options, Number.NaN);
+      if (!Number.isFinite(start)) continue;
+      min = Math.min(min, start);
+      const end = isTimelinePoint(event) ? start : eventEdgeTime(event, "t1", options, start);
+      max = Math.max(max, start, end);
+      if (event.kind === "acquire") {
+        for (const field of ["acquisition_window", "scope_acquisition_window"]) {
+          const windowEnd = acquisitionWindow(event, options, field).end;
+          if (Number.isFinite(windowEnd)) max = Math.max(max, windowEnd);
+        }
+      }
+    }
+    if (!Number.isFinite(min)) return undefined;
+    for (const flow of feedbackFlows || []) {
+      const annotation = feedbackAnnotation(flow, eventById, options);
+      if (annotation) max = Math.max(max, annotation.fromTime, annotation.toTime);
+    }
+    return { min, max };
+  }
+
   function isPlayPathEvent(event) {
     return Boolean(event && event.kind === "play" && /^rt\.path\d+$/.test(eventLaneName(event)));
   }
@@ -219,13 +375,15 @@
     return Number.isInteger(path) ? path : undefined;
   }
 
-  function eventClassNames(event) {
+  function eventClassNames(event, options) {
     return [
       `kind-${event.kind || "event"}`,
       `command-family-${instructionColors.commandFamily(instructionColors.eventCommandToken(event))}`,
       `confidence-${event.confidence || "unknown"}`,
       event.meta && event.meta.diff_status ? `diff-${event.meta.diff_status}` : "",
-      event.kind === "feedback_pop" || event.kind === "feedback_com" ? "normal-feedback-collapsed" : "",
+      event.meta?.rt_trigger_epoch || options.timeBasis === "aligned" && event.meta?.aligned_time_nominal ? "rt-time-nominal" : "",
+      event.meta?.comparison_terminal ? `comparison-terminal comparison-terminal-${event.meta.comparison_terminal.status}` : "",
+      event.kind === "feedback_pop" ? "normal-feedback-collapsed" : "",
       event.kind === "loop_block" ? "loop-collapsed" : "",
       event.kind === "branch_region" ? "branch-effect-marker" : "",
     ].filter(Boolean).join(" ");
@@ -251,22 +409,112 @@
   }
 
   function eventTitle(event, start, end, options) {
-    if (event.kind === "underflow_warning") return underflowLabel(event);
+    if (event.kind === "q1_stall") return `Q1 stall · ${start}–${end} ns · ${event.meta?.reason || "Q1 is waiting"}`;
+    const terminal = event.meta?.comparison_terminal;
+    if (terminal) {
+      const id = event.kind === "feedback_rejected" ? ` · LINQ ID ${event.meta.id ?? "unknown"}` : "";
+      return `Execution ${terminal.status.replaceAll("_", " ")} · ${start} ns · ${terminal.reason}${id}`;
+    }
+    if (event.kind === "underflow_warning") {
+      const label = underflowLabel(event);
+      return event.meta?.diagnostic_message ? `${label} · ${start} ns` : label;
+    }
     if (event.kind === "trigger_receive") return `Trigger address ${event.meta?.address ?? "unknown"} · ${start} ns`;
+    if (event.kind === "feedback_rejected") return `Rejected LINQ arrival · ID ${event.meta?.id ?? "unknown"} · ${start} ns`;
     const aligned = options.timeBasis === "aligned";
     const from = aligned && Number.isFinite(event.meta?.aligned_t0) ? `${event.meta.aligned_t0} ns` : displayValue(event.t0, start);
     const endFallback = event.meta?.conditional_time_unknown ? "unknown" : end;
     const to = aligned && Number.isFinite(event.meta?.aligned_t1) ? `${event.meta.aligned_t1} ns` : displayValue(event.t1, endFallback);
+    const timing = q1IssueTimingText(event, options) || rtTimingText(event, from, to, options);
+    if (timing) {
+      const delay = event.meta?.trigger_wait_duration_ns;
+      const label = event.meta?.merged_play_paths ? `play ${event.detail}` : event.label || event.kind;
+      return `${label} | ${timing}${Number.isFinite(delay) ? ` · ${delay} ns after arrival` : ""}`;
+    }
     if (event && event.kind === "branch_region") {
       return `Branch effect (${branchPathLabel(event)}) | ${from} -> ${to}`;
     }
     return event.title || `${event.label || event.kind || event.id} | ${from} -> ${to}`;
   }
 
+  function timingDisplayOffset(event, options, start) {
+    if (options.timeBasis !== "aligned") return 0;
+    const alignedStart = concreteTime(event.meta?.aligned_t0);
+    return start !== undefined && alignedStart !== undefined ? alignedStart - start
+      : concreteTime(options.alignment?.[event.sequencer_id]?.offset) ?? 0;
+  }
+
+  function q1IssueTimingText(event, options = {}) {
+    if (event.kind !== "q1_issue") return undefined;
+    const cutoff = concreteTime(event.meta?.observation_cutoff_ns);
+    const plannedEnd = concreteTime(event.meta?.planned_q1_end_ns);
+    if (cutoff === undefined || plannedEnd === undefined || plannedEnd <= cutoff) return undefined;
+    const start = concreteTime(event.t0) ?? concreteTime(event.t0_ns);
+    const end = concreteTime(event.t1) ?? concreteTime(event.t1_ns);
+    if (start === undefined || start > cutoff || end !== cutoff) return undefined;
+    const offset = timingDisplayOffset(event, options, start);
+    return `Issue ${start + offset} ns · Observation cutoff ${cutoff + offset} ns · Planned end ${plannedEnd + offset} ns`;
+  }
+
+  function netzeroResultTimingText(event, options = {}) {
+    if (event.kind !== "netzero_result" || event.meta?.status !== "incomplete") return undefined;
+    const cutoff = concreteTime(event.meta.observation_cutoff_ns);
+    const plannedEnd = concreteTime(event.meta.planned_end_ns);
+    if (cutoff === undefined || plannedEnd === undefined || plannedEnd < cutoff) return undefined;
+    const start = concreteTime(event.t0) ?? concreteTime(event.t0_ns);
+    const end = concreteTime(event.t1) ?? concreteTime(event.t1_ns);
+    if (start === undefined || start > cutoff || end !== cutoff) return undefined;
+    const offset = timingDisplayOffset(event, options, start);
+    return `Observation cutoff ${cutoff + offset} ns · Planned end ${plannedEnd + offset} ns`;
+  }
+
+  function rtTimingText(event, from, to, options = {}) {
+    const meta = event.meta || {};
+    const aligned = options.timeBasis === "aligned";
+    if (meta.pending === true && (event.kind === "trigger_wait" || event.kind === "sync_wait")) {
+      const edge = (key) => (aligned ? concreteTime(meta[`aligned_${key}`]) : undefined) ??
+        concreteTime(event[key]) ?? concreteTime(event[`${key}_ns`]);
+      const arm = edge("t0"), cutoff = edge("t1");
+      const target = event.kind === "trigger_wait" ? "trigger" : "synchronization";
+      const armText = Number.isFinite(arm) ? `${arm} ns` : from || "unknown";
+      const cutoffText = Number.isFinite(cutoff) ? ` · observation cutoff ${cutoff} ns` : "";
+      return `Arm ${armText} → waiting for ${target} (completion unresolved)${cutoffText}`;
+    }
+    const nominal = meta.rt_trigger_epoch || aligned && meta.aligned_time_nominal;
+    let timing = meta.trigger_arrival_unknown
+      ? `${nominal ? "Nominal arm" : "Arm"} ${from} → waiting for trigger (completion unresolved)`
+      : nominal ? `Nominal RT ${from} → ${to} (trigger arrival unresolved)` : undefined;
+    const phase = event.kind === "wait_trigger" ? "Trigger arrival" : event.kind === "wait_sync" ? "Barrier release" : undefined;
+    const execution = phase && !timing && !meta.pending && !meta.trigger_assumption && !meta.conditional_skipped && !meta.interrupted_by_fault
+      ? concreteTime(meta.rt_execution_ns) : undefined;
+    const bound = meta.queue_duration_ns === 0 ? concreteTime(meta.next_dequeue_not_before_ns) : undefined;
+    const cutoff = concreteTime(meta.observation_cutoff_ns);
+    const plannedEnd = cutoff !== undefined && !timing && !meta.pending && !meta.interrupted_by_fault && eventLaneName(event).startsWith("rt.")
+      ? concreteTime(meta.planned_rt_end_ns) : undefined;
+    if (execution === undefined && bound === undefined && plannedEnd === undefined) return timing;
+
+    const start = concreteTime(event.t0) ?? concreteTime(event.t0_ns);
+    const end = concreteTime(event.t1) ?? concreteTime(event.t1_ns);
+    const offset = timingDisplayOffset(event, options, start);
+    const incomplete = start <= cutoff && end === cutoff && plannedEnd > cutoff
+      ? `Observation cutoff ${cutoff + offset} ns · Planned end ${plannedEnd + offset} ns` : undefined;
+    if (execution !== undefined && start <= execution && execution <= end) {
+      const completion = incomplete || (cutoff === undefined ? `Complete ${end + offset} ns` : `Observation cutoff ${cutoff + offset} ns`);
+      timing = `Arm ${start + offset} ns · ${phase} ${execution + offset} ns · ${completion}`;
+    } else if (incomplete) {
+      timing = `Start ${start + offset} ns · ${incomplete}`;
+    }
+    if (bound === undefined) return timing;
+    const label = nominal || meta.trigger_arrival_unknown ? "Nominal earliest next dequeue" : "Earliest next dequeue";
+    return `${timing || `${from} -> ${to}`} · ${label} ${bound + offset} ns`;
+  }
+
   function eventBlock(event, options = {}) {
     const start = eventEdgeTime(event, "t0", options);
     const end = eventEdgeTime(event, "t1", options, start);
-    const duration = Math.max(eventTimeValue(event.duration, end - start), end - start, 0);
+    const pointMarker = isTimelinePoint(event) || (event.kind === "q1_stall" && options.layout === "instruction");
+    const duration = pointMarker ? 0 : Math.max(eventTimeValue(event.duration, end - start), end - start, 0);
+    const commandToken = pointMarker ? undefined : instructionColors.eventCommandToken(event);
     const source = event.source || {};
     const meta = event.meta || {};
     const rawStart = options.timeBasis === "aligned" && meta.aligned_t0 !== undefined
@@ -278,12 +526,12 @@
       eventId: String(eventIds[0] || event.id),
       eventIds,
       label: eventLabelToken(event, options),
-      commandToken: instructionColors.eventCommandToken(event),
+      commandToken,
       detail,
       kind: String(event.kind || "event"),
-      ...(event.kind === "trigger_receive" ? { pointMarker: true } : {}),
+      ...(pointMarker ? { pointMarker } : {}),
       visualKind: eventVisualKind(event),
-      accentColor: instructionColors.commandAccentColor(instructionColors.eventCommandToken(event)),
+      accentColor: instructionColors.commandAccentColor(commandToken),
       start,
       duration,
       connectionStartKnown: Number.isFinite(rawStart) || Boolean(rawStart && typeof rawStart === "object" &&
@@ -300,7 +548,7 @@
         source.raw,
         ...(Array.isArray(meta.play_paths) ? meta.play_paths.map((path) => `${path.path} ${path.label} ${path.waveform_index}`) : []),
       ].filter(Boolean).join(" ").toLowerCase(),
-      classNames: eventClassNames(event),
+      classNames: eventClassNames(event, options),
       domain: {
         eventId: eventIds[0] || event.id,
         eventIds,
@@ -318,7 +566,8 @@
     const offset = start - localStart;
     const end = Number.isFinite(window.end_ns) && window.status !== "unknown"
       ? window.end_ns + offset : undefined;
-    return { ...window, start, end, status: end === undefined ? "unknown" : window.status };
+    const nominal = options.timeBasis === "aligned" && event.meta?.aligned_time_nominal;
+    return { ...window, ...(nominal ? {time_basis: "nominal"} : {}), start, end, status: end === undefined ? "unknown" : window.status };
   }
 
   function acquisitionMode(event) {
@@ -348,7 +597,7 @@
       start: window.start, duration,
       label: assumed ? `≈ ${label}` : label, detail: "", accentColor: undefined, acquisitionMode: mode, acquisitionTrack: scope ? 1 : 0,
       classNames: `${block.classNames} acquisition-window acquisition-${window.status}${assumed ? " acquisition-assumed" : ""}`,
-      title: `${scope ? `Scope · paths ${(window.paths || []).join(", ")}` : `${mode} · ${target}`} | ${length} | ${window.status}` };
+      title: `${scope ? `Scope · paths ${(window.paths || []).join(", ")}` : `${mode} · ${target}`} | ${length} | ${window.status}${window.time_basis === "nominal" ? " | Nominal RT position" : ""}` };
   }
 
   function playMergeTimeKey(event, options) {
@@ -428,7 +677,7 @@
     const stateKinds = new Set(["marker_state", "latched_state_applied"]);
     const nonCommandKinds = new Set([
       ...stateKinds, "rt_queue_enqueue", "rt_queue_dequeue", "q1_stall", "sync_wait", "trigger_wait",
-      "feedback_receive", "feedback_send", "trigger_receive", "acquisition_result",
+      "feedback_receive", "feedback_send", "acquisition_result",
     ]);
     const timeKey = (event, edge) => {
       const meta = event.meta || {};
@@ -447,7 +696,7 @@
     for (const lane of lanes) {
       for (const block of lane.blocks) {
         const event = eventById.get(block.eventId);
-        if (!event || nonCommandKinds.has(event.kind) || !eventLaneName(event).startsWith("rt.")) continue;
+        if (!event || isTimelinePoint(event) || nonCommandKinds.has(event.kind) || !eventLaneName(event).startsWith("rt.")) continue;
         const key = packetKey(event);
         if (key !== undefined && !commands.has(key)) commands.set(key, block);
       }
@@ -477,7 +726,7 @@
       : `${instructionColors.eventCommandToken(event)}${integrationEnd ? " integration end" : ""}`;
     const location = event.source?.file ? [String(event.source.file).split(/[\\/]/).pop(), event.source.line].filter(Boolean).join(":") : "";
     const unknownTime = latency ? latency.unknown
-      : event.meta?.conditional_time_unknown || !integrationEnd && event.t0?.kind && event.t0.kind !== "concrete";
+      : event.meta?.rt_trigger_epoch || event.meta?.conditional_time_unknown || !integrationEnd && event.t0?.kind && event.t0.kind !== "concrete";
     const timestamp = unknownTime ? "time unknown"
       : `${time} ns (${options.timeBasis === "aligned" ? "aligned" : "local"})`;
     return [`${role} (${core})`, event.sequencer_id, command, timestamp,
@@ -616,9 +865,10 @@
   function applyInstructionLayout(lanes, annotations, events) {
     const eventOrder = new Map(events.map((event, index) => [String(event.id), index]));
     const eventById = new Map(events.map((event) => [String(event.id), event]));
-    const warning = (block) => block.kind === "underflow_warning" || block.kind === "analysis_incomplete";
+    const warning = (block) => !block.pointMarker && (block.kind === "underflow_warning" || block.kind === "analysis_incomplete");
+    const occupiesSlot = (block) => !warning(block) && !block.pointMarker;
     const packetEffects = new Set(["marker_state", "latched_state_applied", "sync_wait", "trigger_wait",
-      "feedback_receive", "feedback_send", "trigger_receive", "acquisition_result"]);
+      "feedback_receive", "feedback_send", "acquisition_result"]);
     const visibleLaneIds = new Set(lanes.filter((lane) => !lane.hidden).map((lane) => lane.id));
     const positions = new Map();
     const startsByLane = new Map();
@@ -628,9 +878,9 @@
     let maxCount = 1;
     for (const lane of lanes) {
       if (lane.kind === "runtime") lane.label = `${lane.sequencer || lane.label} · RT`;
-      const conditionalTimeUnknown = lane.blocks.some((block) => block.domain.meta.conditional_time_unknown);
+      const conditionalTimeUnknown = lane.blocks.some((block) => !block.pointMarker && block.domain.meta.conditional_time_unknown);
       lane.blocks.sort((left, right) => (conditionalTimeUnknown ? 0 : left.start - right.start) || blockOrder(left) - blockOrder(right));
-      const commands = lane.blocks.filter((block) => !warning(block));
+      const commands = lane.blocks.filter(occupiesSlot);
       startsByLane.set(lane.id, commands.map((block) => block.start));
       durationsByLane.set(lane.id, commands.map((block) => block.duration));
       if (!lane.hidden) maxCount = Math.max(maxCount, commands.length);
@@ -649,8 +899,8 @@
         event.kind === (lane.kind === "q1-issue" ? "q1_issue" : "branch_region"));
       const offset = anchor ? (positions.get(String(anchor.id)) || {}).end || 0 : 0;
       offsetsByLane.set(lane.id, offset);
-      for (const block of lane.blocks) {
-        if (warning(block)) continue;
+      const commands = lane.blocks.filter(occupiesSlot);
+      for (const block of commands) {
         block.start += offset;
         for (const id of block.eventIds) {
           const position = positions.get(id);
@@ -658,7 +908,7 @@
           position.end += offset;
         }
       }
-      if (!lane.hidden) maxCount = Math.max(maxCount, offset + lane.blocks.filter((block) => !warning(block)).length);
+      if (!lane.hidden) maxCount = Math.max(maxCount, offset + commands.length);
     }
     function insertionPosition(laneId, time) {
       const starts = startsByLane.get(laneId) || [];
@@ -672,14 +922,18 @@
       return index < 0 ? insertionPosition(laneId, time)
         : (offsetsByLane.get(laneId) || 0) + index + (time - starts[index]) / durations[index];
     }
-    // Queue warnings flag an RT boundary rather than occupying another instruction.
     for (const lane of lanes) {
+      for (const block of lane.blocks.filter((candidate) => candidate.pointMarker)) {
+        block.start = positionAtTime(lane.id, block.start);
+        for (const id of block.eventIds) positions.set(id, { laneId: lane.id, laneKind: lane.kind, start: block.start, end: block.start });
+      }
+      // Queue warnings flag an RT boundary rather than occupying another instruction.
       for (const block of lane.blocks.filter(warning)) {
         const event = eventById.get(block.eventId);
         const meta = event.meta || {};
         const candidates = meta.rt_packet_id === undefined ? [] : events.filter((candidate) => {
           const other = candidate.meta || {};
-          return candidate.sequencer_id === event.sequencer_id && eventLaneName(candidate).startsWith("rt.") &&
+          return candidate.sequencer_id === event.sequencer_id && eventLaneName(candidate).startsWith("rt.") && !isTimelinePoint(candidate) &&
             candidate.kind !== "underflow_warning" && candidate.kind !== "analysis_incomplete" && !packetEffects.has(candidate.kind) &&
             other.rt_packet_id === meta.rt_packet_id &&
             other.branch_comparison_branch_id === meta.branch_comparison_branch_id &&
@@ -728,7 +982,9 @@
   function buildQ1TimelineSelectionIndex(timelineIr) {
     const events = Array.isArray(timelineIr && timelineIr.events) ? timelineIr.events : [];
     const eventsById = new Map(events.map((event) => [String(event.id), event]));
-    const index = new Map(events.map((event) => [String(event.id), { relatedEventIds: new Set(), appliedEventIds: new Set(), rtEventIds: new Set() }]));
+    const index = new Map(events.map((event) => [String(event.id), {
+      relatedEventIds: new Set(), appliedEventIds: new Set(), capturedEventIds: new Set(), rtEventIds: new Set(),
+    }]));
     const packetKey = (event) => {
       const meta = event.meta || {};
       return JSON.stringify([event.sequencer_id, meta.rt_packet_id, meta.branch_comparison_branch_id,
@@ -744,10 +1000,11 @@
     }
     const nonCommandKinds = new Set([
       "marker_state", "latched_state_applied", "rt_queue_enqueue", "rt_queue_dequeue", "q1_stall",
-      "sync_wait", "trigger_wait", "feedback_pop", "feedback_receive", "feedback_send", "trigger_receive", "acquisition_result",
+      "sync_wait", "trigger_wait", "feedback_pop", "feedback_receive", "feedback_send", "acquisition_result",
     ]);
     const commands = events.filter((event) => {
-      if (!/^(?:branch_compare\.(?:taken|fallthrough)\.)*rt\./.test(String(event.lane || "")) || nonCommandKinds.has(event.kind)) return false;
+      if (!/^(?:branch_compare\.(?:taken|fallthrough)\.)*rt\./.test(String(event.lane || "")) ||
+        isTimelinePoint(event) || nonCommandKinds.has(event.kind)) return false;
       const meta = event.meta || {};
       if (!meta.preview_source_event_id) return true;
       const issue = eventsById.get(String(meta.q1_issue_event_id));
@@ -760,7 +1017,9 @@
       index.get(left).relatedEventIds.add(right);
       index.get(right).relatedEventIds.add(left);
     };
-    for (const event of commands) {
+    const pendingWaits = events.filter((event) => primaryWaitKindByAuxiliary.has(event.kind) && event.meta?.pending);
+    const navigationCommands = [...commands, ...pendingWaits];
+    for (const event of navigationCommands) {
       const meta = event.meta || {};
       const issue = meta.q1_issue_event_id !== undefined
         ? eventsById.get(String(meta.q1_issue_event_id)) : issuesByPacket.get(packetKey(event));
@@ -779,14 +1038,24 @@
     const firstApplications = new Map();
     for (const event of commands) {
       const meta = event.meta || {};
-      if (event.kind === "conditional_skip" || meta.conditional_skipped || ["wait", "wait_sync", "wait_trigger"].includes(event.kind)) continue;
-      for (const [field, setterId] of Object.entries(meta.applied_setter_event_ids || {})) {
-        if (!Object.prototype.hasOwnProperty.call(meta.applied_state || {}, field)) continue;
+      if (["wait", "wait_sync", "wait_trigger"].includes(event.kind)) continue;
+      const skipped = event.kind === "conditional_skip" || meta.conditional_skipped;
+      const setterIds = skipped ? meta.captured_setter_event_ids
+        : meta.committed_setter_event_ids ?? meta.applied_setter_event_ids;
+      const settings = skipped ? meta.captured_state : meta.applied_state;
+      for (const [field, setterId] of Object.entries(setterIds || {})) {
+        if (skipped && !["phase_delta", "phase_reset"].includes(field)) continue;
+        if (!Object.prototype.hasOwnProperty.call(settings || {}, field)) continue;
         const setter = eventsById.get(String(setterId));
         const setterMeta = setter && setter.meta || {};
         const issue = eventsById.get(String(setterMeta.q1_issue_event_id));
         if (!setter || setter.kind !== "latched_state_pending" || setterMeta.field !== field ||
           !issue || issue.kind !== "q1_issue" || !sameSequencer(setter, event) || !sameSequencer(issue, event)) continue;
+        if (skipped) {
+          link(String(issue.id), String(event.id));
+          index.get(String(issue.id)).capturedEventIds.add(String(event.id));
+          continue;
+        }
         const key = JSON.stringify([event.sequencer_id, setterId, field, meta.branch_comparison_branch_id, meta.branch_comparison_path]);
         const applicationKey = JSON.stringify([event.sequencer_id, meta.rt_packet_id ?? meta.q1_issue_event_id ?? event.id,
           meta.loop_preview, meta.loop_iteration_index]);
@@ -806,10 +1075,13 @@
         index.get(issueId).appliedEventIds.add(eventId);
       }
     }
-    const rtCommands = new Set(commands.filter((event) =>
+    const rtCommands = new Set(navigationCommands.filter((event) =>
       !["loop_block", "loop_iteration_preview", "branch_region"].includes(event.kind) &&
       (event.kind !== "unknown_region" || event.meta?.conditional_timing_known)).map((event) => String(event.id)));
     for (const id of rtCommands) index.get(id).rtNavigationEventId = id;
+    for (const [primary, aliases] of completedWaitAliases(events)) {
+      for (const alias of aliases) index.get(alias).rtNavigationEventId = primary;
+    }
     // Navigation follows instruction order; Q1 and RT clocks can be far apart.
     const issues = events.filter((event) => event.kind === "q1_issue");
     const scope = (event, common = false) => JSON.stringify([event.sequencer_id,
@@ -848,9 +1120,9 @@
       const key = scope(issue);
       const own = [...entry.rtEventIds].find((id) => rtCommands.has(id));
       if (own) next.set(key, own);
-      const applied = [...entry.appliedEventIds].find((id) => rtCommands.has(id));
-      if (applied) {
-        entry.rtNavigationEventId = applied;
+      const applicationOrCapture = [...entry.appliedEventIds, ...entry.capturedEventIds].find((id) => rtCommands.has(id));
+      if (applicationOrCapture) {
+        entry.rtNavigationEventId = applicationOrCapture;
         entry.rtPreparation = false;
       } else if (parameterSetters.has(String(issue.id))) {
         entry.rtNavigationEventId = undefined;
@@ -858,6 +1130,7 @@
     }
     return new Map(Array.from(index, ([id, entry]) => [id, {
       relatedEventIds: [...entry.relatedEventIds], appliedEventIds: [...entry.appliedEventIds], rtEventIds: [...entry.rtEventIds],
+      capturedEventIds: [...entry.capturedEventIds],
       rtNavigationEventId: entry.rtNavigationEventId, rtPreparation: entry.rtPreparation === true,
     }]));
   }
@@ -891,7 +1164,7 @@
     };
     const commands = events.filter((event) => /^(?:branch_compare\.(?:taken|fallthrough)\.)?rt\./.test(String(event.lane || "")) &&
       !["wait", "wait_sync", "wait_trigger", "conditional_skip", "marker_state", "latched_state_applied"].includes(event.kind) &&
-      !event.meta?.conditional_skipped && event.meta?.applied_state);
+      !isTimelinePoint(event) && !event.meta?.conditional_skipped && event.meta?.applied_state);
     const unknownFields = new Set(commands.flatMap((event) => concreteTime(event, "t0", "local") === undefined
       ? Object.keys(event.meta.applied_state).map((field) => `${scopeKey(event)}:${field}`) : []));
     const previousByEvent = new Map();
@@ -981,11 +1254,11 @@
         common ? undefined : meta.branch_comparison_path, meta.diff_status === "removed" ? "removed" : undefined]);
     };
     const excluded = new Set(["marker_state", "latched_state_applied", "rt_queue_enqueue", "rt_queue_dequeue", "q1_stall",
-      "sync_wait", "trigger_wait", "feedback_pop", "feedback_receive", "feedback_send", "trigger_receive", "acquisition_result",
+      "sync_wait", "trigger_wait", "feedback_pop", "feedback_receive", "feedback_send", "acquisition_result",
       "loop_block", "loop_iteration_preview", "branch_region", "control_flow_loop", "control_flow_branch"]);
     const states = new Map(), packets = new Map(), details = new Map();
     const ordered = events.map((event, index) => ({ event, index })).filter(({ event }) =>
-      eventLaneName(event).startsWith("rt.") && !excluded.has(event.kind));
+      eventLaneName(event).startsWith("rt.") && !isTimelinePoint(event) && !excluded.has(event.kind));
     for (const [index, event] of events.entries()) {
       const end = concreteValue(event.t1 ?? event.t1_ns);
       if (event.meta?.latched_state_at_join && Number.isFinite(end)) {
@@ -1058,7 +1331,10 @@
       const updatedFields = meta.applied_updated_fields || Object.keys(applied);
       // An increment describes this application; retaining it would imply another increment.
       delete state.parameters.phase_delta;
+      delete state.parameters.phase_reset;
       if (!updatedFields.includes("phase_delta")) delete applied.phase_delta;
+      if (!updatedFields.includes("phase_reset")) delete applied.phase_reset;
+      if (applies && meta.phase_reset && applied.phase === undefined) applied.phase = 0;
       for (const [name, setterId] of Object.entries(meta.applied_setter_event_ids || {})) {
         const setter = byId.get(String(setterId));
         const setterIssue = byId.get(String(setter?.meta?.q1_issue_event_id));
@@ -1089,10 +1365,16 @@
     const playback = Boolean(timelineIr?.playback);
     const expandedLoops = new Set(options.expandedPlaybackLoops || []);
     const hidden = collapsedExecutedLoopIds(allEvents, expandedLoops, playback);
+    if (mode === "normal") {
+      const q1OnlyLoops = options.q1OnlyLoops || q1OnlyLoopIds(new Map(allEvents.map((event) => [String(event.id), event])));
+      for (const id of q1OnlyLoops) hidden.add(id);
+    }
     const events = allEvents.filter((event) => !hidden.has(String(event.id)) &&
       (options.layout === "instruction" || !event.meta?.conditional_time_unknown ||
         Number.isFinite(eventEdgeTime(event, "t0", options, Number.NaN))));
     const eventById = new Map(events.map((event) => [String(event.id), event]));
+    const waitAliases = completedWaitAliases(events);
+    const collapsedWaitIds = new Set([...waitAliases.values()].flat());
     const lanes = [];
     const laneById = new Map();
     const annotations = [];
@@ -1106,6 +1388,7 @@
     const instruction = options.layout === "instruction";
     const adapterOptions = { mode, layout: options.layout, timeBasis: options.timeBasis, mergedPlayEventIds, expandedQ1IssueSequencers,
       alignment: timelineIr?.alignment };
+    const triggerArrivals = coincidentTriggerArrivals(events, adapterOptions);
     let maxTime = 1;
 
     function ensureLane(lane) {
@@ -1137,7 +1420,8 @@
     }
 
     for (const event of events) {
-      if (!shouldIncludeEvent(event, { mode })) {
+      const triggerGroup = triggerArrivals.get(String(event.id));
+      if (!shouldIncludeEvent(event, { mode }) || collapsedWaitIds.has(String(event.id)) || (triggerGroup && triggerGroup.primary !== event)) {
         continue;
       }
       if (event.kind === "loop_block") {
@@ -1155,6 +1439,18 @@
         continue;
       }
       const block = eventBlock(event, adapterOptions);
+      block.eventIds.push(...(waitAliases.get(block.id) || []));
+      if (triggerGroup) {
+        const counts = new Map();
+        for (const arrival of triggerGroup.arrivals) {
+          if (arrival !== event) block.eventIds.push(String(arrival.id));
+          const address = arrival.meta?.address ?? "unknown";
+          counts.set(address, (counts.get(address) || 0) + 1);
+        }
+        const addresses = [...counts].map(([address, count]) => count === 1 ? address : `${address} ×${count}`);
+        block.title = `Trigger addresses ${addresses.join(", ")} · ${block.start} ns`;
+        block.search += ` ${block.eventIds.join(" ")} ${block.title}`.toLowerCase();
+      }
       const lane = ensureLane(eventLane(event, adapterOptions));
       if (!lane.hidden) maxTime = Math.max(maxTime, block.start + Math.max(block.duration, 1));
       lane.blocks.push(block);
@@ -1197,7 +1493,8 @@
         block.rtEventIds = rtEventIds;
         const issueStart = adapterOptions.timeBasis === "aligned" && Number.isFinite(event.meta?.aligned_t0)
           ? `${event.meta.aligned_t0} ns` : displayValue(event.t0 ?? event.t0_ns, "unknown");
-        block.title = `Issue ${block.label} | Q1 instruction start: ${issueStart} | Select to trace RT execution`;
+        const timing = q1IssueTimingText(event, adapterOptions) || `Q1 instruction start: ${issueStart}`;
+        block.title = `Issue ${block.label} | ${timing} | Select to trace RT execution`;
       }
     }
 
@@ -1256,23 +1553,25 @@
       if (!target.block.eventIds.includes(eventId)) target.block.eventIds = [...target.block.eventIds, eventId];
     }
     for (const event of events) {
-      if (event.kind !== "underflow_warning" || !shouldIncludeEvent(event, adapterOptions)) continue;
+      if (event.kind !== "underflow_warning" || isTimelinePoint(event) || !shouldIncludeEvent(event, adapterOptions)) continue;
       const eventId = String(event.id);
+      const message = event.meta?.diagnostic_message || underflowLabel(event);
       const lane = laneById.get(eventLane(event, adapterOptions).id);
       const block = lane.blocks.find((candidate) => candidate.id === eventId);
       const target = events.filter((candidate) => sameOccurrence(event, candidate) &&
         event.meta?.rt_packet_id !== undefined && candidate.meta?.rt_packet_id === event.meta.rt_packet_id &&
-        eventLaneName(candidate).startsWith("rt.") && !["underflow_warning", "analysis_incomplete", "marker_state",
-          "latched_state_applied", "sync_wait", "trigger_wait", "feedback_receive", "feedback_send", "trigger_receive", "acquisition_result"].includes(candidate.kind))
+        eventLaneName(candidate).startsWith("rt.") && !isTimelinePoint(candidate) &&
+        !["underflow_warning", "analysis_incomplete", "marker_state", "latched_state_applied", "sync_wait", "trigger_wait",
+          "feedback_receive", "feedback_send", "acquisition_result"].includes(candidate.kind))
         .map((candidate) => commandPositions.get(String(candidate.id)))
         .find((position) => position && !position.lane.hidden);
       if (target) {
         lane.blocks.splice(lane.blocks.indexOf(block), 1);
-        addError(target, eventId, underflowLabel(event));
+        addError(target, eventId, message);
       } else {
         block.duration = 0;
         block.diagnosticPlacement = "point";
-        block.diagnosticErrors = [{ eventId, message: underflowLabel(event) }];
+        block.diagnosticErrors = [{ eventId, message }];
       }
     }
     for (const diagnostic of timelineIr.diagnostics || []) {
@@ -1286,7 +1585,8 @@
           candidate.source?.file === diagnostic.source.file && candidate.source?.line === diagnostic.source.line) : undefined);
       const eventId = String(event?.id);
       const target = commandPositions.get(eventId);
-      if (target) addError(target, eventId, diagnostic.message || diagnostic.category);
+      if (target) addError(target, eventId, diagnostic.details?.display_message ||
+        networkConflictDisplayMessage(diagnostic, timelineIr.alignment, options.timeBasis) || diagnostic.message || diagnostic.category);
     }
     const viewport = {
       start: 0,
@@ -1309,6 +1609,85 @@
         rows: [],
       },
     };
+  }
+
+  function foldTimelineCommands(model, {mode, timeBasis, eventsById, expandedGroups, expandedLoops, hasQ1Control}) {
+    const groupByEvent = new Map();
+    const instruction = model.layout === "instruction";
+    const expandedLoopMembers = new Set();
+    if (mode === "normal" && !instruction && expandedLoops?.size) {
+      for (const annotation of model.annotations) {
+        const meta = annotation.domain?.meta;
+        if (annotation.type !== "loop-range" || !expandedLoops.has(String(meta?.loop_preview_key || meta?.loop_id || annotation.eventId))) continue;
+        for (const id of [...(meta?.first_iteration_event_ids || []), ...(meta?.hidden_event_ids || [])]) {
+          expandedLoopMembers.add(String(id));
+        }
+      }
+    }
+    for (const lane of model.lanes) {
+      const q1 = mode === "debug" && lane.kind === "q1-issue";
+      const waits = mode === "normal" && !instruction && ["runtime", "branch-runtime"].includes(lane.kind);
+      if (!q1 && !waits) continue;
+      const replacements = new Map();
+      let run = [];
+      let runScope;
+      let previousEnd;
+      function finishRun() {
+        if (!run.length) return;
+        if (q1 || run.length > 1) {
+          const first = run[0], last = run.at(-1);
+          const id = `command-group:${first.id}`;
+          const expanded = expandedGroups.has(id);
+          const duration = last.start + last.duration - first.start;
+          const label = q1 ? `Q1 × ${run.length}` : `wait × ${run.length}`;
+          const action = `${expanded ? "Collapse" : "Expand"} ${run.length} ${q1 ? "Q1 instructions" : "wait commands"}`;
+          const span = instruction ? `instructions ${first.start + 1}–${first.start + duration}` :
+            `${first.start}–${first.start + duration} ns${waits ? ` (${duration} ns)` : ""}`;
+          for (const block of run) {
+            for (const eventId of block.eventIds) groupByEvent.set(eventId, id);
+            if (!expanded) replacements.set(block, []);
+          }
+          const summary = {
+            id, kind: "command_group", label: expanded ? "−" : label,
+            start: first.start, duration, title: `${action} · ${span}`, eventIds: [],
+            accentColor: waits ? first.accentColor : undefined,
+            foldGroup: {expanded, waits, action, count: run.length},
+            search: run.map((block) => block.search).join(" "),
+            classNames: expanded ? "timeline-command-group timeline-command-group-open" : "timeline-command-group",
+          };
+          replacements.set(first, expanded ? [first, summary] : [summary]);
+        }
+        run = [];
+      }
+      const ordered = [...lane.blocks].sort((left, right) => left.start - right.start ||
+        Number(Boolean(right.pointMarker)) - Number(Boolean(left.pointMarker)));
+      for (const block of ordered) {
+        const event = eventsById.get(block.eventId);
+        const meta = event?.meta || {};
+        const start = concreteTime(timeBasis === "aligned" ? meta.aligned_t0 : undefined) ??
+          concreteTime(event?.t0 ?? event?.t0_ns);
+        const end = concreteTime(timeBasis === "aligned" ? meta.aligned_t1 : undefined) ??
+          concreteTime(event?.t1 ?? event?.t1_ns);
+        const ordinaryWait = block.kind === "wait" && block.commandToken === "wait" && !expandedLoopMembers.has(block.eventId) &&
+          !meta.conditional_time_unknown && !(timeBasis === "aligned" && meta.aligned_time_nominal);
+        const eligible = (q1 ? block.kind === "q1_issue" && !hasQ1Control?.(event) : ordinaryWait) &&
+          !block.diagnosticErrors?.length && block.duration > 0 &&
+          (instruction || start === block.start && block.start + block.duration === end);
+        const scope = JSON.stringify([meta.loop_preview, meta.loop_iteration_index, meta.diff_status, meta.rt_trigger_epoch]);
+        const previous = run.at(-1);
+        if (!eligible || previous && (previous.start + previous.duration !== block.start ||
+          runScope !== scope || q1 && (run.length === 12 ||
+            previousEnd !== undefined && start !== undefined && previousEnd !== start))) finishRun();
+        if (eligible) {
+          runScope = scope;
+          previousEnd = end;
+          run.push(block);
+        }
+      }
+      finishRun();
+      lane.blocks = lane.blocks.flatMap((block) => replacements.get(block) || [block]);
+    }
+    return groupByEvent;
   }
 
   function timeScaleFromGaps(gaps, ranges = gaps) {
@@ -1387,10 +1766,12 @@
     const sequencers = new Set([...(timelineIr?.sequencers || []).map((sequencer) => String(sequencer.id)), ...events.map((event) => String(event.sequencer_id))]);
     const offsets = [...sequencers].map((id) => timelineIr.alignment && timelineIr.alignment[id]);
     const sharedClock = [...sequencers].every((id) => timelineIr.execution?.[id]?.timing_model === "event_driven");
+    const sameOffset = new Set(offsets.map((alignment) => exactTime(alignment?.offset))).size === 1;
+    const sharedAlignment = sharedClock && sameOffset && offsets.every((alignment) => alignment?.clock === "shared_simulation");
     const commonClock = sequencers.size <= 1 || [...sequencers].every((id) => events.some((event) => String(event.sequencer_id) === id)) && offsets.every((alignment) => alignment && alignment.confidence === "exact" &&
       !alignment.unaligned && Number.isFinite(exactTime(alignment.offset)) &&
-      (alignment.mode === "first_wait_sync" || String(alignment.mode).startsWith("manual:") || alignment.mode === "none" && sharedClock)) &&
-      (options.timeBasis === "aligned" || new Set(offsets.map((alignment) => exactTime(alignment.offset))).size === 1);
+      (sharedAlignment || alignment.mode === "first_wait_sync" || String(alignment.mode).startsWith("manual:") || alignment.mode === "none" && sharedClock)) &&
+      (options.timeBasis === "aligned" || sameOffset);
     const hidden = collapsedExecutedLoopIds(events, expanded, playback);
     const activity = events.filter((event) => !hidden.has(String(event.id)) &&
       !["wait", "wait_sync", "wait_trigger", "loop_block", "branch_region", "loop_iteration_preview", "control_flow_loop", "control_flow_branch", "latched_state_pending", "queue_depth", "slack", "analysis_incomplete"].includes(event.kind) &&
@@ -1511,14 +1892,6 @@
     const gaps = [];
     const acquisitionWindows = [];
     const scale = timeScaleFromGaps(gaps);
-    function concreteTime(value) {
-      if (typeof value === "number" && Number.isFinite(value)) return value;
-      if (value && typeof value === "object" && (!value.kind || value.kind === "concrete")) {
-        const number = value.value ?? value.value_ns;
-        if (typeof number === "number" && Number.isFinite(number)) return number;
-      }
-      return undefined;
-    }
     function merge(intervals) {
       const merged = [];
       for (const interval of intervals.sort((a, b) => a.start - b.start || a.end - b.end)) {
@@ -1566,15 +1939,16 @@
     if (!sequencers.size) return scale;
     const offsets = new Map();
     const sharedClock = [...sequencers].every((id) => timelineIr.execution && timelineIr.execution[id] && timelineIr.execution[id].timing_model === "event_driven");
+    const sharedAlignment = sharedClock && [...sequencers].every((id) => timelineIr.alignment?.[id]?.clock === "shared_simulation");
     for (const id of sequencers) {
       const alignment = timelineIr.alignment && timelineIr.alignment[id];
       const offset = alignment ? concreteTime(alignment.offset) : 0;
       if ((sequencers.size > 1 && !alignment) || (alignment && (alignment.confidence !== "exact" || alignment.unaligned || offset === undefined))) return scale;
-      if (sequencers.size > 1 && alignment.mode !== "first_wait_sync" && !String(alignment.mode).startsWith("manual:") && !(alignment.mode === "none" && sharedClock)) return scale;
+      if (sequencers.size > 1 && !sharedAlignment && alignment.mode !== "first_wait_sync" && !String(alignment.mode).startsWith("manual:") && !(alignment.mode === "none" && sharedClock)) return scale;
       offsets.set(id, offset);
     }
     // Local clocks with different origins cannot establish simultaneous unchanged time.
-    if (options.timeBasis !== "aligned" && new Set(offsets.values()).size > 1) return scale;
+    if ((sharedAlignment || options.timeBasis !== "aligned") && new Set(offsets.values()).size > 1) return scale;
     const playback = Boolean(timelineIr.playback);
     const expandedLoops = new Set(options.expandedPlaybackLoops || []);
     const hidden = collapsedExecutedLoopIds(events, expandedLoops, playback);
@@ -1655,7 +2029,7 @@
       const acquisitionEnds = new Map();
       for (const { event, start } of records) {
         const meta = event.meta || {};
-        if (event.kind !== "acquisition_result" || event.confidence !== "exact" || !meta.rt_packet_id || !["configured", "weight_memory"].includes(meta.integration_length_source)) continue;
+        if (event.kind !== "acquisition_result" || event.confidence !== "exact" || !meta.rt_packet_id || !["configured", "hardware_parameters", "weight_memory"].includes(meta.integration_length_source)) continue;
         const acquiredAt = concreteTime(meta.start_ns);
         const duration = concreteTime(meta.duration_ns);
         if (acquiredAt !== undefined && duration > 0 && Math.abs(acquiredAt + offset + duration - start) < 1e-6) {
@@ -1667,7 +2041,8 @@
       for (const { event, start, end } of records) {
         const meta = event.meta || {};
         const provenWaitCopy = waitKinds.has(event.kind) && waitLoops.some((loop) => start >= loop.start && end <= loop.end);
-        if (event.confidence !== "exact" || (meta.preview_source_event_id && !provenWaitCopy) || meta.assumed_branch_path || meta.comparison_paths) {
+        if (event.confidence !== "exact" && !meta.trigger_arrival_unknown ||
+            (meta.preview_source_event_id && !provenWaitCopy) || meta.assumed_branch_path || meta.comparison_paths) {
           blocked.push({ start, end: Infinity });
           continue;
         }
@@ -1738,8 +2113,15 @@
     buildWaitTimeScale,
     eventLabelToken,
     eventTimeValue,
+    foldTimelineCommands,
     isExecutedLoop,
+    networkConflictDisplayMessage,
+    netzeroResultTimingText,
+    q1IssueTimingText,
+    q1OnlyLoopIds,
+    rtTimingText,
     underflowLabel,
+    visibleRtExtent,
   };
 
   root.q1timelineTimelineAdapter = api;

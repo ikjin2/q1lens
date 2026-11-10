@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, replace
 from decimal import Decimal
 from math import sqrt
 from pathlib import Path
+from random import Random
 from time import monotonic
 
 from q1timeline.analysis.alignment import align_timelines
@@ -31,6 +32,7 @@ from q1timeline.simulation.runtime import simulate_programs
 
 
 MAX_CASES = 4096
+MAX_RANDOM_CASES = 25_000
 MAX_STATISTICS_CASES = 1_000_000
 REGISTERS = frozenset(f"R{i}" for i in range(64))
 
@@ -77,7 +79,8 @@ def sweep_plan(axes: list, defs: dict[str, Arg], *, statistics_only: bool = Fals
         ranges.append({"name": name, "count": str(Decimal(count)), "min": str(lower), "step": str(step),
                        "last": str(lower + (count - 1) * step)})
     limit = MAX_STATISTICS_CASES if statistics_only else MAX_CASES
-    return {"axes": ranges, "total": str(Decimal(total)), "allowed": total <= limit, "limit": limit}
+    return {"axes": ranges, "total": str(Decimal(total)), "allowed": total <= limit, "limit": limit,
+            "sample_limit": MAX_STATISTICS_CASES if statistics_only else MAX_RANDOM_CASES}
 
 
 @dataclass
@@ -258,7 +261,9 @@ class RunSnapshot:
         if self.mode == "simulation":
             states = simulate_programs(programs, params=self.params, max_steps=self.max_steps,
                                        simulation=config.simulation, sequences=self.memories, strict_q1asm=self.strict,
-                                       prepared_programs=prepared)
+                                       prepared_programs=prepared,
+                                       hardware_parameters={seq.id: seq.hardware_parameters for seq in config.sequencers},
+                                       sequencer_metadata=config.sequencer_metadata())
         else:
             states = [interpret_program(program, sequencer_id=name, params=self.params,
                                         waveform_names=self.names[name].waveforms if name in self.names else None,
@@ -267,11 +272,13 @@ class RunSnapshot:
                                         strict_q1asm=self.strict, branch_policy=config.analysis.branch_policy,
                                         prepared=prepared[name] if prepared else None)
                       for name, program in programs.items()]
-            if prepared is None or any(program.needs_queue_analysis for program in prepared.values()):
-                analyze_underflows(states)
         for state, seq in zip(states, config.sequencers):
             state.metadata.update(module=seq.module, module_type=seq.module_type,
                                   sequencer_index=seq.sequencer_index, hardware_parameters=seq.hardware_parameters)
+            if self.mode != "simulation" and seq.id in self.names:
+                state.metadata["weight_lengths"] = self.names[seq.id].weight_lengths
+        if self.mode != "simulation" and (prepared is None or any(program.needs_queue_analysis for program in prepared.values())):
+            analyze_underflows(states)
         analyze_project_hardware_readiness(states, config.sequencers, include_optional_checks=self.hardware_readiness)
         observed = next(state for state in states if state.sequencer_id == target)
         execution = observed.metadata["execution"]
@@ -318,9 +325,12 @@ class RunSnapshot:
                     reason=reason, diagnostics=[_diagnostic_to_dict(item) for item in diagnostics])
         if not detail:
             return case
-        align_timelines(states, mode=config.alignment_mode, anchor_kinds=config.alignment_anchor_kinds)
+        alignment_mode = config.alignment_for_execution(self.mode)
+        align_timelines(states, mode=alignment_mode, anchor_kinds=config.alignment_anchor_kinds)
         ir = timeline_ir_from_states(states, project={"root": str(config.root),
-                                    "feedback_transport_delay_ns": config.analysis.feedback_transport_delay_ns})
+                                    "alignment_mode": alignment_mode, "alignment_anchor_kinds": list(config.alignment_anchor_kinds),
+                                    "feedback_transport_delay_ns": config.analysis.feedback_transport_delay_ns},
+                                    feedback_routes=config.simulation.get("routes", ()))
         pending = [{"register": write.register, "event_id": write.event_id, "value": value_to_json(write.value),
                     "ready_ns": write.meta.get("scheduled_ready_ns")}
                    for write in observed.pending_register_writes]
@@ -363,12 +373,22 @@ def main(argv: list[str] | None = None) -> int:
             elif command == "sweep":
                 target, selection, values = snapshot.inputs(request)
                 plan = sweep_plan(request["axes"], numeric_defs(snapshot.programs[target]), statistics_only=statistics_only)
-                if not plan["allowed"]:
+                sample_count = request.get("sample_count")
+                if "sample_count" in request:
+                    if type(sample_count) is not int or not 1 <= sample_count <= plan["sample_limit"]:
+                        raise ValueError(f"Sample count must be an integer from 1 to {plan['sample_limit']:,}.")
+                    plan.update(sampling="random", total=str(sample_count), allowed=True)
+                elif not plan["allowed"]:
                     raise ValueError(f"This sweep mode supports up to {plan['limit']:,} combinations.")
                 snapshot.validate_sweep_source()
                 names = [axis["name"] for axis in plan["axes"]]
                 ranges = [range(int(axis["min"]), int(axis["last"]) + 1, int(axis["step"])) for axis in plan["axes"]]
-                points = ((x,) for x in ranges[0]) if len(ranges) == 1 else ((x, y) for x in ranges[0] for y in ranges[1])
+                if sample_count is not None:
+                    rng = Random()
+                    spans = [(span, int(axis["count"])) for span, axis in zip(ranges, plan["axes"])]
+                    points = (tuple(span[rng.randrange(count)] for span, count in spans) for _ in range(sample_count))
+                else:
+                    points = ((x,) for x in ranges[0]) if len(ranges) == 1 else ((x, y) for x in ranges[0] for y in ranges[1])
                 statistics = _SweepStatistics(selection) if statistics_only else None
                 prepared = snapshot.prepare_statistics(target, values, set(names)) if statistics_only else None
                 sweep = enumerate(points, 1)

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -13,6 +16,28 @@ LOOP_PROGRAM = (
     "body: add R1,1,R1\nnop\nloop R0,@body\n"
     "move R1,R2\nnop\nstop\n"
 )
+
+
+@pytest.mark.parametrize("first_import", [
+    "from q1timeline.ir import timeline_ir_to_json",
+    "from q1timeline.analysis import analyze_text",
+    "from q1timeline.ir.serialize import timeline_ir_to_json",
+])
+def test_public_analysis_and_ir_import_independently_in_a_fresh_process(first_import: str) -> None:
+    program = f"""\
+import json
+import sys
+sys.path.insert(0, sys.argv[1])
+{first_import}
+from q1timeline.analysis import analyze_documents, analyze_text
+from q1timeline.ir import timeline_ir_to_json
+source = 'wait 4\\nstop'
+for ir in (analyze_text(source), analyze_documents({{'sample.q1asm': source}}, alignment_mode='none')):
+    assert any(event['kind'] == 'wait' for event in json.loads(timeline_ir_to_json(ir))['events'])
+"""
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    result = subprocess.run([sys.executable, "-c", program, str(source_root)], capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stderr
 
 
 def test_concrete_api_serializes_executed_iterations_and_register_evidence() -> None:

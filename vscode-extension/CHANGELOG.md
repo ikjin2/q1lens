@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.10
+
+- Model more Q1ASM and QTM behavior, including zero-duration RT packets, trigger counters and forwarding, digital acquisition, scope capture, and NetZero compensation.
+- Add scheduled LINQ receipts to Play and improve feedback ordering, acquisition payloads, and arrival diagnostics.
+- Preserve planned and observed timing for clipped commands, record terminal and branch evidence, and improve source navigation in VS Code and standalone timelines.
+- Add DEF random sampling, runtime estimates, and formula comparisons with absolute tolerances.
+- Pair with Python package 0.2.10.
+
 ## 0.2.9
 
 - Run Q1ASM with draft DEF values, sweep one or two inputs, and inspect register results, Q1 time, and replayable cases. Add statistics-only sweeps and formulas over saved cases.

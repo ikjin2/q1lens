@@ -28,7 +28,9 @@
   }
 
   function eventLabel(event) {
-    return event ? event.label || event.source && event.source.raw || event.kind : "No active event";
+    if (!event) return "No active event";
+    const label = event.label || event.source && event.source.raw || event.kind;
+    return event.meta?.stop_code === undefined ? label : `${label} · stop code ${display(event.meta.stop_code)}`;
   }
 
   function moduleId(sequencer) {
@@ -43,11 +45,18 @@
     return String(status || "unknown").replaceAll("-", " ").replaceAll("_", " ");
   }
 
-  function executionLabel(execution) {
+  function binKindLabel(kind) {
+    return { acquire_timetags: "Timetags", acquire_digital: "Digital level", acquire_ttl: "TTL counts" }[kind];
+  }
+
+  function executionLabel(execution, terminal) {
     if (!execution) return "Static analysis";
     const parts = [execution.mode === "simulation" ? "Event-driven simulation" : execution.mode === "concrete" ? "Concrete execution" : execution.mode === "playback" ? "Path execution" : statusLabel(execution.mode), statusLabel(execution.status)];
     if (Number.isFinite(execution.steps)) parts.push(`${execution.steps}${Number.isFinite(execution.max_steps) ? ` / ${execution.max_steps}` : ""} instructions`);
-    if (execution.reason) parts.push(execution.reason);
+    if (execution.stop_code !== undefined) parts.push(`Stop code ${display(execution.stop_code)}`);
+    const reason = terminal?.display_reason ?? execution.reason;
+    if (reason) parts.push(reason);
+    if (Number.isFinite(terminal?.time)) parts.push(`${terminal.core === "q1" ? "Q1 observation end" : "Observation end"} ${terminal.time} ns`);
     return parts.join(" · ");
   }
 
@@ -67,6 +76,8 @@
   function mount(container, ir, options = {}) {
     const model = root.q1lensHardwareState;
     const index = model.createIndex(ir);
+    const timeStep = Object.values(index.simulation).some((run) => run.clock_tick_ns === 1 / 128) ? 1 / 128 : 1;
+    const snapTime = (time) => Math.round(time / timeStep) * timeStep;
     const sequencers = index.sequencers;
     const modules = [...new Set(sequencers.map(moduleId))];
     const ranges = {};
@@ -80,7 +91,7 @@
     const initial = options.initialState || {};
     const state = {
       sequencerId: sequencers.some((seq) => seq.id === initial.sequencerId) ? initial.sequencerId : sequencers[0] && sequencers[0].id,
-      time: Number.isFinite(initial.time) ? Math.round(initial.time) : 0,
+      time: Number.isFinite(initial.time) ? snapTime(initial.time) : 0,
       basis: initial.basis === "aligned" ? "aligned" : "local",
       selectedBlock: BLOCKS.some((block) => block.id === initial.selectedBlock) || initial.selectedBlock === "simulation" ? initial.selectedBlock : "registers",
       signalStage: initial.signalStage || "dac",
@@ -113,6 +124,13 @@
     let replayRegisterNames = [];
     const replaySourceTraces = new WeakMap();
     const projectReplayTrace = model.projectExecutionTrace(index);
+    const sharedOffset = model.numericValue(index.alignment[sequencers[0]?.id]?.offset);
+    const hasSharedAlignment = Number.isFinite(sharedOffset) && sequencers.every(({ id }) => {
+      const alignment = index.alignment[id];
+      return alignment?.clock === "shared_simulation" && alignment.confidence === "exact" &&
+        !alignment.unaligned && model.numericValue(alignment.offset) === sharedOffset;
+    });
+    const alignedProjectFrames = hasSharedAlignment ? projectReplayTrace.frames.map((time) => time + sharedOffset) : [];
     let projectReplayTracks;
     let replayEnd = 0;
     const overviewSteps = new Map();
@@ -138,7 +156,7 @@
         <button type="button" data-action="previous" title="Previous state change" aria-label="Previous state change">‹</button>
         <button type="button" data-action="next" title="Next state change" aria-label="Next state change">›</button>
         <label class="hardware-time">Time <input data-control="time" type="number" step="any" aria-label="Selected time in nanoseconds"> ns</label>
-        <input data-control="scrubber" type="range" step="1" aria-label="Explore sequencer state over time">
+        <input data-control="scrubber" type="range" step="${timeStep}" aria-label="Explore sequencer state over time">
         <span data-value="basis" class="hardware-muted"></span>
       </div>
       <p class="hardware-warnings" data-value="warnings" role="status" hidden></p>
@@ -206,7 +224,7 @@
           <div class="hardware-tab-panel" data-panel="bins" role="tabpanel" aria-label="Acquisition bins" hidden>
             <div class="hardware-panel-toolbar"><span data-value="bin-count"></span><div class="hardware-bin-pager"><button type="button" data-action="bins-previous" aria-label="Previous bins">‹</button><button type="button" data-action="bins-next" aria-label="Next bins">›</button></div></div>
             <p class="hardware-panel-hint" data-value="bins-note"></p>
-            <div class="hardware-table-scroll"><table class="hardware-table"><thead><tr><th>Acquisition</th><th>Bin</th><th>Writes</th><th>Last target</th><th>Latest result</th></tr></thead><tbody data-value="bins"></tbody></table></div>
+            <div class="hardware-table-scroll"><table class="hardware-table"><thead><tr><th>Acquisition</th><th>Bin</th><th>Targets</th><th>Last target or write</th><th>Latest result</th></tr></thead><tbody data-value="bins"></tbody></table></div>
             <div class="hardware-bin-history" data-value="bin-history"></div>
           </div>
           <div class="hardware-tab-panel hardware-simulation" data-panel="simulation" role="tabpanel" aria-label="Simulation" hidden>
@@ -262,6 +280,10 @@
 
     function isProjectReplay() { return state.replayScope === "project"; }
 
+    function projectFrames() {
+      return state.basis === "aligned" && hasSharedAlignment ? alignedProjectFrames : projectReplayTrace.frames;
+    }
+
     function replayCount() { return isProjectReplay() ? projectReplayTrace.frames.length : replayTrace.instructions.length; }
 
     function instructionPosition(trace, time = state.time) {
@@ -278,7 +300,7 @@
 
     function syncReplayPosition() {
       if (!isProjectReplay()) { replayPosition = instructionPosition(replayTrace); return; }
-      const frames = projectReplayTrace.frames;
+      const frames = projectFrames();
       let low = 0;
       let high = frames.length;
       while (low < high) {
@@ -310,12 +332,12 @@
     }
 
     function useProjectClock(notifyScope = true) {
-      if (state.basis === "aligned") {
+      if (state.basis === "aligned" && !hasSharedAlignment) {
         const offset = model.numericValue((index.alignment[state.sequencerId] || {}).offset);
         if (!alignmentUnknown() && offset !== undefined) state.time -= offset;
         state.basis = "local";
       }
-      if (notifyScope && options.onReplayScopeChange) options.onReplayScopeChange("project");
+      if (!hasSharedAlignment && notifyScope && options.onReplayScopeChange) options.onReplayScopeChange("project");
       times = stepTimesForView();
       updateReplayTrace();
     }
@@ -324,7 +346,7 @@
       if (replayPosition >= replayCount() - 1) return;
       replayPosition++;
       const instruction = isProjectReplay() ? undefined : replayTrace.instructions[replayPosition];
-      state.time = isProjectReplay() ? projectReplayTrace.frames[replayPosition] : replayPosition === replayCount() - 1 ? replayEnd : instruction.end;
+      state.time = isProjectReplay() ? projectFrames()[replayPosition] : replayPosition === replayCount() - 1 ? replayEnd : instruction.end;
       state.binOffset = 0;
       if (replayPosition === replayCount() - 1) pauseReplay();
       render();
@@ -374,7 +396,7 @@
       const previousTime = replayPosition > 0 ? instructions[replayPosition - 1].end : instructions[0].time;
       renderReplayTrack(find('[data-replay-single]'), "replay", replayTrace, replayRegisterNames, snapshot, replayPosition, previousTime, state.basis);
       const execution = snapshot.execution;
-      text(values["replay-status"], finished ? execution && execution.status !== "completed" ? `Recorded trace ended · ${executionLabel(execution)}` : "Execution replay complete" : instruction ? `Instruction ${replayPosition + 1} · ${instruction.event.source && instruction.event.source.raw || eventLabel(instruction.event)}` : "Ready to replay");
+      text(values["replay-status"], finished ? execution && execution.status !== "completed" ? `Recorded trace ended · ${executionLabel(execution, snapshot.terminal)}` : "Execution replay complete" : instruction ? `Instruction ${replayPosition + 1} · ${instruction.event.source && instruction.event.source.raw || eventLabel(instruction.event)}` : "Ready to replay");
     }
 
     function renderReplayTrack(target, prefix, trace, names, current, position, previousTime, basis) {
@@ -415,9 +437,9 @@
       if (prefix === "project") {
         for (const core of ["q1", "rt"]) {
           const event = current[core].event;
-          text(node(core), `${core.toUpperCase()}: ${current[core].status} · ${event && event.source && event.source.raw || eventLabel(event)}`);
+          text(node(core), `${core.toUpperCase()}: ${statusLabel(current[core].status)} · ${event && event.source && event.source.raw || eventLabel(event)}`);
         }
-      } else text(node("cores"), `Q1: ${current.q1.status} · RT: ${current.rt.status} · ${eventLabel(current.rt.event)}`);
+      } else text(node("cores"), `Q1: ${statusLabel(current.q1.status)} · RT: ${statusLabel(current.rt.status)} · ${eventLabel(current.rt.event)}`);
     }
 
     function renderProjectReplay(finished) {
@@ -429,20 +451,22 @@
         }).join(""));
         projectReplayTracks = projectReplayTrace.traces.map((track, number) => ({ ...track, element: grid.children[number], names: registerNames(track.trace) }));
       }
-      const previousTime = projectReplayTrace.frames[Math.max(0, replayPosition - 1)];
+      const previousTime = projectFrames()[Math.max(0, replayPosition - 1)];
       for (const track of projectReplayTracks) {
-        const current = model.snapshot(index, track.sequencerId, state.time, "local", { limit: 1 });
-        const position = instructionPosition(track.trace);
-        text(track.element.querySelector('[data-value="project-progress"]'), `${position + 1} / ${track.trace.instructions.length} instructions`);
-        renderReplayTrack(track.element, "project", track.trace, track.names, current, position, previousTime, "local");
+        const trace = state.basis === "aligned" ? model.executionTrace(index, track.sequencerId, "aligned") : track.trace;
+        const current = model.snapshot(index, track.sequencerId, state.time, state.basis, { limit: 1 });
+        const position = instructionPosition(trace);
+        text(track.element.querySelector('[data-value="project-progress"]'), `${position + 1} / ${trace.instructions.length} instructions`);
+        renderReplayTrack(track.element, "project", trace, track.names, current, position, previousTime, state.basis);
         track.element.querySelector('[data-action="project-replay-source"]').disabled = !(current.q1.event && current.q1.event.source && options.onSourceClick);
-        text(track.element.querySelector('[data-value="project-execution"]'), finished ? executionLabel(current.execution) : "");
+        const ended = Number.isFinite(current.terminal?.time) && current.time >= current.terminal.time;
+        text(track.element.querySelector('[data-value="project-execution"]'), finished || ended ? executionLabel(current.execution, current.terminal) : "");
       }
-      text(values["replay-status"], finished ? projectReplayTrace.traces.every(({ sequencerId }) => index.execution[sequencerId].status === "completed") ? "All sequencers finished" : "Recorded trace ended · inspect each sequencer's stop reason." : `Shared simulation time · ${state.time} ns`);
+      text(values["replay-status"], finished ? projectReplayTrace.traces.every(({ sequencerId }) => index.execution[sequencerId].status === "completed") ? "All sequencers finished" : "Recorded trace ended · inspect each sequencer's stop reason." : `Shared ${state.basis === "aligned" ? "RT" : "simulation"} time · ${state.time} ns`);
     }
 
     function stepTimesForView() {
-      if (replayOpen && isProjectReplay()) return projectReplayTrace.frames;
+      if (replayOpen && isProjectReplay()) return projectFrames();
       if (state.level === "detail") return model.stepTimes(index, state.sequencerId, state.basis);
       const key = JSON.stringify([state.basis, state.level === "modules" ? null : state.moduleId]);
       if (!overviewSteps.has(key)) {
@@ -535,7 +559,7 @@
           }
           const command = summary.rt.event || summary.q1.event;
           text(card.querySelector("[data-sequencer-command]"), command ? eventLabel(command) : "No resolved command at this time");
-          text(card.querySelector("[data-sequencer-execution]"), executionLabel(index.execution[card.dataset.sequencerCard]));
+          text(card.querySelector("[data-sequencer-execution]"), executionLabel(index.execution[card.dataset.sequencerCard], summary.terminal));
           card.title = `Q1: ${statusLabel(summary.q1.status)} · RT: ${statusLabel(summary.rt.status)}${command ? ` · ${eventLabel(command)}` : ""}`;
         }
       }
@@ -649,9 +673,12 @@
         return registerInput(name, value, writer && writer.eventId);
       }).join(" · ")}</span>`);
       if (meta.input_event_ids && meta.input_event_ids.length) parts.push(`<span>Received input: ${meta.input_event_ids.map((id) => `<button type="button" data-event="${escapeHtml(id)}">${escapeHtml(id)}</button>`).join(" ")}</span>`);
-      if (Object.prototype.hasOwnProperty.call(meta, "flags_before") || Object.prototype.hasOwnProperty.call(meta, "flags_after")) {
+      const clipped = Number.isFinite(meta.observation_cutoff_ns) && Number.isFinite(meta.planned_q1_end_ns) &&
+        meta.planned_q1_end_ns > meta.observation_cutoff_ns && model.eventTime(index, event, "local", "t1") === meta.observation_cutoff_ns;
+      if (clipped || Object.prototype.hasOwnProperty.call(meta, "flags_before") || Object.prototype.hasOwnProperty.call(meta, "flags_after")) {
         const flags = (value) => value ? ["zf", "nf", "cf", "of"].map((name) => `${name.toUpperCase()}=${value[name] === undefined ? "?" : Number(value[name])}`).join(" ") : "unknown";
-        parts.push(`<span>Flags before → after: ${escapeHtml(flags(meta.flags_before))} → ${escapeHtml(flags(meta.flags_after))}</span>`);
+        const after = clipped ? "unobserved" : flags(meta.flags_after);
+        parts.push(`<span>Flags before → after: ${escapeHtml(flags(meta.flags_before))} → ${escapeHtml(after)}</span>`);
       }
       html(values["instruction-detail"], parts.join("") || '<span>Register reads and flags were not recorded for this instruction.</span>');
     }
@@ -671,7 +698,30 @@
 
     function resultLabel(result) {
       if (!result || result === "unknown") return "unknown";
+      const reasons = [...new Set([result.reason, result.timetag_reason, result.count_valid === false ? result.classification_reason : undefined].filter(Boolean))];
+      if (!Number.isFinite(result.readyTime)) return [statusLabel(result.status), ...reasons].join(" · ");
+      if (result.digital) {
+        const { level, edgeCount, timetagTicks } = result.digital;
+        const values = [];
+        if (Number.isFinite(level)) values.push(`Level ${level}`);
+        if (Number.isFinite(edgeCount)) values.push(`Edge count ${edgeCount}`);
+        if (Number.isFinite(timetagTicks)) values.push(`Timetag delta ${timetagTicks / 128} ns`);
+        return [...values, ...reasons].join(" · ");
+      }
       return `I ${display(result.i)} · Q ${display(result.q)}${result.units ? ` (${result.units})` : result.source && result.source.kind === "scenario" ? " (scenario values)" : ""} · threshold ${display(result.thresholded)}`;
+    }
+
+    function resultTimeLabel(result) {
+      return Number.isFinite(result.readyTime) ? `Ready at ${result.readyTime} ns` : `Observed at ${result.outcomeTime} ns`;
+    }
+
+    function binAggregateLabel(aggregate) {
+      if (aggregate.kind === "ttl") return `TTL bin total · Edge count ${display(aggregate.total_count)}`;
+      if (aggregate.kind === "iq") {
+        return `I/Q bin aggregate · ${aggregate.count} accepted ${aggregate.count === 1 ? "window" : "windows"} · Mean I ${display(aggregate.mean_i)} · Mean Q ${display(aggregate.mean_q)} · Threshold count ${display(aggregate.thresholded_count)}${aggregate.units ? ` (${aggregate.units})` : ""}`;
+      }
+      const delta = Number.isFinite(aggregate.timetag_ticks) ? `${aggregate.timetag_ticks / 128} ns` : "unknown";
+      return `QTM bin aggregate · ${aggregate.avg_cnt} accepted ${aggregate.avg_cnt === 1 ? "write" : "writes"} · Mean count ${display(aggregate.count)} · Mean delta ${delta}`;
     }
 
     function renderSimulation() {
@@ -711,7 +761,7 @@
         cursor.setAttribute("visibility", Number.isFinite(cursorX) && cursorX >= 0 && cursorX <= 600 ? "visible" : "hidden");
         cursor.setAttribute("x1", String(Number.isFinite(cursorX) ? cursorX : 0));
         cursor.setAttribute("x2", String(Number.isFinite(cursorX) ? cursorX : 0));
-        html(values["signal-values"], signal.values.map((entry) => `<p><strong>${escapeHtml(entry.path.toUpperCase())}: ${escapeHtml(display(entry.value))}</strong>${entry.sampleTime === undefined ? signal.localTime === undefined ? " · alignment unavailable" : " · outside available trace" : ` · sample ${entry.sampleTime + signal.offset} ns`}<br>${escapeHtml(inputSource(entry.source))}</p>`).join(""));
+        html(values["signal-values"], signal.values.map((entry) => `<p><strong>${escapeHtml(entry.path.toUpperCase())}: ${escapeHtml(display(entry.value))}</strong>${entry.sampleTime === undefined ? signal.localTime === undefined ? " · alignment unavailable" : " · outside available trace" : ` · sample ${entry.sampleTime} ns`}<br>${escapeHtml(inputSource(entry.source))}</p>`).join(""));
       } else {
         text(values["signal-chart"], "No physical signal trace was exported for this sequencer.");
         signalChartKey = undefined;
@@ -722,20 +772,40 @@
       const communication = simulation.communications;
       html(values.communications, `<p>${communication.count} / ${communication.total} events${communication.count > communication.entries.length ? ` · latest ${communication.entries.length}` : ""}${communication.next ? ` · <button type="button" data-event="${escapeHtml(communication.next.event.id)}">Next at ${communication.next.time} ns</button>` : ""}</p>${communication.entries.map((entry) => {
         const meta = entry.event.meta || {};
-        const details = entry.event.kind === "acquisition_result" ? resultLabel(meta) : [meta.id === undefined ? null : `id ${display(meta.id)}`, meta.address === undefined ? null : `address ${display(meta.address)}`, meta.value === undefined ? null : `value ${display(meta.value)}`, meta.targets ? `to ${display(meta.targets)}` : null, meta.reason && statusLabel(meta.reason), meta.condition === undefined ? null : `condition ${display(meta.condition)}`].filter(Boolean).join(" · ");
+        const details = entry.acquisitionOutcome ? resultLabel(entry.acquisitionOutcome) : [meta.id === undefined ? null : `id ${display(meta.id)}`, meta.address === undefined ? null : `address ${display(meta.address)}`, meta.value === undefined ? null : `value ${display(meta.value)}`, meta.targets ? `to ${display(meta.targets)}` : null, meta.reason && statusLabel(meta.reason), meta.condition === undefined ? null : `condition ${display(meta.condition)}`].filter(Boolean).join(" · ");
         return `<div class="hardware-communication"><button type="button" data-event="${escapeHtml(entry.event.id)}">${entry.time} ns · ${escapeHtml(statusLabel(entry.event.kind))}</button><span>${escapeHtml(details)}</span>${meta.input_index === undefined ? "" : `<span>Scenario input ${escapeHtml(meta.input_index)}</span>`}${meta.source || meta.input_source ? `<span>${escapeHtml(inputSource(meta.input_source || meta.source))}</span>` : ""}${meta.source_event_id ? `<button type="button" data-event="${escapeHtml(meta.source_event_id)}">Show sending event</button>` : ""}${entry.event.kind === "feedback_send" && meta.q1_issue_event_id ? `<button type="button" data-event="${escapeHtml(meta.q1_issue_event_id)}" data-instruction-event="${escapeHtml(meta.q1_issue_event_id)}">Show sending instruction</button>` : ""}</div>`;
       }).join("")}`);
     }
 
+    function selectedBinRecord() {
+      const records = snapshot.bins.records;
+      const exact = records.find((entry) => entry.key === selectedBin);
+      if (exact || selectedBin === undefined) return exact;
+      const legacy = records.filter((entry) => entry.legacyKey === selectedBin);
+      if (legacy.length !== 1) return undefined;
+      selectedBin = legacy[0].key;
+      return legacy[0];
+    }
+
     function renderBins() {
       const bins = snapshot.bins;
-      text(values["bins-note"], snapshot.simulation ? "Writes count executed acquire commands. Results appear only after acquisition completion; their input source is shown below." : "Observed acquire commands, not hardware average counts. I/Q and threshold results are unknown in analytical timing.");
+      text(values["bins-note"], snapshot.simulation ? "Targets count executed commands that specify a bin destination. Acquisition outcomes show when they were observed and their input source." : "Observed acquire commands, not hardware average counts. I/Q and threshold results are unknown in analytical timing.");
       text(values["bin-count"], bins.total ? `${state.binOffset + 1}–${Math.min(state.binOffset + PAGE_SIZE, bins.total)} of ${bins.total} targets` : "No acquisition targets yet");
       find('[data-action="bins-previous"]').disabled = state.binOffset === 0;
       find('[data-action="bins-next"]').disabled = state.binOffset + PAGE_SIZE >= bins.total;
-      html(values.bins, bins.records.length ? bins.records.map((bin) => `<tr><td>${escapeHtml(display(bin.acquisitionIndex))}</td><td><button type="button" data-bin="${escapeHtml(`${bin.acquisitionIndex}:${bin.binIndex}`)}" title="Inspect this bin's target history">${escapeHtml(display(bin.binIndex))}</button></td><td>${escapeHtml(bin.count)}</td><td><button type="button" data-event="${escapeHtml(bin.eventId || "")}" title="Select last acquisition targeting this bin">${escapeHtml(display(bin.lastTime))} ns</button></td><td>${bin.result === "unknown" ? "unknown" : `<button type="button" data-event="${escapeHtml(bin.result.eventId)}" title="Ready at ${bin.result.readyTime} ns; ${escapeHtml(inputSource(bin.result.input_source || bin.result.source))}">${escapeHtml(resultLabel(bin.result))}</button>`}</td></tr>`).join("") : '<tr><td colspan="5" class="hardware-empty">No resolved bin targets at this time.</td></tr>');
-      const bin = bins.records.find((entry) => `${entry.acquisitionIndex}:${entry.binIndex}` === selectedBin);
-      html(values["bin-history"], bin ? `<span>Acquisition ${escapeHtml(bin.acquisitionIndex)} · bin ${escapeHtml(bin.binIndex)} · latest ${bin.history.length} targets</span><div>${bin.history.map((entry) => `<button type="button" data-event="${escapeHtml(entry.eventId)}">${escapeHtml(entry.time)} ns</button>`).join("")}</div>${bin.result === "unknown" ? "<p>No completed result at this cursor.</p>" : `<p>${escapeHtml(resultLabel(bin.result))} · ready ${bin.result.readyTime} ns<br>${escapeHtml(inputSource(bin.result.input_source || bin.result.source))}</p>`}` : '<span>Select a bin number to inspect its target history.</span>');
+      html(values.bins, bins.records.length ? bins.records.map((bin) => {
+        const result = bin.result;
+        const outcome = result === "unknown" ? "unknown" : `<button type="button" data-event="${escapeHtml(result.eventId)}" title="${resultTimeLabel(result)} · ${escapeHtml(inputSource(result.input_source || result.source))}">${escapeHtml(resultLabel(result))}</button>`;
+        const aggregateText = bin.aggregate ? `<div data-bin-aggregate>${escapeHtml(binAggregateLabel(bin.aggregate))}</div>` : "";
+        const kind = binKindLabel(bin.kind);
+        const anchor = bin.count ? "Select last acquisition targeting this bin" : "Select observed bin write";
+        return `<tr><td>${escapeHtml(display(bin.acquisitionIndex))}</td><td><button type="button" data-bin="${escapeHtml(bin.key)}" title="Inspect this bin's target history">${escapeHtml(display(bin.binIndex))}</button>${kind ? ` <span>${kind}</span>` : ""}</td><td>${escapeHtml(bin.count)}</td><td><button type="button" data-event="${escapeHtml(bin.eventId || "")}" title="${anchor}">${escapeHtml(display(bin.lastTime))} ns${bin.count ? "" : " write"}</button></td><td>${outcome}${aggregateText}</td></tr>`;
+      }).join("") : '<tr><td colspan="5" class="hardware-empty">No resolved bin targets at this time.</td></tr>');
+      const bin = selectedBinRecord();
+      const kind = binKindLabel(bin?.kind);
+      const gate = Object.entries(bin?.gate || {}).filter(([, entry]) => entry).map(([role, entry]) =>
+        `<button type="button" data-event="${escapeHtml(entry.eventId)}">Gate ${role} · ${escapeHtml(entry.time)} ns</button>`).join("");
+      html(values["bin-history"], bin ? `<span>Acquisition ${escapeHtml(bin.acquisitionIndex)} · bin ${escapeHtml(bin.binIndex)}${kind ? ` · ${kind}` : ""} · latest ${bin.history.length} targets</span><div>${bin.history.map((entry) => `<button type="button" data-event="${escapeHtml(entry.eventId)}">${escapeHtml(entry.time)} ns</button>`).join("")}</div>${gate ? `<div>${gate}</div>` : ""}${bin.result === "unknown" ? "<p>No acquisition outcome at this cursor.</p>" : `<p>${escapeHtml(resultLabel(bin.result))} · ${resultTimeLabel(bin.result)}<br>${escapeHtml(inputSource(bin.result.input_source || bin.result.source))}</p>`}` : '<span>Select a bin number to inspect its target history.</span>');
     }
 
     function setBlock(id, value, active, detail) {
@@ -802,27 +872,39 @@
       renderReplay();
       if (replayOpen) { sourceTarget = undefined; if (notifyChange) notify(); return; }
       const known = snapshot.registers.filter((register) => register.known).length;
-      text(values.execution, executionLabel(snapshot.execution));
+      text(values.execution, executionLabel(snapshot.execution, snapshot.terminal));
       text(values["trace-kind"], snapshot.simulation ? "SIMULATED TRACE" : snapshot.execution?.mode === "playback" ? "PATH EXECUTION" : "ANALYZED TRACE");
       text(values["timing-note"], snapshot.simulation ? "Q1 registers advance independently of RT execution. Timing uses an event-driven model of queues and configured inputs. Signal and result sources identify modeled values, supplied traces, or supplied measurements." : "Q1 registers advance independently of RT execution. Timing is analytical; RT queue stalls are not modeled. Values are computed from the program, not measured on hardware.");
       values.execution.classList.toggle("is-incomplete", !!snapshot.execution && snapshot.execution.status !== "completed");
       renderInstruction();
       setBlock("registers", `${known} / 64 known`, snapshot.registers.some((register) => register.changed));
-      setBlock("q1", snapshot.q1.status, ["active", "stalled"].includes(snapshot.q1.status), eventLabel(snapshot.q1.event));
+      setBlock("q1", statusLabel(snapshot.q1.status), ["active", "stalled"].includes(snapshot.q1.status), eventLabel(snapshot.q1.event));
       setBlock("queue", snapshot.simulation ? `${display(snapshot.simulation.queue.depth)} / ${display(snapshot.simulation.queue.capacity)} packets` : "Depth unknown", snapshot.simulation && snapshot.simulation.queue.depth > 0, snapshot.simulation ? "Simulated RT packet queue. Inspect queue stalls, input events and signals." : "RT command queue. Occupancy is unavailable in analytical timing.");
-      setBlock("rt", snapshot.rt.status, snapshot.rt.status === "active", eventLabel(snapshot.rt.event));
+      setBlock("rt", statusLabel(snapshot.rt.status), snapshot.rt.status === "active", eventLabel(snapshot.rt.event));
       const plays = snapshot.awg.filter((entry) => entry.event);
       setBlock("awg", plays.length ? "Last play command" : "No resolved play", false, plays.map((entry) => `Path ${entry.path}: ${eventLabel(entry.event)}`).join(" · ") || "No resolved play command. Waveform duration is not inferred from RT command duration.");
-      const integration = snapshot.acquisition.event?.meta?.acquisition_window;
-      const acquisitionStatus = !snapshot.acquisition.event ? "No resolved acquire" : snapshot.acquisition.status === "active"
-        ? "Integrating" : snapshot.acquisition.status === "unknown" ? "Integration length unknown"
+      const acquisition = snapshot.acquisition;
+      const activeAcquisition = acquisition.status === "active";
+      const integration = acquisition.event?.meta?.acquisition_window;
+      let acquisitionStatus = !acquisition.event ? "No resolved acquire" : activeAcquisition
+        ? "Integrating" : acquisition.status === "unknown" ? "Integration length unknown"
         : integration?.status === "interrupted" ? "Interrupted" : "Last acquire command";
+      let acquisitionDetail = eventLabel(acquisition.event);
+      if (acquisition.gate) {
+        const { start, end, status } = acquisition.gate;
+        acquisitionStatus = activeAcquisition ? "Gate open" : status === "incomplete" ? "Gate incomplete" : "Gate closed";
+        acquisitionDetail += activeAcquisition ? ` · Opened at ${start} ns` : ` · ${acquisitionStatus} at ${end} ns`;
+      } else if (acquisition.sample) {
+        const level = acquisition.sample.digital?.level;
+        acquisitionStatus = Number.isFinite(level) ? `Sampled level ${level}` : "Level unavailable";
+        acquisitionDetail = `${resultLabel(acquisition.sample)} · Observed at ${acquisition.sample.outcomeTime} ns`;
+      }
       const assumed = integration?.source === "instruction_duration_fallback" && integration.status !== "unknown";
       setBlock("acquisition", assumed ? `${acquisitionStatus} (assumed)` : acquisitionStatus,
-        snapshot.acquisition.status === "active", eventLabel(snapshot.acquisition.event));
-      setBlock("bins", `${snapshot.bins.total} targets`, snapshot.acquisition.status === "active", snapshot.simulation ? "Acquisition targets, completed I/Q and threshold results, with input provenance." : "Acquisition targets and their write history; measured results are unavailable.");
+        activeAcquisition, acquisitionDetail);
+      setBlock("bins", `${snapshot.bins.total} targets`, activeAcquisition, snapshot.simulation ? "Acquisition targets, completed I/Q and threshold results, with input provenance." : "Acquisition targets and their write history; measured results are unavailable.");
       for (const core of ["q1", "rt"]) {
-        text(values[`${core}-event`], `${snapshot[core].status} · ${eventLabel(snapshot[core].event)}`);
+        text(values[`${core}-event`], `${statusLabel(snapshot[core].status)} · ${eventLabel(snapshot[core].event)}`);
         find(`[data-action="${core}-event"]`).disabled = !snapshot[core].event;
       }
       const tab = activeTab();
@@ -838,8 +920,10 @@
       if (tab === "simulation") renderSimulation();
       const event = selectedEvent();
       sourceTarget = state.selectedBlock === "registers" && register ? { source: register.source, eventId: register.eventId } : event ? { source: event.source, eventId: event.id } : undefined;
-      const bin = snapshot.bins.records.find((entry) => `${entry.acquisitionIndex}:${entry.binIndex}` === selectedBin);
-      if (state.selectedBlock === "bins" && selectedBin !== undefined) sourceTarget = bin ? { source: bin.source, eventId: bin.eventId } : undefined;
+      if (state.selectedBlock === "bins" && selectedBin !== undefined) {
+        const bin = selectedBinRecord();
+        sourceTarget = bin ? { source: bin.source, eventId: bin.eventId } : undefined;
+      }
       const source = sourceTarget && sourceTarget.source;
       text(values["selection-detail"], source && source.file ? `${source.file}:${source.line || 1}` : "Select a register or active block to inspect its source instruction.");
       find('[data-action="source"]').disabled = !(source && source.file && options.onSourceClick);
@@ -849,9 +933,18 @@
     function setTime(time, notifyChange = true) {
       if (!Number.isFinite(time)) return;
       pauseReplay();
-      state.time = Math.round(time);
+      state.time = snapTime(time);
       syncReplayPosition();
       render(notifyChange);
+    }
+
+    function commitTimeInput() {
+      const time = controls.time.valueAsNumber;
+      if (!Number.isFinite(time) || snapTime(time) === state.time) {
+        controls.time.value = String(state.time);
+        return;
+      }
+      setTime(time);
     }
 
     function chooseEvent(eventId, notifyEvent = true) {
@@ -920,7 +1013,7 @@
       if (node.dataset.action === "replay-run") {
         if (replayTimer !== undefined) pauseReplay();
         else if (replayCount()) {
-          if (replayPosition === replayCount() - 1) { state.time = isProjectReplay() ? projectReplayTrace.frames[0] : replayTrace.instructions[0].time; replayPosition = isProjectReplay() ? 0 : -1; }
+          if (replayPosition === replayCount() - 1) { state.time = isProjectReplay() ? projectFrames()[0] : replayTrace.instructions[0].time; replayPosition = isProjectReplay() ? 0 : -1; }
           scheduleReplay();
         }
         render(); return;
@@ -931,7 +1024,7 @@
         return;
       }
       if (node.dataset.action === "project-replay-source") {
-        const current = model.snapshot(index, node.dataset.sequencerId, state.time, "local", { limit: 1 });
+        const current = model.snapshot(index, node.dataset.sequencerId, state.time, state.basis, { limit: 1 });
         if (current.q1.event && options.onSourceClick) options.onSourceClick(current.q1.event.source, current.q1.event.id);
         return;
       }
@@ -980,7 +1073,7 @@
       if (control === "signal-stage") { state.signalStage = controls[control].value; render(); }
       if (control === "replay-scope") { pauseReplay(); state.replayScope = controls[control].value; if (isProjectReplay()) useProjectClock(); times = stepTimesForView(); updateReplayTrace(); render(); }
       if (control === "replay-speed") { state.replaySpeed = Number(controls[control].value); if (replayTimer !== undefined) { pauseReplay(); scheduleReplay(); } render(); }
-      if (control === "time") setTime(Number(controls.time.value));
+      if (control === "time") commitTimeInput();
     }
 
     function onInput(event) {
@@ -997,7 +1090,7 @@
       }
       if (event.target === controls.time && event.key === "Enter") {
         event.preventDefault();
-        setTime(Number(controls.time.value));
+        commitTimeInput();
       }
       const block = event.target.closest("[data-block]");
       if (block && (event.key === "Enter" || event.key === " ")) { event.preventDefault(); state.selectedBlock = block.dataset.block; render(); notifySelection(); }
@@ -1033,7 +1126,7 @@
         const nextBasis = basis === "aligned" ? "aligned" : "local";
         if (state.basis === nextBasis) return;
         pauseReplay();
-        if (replayOpen && isProjectReplay() && nextBasis === "aligned") replayOpen = false;
+        if (replayOpen && isProjectReplay() && nextBasis === "aligned" && !hasSharedAlignment) replayOpen = false;
         const alignment = index.alignment[state.sequencerId] || {};
         const offset = model.numericValue(alignment.offset);
         if (!alignmentUnknown() && offset !== undefined) state.time += nextBasis === "aligned" ? offset : -offset;

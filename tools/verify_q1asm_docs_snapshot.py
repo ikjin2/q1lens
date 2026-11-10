@@ -14,7 +14,8 @@ from q1timeline.q1asm.instruction_table import STATUS_BRANCH_OPS, INSTRUCTION_TA
 
 
 DOCS_URL = "https://docs.qblox.com/en/main/products/qblox_instruments/q1/index.html"
-ALLOWED_LOCAL_EXTRAS = {"acquire_weighed", "mulu32", "play_pulse", "sw_req"}
+LINQ_RECEIVE_URL = "https://docs.qblox.com/en/main/products/architecture/sequencers/linq_based_feedback.html#fb-pull-data"
+ALLOWED_LOCAL_EXTRAS = {"acquire_weighed", "fb_cmd", "mulu32", "play_pulse", "sw_req"}
 DYNAMIC_RUNTIME_EXPECTED = {
     **{op: {"jump": 16, "continue": 4} for op in STATUS_BRANCH_OPS},
     "jge": {"jump": 24, "continue": 4},
@@ -93,6 +94,7 @@ def main() -> int:
     unexpected_local_ops = sorted(set(INSTRUCTION_TABLE) - set(docs) - ALLOWED_LOCAL_EXTRAS)
     missing_local_signatures: dict[str, list[dict[str, object]]] = {}
     runtime_mismatches: dict[str, list[dict[str, object]]] = {}
+    documented_runtime_conflicts: dict[str, dict[str, object]] = {}
 
     for op, docs_signatures in sorted(docs.items()):
         if op not in INSTRUCTION_TABLE:
@@ -105,7 +107,14 @@ def main() -> int:
             if (signature, runtime) in local_signatures:
                 continue
             local_runtimes = sorted(local_runtimes_by_signature.get(signature, []))
-            if local_runtimes:
+            if op == "fb_pull_data" and signature == ("R", "R") and runtime == 4 and local_runtimes == [8]:
+                documented_runtime_conflicts[op] = {
+                    "signature": signature,
+                    "instruction_reference": {"runtime_ns": runtime, "url": DOCS_URL + "#fb_pull_data-instt"},
+                    "linq_receive_guide": {"runtime_ns": 8, "url": LINQ_RECEIVE_URL},
+                    "local_runtime_ns": 8,
+                }
+            elif local_runtimes:
                 runtime_mismatches.setdefault(op, []).append(
                     {"signature": signature, "docs_runtime": runtime, "local_runtimes": local_runtimes}
                 )
@@ -124,10 +133,16 @@ def main() -> int:
         "docs_op_count": len(docs),
         "local_op_count": len(INSTRUCTION_TABLE),
         "allowed_local_extras": sorted(ALLOWED_LOCAL_EXTRAS),
+        "assembler_backed_aliases": {"fb_cmd": {
+            "assembler": "Qblox Instruments 1.4.1 q1asm_windows -d",
+            "signature_fixture": "tests/fixtures/q1asm_signatures.json",
+            "alias_vectors": "tests/test_q1timeline_linq_aliases.py",
+        }},
         "unexpected_local_ops": unexpected_local_ops,
         "missing_local_ops": missing_local_ops,
         "missing_local_signatures": missing_local_signatures,
         "runtime_mismatches": runtime_mismatches,
+        "documented_runtime_conflicts": documented_runtime_conflicts,
         "dynamic_runtime_mismatches": dynamic_runtime_mismatches,
         "dynamic_runtimes": dynamic_runtimes,
     }

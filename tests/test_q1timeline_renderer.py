@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 
 import pytest
 
@@ -14,17 +15,267 @@ def _ns(value: int) -> dict:
     return {"kind": "concrete", "value": value}
 
 
-def test_rt_ruler_starts_after_q1_prep_and_queue_telemetry_is_not_a_lane() -> None:
+def test_rt_ruler_excludes_q1_prep_in_normal_but_keeps_a_labeled_debug_axis() -> None:
     from q1timeline.analysis.api import analyze_text
 
     ir = analyze_text("set_mrk 1\nupd_param 4\nstop", execution_mode="simulation",
                       alignment_mode="first_anchor", alignment_anchor_kinds=["upd_param"])
-    html = render_html(ir, default_mode="debug")
-    assert 'data-time-min="-12"' in html
-    assert 'data-lane-role="q1-issue"' in html
-    assert re.findall(r'class="tick-label"[^>]*>(-?\d+) ns</text>', html) == ["0", "1", "2", "3", "4"]
-    assert ' / debug.rt_queue' not in html
+    normal = render_html(ir).split("<template", 1)[0]
+    debug = render_html(ir, default_mode="debug").split("<template", 1)[0]
+    assert 'data-time-min="0"' in normal and 'data-time-min="-12"' in debug
+    assert 'data-lane-role="q1-issue"' in debug
+    assert re.findall(r'class="tick-label"[^>]*>(-?\d+) ns</text>', normal) == ["0", "1", "2", "3", "4"]
+    assert re.findall(r'class="tick-label"[^>]*>(-?\d+) ns</text>', debug) == ["-12", "-8", "-4", "0", "4"]
+    assert ' / debug.rt_queue' not in normal and ' / debug.rt_queue' not in debug
     assert {"rt_queue_enqueue", "rt_queue_dequeue"} <= {event["kind"] for event in ir["events"]}
+
+
+def test_rt_origin_simulation_parks_the_other_geometry_with_one_embedded_ir(capsys) -> None:
+    from q1timeline.cli import main
+
+    project = Path(__file__).parents[1] / "examples" / "set-cond-review" / "02-trigger-execution" / "q1timeline.yml"
+    assert main(["analyze", "--project", str(project), "--branch-assumption", "trigger_demo:set_cond:4:1=both",
+                 "--format", "vscode-json", "--include-timeline-ir", "--no-render"]) == 0
+    ir = json.loads(capsys.readouterr().out)["timeline_ir"]
+    for mode, other, minimum, other_minimum in (("normal", "debug", 0, -60), ("debug", "normal", -60, 0)):
+        html = render_html(ir, default_mode=mode)
+        active = html.split("<template", 1)[0]
+        parked = re.search(rf'<template data-timeline-mode="{other}">([\s\S]*?)</template>', html).group(1)
+        assert f'data-time-min="{minimum}"' in active
+        assert f'data-time-min="{other_minimum}"' in parked
+        assert active.count('id="time-cursor"') == parked.count('id="time-cursor"') == 1
+        assert f'<template data-timeline-mode="{mode}"></template>' in html
+        assert html.count('id="timeline-ir"') == 1
+        assert "Execute · RT" in html and "Skip · RT" in html
+        assert 'aria-label="Trigger address 1 · 30 ns"' in active and 'aria-label="Trigger address 1 · 30 ns"' in parked
+        assert ' / debug.rt_queue' not in html
+
+
+@pytest.mark.parametrize("program,anchor_kind,offset,minimum,debug_minimum", [
+    ("nop\nwait 20\nstop", "rt_queue_dequeue", -100, 0, -100),
+    ("nop\nwait 20\nplay 0,1,4\nstop", "play", -120, -20, -120),
+    ("nop\nstop", None, 0, 0, None),
+])
+def test_simulation_rt_origin_uses_the_recorded_anchor(program, anchor_kind, offset, minimum, debug_minimum):
+    from q1timeline.analysis.api import analyze_text
+
+    ir = analyze_text(program, sequencer_id="seq", execution_mode="simulation", alignment_mode="first_play",
+                      simulation={"startup_delay_ns": 100})
+    alignment = ir["alignment"]["seq"]
+    anchor = next((event for event in ir["events"] if event["id"] == alignment["anchor_event_id"]), None)
+    assert (anchor["kind"] if anchor else None) == anchor_kind
+    assert alignment["offset"] == offset and alignment["clock"] == "shared_simulation"
+    assert ir["project"]["alignment_mode"] == alignment["mode"] == "first_play"
+    warnings = [item for item in ir["diagnostics"] if item["category"] == "alignment_missing"]
+    if anchor_kind != "play":
+        warning, = warnings
+        assert warning["details"]["fallback"] == alignment["fallback"] == "first_rt_dequeue"
+        assert ("simulation time zero" if anchor is None else "first RT dequeue") in warning["message"]
+    else:
+        assert not warnings and "fallback" not in alignment
+    html = render_html(ir)
+    assert re.search(r'<svg class="timeline-svg"[^>]*data-time-min="([^"]+)"', html).group(1) == str(minimum)
+    if debug_minimum is not None:
+        parked = re.search(r'<template data-timeline-mode="debug">([\s\S]*?)</template>', html).group(1)
+        assert f'data-time-min="{debug_minimum}"' in parked
+    else:
+        assert '<template data-timeline-mode=' not in html
+    wait = next((event for event in ir["events"] if event["kind"] == "wait"), None)
+    if wait:
+        assert (wait["t0"]["value"], wait["meta"]["aligned_t0"]) == (100, 100 + offset)
+        if anchor_kind == "rt_queue_dequeue":
+            assert re.search(rf'data-event-id="{wait["id"]}"[^>]*data-t0-x="190\.00"', html)
+
+
+@pytest.mark.parametrize("mode,anchors,arrival,expected_anchor,normal_min,debug_min", [
+    ("after_first_wait_sync", [], None, "wait_sync", -24, -124),
+    ("after_first_wait_sync", [], 90, "wait_sync", -34, -124),
+    ("first_wait_sync", [], None, "wait_sync", 0, -100),
+    ("first_anchor", ["rt_queue_dequeue", "play"], None, "rt_queue_dequeue", 0, -100),
+    ("first_anchor", ["rt_queue_dequeue", "q1_issue"], None, "q1_issue", 0, None),
+])
+def test_shared_simulation_axis_uses_the_selected_rt_anchor(mode, anchors, arrival, expected_anchor, normal_min, debug_min):
+    from q1timeline.analysis.api import analyze_text
+
+    program = "wait_sync 4\nwait 8\nstop"
+    if mode != "first_wait_sync":
+        program = "wait 20\n" + program
+    simulation = {"startup_delay_ns": 100}
+    if arrival is not None:
+        simulation["inputs"] = {"triggers": [{"target": "seq", "address": 1, "time_ns": arrival}]}
+    ir = analyze_text(program, sequencer_id="seq", execution_mode="simulation", alignment_mode=mode,
+                      alignment_anchor_kinds=anchors, simulation=simulation)
+    anchor_id = ir["alignment"]["seq"]["anchor_event_id"]
+    anchor, = [event for event in ir["events"] if event["id"] == anchor_id]
+    assert anchor["kind"] == expected_anchor and "fallback" not in ir["alignment"]["seq"]
+    html = render_html(ir)
+    active = html.split("<template", 1)[0]
+    assert f'data-time-min="{normal_min}"' in active
+    if debug_min is None:
+        assert '<template data-timeline-mode=' not in html
+        assert re.search(r'class="tick-label"[^>]*>100 ns</text>', active)
+    else:
+        debug = re.search(r'<template data-timeline-mode="debug">([\s\S]*?)</template>', html).group(1)
+        for geometry, edge in ((active, normal_min), (debug, debug_min)):
+            assert f'data-time-min="{edge}"' in geometry
+            assert re.search(r'class="tick-label"[^>]*>(-?\d+) ns</text>', geometry).group(1) == str(edge)
+        first = next(event for event in ir["events"] if event["kind"] in {"wait", "wait_sync", "trigger_receive"})
+        assert first["t0"]["value"] == (100 if arrival is None else arrival)
+        assert first["meta"]["aligned_t0"] == normal_min
+        assert re.search(rf'data-event-id="{first["id"]}"[^>]*data-t0-x="190\.00"', active)
+
+
+@pytest.mark.parametrize("program,mode,comparison,normal,debug", [
+    ("wait 20\nstop", None, False, (0, 20), (-8, 396)),
+    ("wait 20\nplay 0,1,4\nstop", "first_play", False, (-20, 4), (-32, 372)),
+    ("set_cond 1,1,0,4\nwait 60\nstop", None, True, (0, 60), (-12, 392)),
+])
+def test_shared_simulation_normal_extent_keeps_rt_and_ignores_q1_tail(program, mode, comparison, normal, debug):
+    from q1timeline.analysis.api import analyze_documents
+
+    ir = analyze_documents({"a.q1asm": program, "peer.q1asm": "nop\n" * 100 + "stop"},
+                           execution_mode="simulation", alignment_mode=mode,
+                           branch_assumptions={"a:set_cond:0:1": "both"} if comparison else None)
+    peer_issues = [event for event in ir["events"] if event["sequencer_id"] == "peer" and event["kind"] == "q1_issue"]
+    assert len(peer_issues) == 101 and peer_issues[-1]["meta"]["aligned_t1"] == debug[1]
+    assert not any(event["lane"].startswith("rt.") for event in ir["events"] if event["sequencer_id"] == "peer")
+    html = render_html(ir)
+    active, parked = html.split('<template data-timeline-mode="debug">', 1)
+    assert f'data-time-min="{normal[0]}" data-time-max="{normal[1]}"' in active
+    assert f'data-time-min="{debug[0]}" data-time-max="{debug[1]}"' in parked
+    assert peer_issues[-1]["id"] in json.loads(
+        re.search(r'<script id="timeline-ir" type="application/json">([\s\S]*?)</script>', html).group(1)
+    )["source_map"]["by_event_id"]
+    if comparison:
+        late_stop, = [event for event in ir["events"] if event["kind"] == "stop"
+                      and event["meta"].get("branch_comparison_path") == "taken"]
+        assert f'data-event-id="{late_stop["id"]}"' in active
+
+
+@pytest.mark.parametrize("compare", [False, True])
+def test_standalone_normal_hides_network_sender_debug_traffic_but_keeps_the_arrival(compare):
+    from q1timeline.analysis.api import analyze_documents
+
+    source = "acquire 0,0,4\nstop"
+    if compare:
+        source = "set_cond 1,1,0,4\nacquire 0,0,4\nset_cond 0,0,0,4\nstop"
+    ir = analyze_documents({"tx.q1asm": source, "rx.q1asm": "wait 400\nstop"}, execution_mode="simulation",
+                           branch_assumptions={"tx:set_cond:0:1": "both"} if compare else None, simulation={
+                               "startup_delay_ns": 100, "trigger_networks": {"rack": {"grid_epoch_ns": 100}},
+                               "trigger_routes": [{"source": "tx", "target": "rx", "address": 3, "network": "rack"}],
+                               "inputs": {"acquisitions": [{"sequencer": "tx", "acquisition_index": 0, "bin_index": 0,
+                                                           "thresholded": 1}]},
+                           })
+    request, launch, arrival = (next(event for event in ir["events"] if event["kind"] == kind)
+                                for kind in ("trigger_network_request", "trigger_network_launch", "trigger_receive"))
+    expected_prefix = "branch_compare.taken." if compare else ""
+    assert request["lane"] == launch["lane"] == f"{expected_prefix}debug.trigger_send"
+    assert arrival["lane"] == f"{expected_prefix}rt.trigger" and arrival["meta"]["aligned_t0"] == 240
+    normal = render_html(ir, default_mode="normal")
+    normal_svg = normal.split("<template", 1)[0]
+    debug_svg = render_html(ir, default_mode="debug").split("<template", 1)[0]
+    for event in (request, launch):
+        marker = f'data-event-id="{event["id"]}"'
+        assert marker not in normal_svg and marker in debug_svg
+    for svg in (normal_svg, debug_svg):
+        assert f'data-event-id="{arrival["id"]}"' in svg
+        assert 'aria-label="Trigger address 3 · 240 ns"' in svg
+    assert 'data-time-min="0"' in normal_svg
+    embedded = json.loads(re.search(r'<script id="timeline-ir" type="application/json">([\s\S]*?)</script>', normal).group(1))
+    assert {request["id"], launch["id"], arrival["id"]} <= {event["id"] for event in embedded["events"]}
+    assert embedded["feedback_flows"] == ir["feedback_flows"]
+    flow, = embedded["feedback_flows"]
+    assert (flow["from_event_id"], flow["to_event_id"]) == (launch["id"], arrival["id"])
+
+
+def test_standalone_unobserved_trigger_edge_window_is_debug_only():
+    from q1timeline.analysis.api import analyze_documents
+
+    ir = analyze_documents({"tx.q1asm": "acquire_ttl 0,0,1,40\nacquire_ttl 0,0,0,4\nstop",
+                            "rx.q1asm": "wait 400\nstop"}, execution_mode="simulation",
+                           sequences={"tx": {"acquisitions": {"edges": {"index": 0, "num_bins": 1}}}}, simulation={
+                               "startup_delay_ns": 100, "trigger_networks": {"rack": {"grid_epoch_ns": 100}},
+                               "trigger_routes": [{"source": "tx", "target": "rx", "address": 3, "network": "rack",
+                                                   "source_kind": "ttl_edge"}],
+                           })
+    window, = [event for event in ir["events"] if event["kind"] == "trigger_edge_window"]
+    marker = f'data-event-id="{window["id"]}"'
+    assert marker not in render_html(ir, default_mode="normal").split("<template", 1)[0]
+    assert marker in render_html(ir, default_mode="debug").split("<template", 1)[0]
+
+
+def test_analytical_render_keeps_its_single_geometry():
+    from q1timeline.analysis.api import analyze_text
+
+    html = render_html(analyze_text("wait 4\nstop"))
+    assert html.count('<svg class="timeline-svg"') == 1
+    assert '<template data-timeline-mode=' not in html
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_completed_rt_waits_share_the_primary_svg_event_but_remain_in_the_ir(legacy):
+    from q1timeline.analysis.api import analyze_text
+
+    ir = analyze_text("wait 20\nwait_trigger 3,4\nwait_sync 4\nwait 8\nstop", sequencer_id="seq",
+                      execution_mode="simulation", simulation={"startup_delay_ns": 100, "inputs": {"triggers": [
+                          {"target": "seq", "time_ns": 150, "address": 3},
+                      ]}})
+    by_kind = {event["kind"]: event for event in ir["events"]}
+    for auxiliary_kind, primary_kind in (("trigger_wait", "wait_trigger"), ("sync_wait", "wait_sync")):
+        auxiliary, primary = by_kind[auxiliary_kind], by_kind[primary_kind]
+        assert auxiliary["meta"]["rt_packet_id"] == primary["meta"]["rt_packet_id"]
+        if legacy:
+            auxiliary["meta"].pop("rt_packet_id")
+        for mode in ("normal", "debug"):
+            active = render_html(ir, default_mode=mode).split("<template", 1)[0]
+            assert f'data-event-id="{auxiliary["id"]}"' not in active
+            assert f'data-event-id="{primary["id"]}" data-event-ids="{auxiliary["id"]}"' in active
+    auxiliary = by_kind["trigger_wait"]
+    assert auxiliary["meta"]["input_event_ids"] == [by_kind["trigger_receive"]["id"]]
+    assert auxiliary["duration"]["value"] == 30 and by_kind["wait_trigger"]["duration"]["value"] == 34
+    embedded = json.loads(re.search(r'<script id="timeline-ir" type="application/json">([\s\S]*?)</script>',
+                                    render_html(ir)).group(1))
+    assert auxiliary in embedded["events"]
+
+
+@pytest.mark.parametrize("program,arrivals,compare,expected", [
+    ("move 2,R0\nagain: wait_trigger 3,4\nloop R0,@again\nstop", (110, 120), False, 2),
+    ("set_cond 1,1,0,4\nwait_trigger 3,4\nset_cond 0,0,0,4\nwait 20\nstop", (150,), True, 1),
+])
+def test_wait_projection_retains_dynamic_occurrence_and_comparison_identity(program, arrivals, compare, expected):
+    from q1timeline.analysis.api import analyze_text
+
+    ir = analyze_text(program, sequencer_id="seq", execution_mode="simulation",
+                      branch_assumptions={"seq:set_cond:0:1": "both"} if compare else None,
+                      simulation={"startup_delay_ns": 100, "inputs": {"triggers": [
+                          {"target": "seq", "time_ns": time, "address": 3} for time in arrivals
+                      ]}})
+    primary = {event["meta"]["rt_packet_id"]: event for event in ir["events"] if event["kind"] == "wait_trigger"}
+    auxiliaries = [event for event in ir["events"] if event["kind"] == "trigger_wait"]
+    assert len(primary) == len(auxiliaries) == expected
+    active = render_html(ir).split("<template", 1)[0]
+    for auxiliary in auxiliaries:
+        owner = primary[auxiliary["meta"]["rt_packet_id"]]
+        assert owner["meta"].get("branch_comparison_path") == ("taken" if compare else None)
+        assert f'data-event-id="{owner["id"]}" data-event-ids="{auxiliary["id"]}"' in active
+        assert f'data-event-id="{auxiliary["id"]}"' not in active
+
+
+def test_rt_origin_normal_ir_contains_parked_debug_inspector_event():
+    from q1timeline.analysis.api import analyze_text
+
+    ir = analyze_text("wait 4\nstop", execution_mode="simulation")
+    wait = next(event for event in ir["events"] if event["kind"] == "wait")
+    ir["events"].append({**wait, "id": "loop", "kind": "loop_block", "lane": "rt.loop",
+                         "label": "Loop", "meta": {**wait["meta"], "loop_id": "L0"}})
+    html = render_html(ir)
+    active, parked = html.split('<template data-timeline-mode="debug">', 1)
+    assert 'data-event-id="loop:control-flow"' not in active
+    assert 'data-event-id="loop:control-flow"' in parked
+    embedded = re.search(r'<script id="timeline-ir" type="application/json">([\s\S]*?)</script>', html).group(1)
+    chip, = [event for event in json.loads(embedded)["events"] if event["id"] == "loop:control-flow"]
+    assert chip["kind"] == "control_flow_loop"
+    assert chip["meta"]["control_flow_source_event_id"] == "loop"
 
 
 def test_diagnostics_are_outside_details_with_compact_paths_and_no_repeated_codes_or_fixes() -> None:
@@ -381,14 +632,16 @@ def test_branch_region_renders_marker_without_block_in_debug_mode() -> None:
     )
 
     assert 'class="branch-marker' in html
+    assert re.search(r'<g[^>]*data-event-id="seq0:e1"[^>]*role="button" tabindex="0">', html)
+    assert re.search(r'<g[^>]*class="branch-marker [^>]*data-event-id="seq0:branch:1"[^>]*role="button" tabindex="0">', html)
     assert "q1-branch-collapsed" in html
     assert ".event.q1-branch-collapsed { display: none; }" in html
     assert ".event.branch-collapsed { display: none; }" in html
     assert "body.mode-normal .event.branch-collapsed" not in html
     assert "eventNode.classList.contains('branch-collapsed'))" in html
     assert "eventNode.classList.contains('q1-branch-collapsed'))" in html
-    assert "Condition true: jump target" in html
-    assert "Condition false: continue" in html
+    assert "'Recorded branch path'" in html
+    assert "q1timeline:setBranchAssumption" not in html
     assert "Compare true and false" not in html
     assert re.search(
         r'<g class="branch-marker-path-icon branch-marker-path-icon-taken"[^>]*aria-label="shown path: condition true"',
@@ -499,30 +752,32 @@ def test_control_flow_graph_is_retained_without_rendering_a_panel(mode: str) -> 
     embedded_ir = json.loads(embedded_json[1])
     assert embedded_ir["control_flow_graph"] == ir["control_flow_graph"]
     assert embedded_ir["events"][0] == ir["events"][0]
-    assert "function renderBranchActions" in html
+    assert "'Recorded branch path'" in html
+    assert "q1timeline:setBranchAssumption" not in html
 
 
-def test_normal_mode_collapses_feedback_instruction_blocks_behind_flow_overlay() -> None:
+@pytest.mark.parametrize("source_kind,source_value", [("acquire", "acq#0/bin0"), ("feedback_com", "R0")])
+def test_normal_mode_shows_feedback_source_block_and_collapses_pop(source_kind: str, source_value: str) -> None:
     html = render_html(
         {
             "version": "0.1.0",
             "events": [
                 {
-                    "id": "seq0:acquire",
+                    "id": "seq0:send",
                     "sequencer_id": "seq0",
-                    "lane": "rt.acquire",
-                    "kind": "acquire",
+                    "lane": f"rt.{source_kind}",
+                    "kind": source_kind,
                     "t0": _ns(40),
                     "t1": _ns(80),
                     "duration": _ns(40),
-                    "label": "acquire",
+                    "label": source_kind,
                     "confidence": "exact",
                     "source": {"file": "seq0.q1asm", "line": 1, "column": 1},
                     "meta": {
                         "feedback": {
                             "channel": "1",
                             "direction": "send",
-                            "source": "acq#0/bin0",
+                            "source": source_value,
                         }
                     },
                 },
@@ -549,10 +804,10 @@ def test_normal_mode_collapses_feedback_instruction_blocks_behind_flow_overlay()
             "feedback_flows": [
                 {
                     "id": "feedback-flow-0",
-                    "from_event_id": "seq0:acquire",
+                    "from_event_id": "seq0:send",
                     "to_event_id": "seq0:pop",
                     "channel": "1",
-                    "label": "feedback ch 1: acq#0/bin0 -> $LEFT",
+                    "label": f"feedback ch 1: {source_value} -> $LEFT",
                 }
             ],
             "diagnostics": [],
@@ -561,8 +816,11 @@ def test_normal_mode_collapses_feedback_instruction_blocks_behind_flow_overlay()
     )
 
     assert 'class="feedback-flow-group"' in html
-    assert "feedback ch 1: acq#0/bin0 -&gt; $LEFT" in html
-    assert "kind-acquire normal-feedback-collapsed" not in html
+    assert f"feedback ch 1: {source_value} -&gt; $LEFT" in html
+    source_block = re.search(r'class="([^"]+)" data-event-id="seq0:send"', html)
+    assert source_block is not None
+    assert f"kind-{source_kind}" in source_block[1]
+    assert "normal-feedback-collapsed" not in source_block[1]
     assert re.search(r'class="[^"]*kind-feedback_pop[^"]*normal-feedback-collapsed', html)
     assert "body.mode-normal .event.normal-feedback-collapsed { display: none; }" in html
     assert "eventNode.classList.contains('normal-feedback-collapsed')" in html
@@ -1005,6 +1263,18 @@ def test_feedback_balance_item_shows_discarded_payloads() -> None:
     )
 
     assert "discarded payloads=1" in html
+
+
+def test_feedback_balance_shows_uncertain_order_and_unknown_payload_count():
+    html = render_html({
+        "version": "0.1.0", "events": [], "feedback_balance": {"status": "incomplete", "channels": {
+            "5": {"channel": "5", "status": "incomplete", "receives": 1,
+                  "ordering_unknown_receives": 1, "unconsumed_payloads": None},
+        }},
+    })
+    assert '<details class="feedback-balance" open' in html
+    assert "unconsumed payloads=unknown" in html
+    assert "receive ordering unknown=1" in html
 
 
 def test_loop_truncated_info_stays_in_diagnostics() -> None:

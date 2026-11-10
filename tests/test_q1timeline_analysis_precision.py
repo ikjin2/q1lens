@@ -4,6 +4,7 @@ from q1timeline.analysis.interpreter import AnalysisState, _run_concrete_program
 from q1timeline.analysis.underflow import analyze_underflow
 from q1timeline.analysis.values import Concrete
 from q1timeline.q1asm.parser import parse_q1asm
+from q1timeline.simulation.runtime import simulate_programs
 
 
 def analyze(source: str, **kwargs):
@@ -310,7 +311,7 @@ def test_singleton_result_bounds_prove_register_values_and_waits(operation: str)
     state = analyze(f"and R7,15,R1\nnop\n{operation}\nnop\nwait R2\nstop\n")
 
     assert state.registers["R2"] == Concrete(0)
-    assert state.rt_time_ns == Concrete(0)
+    assert state.rt_time_ns == Concrete(4)
     assert state.rt_packets[0].duration == Concrete(0)
     assert "cf" not in state.alu_flags
     assert analyze_underflow(state).status == "not_detected_under_current_assumptions"
@@ -515,3 +516,146 @@ def test_legacy_comparison_preserves_sparse_bit_flags_for_a_following_status_bra
     assert branch.meta["branch_decision"] == "concrete"
     assert branch.meta["branch_taken"] is False
     assert state.rt_time_ns == Concrete(100)
+
+
+@pytest.mark.parametrize(("setup", "instruction"), [
+    ("", "sw_req 1"),
+    ("move 0,R0\nnop\n", "sw_req R0"),
+    ("", "play_pulse 0,4"),
+    ("move 0,R0\nnop\n", "play_pulse R0,4"),
+])
+def test_unverified_instruction_preserves_analytical_prefix(setup, instruction):
+    state = analyze(f"wait 8\n{setup}set_freq 4000000\n{instruction}\nupd_param 4\nstop")
+    op = instruction.split()[0]
+    wait, = [event for event in state.events if event.kind == "wait"]
+    boundary, = [event for event in state.events if event.kind == "unknown_region"]
+    diagnostic, = [item for item in state.diagnostics if item.category == "analysis_incomplete"]
+    issue = next(event for event in state.events if event.id == boundary.meta["q1_issue_event_id"])
+    pending, = [event for event in state.events if event.kind == "latched_state_pending"]
+
+    assert (wait.t0, wait.t1) == (Concrete(0), Concrete(8))
+    assert boundary.t0 == state.rt_time_ns == wait.t1 and boundary.t1 is None
+    assert issue.kind == "q1_issue" and issue.meta["op"] == op
+    assert issue.source == boundary.source == diagnostic.source
+    assert diagnostic.related_events == [boundary.id]
+    assert boundary.meta["q1_proof_cutoff"] is True
+    assert state.latched_state.pending_event_ids == {"frequency": pending.id}
+    assert not any(event.kind in {"play_pulse", "upd_param", "stop"} for event in state.events)
+    if op == "play_pulse":
+        packet = state.rt_packets[-1]
+        assert packet.id == boundary.meta["rt_packet_id"] == issue.meta["rt_packet_id"]
+        assert packet.meta["planned_duration_ns"] == boundary.meta["planned_duration_ns"] == 4
+        assert packet.rt_t1 is None and packet.confidence == "unknown"
+        assert "applied_state" not in boundary.meta and "applied_state" not in packet.meta
+    else:
+        assert [packet.op for packet in state.rt_packets] == ["wait"]
+
+
+def test_proven_play_pulse_skip_preserves_else_dwell_and_the_pending_frequency():
+    state = analyze("wait 8\nset_freq 4000000\nset_cond 1,0,0,12\nplay_pulse 0,4\n"
+                    "set_cond 0,0,0,4\nupd_param 4\nstop")
+    skip, = [event for event in state.events if event.kind == "conditional_skip"]
+    update, = [event for event in state.events if event.kind == "upd_param"]
+    stop, = [event for event in state.events if event.kind == "stop"]
+
+    assert (skip.t0, skip.t1) == (Concrete(8), Concrete(20))
+    assert skip.meta["op"] == "play_pulse" and skip.meta["applied_state"] == {}
+    assert update.t0 == skip.t1 and update.meta["applied_state"] == {"frequency": 4000000}
+    assert stop.t0 == Concrete(24)
+    assert not any(event.kind == "unknown_region" for event in state.events)
+
+
+def test_conditional_pulse_cannot_prove_elapsed_time_from_equal_encoded_dwell():
+    state = analyze("wait 8\nset_cond 1,1,0,4\nplay_pulse 0,4\nwait 100\nstop")
+    boundary, = [event for event in state.events if event.kind == "unknown_region"]
+
+    assert boundary.t0 == Concrete(8) and boundary.t1 is None
+    assert boundary.meta["planned_duration_ns"] == 4
+    assert not any(event.kind == "stop" for event in state.events)
+
+
+@pytest.mark.parametrize(("register_form", "immediate_form", "role", "maximum"), [
+    ("set_latch_en R0,4", "set_latch_en {},4", "enable_flag", 1),
+    ("wait_trigger R0,R1", "wait_trigger {},4", "trigger_index", 15),
+    ("play R0,R1,4", "play {},4,4", "waveform_index", 1023),
+    ("acquire 0,R0,4", "acquire 0,{},4", "bin_index", 16777215),
+    ("fb_acq_tb_id R0,4", "fb_acq_tb_id {},4", "feedback_acquisition_channel", 255),
+])
+def test_analytical_rt_admission_requires_a_supported_ready_register(register_form, immediate_form, role, maximum):
+    op = register_form.split()[0]
+    valid = analyze(f"wait 8\nmove {maximum},R0\nmove 4,R1\nnop\n{register_form}\nupd_param 4\nstop")
+    literal = analyze(f"wait 8\n{immediate_form.format(maximum)}\nupd_param 4\nstop")
+
+    for trace in (valid, literal):
+        assert [packet.op for packet in trace.rt_packets] == ["wait", op, "upd_param"]
+        assert trace.rt_packets[1].rt_t0 == Concrete(8)
+        assert trace.rt_packets[1].duration == Concrete(4)
+        assert any(event.kind == "stop" for event in trace.events)
+
+    value = maximum + 1
+    source = f"wait 8\nmove {value},R0\nmove 4,R1\nnop\n{register_form}\nupd_param 4\nstop"
+    simulated, = simulate_programs({"seq0": parse_q1asm(source)}, simulation={"startup_delay_ns": 100})
+    assert simulated.metadata["execution"]["status"] == "error"
+    assert f"resolved {role} {value} is outside" in simulated.metadata["execution"]["reason"]
+    state = analyze(source)
+    wait, = [event for event in state.events if event.kind == "wait"]
+    boundary, = [event for event in state.events if event.kind == "unknown_region"]
+    issue = next(event for event in state.events if event.id == boundary.meta["q1_issue_event_id"])
+    diagnostic, = [item for item in state.diagnostics if item.category == "analysis_incomplete"]
+
+    assert (wait.t0, wait.t1) == (Concrete(0), Concrete(8))
+    assert boundary.t0 == state.rt_time_ns == wait.t1 and boundary.t1 is None
+    assert boundary.meta["q1_proof_cutoff"] is True
+    assert diagnostic.related_events == [boundary.id]
+    assert issue.kind == "q1_issue" and issue.meta["op"] == op
+    assert issue.source == boundary.source == diagnostic.source and issue.source.line == 5
+    assert diagnostic.details["operand"] == "R0" and diagnostic.details["register"] == "R0"
+    assert diagnostic.details["operand_role"] == role
+    assert diagnostic.details["value"] == issue.meta["register_reads"]["R0"]["value"] == value
+    assert [packet.op for packet in state.rt_packets] == ["wait"]
+    assert not any(event.kind in {op, "upd_param", "stop"} for event in state.events)
+
+
+@pytest.mark.parametrize("setup", ["", "move 2,R0\nnop\nmove 1,R0\n"], ids=["unresolved", "register-not-ready"])
+def test_analytical_rt_range_validation_requires_a_ready_value(setup):
+    state = analyze(f"wait 8\n{setup}set_latch_en R0,4\nupd_param 4\nstop")
+
+    assert [packet.op for packet in state.rt_packets] == ["wait", "set_latch_en", "upd_param"]
+    assert state.rt_time_ns == Concrete(16)
+    assert not any(event.kind == "unknown_region" for event in state.events)
+    assert any(item.category == "register_not_ready" for item in state.diagnostics) == bool(setup)
+
+
+@pytest.mark.parametrize("value", [1, 2])
+def test_analytical_rt_register_validation_precedes_a_proven_skip(value):
+    state = analyze(f"wait 8\nmove {value},R0\nnop\nset_cond 1,0,0,12\nset_latch_en R0,4\n"
+                    "set_cond 0,0,0,4\nupd_param 4\nstop")
+    if value == 1:
+        skip, = [event for event in state.events if event.kind == "conditional_skip"]
+        assert (skip.t0, skip.t1) == (Concrete(8), Concrete(20))
+    else:
+        boundary, = [event for event in state.events if event.kind == "unknown_region"]
+        assert boundary.t0 == Concrete(8) and boundary.source.line == 5
+        assert [packet.op for packet in state.rt_packets] == ["wait"]
+        assert not any(event.kind in {"conditional_skip", "stop"} for event in state.events)
+
+
+def test_analytical_rt_register_validation_preserves_duration_validation():
+    state = analyze("wait 8\nmove 16,R0\nmove 3,R1\nnop\nwait_trigger R0,R1\nwait 8\nstop")
+    boundary, = [event for event in state.events if event.kind == "unknown_region"]
+
+    assert boundary.t0 == Concrete(8) and boundary.meta["reason"] == "invalid_rt_duration"
+    assert boundary.meta["operand"] == "R1"
+    assert not any(item.details.get("reason") == "unsupported_rt_register_value" for item in state.diagnostics)
+
+
+@pytest.mark.parametrize(("waveform_index", "expected_alternatives"), [(1023, 2), (1024, 0)])
+def test_joined_queue_replay_requires_both_rt_register_admissions(waveform_index, expected_alternatives):
+    state = analyze(f"move 0,R1\nnop\nwait 8\njlt R7,1,@taken\nmove {waveform_index},R0\njmp @join\n"
+                    "taken: move 1,R0\nnop\njoin: nop\nplay R0,R1,4\nupd_param 4\nstop")
+    region, = [event for event in state.events if event.kind == "branch_region"]
+
+    assert region.meta["branch_rt_join_proven"] is True
+    assert len(state.queue_alternatives) == expected_alternatives
+    for alternative in state.queue_alternatives.values():
+        assert [packet.op for packet in alternative.rt_packets] == ["wait", "play", "upd_param"]

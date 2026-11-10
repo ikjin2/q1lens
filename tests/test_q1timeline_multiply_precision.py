@@ -153,7 +153,7 @@ def test_known_zero_low_word_proves_product_zero_with_two_unknown_words(op):
     state = analyze(f"and R7,4294901760,R0\nnop\n{op} R0,R8,R1\nnop\nwait R1\nstop\n")
 
     assert state.registers["R1"] == Concrete(0)
-    assert state.rt_time_ns == Concrete(0)
+    assert state.rt_time_ns == Concrete(4)
 
 
 @pytest.mark.parametrize("op", ["mulu32l", "muls32l"])
@@ -162,7 +162,7 @@ def test_low_word_power_of_two_product_retains_sparse_bit_facts(op, factor, mask
     state = analyze(f"and R7,5,R0\nnop\n{op} R0,{factor},R1\nnop\nand R1,{mask},R2\nnop\nwait R2\nstop\n")
 
     assert state.registers["R2"] == Concrete(0)
-    assert state.rt_time_ns == Concrete(0)
+    assert state.rt_time_ns == Concrete(4)
 
 
 @pytest.mark.parametrize("op", ["mulu32", "muls32"])
@@ -243,7 +243,7 @@ def test_low_word_copied_negative_square_keeps_its_nonnegative_interval():
 def test_constant_low_word_product_and_shift_preserve_the_same_modular_value(op, destination):
     state = analyze(f"{op} R7,2,{destination}\nlsl R7,1,R2\nnop\nxor R1,R2,R3\nnop\nwait R3\nstop\n")
     assert state.registers["R3"] == Concrete(0)
-    assert state.rt_time_ns == Concrete(0)
+    assert state.rt_time_ns == Concrete(4)
 
 
 def test_constant_product_origin_captures_the_operand_before_a_later_overwrite():

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 
-const { buildQ1TimelineSharedModel: buildModel } = require("../src/q1timeline/media/timelineAdapter.js");
+const { buildQ1TimelineSharedModel: buildModel, buildQ1TimelineSelectionIndex: buildIndex } = require("../src/q1timeline/media/timelineAdapter.js");
 
 const branchId = "Control:branch:Control.q1asm:2:jge:taken";
 
@@ -85,6 +85,35 @@ describe("Q1 timeline branch comparison lanes", () => {
     assert.equal(instruction.totalTime, 4);
   });
 
+  it("shows incomplete alternative rows as points in both layouts", () => {
+    for (const [kind, status] of [["branch_terminal", "blocked"], ["underflow_warning", "error"], ["illegal", "error"], ["feedback_rejected", "error"]]) {
+      const reason = "The alternative ended here.";
+      const ir = comparison();
+      ir.events = ir.events.filter((item) => !["jump-rt", "jump-stop"].includes(item.id));
+      ir.events.push(pathEvent("terminal", kind, "taken", 8, 0, {
+        branch_comparison_kind: "rt_condition", comparison_terminal: { status, reason },
+        aligned_t0: 4, aligned_t1: 4, q1_issue_event_id: "jump-q1", applied_state: { frequency: 100 }, id: 1,
+      }));
+      for (const layout of ["time", "instruction"]) {
+        const model = buildModel(ir, { layout, timeBasis: "aligned" });
+        const lane = pathLanes(model).find((candidate) => candidate.kind === "branch-runtime" && candidate.branchComparisonPath === "taken");
+        const [terminal] = lane.blocks;
+        assert.equal(lane.label, "Execute · RT");
+        assert.equal(lane.blocks.length, 1);
+        assert.equal(terminal.start, layout === "time" ? 4 : 2);
+        assert.equal(terminal.duration, 0);
+        assert.equal(terminal.pointMarker, true);
+        const identifier = kind === "feedback_rejected" ? " · LINQ ID 1" : "";
+        assert.equal(terminal.title, `Execution ${status} · 4 ns · ${reason}${identifier}`);
+        assert.equal(terminal.diagnosticErrors, undefined);
+        assert.equal(terminal.rtDetails, undefined);
+        assert.equal(terminal.parameterChanges, undefined);
+        if (layout === "instruction") assert.equal(model.totalTime, 4);
+      }
+      assert.deepEqual(buildIndex(ir).get("jump-q1").rtEventIds, []);
+    }
+  });
+
   it("merges prefixed AWG paths within each comparison only, even when packet, source and timing match", () => {
     const events = [];
     for (const comparisonId of [branchId, "Control:branch:second"]) {
@@ -147,6 +176,24 @@ describe("Q1 timeline branch comparison lanes", () => {
     for (const layout of ["time", "instruction"]) {
       const model = buildModel({events}, {layout});
       assert.deepEqual(pathLanes(model).map((lane: any) => lane.label), ["Execute · RT", "Skip · RT"]);
+    }
+  });
+
+  it("renders a status branch as Jump and Continue with the wait on Continue only", () => {
+    const statusId = "Control:branch:Control.q1asm:2:jz:end";
+    const ir = {events: [
+      event("status-q1", "q1_issue", 12, 16, {op: "jz", condition: "jz status flags", branch_id: statusId,
+        branch_comparison_supported: true, assumed_branch_path: "both", comparison_q1_durations_ns: {taken: 16, fallthrough: 4}}),
+      event("status-rt", "branch_region", 0, 0, {branch_id: statusId, assumed_branch_path: "both"}),
+      pathEvent("jump-update", "upd_param", "taken", 0, 4, {}, undefined, statusId),
+      pathEvent("continue-wait", "wait", "fallthrough", 0, 12, {}, undefined, statusId),
+      pathEvent("continue-update", "upd_param", "fallthrough", 12, 4, {}, undefined, statusId),
+    ]};
+    for (const layout of ["time", "instruction"]) {
+      const model = buildModel(ir, {layout});
+      assert.deepEqual(pathLanes(model).map((lane: any) => [lane.label, lane.blocks.map((block: any) => block.id)]), [
+        ["Jump · RT", ["jump-update"]], ["Continue · RT", ["continue-wait", "continue-update"]],
+      ]);
     }
   });
 

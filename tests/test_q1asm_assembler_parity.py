@@ -317,7 +317,7 @@ def test_jmp_register_subroutine_can_return_to_multiple_call_sites() -> None:
     )
 
 
-def test_jmp_register_loop_to_visited_target_stays_collapsed() -> None:
+def test_jmp_register_loop_to_visited_target_has_a_compact_summary() -> None:
     state = _state(
         "move @loop_body,R27\n"
         "loop_body: wait 4\n"
@@ -330,10 +330,10 @@ def test_jmp_register_loop_to_visited_target_stays_collapsed() -> None:
 
     assert q1_ops == ["move", "wait", "jmp"]
     assert loop_jump.meta["target_pc"] == 1
-    assert any(
-        event.kind == "unknown_region" and event.meta.get("reason") == "unsupported_backward_numeric_branch"
-        for event in state.events
-    )
+    loop, = [event for event in state.events if event.kind == "loop_block"]
+    assert loop.meta["count"] == "forever"
+    assert loop.meta["period"]["value"] == 4
+    assert not any(event.kind == "unknown_region" for event in state.events)
 
 
 @pytest.mark.parametrize(
@@ -502,7 +502,7 @@ def test_signed_immediate_first_shifts_accept_q1asm_windows_negative_literals(op
     assert _error_categories(f"move 1,R0\nnop\n{op} -1,R0,R1\nstop\n") == []
 
 
-@pytest.mark.parametrize("op", ["fb_com_cfg", "fb_acq_tb_cfg", "fb_com_extra", "fb_acq_tb_extra", "fb_acq_tb_mock"])
+@pytest.mark.parametrize("op", ["fb_com_cfg", "fb_acq_tb_cfg", "fb_com_extra", "fb_acq_tb_extra"])
 def test_register_packed_feedback_forms_use_second_operand_as_duration(op: str) -> None:
     state = _state(f"{op} R0,1000\nstop\n")
     categories = [diagnostic.category for diagnostic in state.diagnostics if diagnostic.severity == "error"]
@@ -588,9 +588,9 @@ def test_compact_loop_final_hidden_iteration_uses_continue_q1_runtime() -> None:
 
 
 def test_fb_cmd_accepts_register_payload_and_emits_feedback_event() -> None:
-    state = _state("move 7,R0\nnop\nfb_cmd 3,R0,4\nstop\n")
+    state = _state("move 7,R0\nnop\nfb_cmd 0x103,R0,4\nstop\n")
 
-    assert _error_categories("fb_cmd 3,R0,4\nstop\n") == []
+    assert _error_categories("fb_cmd 0x103,R0,4\nstop\n") == []
     event = next(event for event in state.events if event.kind == "feedback_com")
     assert event.meta["feedback"]["channel"] == "3"
     assert event.meta["feedback"]["source"] == "R0"

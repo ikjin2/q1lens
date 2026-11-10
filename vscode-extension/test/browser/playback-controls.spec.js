@@ -52,6 +52,211 @@ function timeFoldFixture() {
     event("wait1", "wait", 9020, 10000, {op: "wait"}), event("stop", "stop", 10000, 10000)]};
 }
 
+async function expandQ1Sections(page) {
+  const sections = page.getByRole("button", {name: /^Expand \d+ Q1 instructions$/});
+  while (await sections.count()) await sections.first().press("Enter");
+}
+
+test("Normal time scale groups adjacent waits while preserving separate RT actions", async ({page}) => {
+  const ir = {sequencers: [{id: "seq"}], events: [
+    event("w0", "wait", 0, 100, {op: "wait"}), event("w1", "wait", 100, 300, {op: "wait"}),
+    event("p0", "play", 300, 400), event("p1", "play", 400, 500),
+    event("trigger", "wait_trigger", 500, 600),
+    event("w2", "wait", 600, 700), event("w3", "wait", 704, 800),
+  ]};
+  await mount(page, "idle", ir, {analysisDetailsOpen: false, timelineWaitsCollapsed: false}, {viewMode: "normal"});
+  const group = page.getByRole("button", {name: "Expand 2 wait commands", exact: true});
+  const block = (id) => page.locator(`.timeline-block[data-event-id="${id}"]`);
+  await expect(group).toHaveText("wait 300 ns × 2");
+  for (const id of ["p0", "p1", "trigger", "w2", "w3"]) await expect(block(id)).toBeVisible();
+  await expect(block("w0")).toBeHidden();
+  await group.press("Enter");
+  await expect(block("w0")).toBeVisible();
+  await expect(block("w1")).toBeVisible();
+  await page.getByRole("button", {name: "Collapse 2 wait commands", exact: true}).click();
+  await expect(block("w1")).toBeHidden();
+  await page.getByRole("button", {name: "Instruction", exact: true}).click();
+  await expect(block("w0")).toBeVisible();
+  await expect(block("w1")).toBeVisible();
+});
+
+test("Debug folds Q1 sections and keeps stall and error positions visible", async ({page}) => {
+  const ir = {sequencers: [{id: "seq"}], events: [
+    event("q0", "q1_issue", 0, 4, {op: "nop"}), event("q1", "q1_issue", 4, 8, {op: "nop"}),
+    {...event("stall", "q1_stall", 8, 20, {reason: "RT queue full"}), lane: "debug.q1_stall"},
+    event("q2", "q1_issue", 20, 24, {op: "move"}), event("q3", "q1_issue", 24, 28, {op: "add"}),
+    event("error", "q1_issue", 28, 32, {op: "add"}), event("wait", "wait", 0, 40),
+  ], diagnostics: [{severity: "error", message: "Q1 fault", related_events: ["error"]}]};
+  await mount(page, "idle", ir, {analysisDetailsOpen: false, timelineWaitsCollapsed: false});
+  const groups = page.getByRole("button", {name: "Expand 2 Q1 instructions", exact: true});
+  const block = (id) => page.locator(`.timeline-block[data-event-id="${id}"]`);
+  await expect(groups).toHaveCount(2);
+  await expect(block("stall")).toBeVisible();
+  await expect(block("stall")).toHaveAttribute("title", "Q1 stall · 8–20 ns · RT queue full");
+  await expect(block("error").locator(".timeline-error-mark")).toBeVisible();
+  await groups.first().click();
+  await expect(block("q0")).toBeVisible();
+  await expect(block("q2")).toBeHidden();
+  await page.getByRole("button", {name: "Collapse 2 Q1 instructions", exact: true}).press("Space");
+  await expect(block("q0")).toBeHidden();
+  await page.getByRole("button", {name: "Instruction", exact: true}).click();
+  await expect(block("stall")).toHaveAttribute("data-instruction-index", "2");
+  await expect(groups).toHaveCount(2);
+  await page.evaluate(() => window.postMessage({type: "highlightEventIds", highlightEventIds: ["q2"]}, "*"));
+  await expect(block("q2")).toBeVisible();
+  await expect(block("q0")).toBeHidden();
+});
+
+test("RT wait evidence preserves one command slot and pending Q1 selection", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const [complete, sameTime, pending] = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json",
+    "from q1timeline.analysis.api import analyze_text",
+    "from q1timeline.render.html import render_html",
+    "source = 'wait 20\\nwait_trigger 3,4\\nwait_sync 4\\nwait 8\\nstop'",
+    "def fixture(arrival):",
+    "    triggers = [] if arrival is None else [{'target': 'seq', 'address': 3, 'time_ns': arrival}]",
+    "    ir = analyze_text(source, file='waits.q1asm', sequencer_id='seq', execution_mode='simulation',",
+    "                      simulation={'startup_delay_ns': 100, 'inputs': {'triggers': triggers}})",
+    "    return {'ir': ir, 'html': render_html(ir)}",
+    "print(json.dumps([fixture(arrival) for arrival in (150, 120, None)]))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const shell = (html) => html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+    /type=["']application\/json["']/i.test(attributes) ? tag : "");
+  const svg = (id) => page.locator(`#timeline-root > svg [data-event-id="${id}"]`);
+  const block = (id) => page.locator(`.timeline-block[data-block-id="${id}"]`);
+  for (const {ir, html} of [complete, sameTime]) {
+    const primary = ir.events.find((event) => event.kind === "wait_trigger");
+    const auxiliary = ir.events.find((event) => event.kind === "trigger_wait");
+    const arrival = ir.events.find((event) => event.kind === "trigger_receive");
+    const sync = ir.events.find((event) => event.kind === "sync_wait");
+    await page.goto("about:blank");
+    await page.setContent(html);
+    await expect(svg(primary.id)).toBeVisible();
+    await expect(svg(arrival.id).locator("circle")).toBeVisible();
+    if (auxiliary) await expect(svg(auxiliary.id)).toHaveCount(0);
+    await expect(svg(sync.id)).toHaveCount(0);
+    await mount(page, "idle", ir, {}, {viewMode: "normal"}, shell(html));
+    if (auxiliary) {
+      await expect(block(primary.id)).toHaveAttribute("data-event-ids", `${primary.id} ${auxiliary.id}`);
+      await expect(block(auxiliary.id)).toHaveCount(0);
+    }
+    await expect(block(primary.id)).toHaveAttribute("title", new RegExp(`20 ns.*${primary.meta.aligned_t1} ns`));
+    await page.getByRole("button", {name: "Instruction", exact: true}).click();
+    const row = page.locator('[data-lane="sequencer:seq"]');
+    await expect(row.locator(".timeline-block:not(.timeline-point-marker)")).toHaveCount(5);
+    await expect(block(primary.id)).toHaveAttribute("data-instruction-index", "1");
+    const ordinal = Number(await block(arrival.id).getAttribute("data-instruction-index"));
+    expect(ordinal).toBeGreaterThanOrEqual(1);
+    expect(ordinal).toBeLessThan(2);
+  }
+
+  const wait = pending.ir.events.find((event) => event.kind === "trigger_wait");
+  const issue = pending.ir.events.find((event) => event.id === wait.meta.q1_issue_event_id);
+  await page.goto("about:blank");
+  await page.setContent(pending.html);
+  await page.getByRole("link", {name: "Show event"}).click();
+  await expect(svg(wait.id)).toHaveClass(/is-selected/);
+  await page.getByRole("button", {name: "Debug", exact: true}).click();
+  await svg(issue.id).click();
+  await expect(svg(wait.id)).toHaveClass(/is-related/);
+  await mount(page, "idle", pending.ir, {}, {viewMode: "normal"}, shell(pending.html));
+  await page.evaluate((id) => window.postMessage({type: "highlightEventIds", highlightEventIds: [id]}, "*"), issue.id);
+  await expect(block(wait.id)).toHaveAttribute("aria-selected", "true");
+  await page.getByRole("button", {name: "Debug view", exact: true}).click();
+  await expandQ1Sections(page);
+  await block(issue.id).press("Enter");
+  await expect(block(wait.id)).toHaveClass(/is-instruction-related/);
+  await page.getByRole("link", {name: "Show event"}).click();
+  await expect(block(wait.id)).toHaveAttribute("aria-selected", "true");
+});
+
+test("keeps the trigger hit target centered and narrow in Instruction layout", async ({page}) => {
+  const ir = {sequencers: [{id: "seq"}], events: [
+    event("wait", "wait", 0, 100),
+    event("trigger", "trigger_receive", 30, 30, {address: 1}),
+    event("stop", "stop", 100, 100),
+  ]};
+  await mount(page, "idle", ir, {analysisDetailsOpen: false});
+  const marker = page.getByRole("button", {name: "Trigger address 1 · 30 ns"});
+  expect((await marker.boundingBox()).width).toBe(10);
+  await page.getByRole("button", {name: "Instruction", exact: true}).click();
+  const wait = page.locator('.timeline-block[data-event-id="wait"]');
+  const [point, slot] = await Promise.all([marker.boundingBox(), wait.boundingBox()]);
+  expect(point.width).toBe(10);
+  expect(slot.width).toBeGreaterThan(20);
+  expect(Math.abs(point.x + point.width / 2 - (slot.x + 0.3 * slot.width))).toBeLessThan(1);
+  await wait.click({position: {x: slot.width / 2, y: slot.height / 2}});
+  await expect(wait).toHaveAttribute("aria-selected", "true");
+});
+
+test("coincident trigger arrivals share one point and preserve each linked address", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const {ir, html} = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json",
+    "from q1timeline.analysis.api import analyze_text",
+    "from q1timeline.render.html import render_html",
+    "inputs = {'triggers': [{'target': 'seq', 'time_ns': time, 'address': address}",
+    "    for time, address in [(120, 1), (120, 2), (120, 1), (140, 3)]]}",
+    "ir = analyze_text('wait 100\\nstop', file='arrivals.q1asm', sequencer_id='seq', execution_mode='simulation',",
+    "    alignment_mode='first_anchor', alignment_anchor_kinds=['wait'],",
+    "    simulation={'startup_delay_ns': 100, 'inputs': inputs})",
+    "arrivals = [event for event in ir['events'] if event['kind'] == 'trigger_receive']",
+    "ir['diagnostics'].append({'severity': 'warning', 'category': 'trigger_arrival_fixture',",
+    "    'message': 'Second original arrival.', 'related_events': [arrivals[1]['id']]})",
+    "print(json.dumps({'ir': ir, 'html': render_html(ir)}))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const [first, second, duplicate, later] = ir.events.filter((item) => item.kind === "trigger_receive");
+  const title = (time) => `Trigger addresses 1 ×2, 2 · ${time} ns`;
+  const address = page.locator("#event-inspector-fields").getByText("Trigger address", {exact: true}).locator("xpath=following-sibling::dd[1]");
+  const show = page.locator('.diagnostic[data-diagnostic-category="trigger_arrival_fixture"]').getByRole("link", {name: "Show event"});
+
+  await page.setContent(html);
+  const svgPoints = page.locator('#timeline-root > svg [data-kind="trigger_receive"]');
+  const svgPoint = svgPoints.locator(`xpath=self::*[@data-event-id="${first.id}"]`);
+  await expect(svgPoints).toHaveCount(2);
+  await expect(svgPoint.locator("title")).toHaveText(title(20));
+  await expect(svgPoint.locator("circle")).toHaveAttribute("r", "3");
+  await expect(svgPoint).toHaveAttribute("data-event-ids", `${second.id} ${duplicate.id}`);
+  await expect(svgPoints.locator(`xpath=self::*[@data-event-id="${later.id}"]`).locator("title")).toHaveText("Trigger address 3 · 40 ns");
+  await analysisDetails(page);
+  await show.click();
+  await expect(svgPoint).toHaveClass(/is-selected/);
+  await expect(address).toHaveText("2");
+  await page.getByRole("button", {name: "Debug", exact: true}).click();
+  await expect(svgPoint).toHaveClass(/is-selected/);
+  await expect(address).toHaveText("2");
+
+  const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+    /type=["']application\/json["']/i.test(attributes) ? tag : "");
+  await mount(page, "idle", ir, {}, {viewMode: "normal"}, shell);
+  const points = page.locator('.timeline-point-marker[title^="Trigger address"]');
+  const point = page.locator(`.timeline-point-marker[data-block-id="${first.id}"]`);
+  await expect(points).toHaveCount(2);
+  await expect(point).toHaveAttribute("title", title(20));
+  await expect(point).toHaveAttribute("data-event-ids", `${first.id} ${second.id} ${duplicate.id}`);
+  await show.click();
+  await expect(point).toHaveAttribute("aria-selected", "true");
+  await expect(address).toHaveText("2");
+  await point.click();
+  await expect(address).toHaveText("1");
+  await page.evaluate((id) => window.postMessage({type: "highlightEventIds", highlightEventIds: [id]}, "*"), second.id);
+  await expect(address).toHaveText("2");
+  await page.getByRole("button", {name: "Local time basis"}).click();
+  await expect(point).toHaveAttribute("title", title(120));
+  await expect(address).toHaveText("2");
+  await page.getByRole("button", {name: "Instruction", exact: true}).click();
+  await expect(points).toHaveCount(2);
+  await expect(point).toHaveAttribute("title", title(120));
+  await expect(point).toHaveCSS("width", "10px");
+  await expect(address).toHaveText("2");
+  await expect(page.locator(`.timeline-point-marker[data-block-id="${later.id}"]`)).toHaveAttribute("title", "Trigger address 3 · 140 ns");
+  await page.getByRole("button", {name: "Time scale", exact: true}).click();
+  await page.getByRole("button", {name: "Aligned time basis"}).click();
+  await expect(point).toHaveAttribute("title", title(20));
+  await expect(address).toHaveText("2");
+});
+
 test("time fold tabs keep only icon and duration on the ruler and preserve keyboard focus and source state", async ({page}) => {
   const ir = timeFoldFixture();
   await page.setViewportSize({width: 1000, height: 800});
@@ -177,6 +382,280 @@ test("analysis details contain selection and hardware while compact diagnostics 
   await expect(page.locator(".diagnostics")).toBeVisible();
 });
 
+test("baseline simulation underflow opens the marker in the active time basis", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const {ir, html, manual} = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json", "from q1timeline.analysis.api import analyze_text", "from q1timeline.render.html import render_html",
+    'def simulation(mode=None): return analyze_text("wait 4\\n" + "nop\\n" * 50 + "stop", file="underflow.q1asm", sequencer_id="seq", execution_mode="simulation", simulation={"startup_delay_ns": 100}, alignment_mode=mode)',
+    "ir=simulation()",
+    "print(json.dumps({'ir':ir,'html':render_html(ir),'manual':simulation('manual:-100')}))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const warning = ir.events.find((item) => item.kind === "underflow_warning");
+  const diagnostics = page.locator('.diagnostic[data-diagnostic-category="rt_queue_underflow"]');
+  const showEvent = diagnostics.getByRole("link", {name: "Show event"});
+  const inspector = page.locator("#event-inspector-fields");
+  const time = inspector.getByText("Time range", {exact: true}).locator("xpath=following-sibling::dd[1]");
+  const reason = inspector.locator(".diagnostic-error-message");
+  const description = "The RT queue ran out of commands.";
+
+  await page.setContent(html);
+  await analysisDetails(page);
+  const wait = ir.events.find((item) => item.kind === "wait");
+  const svgWait = page.locator(`#timeline-root > svg [data-event-id="${wait.id}"]`);
+  const svgMarker = page.locator(`#timeline-root > svg [data-event-id="${warning.id}"]`);
+  for (const mode of ["Normal", "Debug"]) {
+    await page.getByRole("button", {name: mode, exact: true}).click();
+    await expect(svgMarker).toHaveCount(1);
+    await expect(svgMarker.locator("title")).toContainText("aligned time: 4 ns");
+    await expect(svgMarker.locator("title")).not.toContainText("104 ns");
+    await expect(svgWait.locator("title")).toContainText("aligned time: 0 -> 4");
+    await svgWait.click();
+    await expect(time).toHaveText("0 ns → 4 ns");
+    await showEvent.click();
+    await expect(time).toHaveText("4 ns");
+    await expect(reason).toHaveText(description);
+  }
+
+  const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+    /type=["']application\/json["']/i.test(attributes) ? tag : "");
+  await mount(page, "idle", manual, {}, {}, shell);
+  const marker = page.locator(`.diagnostic-point[data-event-id="${warning.id}"]`);
+  await expect(diagnostics.locator(".diagnostic-message")).toHaveText(description);
+  for (const mode of ["Normal", "Debug"]) {
+    await page.getByRole("button", {name: `${mode} view`, exact: true}).click();
+    await expect(marker).toHaveCount(1);
+    await expect(page.locator(".shared-timeline-stage .q1-error-marker, .shared-timeline-stage .timeline-block[data-diagnostic-message]:not(.diagnostic-point)")).toHaveCount(0);
+    await showEvent.click();
+    await expect(marker).toHaveAttribute("aria-selected", "true");
+    await expect(time).toHaveText("4 ns");
+    await expect(reason).toHaveText(description);
+    await expect(marker).toHaveAttribute("title", `RT underflow · 4 ns\n${description}`);
+    await page.getByRole("button", {name: "Local time basis"}).click();
+    await expect(time).toHaveText("104 ns");
+    await expect(reason).toHaveText(description);
+    await expect(marker).toHaveAttribute("title", `RT underflow · 104 ns\n${description}`);
+    await page.getByRole("button", {name: "Aligned time basis"}).click();
+    await expect(time).toHaveText("4 ns");
+  }
+});
+
+test("the actual fallback RT dequeue anchors Normal and Debug in both viewers", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const datasets = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json",
+    "from q1timeline.analysis.api import analyze_text",
+    "from q1timeline.render.html import render_html",
+    "programs = ['nop\\nwait 20\\nstop', 'nop\\nwait 20\\nplay 0,1,4\\nstop', 'nop\\nstop']",
+    "def dataset(program):",
+    "    ir = analyze_text(program, file='seq.q1asm', sequencer_id='seq', execution_mode='simulation',",
+    "        alignment_mode='first_play', simulation={'startup_delay_ns': 100})",
+    "    return {'ir': ir, 'html': render_html(ir)}",
+    "print(json.dumps([dataset(program) for program in programs]))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const windowStatus = page.locator("#q1timeline-time-window");
+  const axis = page.locator("#timeline-root > svg");
+  const local = page.getByRole("button", {name: "Local time basis"});
+  for (const [index, {ir, html}] of datasets.entries()) {
+    const wait = ir.events.find((event) => event.kind === "wait");
+    const activeAnchor = ir.events.find((event) => event.id === ir.alignment.seq.anchor_event_id);
+    expect(activeAnchor?.kind).toBe(["rt_queue_dequeue", "play", undefined][index]);
+    expect(ir.project.alignment_mode).toBe("first_play");
+    await page.goto("about:blank");
+    await page.setContent(html);
+    await expect(axis).toHaveAttribute("data-time-min", ["0", "-20", "0"][index]);
+    const standaloneWait = wait && axis.locator(`[data-event-id="${wait.id}"]`);
+    if (index === 0) {
+      await expect(standaloneWait).toHaveAttribute("data-t0-x", "190.00");
+      await expect(axis.locator(".tick-label").first()).toHaveText("0 ns");
+      await analysisDetails(page);
+      await page.getByRole("button", {name: "Debug", exact: true}).click();
+      await expect(axis).toHaveAttribute("data-time-min", "-100");
+      await expect(axis.locator(".tick-label").first()).toHaveText("-100 ns");
+      await expect(standaloneWait).not.toHaveAttribute("data-t0-x", "190.00");
+      await page.getByRole("button", {name: "Normal", exact: true}).click();
+      await expect(axis).toHaveAttribute("data-time-min", "0");
+      await expect(standaloneWait).toHaveAttribute("data-t0-x", "190.00");
+    } else if (wait) {
+      await expect(page.locator('template[data-timeline-mode="debug"]')).toHaveCount(1);
+      await expect(axis.locator(".tick-label").first()).toHaveText("-20 ns");
+    } else {
+      expect(ir.events.filter((event) => event.kind === "stop" || event.kind === "rt_queue_dequeue")).toHaveLength(0);
+      await expect(axis).toHaveAttribute("data-time-max", "8");
+      await expect(page.locator("template[data-timeline-mode]")).toHaveCount(0);
+    }
+
+    const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+      /type=["']application\/json["']/i.test(attributes) ? tag : "");
+    await mount(page, "idle", ir, index === 0 ? {timelineTimeBasis: "local"} : {}, {viewMode: "normal"}, shell);
+    const block = wait && page.locator(`.timeline-block[data-block-id="${wait.id}"]`);
+    await expect(windowStatus).toHaveAttribute("title", ["X (aligned): 0..20 ns", "X (aligned): -20..4 ns", "X (aligned): 0..8 ns"][index]);
+    if (index === 0) {
+      await expect(local).toBeHidden();
+      await expect(block).toHaveCSS("left", "0px");
+      await expect(page.locator(".ruler .tick").first()).toHaveText("0 ns");
+      await page.getByRole("button", {name: "Debug view", exact: true}).click();
+      await expect(windowStatus).toHaveAttribute("title", "X (aligned): -100..20 ns");
+      await expect(page.locator(".ruler .tick").first()).toHaveText("-100 ns");
+      await expect(block).not.toHaveCSS("left", "0px");
+      await page.getByRole("button", {name: "Normal view", exact: true}).click();
+      await expect(windowStatus).toHaveAttribute("title", "X (aligned): 0..20 ns");
+      await expect(block).toHaveCSS("left", "0px");
+    } else {
+      await expect(local).toBeVisible();
+      if (wait) await expect(block).toHaveAttribute("title", /wait \| -20 ns -> 0 ns/);
+    }
+  }
+});
+
+test("resolved RT anchors frame early RT and arrival events separately from Q1 prefill", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const datasets = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json",
+    "from q1timeline.analysis.api import analyze_text",
+    "from q1timeline.render.html import render_html",
+    "def fixture(mode, kinds, normal, debug, arrival=None):",
+    "    program = ('wait 20\\n' if mode != 'first_wait_sync' else '') + 'wait_sync 4\\nwait 8\\nstop'",
+    "    options = {'startup_delay_ns': 100}",
+    "    if arrival is not None:",
+    "        options['inputs'] = {'triggers': [{'target': 'seq', 'address': 1, 'time_ns': arrival}]}",
+    "    ir = analyze_text(program, file='seq.q1asm', sequencer_id='seq', execution_mode='simulation',",
+    "        alignment_mode=mode, alignment_anchor_kinds=kinds, simulation=options)",
+    "    return {'ir': ir, 'html': render_html(ir), 'normal': normal, 'debug': debug, 'arrival': arrival}",
+    "print(json.dumps([fixture('after_first_wait_sync', [], -24, -124),",
+    "    fixture('after_first_wait_sync', [], -34, -124, 90), fixture('first_wait_sync', [], 0, -100),",
+    "    fixture('first_anchor', ['rt_queue_dequeue', 'play'], 0, -100),",
+    "    fixture('first_anchor', ['rt_queue_dequeue', 'q1_issue'], 0, None)]))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const status = page.locator("#q1timeline-time-window");
+  const axis = page.locator("#timeline-root > svg");
+  const ticks = page.locator(".ruler .tick");
+  const local = page.getByRole("button", {name: "Local time basis"});
+  for (const {ir, html, normal, debug, arrival} of datasets) {
+    const anchor = ir.events.find((event) => event.id === ir.alignment.seq.anchor_event_id);
+    const first = ir.events.find((event) => event.kind === (arrival ? "trigger_receive" :
+      ir.project.alignment_mode === "first_wait_sync" ? "wait_sync" : "wait"));
+    await page.goto("about:blank");
+    await page.setContent(html);
+    await expect(axis).toHaveAttribute("data-time-min", String(normal));
+    if (debug !== null) {
+      const firstEvent = axis.locator(`[data-event-id="${first.id}"]`);
+      await expect(firstEvent).toHaveAttribute("data-t0-x", "190.00");
+      await expect(axis.locator(".tick-label").first()).toHaveText(`${normal} ns`);
+      await analysisDetails(page);
+      await page.getByRole("button", {name: "Debug", exact: true}).click();
+      await expect(axis).toHaveAttribute("data-time-min", String(debug));
+      await expect(axis.locator(".tick-label").first()).toHaveText(`${debug} ns`);
+      await expect(firstEvent).toBeVisible();
+      await page.getByRole("button", {name: "Normal", exact: true}).click();
+      await expect(firstEvent).toHaveAttribute("data-t0-x", "190.00");
+    } else {
+      await expect(page.locator("template[data-timeline-mode]")).toHaveCount(0);
+    }
+    const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+      /type=["']application\/json["']/i.test(attributes) ? tag : "");
+    await mount(page, "idle", ir, {}, {viewMode: "normal"}, shell);
+    await expect(status).toHaveAttribute("title", new RegExp(`^X \\(aligned\\): ${normal}\\.\\.`));
+    if (debug === null) {
+      expect(anchor.kind).toBe("q1_issue");
+      await expect(local).toBeVisible();
+      continue;
+    }
+    const block = page.locator(`.timeline-block[data-block-id="${first.id}"]`);
+    await expect(block).toHaveCSS("left", "0px");
+    await expect(ticks.first()).toHaveText(`${normal} ns`);
+    await page.getByRole("button", {name: "Debug view", exact: true}).click();
+    await expect(status).toHaveAttribute("title", new RegExp(`^X \\(aligned\\): ${debug}\\.\\.`));
+    await expect(ticks.first()).toHaveText(`${debug} ns`);
+    await expect(block).toBeVisible();
+    await page.getByRole("button", {name: "Normal view", exact: true}).click();
+    await expect(block).toHaveCSS("left", "0px");
+    if (anchor.kind === "rt_queue_dequeue") {
+      await expect(local).toBeHidden();
+    } else {
+      await local.click();
+      await expect(status).toHaveAttribute("title", new RegExp(`^X \\(local\\): ${arrival || 100}\\.\\.`));
+      await expect(block).toHaveCSS("left", "0px");
+      if (ir.project.alignment_mode === "after_first_wait_sync") {
+        const wait = ir.events.find((event) => event.kind === "wait");
+        await expect(page.locator(`.timeline-block[data-block-id="${wait.id}"]`)).toHaveAttribute("title", /wait \| 100 -> 120/);
+      }
+    }
+  }
+});
+
+test("Normal excludes the Q1 tail while retaining visible RT endpoints", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const datasets = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json",
+    "from q1timeline.analysis.alignment import align_timelines",
+    "from q1timeline.analysis.api import analyze_documents",
+    "from q1timeline.ir.serialize import timeline_ir_from_states",
+    "from q1timeline.q1asm.parser import parse_q1asm",
+    "from q1timeline.render.html import render_html",
+    "from q1timeline.simulation.runtime import simulate_programs",
+    "peer = 'nop\\n' * 100 + 'stop'",
+    "def analyze(**kwargs):",
+    "    return analyze_documents(kwargs.pop('documents', {}) | {'peer.q1asm': peer}, execution_mode='simulation', **kwargs)",
+    "def data(name, ir, normal, debug, scope=None):",
+    "    return {'name': name, 'ir': ir, 'html': render_html(ir), 'normal': normal, 'debug': debug, 'scope': scope}",
+    "scope_programs = {'rx': parse_q1asm('acquire 0,0,4\\nstop'), 'peer': parse_q1asm(peer)}",
+    "scope_states = simulate_programs(scope_programs,",
+    "    hardware_parameters={'rx': {'integration_length_acq': 200, 'scope_acq_sequencer_select': 0,",
+    "                                 'scope_acq_trigger_mode_path0': 'sequencer'}},",
+    "    sequencer_metadata={'rx': {'module_type': 'QRM', 'sequencer_index': 0}},",
+    "    simulation={'inputs': {'acquisitions': [{'sequencer': 'rx', 'acquisition_index': 0, 'bin_index': 0, 'i': 1}]}})",
+    "align_timelines(scope_states)",
+    "scope_ir = timeline_ir_from_states(scope_states, project={'alignment_mode': 'first_rt_dequeue'})",
+    "print(json.dumps([",
+    "    data('buffered', analyze(documents={'a.q1asm': 'wait 20\\nstop'}), [0, 20], [-8, 396]),",
+    "    data('explicit', analyze(documents={'a.q1asm': 'wait 20\\nplay 0,1,4\\nstop'},",
+    "        alignment_mode='first_play'), [-20, 4], [-32, 372]),",
+    "    data('comparison', analyze(documents={'a.q1asm': 'set_cond 1,1,0,4\\nwait 60\\nstop'},",
+    "        branch_assumptions={'a:set_cond:0:1': 'both'}), [0, 60], [-12, 392]),",
+    "    data('flow', analyze(documents={'sender.q1asm': 'fb_com_data 16,7,4\\nstop', 'rx.q1asm': 'fb_pull_data R0,R1\\nstop'},",
+    "        simulation={'routes': [{'source': 'sender', 'target': 'rx', 'id': 16, 'latency_ns': 80}]}), [0, 80], [-8, 396]),",
+    "    data('scope', scope_ir, [0, 200], [-8, 396], 16384),",
+    "    data('q1-only', analyze(), [0, 404], [0, 404]),",
+    "]))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, maxBuffer: 8 * 1024 * 1024,
+    env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const axis = page.locator("#timeline-root > svg");
+  const status = page.locator("#q1timeline-time-window");
+  const windowTitle = ([min, max], scope) => `X (aligned): ${min}..${scope ?? max} ns`;
+  for (const {name, ir, html, normal, debug, scope} of datasets) {
+    await page.goto("about:blank");
+    await page.setContent(html);
+    await expect(axis).toHaveAttribute("data-time-max", String(normal[1]));
+    await analysisDetails(page);
+    await page.getByRole("button", {name: "Debug", exact: true}).click();
+    await expect(axis).toHaveAttribute("data-time-max", String(debug[1]));
+    await page.getByRole("button", {name: "Normal", exact: true}).click();
+    await expect(axis).toHaveAttribute("data-time-max", String(normal[1]));
+
+    const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+      /type=["']application\/json["']/i.test(attributes) ? tag : "");
+    await mount(page, "idle", ir, {}, {viewMode: "normal"}, shell);
+    await expect(status).toHaveAttribute("title", windowTitle(normal, scope));
+    if (name === "flow") {
+      const flow = ir.feedback_flows[0];
+      const endpoint = page.locator(`.feedback-endpoint[data-flow-id="${flow.id}"][data-feedback-role="target"]`);
+      await expect(endpoint).toBeVisible();
+      await expect(endpoint).not.toHaveClass(/is-clipped/);
+    } else if (scope) {
+      const acquire = ir.events.find((event) => event.kind === "acquire");
+      for (const blockId of [`${acquire.id}:acquisition-window`, `${acquire.id}:scope:acquisition-window`]) {
+        const window = page.locator(`.timeline-block[data-block-id="${blockId}"]`);
+        await expect(window).toBeVisible();
+        await expect(window).toHaveAttribute("data-end-clipped", "false");
+      }
+    }
+    await page.getByRole("button", {name: "Debug view", exact: true}).click();
+    await expect(status).toHaveAttribute("title", windowTitle(debug, scope));
+    await page.getByRole("button", {name: "Normal view", exact: true}).click();
+    await expect(status).toHaveAttribute("title", windowTitle(normal, scope));
+  }
+});
+
 test("initial RT buffer summary stays hidden without a related warning or error", async ({page}) => {
   await mount(page);
   await expect(page.locator("#q1timeline-initial-buffer-summary")).toHaveCount(0);
@@ -229,7 +708,7 @@ test("external input editor keeps confirmed settings until rerun succeeds and re
   await expect(summary).toContainText("≈ Scenario input · shot_start · address 1 · 1 sequencers · 1000 ns");
   await expect(summary).toHaveAttribute("title", /TRIGGER_INDEX → 1/);
   await page.getByRole("button", {name: "Configure external inputs"}).click();
-  const form = page.getByRole("form", {name: "External trigger configuration"});
+  const form = page.getByRole("form", {name: "External input configuration"});
   await form.getByLabel("Trigger 1 times (ns)").fill("-1");
   await form.getByRole("button", {name: "Apply & rerun"}).click();
   await expect(form.getByRole("status")).toHaveText("Event times must be nonnegative integers in ns.");
@@ -266,7 +745,7 @@ test("unconfigured projects can add and remove shared inputs without saving unap
   await mount(page, "idle", undefined, {}, {externalInputs: {triggers: [], overridden: false, canSave: false}});
   await expect(page.locator("#q1timeline-external-inputs-summary")).toHaveText("External inputs · not configured");
   await page.getByRole("button", {name: "Configure external inputs"}).click();
-  const form = page.getByRole("form", {name: "External trigger configuration"});
+  const form = page.getByRole("form", {name: "External input configuration"});
   await form.getByRole("button", {name: "Add trigger"}).click();
   await form.getByLabel("Trigger 1 name").fill("shared_start");
   await form.getByLabel("Trigger 1 times (ns)").fill("");
@@ -281,12 +760,492 @@ test("unconfigured projects can add and remove shared inputs without saving unap
   expect(await page.evaluate(() => window.messages.at(-1))).toEqual({type: "setExternalInputs", triggers: []});
 });
 
+test("Configure preserves ordered LINQ arrivals and the inspector links the receipt", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const {ir, html} = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json", "from q1timeline.playback import PlaybackSession", "from q1timeline.render.html import render_html",
+    "inputs={'feedback':[{'target':'seq','arrivals':[{'time_ns':16,'id':9,'value':-1}]}]}",
+    "s=PlaybackSession({'seq':('linq.q1asm','wait 100\\nfb_pull_data R0,R1\\nnop\\nwait 4\\nstop')},external_inputs=inputs)",
+    "s.run(budget_ms=1000)", "ir=s.snapshot()", "print(json.dumps({'ir':ir,'html':render_html(ir,default_mode='debug')}))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+    /type=["']application\/json["']/i.test(attributes) ? tag : "");
+  const trigger = {id: "shot", address: 1, targets: ["seq"], times_ns: [1000]};
+  const base = {triggers: [trigger], overridden: false, canSave: true};
+  await mount(page, "completed", ir, {}, {externalInputs: base}, shell);
+  await page.evaluate((eventId) => window.dispatchEvent(new MessageEvent("message", {
+    data: {type: "highlightEventIds", highlightEventIds: [eventId]},
+  })), ir.playback.feedback[0].event_id);
+  const inspector = page.locator("#event-inspector-fields");
+  await expect(inspector).toContainText(ir.playback.feedback[0].input_event_id);
+  await expect(inspector).toContainText("data → R1, id → R0");
+  await page.getByRole("button", {name: "Configure external inputs"}).click();
+  const form = page.getByRole("form", {name: "External input configuration"});
+  await form.getByRole("button", {name: "Add LINQ receiver"}).click();
+  const arrivals = form.getByLabel("LINQ receiver 1 arrivals");
+  await arrivals.fill("16, 9, -1\n16, 5, 0x7b");
+  await form.getByRole("button", {name: "Apply & rerun"}).click();
+  const feedback = [{target: "seq", arrivals: [{time_ns: 16, id: 9, value: -1}, {time_ns: 16, id: 5, value: 123}]}];
+  expect(await page.evaluate(() => window.messages.at(-1))).toEqual({type: "setExternalInputs", triggers: [trigger], feedback});
+  const update = (state) => page.evaluate((state) => window.dispatchEvent(new MessageEvent("message", {
+    data: {type: "externalInputsState", state},
+  })), state);
+  await update({...base, feedback, overridden: true});
+  await expect(arrivals).toHaveValue("16, 9, -1\n16, 5, 123");
+  await form.getByRole("button", {name: "Save to project"}).click();
+  expect(await page.evaluate(() => window.messages.at(-1))).toEqual({type: "saveExternalInputs"});
+  await update({...base, feedback});
+  await arrivals.fill("");
+  await form.getByRole("button", {name: "Apply & rerun"}).click();
+  expect(await page.evaluate(() => window.messages.at(-1))).toEqual({type: "setExternalInputs", triggers: [trigger], feedback: [{target: "seq", arrivals: []}]});
+  await update({...base, feedback: [{target: "seq", arrivals: []}], overridden: true});
+  await form.getByRole("button", {name: "Reset changes"}).click();
+  expect(await page.evaluate(() => window.messages.at(-1))).toEqual({type: "resetExternalInputs"});
+  await update({...base, feedback});
+  await expect(arrivals).toHaveValue("16, 9, -1\n16, 5, 123");
+});
+
+test("external input inspection follows the selected time basis for each receiver", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const {manual, perReceiver, html} = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json", "from q1timeline.playback import PlaybackSession", "from q1timeline.render.html import render_html",
+    "inputs={'triggers':[{'id':'shot','address':1,'targets':['a','b'],'times_ns':[16]}], 'feedback':[{'target':seq,'arrivals':[{'time_ns':16,'id':9,'value':123}]} for seq in ('a','b')]}",
+    "body='wait_trigger 1,4\\nfb_pull_data R0,R1\\nnop\\nstop'",
+    "s=PlaybackSession({'a':('a.q1asm','origin: wait 12\\n'+body),'b':('b.q1asm','wait 12\\norigin: '+body),'c':('c.q1asm','wait 12\\nwait_trigger 2,4\\nstop')},alignment_mode='manual:-8',external_inputs=inputs)",
+    "s.run(budget_ms=1000)", "manual=s.snapshot()", "s.alignment_mode='label:origin'",
+    "print(json.dumps({'manual':manual,'perReceiver':s.snapshot(),'html':render_html(manual,default_mode='debug')}))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+    /type=["']application\/json["']/i.test(attributes) ? tag : "");
+  const inspector = page.locator("#event-inspector-fields");
+  const field = (label) => inspector.getByText(label, {exact: true}).locator("xpath=following-sibling::dd[1]");
+  const select = async (ir, sequencer, kind, input) => {
+    const event = ir.events.find((item) => item.sequencer_id === sequencer && item.kind === kind && item.meta[input]);
+    await page.evaluate((eventId) => window.dispatchEvent(new MessageEvent("message", {
+      data: {type: "highlightEventIds", highlightEventIds: [eventId]},
+    })), event.id);
+    await expect(field("Sequencer")).toHaveText(sequencer);
+    await expect(field("Lane")).toHaveText(event.lane);
+  };
+  const triggerTimes = async (arm, arrival, resume) => {
+    await expect(field("Wait armed (project ns)")).toHaveText(String(arm));
+    await expect(field("Trigger arrival (project ns)")).toHaveText(String(arrival));
+    await expect(field("Resume (project ns)")).toHaveText(String(resume));
+    await expect(field("Wait after trigger (ns)")).toHaveText("4");
+  };
+  const linqTimes = async (arm, arrival, complete) => {
+    await expect(field("Wait armed (Q1 ns)")).toHaveText(String(arm));
+    await expect(field("LINQ arrival (Q1 ns)")).toHaveText(String(arrival));
+    await expect(field("Read completed (Q1 ns)")).toHaveText(String(complete));
+  };
+
+  await mount(page, "waiting", manual, {}, {}, shell);
+  await select(manual, "a", "trigger_receive", "trigger_assumption");
+  await expect(field("Trigger address")).toHaveText("1");
+  await select(manual, "a", "wait_trigger", "trigger_assumption");
+  await triggerTimes(4, 8, 12);
+  await page.getByRole("button", {name: "Local time basis"}).click();
+  await triggerTimes(12, 16, 20);
+  await page.getByRole("button", {name: "Aligned time basis"}).click();
+  await triggerTimes(4, 8, 12);
+  for (const kind of ["q1_issue", "feedback_pop"]) {
+    await select(manual, "a", kind, "feedback_input");
+    await linqTimes(0, 8, 16);
+    await expect(field("Input event")).toHaveText("external-linq:a:0");
+  }
+  await page.getByRole("button", {name: "Local time basis"}).click();
+  await linqTimes(8, 16, 24);
+  await page.getByRole("button", {name: "Aligned time basis"}).click();
+  await select(manual, "c", "wait_trigger", "trigger_assumption");
+  await expect(field("Wait armed (project ns)")).toHaveText("4");
+  await expect(field("Trigger status")).toContainText("for address 2 at 4 ns.");
+  await expect(field("Trigger arrival (project ns)")).toHaveCount(0);
+  await expect(field("Resume (project ns)")).toHaveCount(0);
+  await page.getByRole("button", {name: "Configure external inputs"}).click();
+  await expect(page.getByLabel("Trigger 1 times (ns)")).toHaveValue("16");
+  await expect(page.getByLabel("LINQ receiver 1 arrivals")).toHaveValue("16, 9, 123");
+
+  await mount(page, "waiting", perReceiver, {}, {}, shell);
+  await select(perReceiver, "a", "wait_trigger", "trigger_assumption");
+  await triggerTimes(12, 16, 20);
+  await select(perReceiver, "b", "wait_trigger", "trigger_assumption");
+  await triggerTimes(0, 4, 8);
+  await select(perReceiver, "b", "q1_issue", "feedback_input");
+  await linqTimes(-4, 4, 12);
+});
+
+test("Play waiting tooltips use each receiver's time basis and current snapshot", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const {manual, perReceiver, completed} = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json", "from q1timeline.playback import PlaybackSession",
+    "sources={'a':('a.q1asm','origin: wait 12\\nwait_trigger 1,4\\nstop'),'b':('b.q1asm','wait 12\\norigin: wait_trigger 1,4\\nstop'),'readout':('readout.q1asm','origin: wait 4\\nfb_pull_data R0,R1\\nnop\\nstop')}",
+    "inputs={'triggers':[{'id':'shot','address':1,'targets':['a','b'],'times_ns':[]}], 'feedback':[{'target':'readout','arrivals':[]}]}",
+    "s=PlaybackSession(sources,alignment_mode='manual:-8',external_inputs=inputs)",
+    "s.run(budget_ms=1000)", "manual=s.snapshot()", "s.alignment_mode='label:origin'", "per_receiver=s.snapshot()",
+    "inputs['triggers'][0]['times_ns']=[16]", "inputs['feedback'][0]['arrivals']=[{'time_ns':16,'id':9,'value':123}]",
+    "s.set_external_inputs(inputs)", "s.run(budget_ms=1000)",
+    "print(json.dumps({'manual':manual,'perReceiver':per_receiver,'completed':s.snapshot()}))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const status = page.locator("#q1timeline-execution-status");
+  const run = page.getByRole("button", {name: "Waiting for external input"});
+  const basis = (name) => page.getByRole("button", {name: `${name} time basis`}).click();
+  const triggerReason = (time) => `No scheduled trigger for address 1 at ${time} ns. Configure external inputs.`;
+  const linqReason = "No scheduled arrival supplies a LINQ word for readout. Configure external inputs.";
+  const waitSummary = (times) => `3 sequencer(s) waiting. ${times.map(triggerReason).join(" ")} ${linqReason}`;
+  const checkTooltips = async (times) => {
+    const summary = waitSummary(times);
+    await expect(status).toHaveAttribute("title", `Waiting for external input · ${manual.playback.steps} instructions · ${summary}`);
+    await expect(status).toHaveAttribute("aria-label", `Waiting for external input · ${manual.playback.steps} instructions · ${summary}`);
+    await expect(run).toHaveAttribute("title", `${summary} Change a branch, feedback, or external input assumption to recalculate.`);
+    await expect(run).toBeDisabled();
+  };
+  const sendState = (state) => page.evaluate((state) => window.dispatchEvent(new MessageEvent("message", {
+    data: {type: "setExecutionState", state},
+  })), state);
+
+  await mount(page, "waiting", manual);
+  await checkTooltips([4]);
+  await basis("Local");
+  await checkTooltips([12]);
+  await basis("Aligned");
+  await checkTooltips([4]);
+  expect(manual.playback.reason).toEqual(waitSummary([12]));
+
+  await mount(page, "waiting", perReceiver);
+  await checkTooltips([12, 0]);
+  await basis("Local");
+  await checkTooltips([12]);
+  await basis("Aligned");
+  await sendState({...perReceiver.playback, steps: perReceiver.playback.steps + 1});
+  await expect(status).toHaveAttribute("title", /at 12 ns\./);
+  await expect(run).not.toHaveAttribute("title", /at 0 ns\./);
+  await sendState(completed.playback);
+  await expect(status).toHaveAttribute("title", /^Completed · \d+ instructions$/);
+  await expect(page.getByRole("button", {name: "Execution complete"})).toHaveAttribute("title", /^Execution complete\./);
+  await mount(page, "completed", completed);
+  await basis("Local");
+  await expect(status).toHaveAttribute("title", /^Completed · \d+ instructions$/);
+});
+
+test("unresolved trigger time is nominal in standalone and VS Code timelines", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const {ir, html} = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json", "from q1timeline.analysis.api import analyze_text", "from q1timeline.render.html import render_html",
+    "ir=analyze_text('wait_trigger 1,4\\nwait 100\\nstop',file='trigger.q1asm',sequencer_id='seq')",
+    "print(json.dumps({'ir':ir,'html':render_html(ir,default_mode='normal')}))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const [trigger, wait, stop] = ir.events.filter((event) => ["wait_trigger", "wait", "stop"].includes(event.kind));
+  const inspector = page.locator("#event-inspector-fields");
+  const waiting = /Arm 0(?: ns)? → waiting for trigger \(completion unresolved\)/;
+  const nominal = /Nominal RT 4(?: ns)? → 104(?: ns)? \(trigger arrival unresolved\)/;
+  await page.setContent(html);
+  const svgEvent = (item) => page.locator(`#timeline-root > svg [data-event-id="${item.id}"]`);
+  await expect(svgEvent(trigger).locator("title")).toContainText(waiting);
+  await expect(svgEvent(wait).locator("title")).toContainText(nominal);
+  await expect(svgEvent(stop).locator("title")).toContainText(/Nominal RT 104/);
+  await svgEvent(trigger).click();
+  await expect(inspector).toContainText(waiting);
+  await expect(inspector).toContainText("Wait after trigger (ns)4");
+  await svgEvent(wait).click();
+  await expect(inspector).toContainText(nominal);
+
+  const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+    /type=["']application\/json["']/i.test(attributes) ? tag : "");
+  await mount(page, "idle", ir, {}, {}, shell);
+  const block = (item) => page.locator(`.timeline-block[data-event-id="${item.id}"]`);
+  await expect(block(trigger)).toHaveAttribute("title", waiting);
+  await expect(block(wait)).toHaveAttribute("title", nominal);
+  await expect(block(stop)).toHaveAttribute("title", /Nominal RT 104/);
+  await block(trigger).click();
+  await expect(inspector).toContainText(waiting);
+  await expect(inspector).toContainText("Wait after trigger (ns)4");
+  await block(wait).click();
+  await expect(inspector).toContainText(nominal);
+});
+
+test("scheduled LINQ overflow is a linked rejection point on the active clock", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const {ir, html} = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json",
+    "from q1timeline.playback import PlaybackSession",
+    "from q1timeline.render.html import render_html",
+    "inputs = {'feedback': [{'target': 'seq', 'arrivals': [{'time_ns': 8, 'id': 9, 'value': 81}, {'time_ns': 8, 'id': 5, 'value': 25}]}]}",
+    "session = PlaybackSession({'seq': ('linq.q1asm', 'fb_pull_data R0,R1\\nstop')}, external_inputs=inputs,",
+    "    feedback_queue_capacity=1, alignment_mode='manual:-4')",
+    "session.run()",
+    "ir = session.snapshot()",
+    "print(json.dumps({'ir': ir, 'html': render_html(ir)}))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const rejected = ir.events.find((item) => item.kind === "feedback_rejected");
+  const rawReason = "LINQ feedback queue overflow at Q1 8 ns (capacity 1).";
+  const cause = "LINQ feedback queue overflow (capacity 1).";
+  expect(ir.playback.reason).toBe(rawReason);
+  const fields = page.locator("#event-inspector-fields");
+  const field = (label) => fields.getByText(label, {exact: true}).locator("xpath=following-sibling::dd[1]");
+  await page.setContent(html);
+  const svgPoint = page.locator(`#timeline-root > svg [data-event-id="${rejected.id}"]`);
+  await expect(svgPoint.locator("circle")).toBeVisible();
+  await expect(svgPoint.locator("title")).toHaveText("Rejected LINQ arrival · ID 5 · 4 ns");
+  const diagnostic = page.locator('.diagnostic[data-diagnostic-category="feedback_queue_overflow"]');
+  await expect(diagnostic).toContainText(cause);
+  await expect(diagnostic).not.toContainText("8 ns");
+  await diagnostic.getByRole("link", {name: "Show event"}).click();
+  await expect(svgPoint).toHaveClass(/is-selected/);
+  await expect(field("Time range")).toHaveText("4 ns");
+  await expect(field("Error")).toHaveText(cause);
+  await expect(field("Source")).toHaveText("linq.q1asm:1");
+  await expect(field("Input event")).toHaveText("external-linq:seq:1");
+
+  const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+    /type=["']application\/json["']/i.test(attributes) ? tag : "");
+  await mount(page, "error", ir, {}, {viewMode: "normal"}, shell);
+  const point = page.locator(`.timeline-point-marker[data-event-id="${rejected.id}"]`);
+  const toolbar = page.locator("#q1timeline-execution-status");
+  await expect(point).toBeVisible();
+  await expect(point).toHaveAttribute("title", `Rejected LINQ arrival · ID 5 · 4 ns\n${cause}`);
+  await expect(toolbar).toHaveAttribute("title", `Execution stopped · 0 instructions · ${cause}`);
+  await point.click();
+  await expect(field("Time range")).toHaveText("4 ns");
+  await expect(field("Error")).toHaveText(cause);
+  await expect(field("Input event")).toHaveText("external-linq:seq:1");
+  await expect(field("Source")).toHaveText("linq.q1asm:1");
+  await page.getByRole("button", {name: "Local time basis"}).click();
+  await expect(point).toHaveAttribute("title", `Rejected LINQ arrival · ID 5 · 8 ns\n${cause}`);
+  await expect(field("Time range")).toHaveText("8 ns");
+  await expect(toolbar).toHaveAttribute("title", `Execution stopped · 0 instructions · ${cause}`);
+});
+
+test("simulated LINQ rejection displays one active clock and retains Compare Both markers", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const {datasets, comparison} = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json",
+    "from q1timeline.analysis.alignment import align_timelines",
+    "from q1timeline.analysis.api import analyze_documents",
+    "from q1timeline.ir.serialize import timeline_ir_from_states",
+    "from q1timeline.q1asm.parser import parse_q1asm",
+    "from q1timeline.render.html import render_html",
+    "from q1timeline.simulation.runtime import simulate_programs",
+    "rx = parse_q1asm('wait 100\\nstop', file='rx.q1asm')",
+    "config = {'startup_delay_ns': 100, 'feedback_queue_capacity': 1, 'inputs': {",
+    "    'feedback': [{'target': 'rx', 'time_ns': 120, 'id': i, 'value': i * 11} for i in (1, 2)]}}",
+    "states = simulate_programs({'rx': rx}, simulation=config)",
+    "datasets = []",
+    "for mode, time in ((None, 120), ('first_rt_dequeue', 20), ('manual:-4', 116)):",
+    "    if mode:",
+    "        align_timelines(states, mode=mode)",
+    "    ir = timeline_ir_from_states(states, project={'alignment_mode': mode or 'none'})",
+    "    datasets.append({'ir': ir, 'html': render_html(ir), 'mode': mode, 'time': time})",
+    "compare = analyze_documents({'a.q1asm': 'set_cond 1,1,0,8\\nfb_com_data 1,42,4\\nstop',",
+    "    'b.q1asm': 'wait 100\\nstop'}, execution_mode='simulation', branch_assumptions={'a:set_cond:0:1': 'both'},",
+    "    simulation={'startup_delay_ns': 20, 'feedback_queue_capacity': 1,",
+    "        'routes': [{'source': 'a', 'target': 'b', 'id': 1, 'latency_ns': 4}],",
+    "        'inputs': {'feedback': [{'target': 'b', 'time_ns': 0, 'id': 2, 'value': 8}]}})",
+    "print(json.dumps({'datasets': datasets, 'comparison': {'ir': compare, 'html': render_html(compare)}}))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const cause = "LINQ feedback queue overflow (capacity 1).";
+  const title = (time) => `Rejected LINQ arrival · ID 2 · ${time} ns`;
+  const fields = page.locator("#event-inspector-fields");
+  const field = (label) => fields.getByText(label, {exact: true}).locator("xpath=following-sibling::dd[1]");
+  const diagnostic = page.locator('.diagnostic[data-diagnostic-category="feedback_queue_overflow"]');
+  const showEvent = diagnostic.getByRole("link", {name: "Show event"});
+  const svg = (id) => page.locator(`#timeline-root > svg [data-event-id="${id}"]`);
+  const point = (id) => page.locator(`.timeline-point-marker[data-block-id="${id}"]`);
+  const shell = (html) => html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+    /type=["']application\/json["']/i.test(attributes) ? tag : "");
+  for (const {ir, html, mode, time} of datasets) {
+    const [accepted] = ir.events.filter((event) => event.kind === "feedback_receive");
+    const [rejected] = ir.events.filter((event) => event.kind === "feedback_rejected");
+    expect([accepted.meta.id, accepted.meta.value, rejected.meta.id, rejected.meta.value, rejected.meta.input_index])
+      .toEqual([1, 11, 2, 22, 1]);
+    expect(ir.execution.rx).toMatchObject({status: "error", reason: "Feedback queue overflow at 120 ns."});
+    expect(ir.diagnostics.find((item) => item.category === "feedback_queue_overflow").message)
+      .toBe("Simulation execution error: Feedback queue overflow at 120 ns.");
+    expect(ir.events.some((event) => event.kind === "stop")).toBe(false);
+    expect(ir.register_history).toEqual([]);
+    await page.goto("about:blank");
+    await page.setContent(html);
+    await expect(svg(rejected.id).locator("circle")).toBeVisible();
+    await expect(svg(rejected.id).locator("title")).toHaveText(title(time));
+    await expect(diagnostic.locator(".diagnostic-message")).toHaveText(cause);
+    await showEvent.click();
+    await expect(svg(rejected.id)).toHaveClass(/is-selected/);
+    await expect(field("Time range")).toHaveText(`${time} ns`);
+    await expect(field("Error")).toHaveText(cause);
+    if (!mode) continue;
+    await mount(page, "idle", ir, {}, {viewMode: "normal"}, shell(html));
+    await expect(point(rejected.id)).toHaveAttribute("title", `${title(time)}\n${cause}`);
+    await showEvent.click();
+    await expect(point(rejected.id)).toHaveAttribute("aria-selected", "true");
+    await expect(field("Time range")).toHaveText(`${time} ns`);
+    await expect(field("Error")).toHaveText(cause);
+    if (mode === "manual:-4") {
+      await page.getByRole("button", {name: "Local time basis"}).click();
+      await expect(point(rejected.id)).toHaveAttribute("title", `${title(120)}\n${cause}`);
+      await expect(field("Time range")).toHaveText("120 ns");
+      await expect(field("Error")).toHaveText(cause);
+    }
+  }
+  const rejection = comparison.ir.events.find((event) => event.kind === "feedback_rejected");
+  const comparisonTitle = "Execution error · 4 ns · Feedback queue overflow · LINQ ID 1";
+  expect(rejection.meta.branch_comparison_path).toBe("taken");
+  await page.goto("about:blank");
+  await page.setContent(comparison.html);
+  await expect(svg(rejection.id).locator("title")).toHaveText(comparisonTitle);
+  await mount(page, "idle", comparison.ir, {}, {viewMode: "normal"}, shell(comparison.html));
+  await expect(point(rejection.id)).toHaveAttribute("title", comparisonTitle);
+});
+
+test("network conflict diagnostics follow the simulation timeline clock", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const datasets = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json",
+    "from q1timeline.analysis.alignment import align_timelines",
+    "from q1timeline.ir.serialize import timeline_ir_from_states",
+    "from q1timeline.q1asm.parser import parse_q1asm",
+    "from q1timeline.render.html import render_html",
+    "from q1timeline.simulation.runtime import simulate_programs",
+    "source = {'a': 'acquire 0,0,4\\nstop', 'b': 'acquire 0,0,4\\nstop', 'rx': 'wait_trigger 3,4\\nstop'}",
+    "programs = {name: parse_q1asm(code, file=f'{name}.q1asm') for name, code in source.items()}",
+    "config = {'startup_delay_ns': 100, 'trigger_networks': {'rack': {'grid_epoch_ns': 100}},",
+    "    'trigger_routes': [{'source': name, 'target': 'rx', 'address': 3, 'network': 'rack'} for name in ('a', 'b')],",
+    "    'inputs': {'acquisitions': [{'sequencer': name, 'acquisition_index': 0, 'bin_index': 0, 'thresholded': 1} for name in ('a', 'b')]}}",
+    "states = simulate_programs(programs, simulation=config)",
+    "datasets = []",
+    "for mode in ('first_rt_dequeue', 'manual:-4'):",
+    "    align_timelines(states, mode=mode)",
+    "    ir = timeline_ir_from_states(states, project={'alignment_mode': mode})",
+    "    datasets.append({'ir': ir, 'html': render_html(ir)})",
+    "print(json.dumps(datasets))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const rows = page.locator('[data-diagnostic-category="trigger_network_conflict"] .diagnostic-message');
+  const message = (time) => `Trigger network 'rack' has conflicting launch slots at ${time} ns and ${time} ns.`;
+  for (const [index, {ir, html}] of datasets.entries()) {
+    const aligned = index === 0 ? 28 : 124;
+    expect(ir.diagnostics.filter((item) => item.category === "trigger_network_conflict").map((item) => item.message))
+      .toEqual([message(128), message(128)]);
+    await page.setContent(html);
+    await expect(rows).toHaveText([message(aligned), message(aligned)]);
+    const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+      /type=["']application\/json["']/i.test(attributes) ? tag : "");
+    await mount(page, "idle", ir, {}, {viewMode: "normal"}, shell);
+    const overlay = page.locator(".timeline-block[data-diagnostic-message]").first();
+    await expect(rows).toHaveText([message(aligned), message(aligned)]);
+    await expect(overlay).toHaveAttribute("data-diagnostic-message", message(aligned));
+    if (index === 0) {
+      await expect(page.getByRole("button", {name: "Local time basis"})).toBeHidden();
+    } else {
+      await page.getByRole("button", {name: "Local time basis"}).click();
+      await expect(rows).toHaveText([message(128), message(128)]);
+      await expect(overlay).toHaveAttribute("data-diagnostic-message", message(128));
+      await page.getByRole("button", {name: "Aligned time basis"}).click();
+      await expect(rows).toHaveText([message(aligned), message(aligned)]);
+      await mount(page, "idle", ir, {timelineTimeBasis: "local"}, {viewMode: "normal"}, shell);
+      await expect(rows).toHaveText([message(128), message(128)]);
+    }
+  }
+});
+
+test("comparison terminal evidence opens the retained event in both viewers", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const datasets = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json",
+    "from q1timeline.analysis.alignment import align_timelines",
+    "from q1timeline.ir.serialize import timeline_ir_from_states",
+    "from q1timeline.q1asm.parser import parse_q1asm",
+    "from q1timeline.render.html import render_html",
+    "from q1timeline.simulation.runtime import simulate_programs",
+    "cond = 'set_cond 1,1,0,4\\n'",
+    "reset = 'set_cond 0,0,0,4\\n'",
+    "acquire = 'acquire 0,0,4\\n'",
+    "trigger = 'wait_trigger 3,4\\n'",
+    "acquisitions = {'acquisitions': {'readout': {'index': 0, 'num_bins': 1}}}",
+    "def fixture(sources, branch_owner, terminal_owner, route=False, variant=None):",
+    "    programs = {name: parse_q1asm(code, file=f'{name}.q1asm') for name, code in sources.items()}",
+    "    options = {'startup_delay_ns': 100}",
+    "    if route:",
+    "        options.update(trigger_routes=[{'source': 'tx', 'target': 'rx', 'address': 3, 'latency_ns': 8}],",
+    "            inputs={'acquisitions': [{'sequencer': 'tx', 'acquisition_index': 0, 'bin_index': 0, 'i': 1}],",
+    "                    'triggers': [{'target': 'rx', 'address': 3, 'time_ns': 150}]})",
+    "    states = simulate_programs(programs, simulation=options, sequences={name: acquisitions for name in sources},",
+    "        branch_assumptions={f'{branch_owner}:set_cond:0:1': 'both'})",
+    "    align_timelines(states)",
+    "    ir = timeline_ir_from_states(states, project={'alignment_mode': 'first_rt_dequeue'})",
+    "    terminal, = [event for event in ir['events'] if event['kind'] == 'branch_terminal' and event['sequencer_id'] == terminal_owner]",
+    "    if variant:",
+    "        issue, = [event for event in ir['events'] if event['kind'] == 'q1_issue' and event['source']['line'] == 2]",
+    "        outcome = terminal['meta']['comparison_terminal']",
+    "        result_ids = outcome['source_event_ids'] if variant == 'priority' else []",
+    "        outcome['source_event_ids'] = ['missing-evidence', issue['id'], *result_ids]",
+    "    return {'ir': ir, 'html': render_html(ir), 'terminal': terminal, 'variant': variant}",
+    "gate = {'gate': cond + 'acquire_ttl 0,0,1,4\\nstop'}",
+    "print(json.dumps([",
+    "    fixture(gate, 'gate', 'gate'),",
+    "    fixture({'tx': cond + acquire + reset + 'stop', 'rx': trigger + 'stop'}, 'tx', 'rx', route=True),",
+    "    fixture({'tx': acquire + 'stop', 'rx': cond + trigger + reset + 'stop'}, 'rx', 'rx', route=True),",
+    "    fixture({'alone': cond + 'fb_acq_tb_mock 1,1,1,4\\n' + reset + 'wait 20\\nstop'}, 'alone', 'alone'),",
+    "    fixture(gate, 'gate', 'gate', variant='priority'),",
+    "    fixture(gate, 'gate', 'gate', variant='hidden'),",
+    "]))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const fields = page.locator("#event-inspector-fields");
+  const field = (label) => fields.getByText(label, {exact: true}).locator("xpath=following-sibling::dd[1]");
+  const showEvidence = fields.getByRole("button", {name: "Show evidence", exact: true});
+  for (const [index, {ir, html, terminal, variant}] of datasets.entries()) {
+    const outcome = terminal.meta.comparison_terminal;
+    const candidates = (outcome.source_event_ids || []).map((id) => ir.events.find((event) => event.id === id));
+    const result = candidates.find((event) => event?.kind === "acquisition_result");
+    const issue = candidates.find((event) => event?.kind === "q1_issue");
+    expect(result?.sequencer_id).toBe(["gate", "tx", "tx", undefined, "gate", undefined][index]);
+    expect(result?.meta.branch_comparison_path).toBe(["taken", "taken", undefined, undefined, "taken", undefined][index]);
+    const checkInspector = async (evidence) => {
+      await expect(field("Execution status")).toHaveText("blocked");
+      await expect(field("Reason")).toHaveText(outcome.reason);
+      if (evidence) {
+        await showEvidence.click();
+        await expect(field("Sequencer")).toHaveText(evidence.sequencer_id);
+        await expect(field("Lane")).toHaveText(evidence.lane);
+        await expect(showEvidence).toHaveCount(0);
+      } else {
+        await expect(showEvidence).toHaveCount(0);
+      }
+    };
+    await page.setContent(html);
+    for (const mode of ["Normal", "Debug"]) {
+      await analysisDetails(page);
+      await page.getByRole("button", {name: mode, exact: true}).click();
+      const svgEvent = (event) => page.locator(`#timeline-root > svg [data-event-id="${event.id}"]`);
+      await svgEvent(terminal).press("Enter");
+      const evidence = mode === "Debug" ? issue || result : result || issue;
+      await checkInspector(evidence);
+      if (evidence && variant === "hidden" && mode === "Normal") await expect(svgEvent(evidence)).toBeHidden();
+      else if (evidence) await expect(svgEvent(evidence)).toHaveClass(/is-selected/);
+    }
+    const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+      /type=["']application\/json["']/i.test(attributes) ? tag : "");
+    await mount(page, "idle", ir, {}, {viewMode: "normal"}, shell);
+    for (const mode of ["Normal view", "Debug view"]) {
+      await page.getByRole("button", {name: mode, exact: true}).click();
+      if (variant && mode === "Debug view") await expandQ1Sections(page);
+      const block = (event) => page.locator(`.timeline-block[data-block-id="${event.id}"]`);
+      await block(terminal).press("Enter");
+      const evidence = mode === "Debug view" ? issue || result : result || issue;
+      await checkInspector(evidence);
+      if (evidence) {
+        if (variant === "hidden" && mode === "Normal view") await expect(block(evidence)).toBeHidden();
+        else await expect(block(evidence)).toHaveAttribute("aria-selected", "true");
+        expect(await page.evaluate(() => window.messages.filter((item) => item.type === "eventClick").at(-1).eventId))
+          .toBe(evidence.id);
+      }
+    }
+  }
+});
+
 test("external input drafts survive unsolicited host updates and initial errors remain visible", async ({page}) => {
   const trigger = {id: "shot_start", address: 1, targets: ["seq"], times_ns: [1000]};
   const base = {triggers: [trigger], overridden: false, canSave: true};
   await mount(page, "idle", undefined, {}, {externalInputs: {...base, error: "External input calculation failed"}});
   await page.getByRole("button", {name: "Configure external inputs"}).click();
-  const form = page.getByRole("form", {name: "External trigger configuration"});
+  const form = page.getByRole("form", {name: "External input configuration"});
   await expect(form.getByRole("status")).toHaveText("External input calculation failed");
   const times = form.getByLabel("Trigger 1 times (ns)");
   const summary = page.locator("#q1timeline-external-inputs-summary");
@@ -358,7 +1317,7 @@ test("adaptive array plays one shared trigger and reruns changed arrival, addres
   await expect(page.locator("#event-inspector-fields")).toContainText("≈ Scenario input");
   await expect(page.locator("#event-inspector-fields")).toContainText(waits[0].meta.trigger_assumption.event_id);
   await page.getByRole("button", {name: "Configure external inputs"}).click();
-  const form = page.getByRole("form", {name: "External trigger configuration"});
+  const form = page.getByRole("form", {name: "External input configuration"});
   await form.getByLabel("Trigger 1 times (ns)").fill("1500");
   await form.getByRole("button", {name: "Apply & rerun"}).click();
   const edit = await page.evaluate(() => window.messages.findLast((message) => message.type === "setExternalInputs"));
@@ -1494,7 +2453,7 @@ test("branch joins retain known settings and keep physical phase uncertain until
 
 test("a bounded symbolic loop total locates the following RT command without inventing packet times", async ({page}) => {
   const repo = path.resolve(__dirname, "../../..");
-  const program = "and R7,15,R1\nmove 10000,R2\nmove 3,R0\nbody: wait R1\nsub R2,R1,R3\nnop\nwait R3\nadd R1,4,R1\nnop\nloop R0,@body\nupd_param 4\nstop\n";
+  const program = "and R7,15,R1\nnop\nadd R1,4,R1\nnop\nmove 10000,R2\nmove 3,R0\nnop\nbody: wait R1\nsub R2,R1,R3\nnop\nwait R3\nadd R1,4,R1\nnop\nloop R0,@body\nupd_param 4\nstop\n";
   const {ir, html} = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
     "import json", "from q1timeline.analysis.api import analyze_text", "from q1timeline.render.html import render_html",
     `program=${JSON.stringify(program)}`,
@@ -1506,16 +2465,16 @@ test("a bounded symbolic loop total locates the following RT command without inv
   expect(loop.meta.total_only).toBe(true);
   expect(loop.meta.total_duration.value).toBe(30000);
   expect(update.t0.value).toBe(30000);
-  expect(ir.events.find((item) => item.kind === "wait" && item.source.line === 4).duration.kind).not.toBe("concrete");
+  expect(ir.events.find((item) => item.kind === "wait" && item.source.line === 8).duration.kind).not.toBe("concrete");
   const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
     /type=["']application\/json["']/i.test(attributes) ? tag : "");
   await mount(page, "idle", ir, {}, {}, shell);
   await page.evaluate((ids) => window.dispatchEvent(new MessageEvent("message", {data: {
     type: "highlightEventIds", highlightEventIds: ids, zoomToRange: false,
-    sourceRange: {file: "symbolic-total.q1asm", startLine: 11, endLine: 11},
-  }})), ir.events.filter((item) => item.source?.line === 11).map((item) => item.id));
+    sourceRange: {file: "symbolic-total.q1asm", startLine: 15, endLine: 15},
+  }})), ir.events.filter((item) => item.source?.line === 15).map((item) => item.id));
   await expect(page.locator(`.timeline-block[data-event-id="${update.id}"]`)).toHaveAttribute("aria-selected", "true");
-  await expect(page.locator("#event-inspector-fields")).toContainText("symbolic-total.q1asm:11");
+  await expect(page.locator("#event-inspector-fields")).toContainText("symbolic-total.q1asm:15");
   await expect(page.locator("#event-inspector-fields")).toContainText("30000");
 });
 
@@ -2017,6 +2976,7 @@ test("Q1 packet markers connect only their RT execution across selection, layout
   const saved = {timelineFoldStateVersion: 2, timelineFoldSnapshotId: "markers", timelineWaitsCollapsed: false};
   const host = {playbackSnapshotId: "markers"};
   await mount(page, "completed", ir, saved, host);
+  await expandQ1Sections(page);
   const marker = page.locator('.timeline-issue-marker[data-event-id="issue"]');
   const rt = page.locator('.timeline-block[data-event-ids~="path0"]');
   const other = page.locator('.timeline-block[data-event-id="other-rt"]');
@@ -2108,6 +3068,7 @@ test("packet selection follows exact repeated play occurrences from a real playb
   await expect(page.locator(`.timeline-issue-marker[data-event-id="${issues[1].id}"]`)).toHaveCount(0);
   await page.locator(`.timeline-loop-range[data-event-id="${loop.id}"]`).click();
   await page.getByRole("button", {name: "Expand executed iterations", exact: true}).click();
+  await expandQ1Sections(page);
   for (const issue of issues) {
     const targets = ir.events.filter((item) => item.kind === "play" && item.meta.q1_issue_event_id === issue.id);
     expect(targets).toHaveLength(2);
@@ -2128,6 +3089,49 @@ test("packet selection follows exact repeated play occurrences from a real playb
   expect(await page.evaluate(() => JSON.parse(document.getElementById("timeline-ir").textContent))).toEqual(ir);
 });
 
+test("simulation setter navigation selects RT commits instead of carried branch snapshots", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const datasets = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json",
+    "from q1timeline.analysis.api import analyze_text",
+    "from q1timeline.render.html import render_html",
+    "def fixture(rewrite):",
+    "    source = 'set_freq 4000000\\nupd_param 4\\nset_cond 1,1,0,4\\n'",
+    "    source += 'set_freq 4000000\\n' if rewrite else ''",
+    "    source += 'upd_param 8\\nset_cond 0,0,0,0\\nupd_param 4\\nstop'",
+    "    ir = analyze_text(source, file='freq.q1asm', sequencer_id='seq', execution_mode='simulation',",
+    "        branch_assumptions={'seq:set_cond:2:1': 'both'}, simulation={'startup_delay_ns': 100})",
+    "    return {'ir': ir, 'html': render_html(ir), 'rewrite': rewrite}",
+    "print(json.dumps([fixture(rewrite) for rewrite in (False, True)]))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const block = (id) => page.locator(`.timeline-block[data-block-id="${id}"]`);
+  for (const {ir, html, rewrite} of datasets) {
+    const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+      /type=["']application\/json["']/i.test(attributes) ? tag : "");
+    const common = ir.events.find((event) => event.kind === "upd_param" && event.source.line === 2);
+    const executed = ir.events.find((event) => event.kind === "upd_param" && event.source.line === 5 &&
+      event.meta.branch_comparison_path === "taken");
+    const afterSkip = ir.events.filter((event) => event.kind === "upd_param" && event.source.line === 7 &&
+      event.meta.branch_comparison_path !== "taken");
+    await mount(page, "idle", ir, {}, {viewMode: "normal"}, shell);
+    for (const mode of ["Normal view", "Debug view"]) {
+      await page.getByRole("button", {name: mode, exact: true}).click();
+      for (const line of rewrite ? [1, 4] : [1]) {
+        const issue = ir.events.find((event) => event.kind === "q1_issue" && event.source.line === line);
+        const rt = line === 1 ? [common] : [executed, ...afterSkip];
+        const expected = rt.map((event) => event.id).sort();
+        const ids = ir.source_map.by_source[`freq.q1asm:${line}`];
+        await page.evaluate((highlightEventIds) => window.postMessage({type: "highlightEventIds", highlightEventIds}, "*"), ids);
+        await expect.poll(() => page.locator(".timeline-block.is-parameter-apply").evaluateAll((nodes) =>
+          nodes.map((node) => node.dataset.blockId).sort())).toEqual(expected);
+        for (const event of rt) await expect(block(event.id)).toHaveAttribute("aria-selected", "true");
+        if (mode === "Debug view") await expect(block(issue.id)).toHaveAttribute("aria-selected", "true");
+        else await expect(block(issue.id)).toBeHidden();
+      }
+    }
+  }
+});
+
 test("latched parameter circles apply at the RT cursor boundary without adding a lane", async ({page}) => {
   const ir = {sequencers: [{id: "seq"}], playback: {status: "completed", steps: 4}, events: [
     event("initial", "upd_param", 0, 4, {applied_state: {frequency: 20}}),
@@ -2144,6 +3148,7 @@ test("latched parameter circles apply at the RT cursor boundary without adding a
   const saved = {timelineFoldStateVersion: 2, timelineFoldSnapshotId: "latched", timelineWaitsCollapsed: false};
   const host = {playbackSnapshotId: "latched"};
   await mount(page, "completed", ir, saved, host);
+  await expandQ1Sections(page);
   const pending = page.locator('.timeline-parameter-marker[data-parameter-role="pending"][data-event-id="setter"]');
   const applied = page.locator('.timeline-parameter-marker[data-parameter-role="applied"]');
   const setter = page.locator('.timeline-block[data-event-id="setter"]');
@@ -2228,6 +3233,7 @@ test("an older queued parameter applies while a newer setter remains independent
   ]};
   await mount(page, "completed", ir, {timelineWaitsCollapsed: false});
   await page.getByRole("button", {name: "Instruction", exact: true}).click();
+  await expandQ1Sections(page);
   const marker = (id) => page.locator(`.timeline-parameter-marker[data-event-id="${id}"]`);
   const time = page.getByRole("spinbutton", {name: "Selected time in nanoseconds"});
   await time.fill("100");
@@ -2252,7 +3258,7 @@ test("an older queued parameter applies while a newer setter remains independent
 });
 
 function feedbackNavigationFixture() {
-  const feedback = (id, kind, time, sequencer, line) => ({...event(id, kind, time, time),
+  const feedback = (id, kind, time, sequencer, line) => ({...event(id, kind, time, time + (kind === "feedback_com" ? 8 : 0)),
     sequencer_id: sequencer, source: {file: `${sequencer}.q1asm`, line}, lane: "rt.feedback"});
   return {sequencers: [{id: "sender"}, {id: "middle"}, {id: "receiver"}], events: [
     feedback("send", "feedback_com", 80, "sender", 3),
@@ -2429,6 +3435,7 @@ test("intra and multi cast follow RT transmission and queue reception without di
         await expect(page.locator(`.timeline-row-runtime .timeline-block[data-event-id="${item.id}"]`)).toHaveCount(0);
       }
       await expect(page.locator('.timeline-row-runtime .timeline-block').filter({hasText:"fb_pop_data"})).toHaveCount(0);
+      if (mode === "Debug view") await expandQ1Sections(page);
       const q1Pops=page.locator('.timeline-row-q1-issue .timeline-block').filter({hasText:"fb_pop_data"});
       await expect(q1Pops).toHaveCount(4);
       for(const node of await q1Pops.all()) {
@@ -2653,22 +3660,27 @@ async function feedbackPathPoint(path, target) {
   }, target);
 }
 
-test("feedback markers and connector navigate in normal view with hidden instruction blocks", async ({page}) => {
+test("feedback RT blocks and connectors navigate in Normal time scale", async ({page}) => {
   const ir = feedbackNavigationFixture();
   await mount(page, "completed", ir, {timelineWaitsCollapsed: false});
   await page.getByRole("button", {name: "Normal view", exact: true}).click();
-  await expect(page.locator('.timeline-block[data-event-id="send"]')).toBeHidden();
+  const send = page.locator('.timeline-block[data-event-id="send"]');
+  await expect(send).toBeVisible();
   await expect(page.locator('.timeline-block[data-event-id="receive"]')).toBeHidden();
   const source = page.locator('.feedback-endpoint[data-flow-id="cross-flow"][data-feedback-role="source"]');
   const target = page.locator('.feedback-endpoint[data-flow-id="cross-flow"][data-feedback-role="target"]');
   const connector = page.locator('.feedback-connector[data-flow-id="cross-flow"]');
   const inline = page.locator('.feedback-inline-capsule[data-flow-id="inline-flow"]');
   const messages = () => page.evaluate(() => window.messages.filter((message) => ["eventClick", "feedbackFlowClick"].includes(message.type)));
+  await page.evaluate(() => {window.messages = [];});
+  await send.click();
+  expect(await messages()).toEqual([{type: "eventClick", eventId: "send", preserveFocus: true}]);
+  await page.keyboard.press("Escape");
   for (const [marker, role] of [[source, "source"], [target, "target"],
     [inline.locator('.feedback-dot-source'), "source"], [inline.locator('.feedback-dot-target'), "target"]]) {
     const flowId = marker === source || marker === target ? "cross-flow" : "inline-flow";
     await page.evaluate(() => {window.messages = [];});
-    await marker.click();
+    await marker.click(role === "source" ? {position: {x: 1, y: 2}, timeout: 3000} : {timeout: 3000});
     expect(await messages()).toEqual([{type: "feedbackFlowClick", flowId, role}]);
   }
   for (const node of [connector, inline]) {
@@ -2744,5 +3756,528 @@ test("blocks take precedence over feedback marker overlap while exposed marker e
     await page.mouse.click(edge.x + edge.width / 2, edge.y + edge.height - 2);
     expect(await page.evaluate(() => window.messages.filter((message) => ["eventClick", "feedbackFlowClick"].includes(message.type))))
       .toEqual([{type: "feedbackFlowClick", flowId, ...(role ? {role} : {})}]);
+  }
+});
+
+test("pending RT wait tooltips and inspectors show arm and observation cutoff in both viewers", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const datasets = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json", "from q1timeline.analysis.api import analyze_documents, analyze_text", "from q1timeline.render.html import render_html",
+    "trigger = 'wait 20\\nwait_trigger 3,4\\nwait 8\\nstop'",
+    "def run(source, mode, inputs=None, branches=None):",
+    "    return analyze_text(source, file='seq.q1asm', sequencer_id='seq', execution_mode='simulation', alignment_mode=mode,",
+    "        simulation={'startup_delay_ns': 100, 'inputs': inputs or {}}, branch_assumptions=branches)",
+    "sync = analyze_documents({'seq.q1asm': 'wait 20\\nwait_sync 4\\nstop',",
+    "    'peer.q1asm': 'jmp @end\\nwait_sync 4\\nend: wait 40\\nstop'}, execution_mode='simulation',",
+    "    alignment_mode='first_wait_sync', simulation={'startup_delay_ns': 100})",
+    "completed = run(trigger, 'first_wait_trigger', {'triggers': [{'target': 'seq', 'address': 3, 'time_ns': 150}]})",
+    "comparison = run('wait 20\\nset_cond 1,1,0,4\\nwait_trigger 3,4\\nset_cond 0,0,0,4\\nwait 8\\nstop',",
+    "    'manual:-120', branches={'seq:set_cond:1:1': 'both'})",
+    "print(json.dumps([{'ir': ir, 'html': render_html(ir)} for ir in",
+    "    (run(trigger, 'first_wait_trigger'), sync, completed, comparison)]))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const inspector = page.locator("#event-inspector-fields");
+  const time = inspector.getByText("Time range", {exact: true}).locator("xpath=following-sibling::dd[1]");
+  const text = (arm, cutoff, target) => `Arm ${arm} ns → waiting for ${target} (completion unresolved) · observation cutoff ${cutoff} ns`;
+  for (const [index, {ir, html}] of datasets.entries()) {
+    const wait = ir.events.find((item) => item.kind === ["trigger_wait", "sync_wait", "wait_trigger", "trigger_wait"][index]);
+    const cutoff = [120, 140, 154, 120][index];
+    const terminal = ir.events.find((item) => item.kind === "branch_terminal");
+    const target = index === 1 ? "synchronization" : "trigger";
+    const complete = index === 2;
+    expect([wait.t0.value, wait.t1.value, wait.duration.value]).toEqual([120, cutoff, cutoff - 120]);
+    expect(wait.meta.pending === true).toBe(!complete);
+    if (index < 2) expect(ir.alignment.seq.anchor_event_id).toBe(wait.id);
+    expect(Boolean(terminal)).toBe(index === 3);
+    if (terminal) expect(terminal.meta.comparison_terminal.source_event_ids).toEqual([wait.id]);
+    const aligned = text(0, cutoff - 120, target);
+    const local = text(120, cutoff, target);
+
+    await page.setContent(html);
+    await analysisDetails(page);
+    const svgEvent = (id) => page.locator(`#timeline-root > svg [data-event-id="${id}"]`);
+    const svgWait = svgEvent(wait.id);
+    await expect(svgWait.locator("title")).toContainText(complete ? "aligned time: Arm 0 ns · Trigger arrival 30 ns · Complete 34 ns" : `aligned time: ${aligned}`);
+    if (!complete) await expect(svgWait.locator("title")).toContainText(`observed duration: ${cutoff - 120}`);
+    if (terminal) {
+      await svgEvent(terminal.id).press("Enter");
+      await inspector.getByRole("button", {name: "Show evidence", exact: true}).click();
+    } else {
+      await svgWait.locator("rect").click();
+    }
+    await expect(svgWait).toHaveClass(/is-selected/);
+    await expect(time).toHaveText(complete ? "Arm 0 ns · Trigger arrival 30 ns · Complete 34 ns" : aligned);
+
+    const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+      /type=["']application\/json["']/i.test(attributes) ? tag : "");
+    await mount(page, "idle", ir, {timelineWaitsCollapsed: false}, {viewMode: "normal"}, shell);
+    const block = (id) => page.locator(`.timeline-block[data-event-id="${id}"]`);
+    const waitBlock = block(wait.id);
+    const alignedTiming = complete ? "Arm 0 ns · Trigger arrival 30 ns · Complete 34 ns" : aligned;
+    const localTiming = complete ? "Arm 120 ns · Trigger arrival 150 ns · Complete 154 ns" : local;
+    await expect(waitBlock).toHaveAttribute("title", new RegExp(alignedTiming.replace(/[()]/g, "\\$&")));
+    if (terminal) {
+      await block(terminal.id).press("Enter");
+      await inspector.getByRole("button", {name: "Show evidence", exact: true}).click();
+    } else {
+      await waitBlock.press("Enter");
+    }
+    await expect(waitBlock).toHaveAttribute("aria-selected", "true");
+    await expect(time).toHaveText(alignedTiming);
+    await page.getByRole("button", {name: "Local time basis"}).click();
+    await expect(waitBlock).toHaveAttribute("aria-selected", "true");
+    await expect(time).toHaveText(localTiming);
+    await expect(waitBlock).toHaveAttribute("title", new RegExp(localTiming.replace(/[()]/g, "\\$&")));
+    expect(await page.evaluate(() => JSON.parse(document.getElementById("timeline-ir").textContent))).toEqual(ir);
+  }
+});
+
+test("RT phase and zero queue bounds follow the active VS Code time basis", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const datasets = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import copy, json",
+    "from q1timeline.analysis.api import analyze_documents, analyze_text",
+    "from q1timeline.playback import PlaybackSession",
+    "from q1timeline.render.html import render_html",
+    "source = 'wait 20\\nwait_trigger 2,4\\nwait 8\\nstop'",
+    "sim = {'startup_delay_ns': 100, 'inputs': {'triggers': [{'target': 'seq', 'address': 2, 'time_ns': 150}]}}",
+    "def run(source, scenario=sim, **options):",
+    "    return analyze_text(source, file='seq.q1asm', sequencer_id='seq', execution_mode='simulation',",
+    "        alignment_mode='manual:-100', simulation=scenario, **options)",
+    "compare = run('wait 20\\nset_cond 1,1,0,0\\nwait_trigger 2,0\\nset_cond 0,0,0,0\\nwait 8\\nstop',",
+    "    branch_assumptions={'seq:set_cond:1:1': 'both'})",
+    "sync = analyze_documents({'seq.q1asm': 'wait 20\\nwait_sync 4\\nstop', 'peer.q1asm': 'wait 40\\nwait_sync 4\\nstop'},",
+    "    execution_mode='simulation', alignment_mode='manual:-100', simulation={'startup_delay_ns': 100})",
+    "cutoff = run(source.replace('2,4', '2,40'), scenario={**sim, 'max_time_ns': 160})",
+    "sync_cutoff = analyze_documents({'seq.q1asm': 'wait 20\\nwait_sync 40\\nstop', 'peer.q1asm': 'wait 40\\nwait_sync 4\\nstop'},",
+    "    execution_mode='simulation', alignment_mode='manual:-100', simulation={'startup_delay_ns': 100, 'max_time_ns': 160})",
+    "limit = {'startup_delay_ns': 100, 'max_time_ns': 160}",
+    "clipped_wait = run('wait 20\\nwait 100\\nwait 8\\nstop', scenario=limit)",
+    "invalid_cutoff = copy.deepcopy(clipped_wait)",
+    "next(e for e in invalid_cutoff['events'] if e['meta'].get('planned_rt_end_ns'))['meta']['observation_cutoff_ns'] = 156",
+    "clipped_play = analyze_documents({'seq.q1asm': 'wait 20\\nplay 0,1,100\\nwait 8\\nstop',",
+    "    'peer.q1asm': 'wait 40\\nstop'}, execution_mode='simulation', alignment_mode='manual:-100', simulation=limit)",
+    "late = run('upd_param 0\\n' + 'nop\\n' * 28 + 'wait 8\\nstop')",
+    "interrupted = run('wait 20\\nwait_trigger 2,40\\n' + 'nop\\n' * 36 + 'illegal')",
+    "legacy = copy.deepcopy(late)",
+    "next(event for event in legacy['events'] if event['kind'] == 'upd_param')['meta'].pop('next_dequeue_not_before_ns')",
+    "nominal = analyze_text('wait_trigger 2,4\\nupd_param 0\\nwait 8\\nstop', file='seq.q1asm', sequencer_id='seq')",
+    "play = PlaybackSession({'seq': ('seq.q1asm', source.replace('wait 8', 'upd_param 0\\nwait 8'))}, alignment_mode='manual:-4',",
+    "    external_inputs={'triggers': [{'id': 'gate', 'address': 2, 'targets': ['seq'], 'times_ns': [50]}]})",
+    "play.run()",
+    "datasets = {'trigger': run(source), 'compare': compare, 'sync': sync, 'cutoff': cutoff, 'syncCutoff': sync_cutoff,",
+    "    'clippedWait': clipped_wait, 'invalidCutoff': invalid_cutoff, 'clippedPlay': clipped_play,",
+    "    'late': late, 'legacy': legacy,",
+    "    'nominal': nominal, 'interrupted': interrupted, 'play': play.snapshot()}",
+    "print(json.dumps({name: {'ir': ir, 'html': render_html(ir)} for name, ir in datasets.items()}))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, maxBuffer: 4 * 1024 * 1024,
+    env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const clipped = datasets.cutoff.ir.events.find((item) => item.kind === "wait_trigger");
+  expect([clipped.t1.value, clipped.meta.observation_cutoff_ns, clipped.meta.planned_rt_end_ns]).toEqual([160, 160, 190]);
+  const checks = {
+    trigger: [["wait_trigger", "seq", undefined, "Arm 20 ns · Trigger arrival 50 ns · Complete 54 ns",
+      "Arm 120 ns · Trigger arrival 150 ns · Complete 154 ns"]],
+    compare: [
+      ["wait_trigger", "seq", "taken", "Arm 20 ns · Trigger arrival 50 ns · Complete 50 ns · Earliest next dequeue 54 ns",
+        "Arm 120 ns · Trigger arrival 150 ns · Complete 150 ns · Earliest next dequeue 154 ns"],
+      ["conditional_skip", "seq", "fallthrough", "20 -> 20 · Earliest next dequeue 24 ns", "120 -> 120 · Earliest next dequeue 124 ns"],
+    ],
+    sync: [
+      ["wait_sync", "seq", undefined, "Arm 20 ns · Barrier release 40 ns · Complete 44 ns",
+        "Arm 120 ns · Barrier release 140 ns · Complete 144 ns"],
+      ["wait_sync", "peer", undefined, "Arm 40 ns · Barrier release 40 ns · Complete 44 ns",
+        "Arm 140 ns · Barrier release 140 ns · Complete 144 ns"],
+    ],
+    cutoff: [["wait_trigger", "seq", undefined, "Arm 20 ns · Trigger arrival 50 ns · Observation cutoff 60 ns · Planned end 90 ns",
+      "Arm 120 ns · Trigger arrival 150 ns · Observation cutoff 160 ns · Planned end 190 ns"]],
+    syncCutoff: [
+      ["wait_sync", "seq", undefined, "Arm 20 ns · Barrier release 40 ns · Observation cutoff 60 ns · Planned end 80 ns",
+        "Arm 120 ns · Barrier release 140 ns · Observation cutoff 160 ns · Planned end 180 ns"],
+      ["wait_sync", "peer", undefined, "Arm 40 ns · Barrier release 40 ns · Complete 44 ns",
+        "Arm 140 ns · Barrier release 140 ns · Complete 144 ns"],
+    ],
+    clippedWait: [["wait", "seq", undefined, "Start 20 ns · Observation cutoff 60 ns · Planned end 120 ns",
+      "Start 120 ns · Observation cutoff 160 ns · Planned end 220 ns", 2]],
+    invalidCutoff: [["wait", "seq", undefined, "20 -> 60", "120 -> 160", 2]],
+    clippedPlay: [
+      ["play", "seq", undefined, "Start 20 ns · Observation cutoff 60 ns · Planned end 120 ns",
+        "Start 120 ns · Observation cutoff 160 ns · Planned end 220 ns"],
+      ["wait", "peer", undefined, "0 -> 40", "100 -> 140"],
+    ],
+    late: [["upd_param", "seq", undefined, "0 -> 0 · Earliest next dequeue 4 ns", "100 -> 100 · Earliest next dequeue 104 ns"],
+      ["wait", "seq", undefined, "20 -> 28", "120 -> 128"]],
+    legacy: [["upd_param", "seq", undefined, "0 -> 0", "100 -> 100"]],
+    nominal: [["upd_param", "seq", undefined, "Nominal RT 4 → 4 (trigger arrival unresolved) · Nominal earliest next dequeue 8 ns"]],
+    interrupted: [["wait_trigger", "seq", undefined, "20 -> 56", "120 -> 156"]],
+    play: [["wait_trigger", "seq", undefined, "16 -> 50", "20 -> 54"],
+      ["upd_param", "seq", undefined, "50 -> 50 · Earliest next dequeue 54 ns", "54 -> 54 · Earliest next dequeue 58 ns"]],
+  };
+  const inspector = page.locator("#event-inspector-fields");
+  const range = inspector.getByText("Time range", {exact: true}).locator("xpath=following-sibling::dd[1]");
+  const timingTitle = (timing) => new RegExp(timing.replace(/[()]/g, "\\$&")
+    .replace(/(\d+) (->|→) (\d+)/, "$1(?: ns)? $2 $3(?: ns)?") + "(?=\\n|$)");
+  for (const [name, cases] of Object.entries(checks)) {
+    const {ir, html} = datasets[name];
+    const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+      /type=["']application\/json["']/i.test(attributes) ? tag : "");
+    await mount(page, "idle", ir, {timelineWaitsCollapsed: false}, {viewMode: "normal"}, shell);
+    const timeWindow = page.locator("#q1timeline-time-window");
+    if (name.startsWith("clipped")) await expect(timeWindow).toHaveAttribute("title", /\.\.60 ns$/);
+    if (name === "clippedWait" || name === "invalidCutoff") {
+      await page.locator('.diagnostic[data-diagnostic-category="simulation_time_limit"]')
+        .getByRole("link", {name: "Show event"}).click();
+    }
+    for (const [kind, sequencer, comparisonPath, aligned, local, sourceLine] of cases) {
+      const event = ir.events.find((item) => item.kind === kind && item.sequencer_id === sequencer &&
+        item.meta.branch_comparison_path === comparisonPath && (sourceLine === undefined || item.source.line === sourceLine));
+      expect(event, `${name} ${kind} ${sequencer}`).toBeTruthy();
+      const block = page.locator(`.timeline-block[data-event-id="${event.id}"]`);
+      await expect(block).toHaveAttribute("title", timingTitle(aligned));
+      if (kind === "play") {
+        const ids = ir.events.filter((item) => item.kind === "play").map((item) => item.id);
+        expect(ids).toHaveLength(2);
+        await expect(block).toHaveAttribute("data-event-ids", ids.join(" "));
+        await expect(block).toHaveAttribute("title", /^play p0 .+ \/ p1 .+ \| /);
+      }
+      await block.press("Enter");
+      await expect(range).toHaveText(aligned);
+      if (local) {
+        await page.getByRole("button", {name: "Local time basis"}).click();
+        await expect(block).toHaveAttribute("aria-selected", "true");
+        await expect(range).toHaveText(local);
+        await expect(block).toHaveAttribute("title", timingTitle(local));
+        if (name.startsWith("clipped")) await expect(timeWindow).toHaveAttribute("title", /\.\.160 ns$/);
+        await page.getByRole("button", {name: "Aligned time basis"}).click();
+      }
+    }
+    expect(await page.evaluate(() => JSON.parse(document.getElementById("timeline-ir").textContent))).toEqual(ir);
+  }
+});
+
+test("clipped Q1 issues preserve read evidence and distinguish their cutoff and planned end", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const fixtures = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json",
+    "from q1timeline.analysis.api import analyze_text",
+    "from q1timeline.render.html import render_html",
+    "prefix = 'move 3,R0\\nnop\\n'",
+    "suffix = 'add R0,1,R1\\nstop'",
+    "def run(source, cutoff, startup=100, alignment=None):",
+    "    ir = analyze_text(source, file='seq.q1asm', sequencer_id='seq', execution_mode='simulation', alignment_mode=alignment,",
+    "        simulation={'startup_delay_ns': startup, 'max_time_ns': cutoff})",
+    "    return {'ir': ir, 'html': render_html(ir, default_mode='debug')}",
+    "print(json.dumps({'clipped': run(prefix + suffix, 12), 'exact': run(prefix + suffix, 20),",
+    "    'shared': run('wait 20\\n' + prefix + 'cmp R0,3\\n' + suffix, 32, 28, 'manual:-28'),",
+    "    'fault': run(prefix + 'illegal', 24)}))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const timing = (start, cutoff, planned) => `Issue ${start} ns · Observation cutoff ${cutoff} ns · Planned end ${planned} ns`;
+  const inspector = page.locator("#event-inspector-fields");
+  const time = inspector.getByText("Time range", {exact: true}).locator("xpath=following-sibling::dd[1]");
+  const q1Detail = page.locator('[data-value="instruction-detail"]');
+  for (const [name, {ir, html}] of Object.entries(fixtures)) {
+    const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+      /type=["']application\/json["']/i.test(attributes) ? tag : "");
+    const issue = ir.events.find((item) => item.kind === "q1_issue" && item.meta.op === (name === "fault" ? "illegal" : "add"));
+    const incomplete = name === "clipped" || name === "shared";
+    expect(Boolean(issue.meta.planned_q1_end_ns)).toBe(incomplete);
+    if (incomplete) {
+      expect(issue.meta.pending_register_ready_ns.R1).toBe(issue.meta.planned_q1_end_ns + 4);
+      expect(ir.register_history.some((write) => write.register === "R1")).toBe(false);
+    }
+    await mount(page, "idle", ir, {timelineWaitsCollapsed: false, hardwareState: {level: "detail", sequencerId: "seq", time: 0}}, {}, shell);
+    await expandQ1Sections(page);
+    const block = page.locator(`.timeline-block[data-block-id="${issue.id}"]`);
+    await block.press("Enter");
+    if (incomplete) {
+      const expected = name === "clipped" ? timing(8, 12, 20) : timing(-4, 4, 8);
+      await expect(time).toHaveText(expected);
+      await expect(block).toHaveAttribute("title", new RegExp(expected));
+      await expect(q1Detail).toContainText("Read at issue: R0 = 3");
+      await expect(q1Detail).toContainText(name === "clipped" ? "Flags before → after: unknown → unobserved"
+        : "Flags before → after: ZF=1 NF=0 CF=0 OF=0 → unobserved");
+      await expect(page.locator('[data-register="R0"] strong')).toHaveText("3");
+      await expect(page.locator('[data-register="R1"] strong')).toHaveText("?");
+      if (name === "shared") {
+        await page.getByRole("button", {name: "Local time basis"}).click();
+        await expect(block).toHaveAttribute("aria-selected", "true");
+        await expect(time).toHaveText(timing(24, 32, 36));
+        await expect(block).toHaveAttribute("title", new RegExp(timing(24, 32, 36)));
+        await expect(q1Detail).toContainText("ZF=1 NF=0 CF=0 OF=0 → unobserved");
+      }
+    } else if (name === "exact") {
+      await expect(time).toHaveText("8 -> 20");
+      await expect(q1Detail).toContainText("Flags before → after: unknown → ZF=0 NF=0 CF=0 OF=0");
+    } else {
+      await expect(time).toHaveText("8 -> 12");
+      await expect(inspector).toContainText("SEQUENCE_PROCESSOR_RT_EXEC_ILLEGAL_INSTRUCTION");
+      await expect(q1Detail).not.toContainText("unobserved");
+    }
+    expect(await page.evaluate(() => JSON.parse(document.getElementById("timeline-ir").textContent))).toEqual(ir);
+  }
+});
+
+test("routed LINQ rejection reveals the exact sending RT command", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const fixtures = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json",
+    "from q1timeline.analysis.api import analyze_documents",
+    "from q1timeline.render.html import render_html",
+    "base = {'startup_delay_ns': 100, 'feedback_queue_capacity': 1}",
+    "route = {**base, 'routes': [{'source': 'tx', 'target': 'rx', 'id': 16, 'latency_ns': 20}]}",
+    "rx = {'rx.q1asm': 'wait 100\\nstop'}",
+    "def run(documents, scenario, branches=None):",
+    "    ir = analyze_documents(documents, execution_mode='simulation', simulation=scenario, branch_assumptions=branches)",
+    "    return {'ir': ir, 'html': render_html(ir)}",
+    "first = 'fb_com_data 16,11,4\\n'",
+    "second = 'fb_com_data 16,22,4\\n'",
+    "routed = run({**rx, 'tx.q1asm': first + second + 'stop'}, route)",
+    "compare = run({**rx, 'tx.q1asm': first + 'set_cond 1,1,0,4\\n' + second + 'set_cond 0,0,0,0\\nstop'},",
+    "    route, {'tx:set_cond:1:1': 'both'})",
+    "scenario = run(rx, {**base, 'inputs': {'feedback': [{'target': 'rx', 'time_ns': time, 'id': 16, 'value': time}",
+    "    for time in (120, 124)]}})",
+    "print(json.dumps({'routed': routed, 'compare': compare, 'scenario': scenario}))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const rejection = (ir) => ir.events.find((item) => item.kind === "feedback_rejected");
+  const sender = (ir) => {
+    const send = ir.events.find((item) => item.id === rejection(ir).meta.source_event_id);
+    return ir.events.find((item) => item.kind === "fb_com_data" && item.meta.rt_packet_id === send.meta.source_packet_id);
+  };
+  for (const name of ["missing", "ambiguous"]) {
+    const fixture = structuredClone(fixtures.routed);
+    if (name === "missing") rejection(fixture.ir).meta.source_event_id = "unretained:send";
+    else fixture.ir.events.push({...sender(fixture.ir), id: "tx:duplicate-sender"});
+    fixtures[name] = fixture;
+  }
+
+  const fields = page.locator("#event-inspector-fields");
+  const showSender = fields.getByRole("button", {name: "Show sender", exact: true});
+  const block = (id) => page.locator(`.timeline-block[data-block-id="${id}"]`);
+  for (const [name, {ir, html}] of Object.entries(fixtures)) {
+    const rejected = rejection(ir);
+    expect(rejected.t0.value).toBe(124);
+    const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+      /type=["']application\/json["']/i.test(attributes) ? tag : "");
+    await mount(page, "idle", ir, {}, {viewMode: "normal"}, shell);
+    await block(rejected.id).press("Enter");
+    await expect(block(rejected.id)).toHaveAttribute("aria-selected", "true");
+    if (name !== "routed" && name !== "compare") {
+      await expect(showSender).toHaveCount(0);
+      continue;
+    }
+    const command = sender(ir);
+    const line = name === "compare" ? 3 : 2;
+    expect(command.source.line).toBe(line);
+    expect(command.meta.branch_comparison_path).toBe(name === "compare" ? "taken" : undefined);
+    await expect(block(rejected.meta.source_event_id)).toHaveCount(0);
+    await page.evaluate(() => {window.messages = [];});
+    await showSender.click();
+    await expect(block(command.id)).toHaveAttribute("aria-selected", "true");
+    await expect(block(rejected.id)).toHaveAttribute("aria-selected", "false");
+    await expect(fields).toContainText(`tx.q1asm:${line}`);
+    expect(await page.evaluate(() => window.messages.filter((message) => message.type === "eventClick")))
+      .toEqual([{type: "eventClick", eventId: command.id}]);
+    if (name === "routed") {
+      await page.locator('.diagnostic[data-diagnostic-category="feedback_queue_overflow"]')
+        .getByRole("link", {name: "Show event"}).click();
+      await expect(block(rejected.id)).toHaveAttribute("aria-selected", "true");
+      await expect(showSender).toBeVisible();
+    }
+  }
+});
+
+test("comparison terminal actions reveal distinct RT cutoff and acquisition evidence", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const {ir, html} = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json",
+    "from q1timeline.analysis.api import analyze_text",
+    "from q1timeline.render.html import render_html",
+    "program = ('set_cond 1,1,0,4\\nfb_tdc_tdelta_id 16,4\\nset_cond 0,0,0,4\\nacquire_timetags 0,0,1,0,8\\n'",
+    "    'acquire_timetags 0,0,0,1025,4\\nwait 4\\nwait 100\\nstop')",
+    "edge = 107 * 128 + 1",
+    "trace = {'initial_level': 0, 'transitions': [{'time_ticks': edge, 'level': 1}, {'time_ticks': edge + 1, 'level': 0}]}",
+    "ir = analyze_text(program, file='tags.q1asm', sequencer_id='tags', execution_mode='simulation',",
+    "    branch_assumptions={'tags:set_cond:0:1': 'both'}, sequence={'acquisitions': {'result': {'index': 0, 'num_bins': 1}}},",
+    "    simulation={'startup_delay_ns': 100, 'inputs': {'digital': {'tags': trace}}})",
+    "print(json.dumps({'ir': ir, 'html': render_html(ir)}))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const terminal = ir.events.find((event) => event.kind === "branch_terminal");
+  const outcome = terminal.meta.comparison_terminal;
+  const [result, cutoff] = outcome.source_event_ids.map((id) => ir.events.find((event) => event.id === id));
+  const skip = ir.events.find((event) => event.kind === "wait" && event.source.line === cutoff.source.line &&
+    event.meta.branch_comparison_path === "fallthrough");
+  const shared = ir.events.find((event) => event.kind === "q1_issue" && event.meta.op === "set_cond" && event.source.line === 3);
+  expect([result.kind, result.meta.timetag_ticks, cutoff.kind, cutoff.meta.observation_cutoff_ns])
+    .toEqual(["acquisition_result", 385, "wait", 120 + 1 / 128]);
+  outcome.source_event_ids = [skip.id, "missing-evidence", result.id, cutoff.id, cutoff.id, shared.id];
+
+  const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+    /type=["']application\/json["']/i.test(attributes) ? tag : "");
+  await mount(page, "idle", ir, {}, {viewMode: "normal"}, shell);
+  const fields = page.locator("#event-inspector-fields");
+  const block = (event) => page.locator(`.timeline-block[data-block-id="${event.id}"]`);
+  const action = (name) => fields.getByRole("button", {name, exact: true});
+  const show = async (label, event) => {
+    await page.evaluate(() => {window.messages = [];});
+    await action(label).click();
+    await expect(block(event)).toHaveAttribute("aria-selected", "true");
+    expect(await page.evaluate(() => window.messages.filter((item) => item.type === "eventClick")))
+      .toEqual([{type: "eventClick", eventId: event.id}]);
+  };
+  for (const mode of ["Normal view", "Debug view"]) {
+    await page.getByRole("button", {name: mode, exact: true}).click();
+    if (mode === "Normal view") {
+      await expect(block(cutoff)).toBeHidden();
+      const filter = page.locator("#event-filter");
+      await filter.fill("branch_terminal");
+      await block(terminal).press("Enter");
+      await expect(action("Show RT cutoff")).toHaveCount(0);
+      await filter.fill("");
+    }
+    await block(terminal).press("Enter");
+    await expect(action("Show evidence")).toHaveCount(1);
+    await expect(action("Show RT cutoff")).toHaveCount(1);
+    await expect(action("Show Q1 issue")).toHaveCount(mode === "Debug view" ? 1 : 0);
+    await expect(action("Show wait")).toHaveCount(0);
+    await show("Show evidence", result);
+    await block(terminal).press("Enter");
+    await show("Show RT cutoff", cutoff);
+    await expect(fields).toContainText("Observation cutoff 20.0078125 ns");
+    await expect(page.locator(`.timeline-block[data-block-id="${skip.id}"][aria-selected="true"]`)).toHaveCount(0);
+    if (mode === "Debug view") {
+      await expect(block(shared)).toBeHidden();
+      await block(terminal).press("Enter");
+      await show("Show Q1 issue", shared);
+    }
+  }
+});
+
+test("NetZero result inspector separates observed compensation and its plan", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const fixtures = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json",
+    "from q1timeline.analysis.api import analyze_text",
+    "from q1timeline.render.html import render_html",
+    "source = 'set_awg_offs 16384,0\\nupd_param 8\\nset_awg_offs 0,0\\nplay_netzero 100,0\\nstop'",
+    "physical = {'sample_period_ns': 1, 'sequencers': {'seq': {'netzero': {'module_type': 'QCM', 'outputs': [",
+    "    {'output': 0, 'path': 0, 'enabled': True, 'ihp_enabled': True, 'amplitude': .5, 'slew_rate_per_s': 2.5e8}]}}}}",
+    "def run(program, cutoff, options=None, branches=None):",
+    "    ir = analyze_text(program, file='seq.q1asm', sequencer_id='seq', execution_mode='simulation',",
+    "        alignment_mode='manual:-100', branch_assumptions=branches, simulation={",
+    "            'startup_delay_ns': 100, 'max_time_ns': cutoff, **(options if options is not None else {'physical': physical})})",
+    "    return {'ir': ir, 'html': render_html(ir)}",
+    "print(json.dumps({'limited': run(source, 112), 'compared': run(source.replace('play_netzero',",
+    "    'set_cond 1,1,0,0\\nplay_netzero'), 112, branches={'seq:set_cond:3:1': 'both'}),",
+    "    'equal': run(source.replace('stop', 'wait 100\\nstop'), 200, {'physical': physical, 'feedback_queue_capacity': 1,",
+    "        'inputs': {'feedback': [{'target': 'seq', 'time_ns': 117, 'id': i, 'value': i} for i in (1, 2)]}}),",
+    "    'completed': run(source, 200), 'unmodeled': run(source, 200, {})}))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, maxBuffer: 4 * 1024 * 1024,
+    env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const inspector = page.locator("#event-inspector-fields");
+  const field = (name) => inspector.getByText(name, {exact: true}).locator("xpath=following-sibling::dd[1]");
+  const block = (id) => page.locator(`.timeline-block[data-block-id="${id}"]`);
+  const timing = (cutoff, planned) => `Observation cutoff ${cutoff} ns · Planned end ${planned} ns`;
+  for (const [name, {ir, html}] of Object.entries(fixtures)) {
+    const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+      /type=["']application\/json["']/i.test(attributes) ? tag : "");
+    const result = ir.events.find((event) => event.kind === "netzero_result" &&
+      (name !== "compared" || event.meta.branch_comparison_path === "taken"));
+    await mount(page, "idle", ir, {}, {viewMode: "normal"}, shell);
+    const viewport = page.locator("#q1timeline-time-window");
+    if (name === "limited") {
+      await expect(viewport).toHaveAttribute("title", /\.\.12 ns$/);
+      await page.locator('.diagnostic[data-diagnostic-category="simulation_time_limit"]')
+        .getByRole("link", {name: "Show event"}).click();
+    } else if (name === "compared") {
+      const terminal = ir.events.find((event) => event.kind === "branch_terminal" && event.meta.branch_comparison_path === "taken");
+      await block(terminal.id).press("Enter");
+      await inspector.getByRole("button", {name: "Show evidence", exact: true}).click();
+    } else await block(result.id).press("Enter");
+    await expect(block(result.id)).toHaveAttribute("aria-selected", "true");
+    if (name === "completed" || name === "unmodeled") {
+      await expect(field("Compensation timing")).toHaveCount(0);
+      await expect(field("Planned compensation area")).toHaveCount(0);
+      continue;
+    }
+    const cutoff = name === "equal" ? 17 : 12;
+    await expect(field("Time range")).toHaveText(`8 -> ${cutoff}`);
+    await expect(field("Compensation timing")).toHaveText(timing(cutoff, 17));
+    await expect(field("Observed compensation area")).toHaveText(`${name === "equal" ? -4 : -1.75} normalized full scale × ns`);
+    await expect(field("Planned compensation area")).toHaveText("-4 normalized full scale × ns");
+    await page.getByRole("button", {name: "Local time basis"}).click();
+    await expect(block(result.id)).toHaveAttribute("aria-selected", "true");
+    await expect(field("Compensation timing")).toHaveText(timing(cutoff + 100, 117));
+    if (name === "limited") await expect(viewport).toHaveAttribute("title", /\.\.112 ns$/);
+  }
+});
+
+test("TB rejection diagnostic links reveal each retained contributor and local cutoff", async ({page}) => {
+  const repo = path.resolve(__dirname, "../../..");
+  const fixtures = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json",
+    "from q1timeline.analysis.alignment import align_timelines",
+    "from q1timeline.analysis.interpreter import prepare_def_program",
+    "from q1timeline.ir.serialize import timeline_ir_from_states",
+    "from q1timeline.q1asm.parser import parse_q1asm",
+    "from q1timeline.render.html import render_html",
+    "from q1timeline.simulation.runtime import simulate_programs",
+    "sender = 'fb_acq_tb_id 16,4\\nfb_acq_tb_cfg 1,0,1,4\\nacquire 0,0,8\\nwait 100\\nstop'",
+    "def run(shift=0, prepared=False, partial=False):",
+    "    sources = {'a': sender, 'b': sender.replace('1,0,1,4', f'1,{shift},1,4'), 'rx': 'wait 100\\nstop'}",
+    "    programs = {name: parse_q1asm(source, file=f'{name}.q1asm') for name, source in sources.items()}",
+    "    bindings = {name: prepare_def_program(program, params={}, strict_q1asm=False, varying=set())",
+    "        for name, program in programs.items()} if prepared else None",
+    "    states = simulate_programs(programs, prepared_programs=bindings, simulation={'startup_delay_ns': 100,",
+    "        'routes': [{'source': name, 'target': 'rx', 'id': 16, 'latency_ns': 5} for name in ('a', 'b')],",
+    "        'inputs': {'acquisitions': [{'sequencer': name, 'acquisition_index': 0, 'bin_index': 0,",
+    "            'thresholded': 1} for name in ('a', 'b')]}})",
+    "    align_timelines(states)",
+    "    ir = timeline_ir_from_states(states, project={'alignment_mode': 'first_rt_dequeue'})",
+    "    if partial:",
+    "        ir['events'] = [e for e in ir['events'] if not (e['kind'] == 'feedback_contribution' and e['sequencer_id'] == 'b')]",
+    "        retained = {event['id'] for event in ir['events']}",
+    "        for diagnostic in ir['diagnostics']:",
+    "            diagnostic['related_events'] = [id for id in diagnostic.get('related_events', ()) if id in retained]",
+    "    return {'ir': ir, 'html': render_html(ir)}",
+    "print(json.dumps({'collision': run(), 'partial': run(partial=True), 'prepared': run(prepared=True), 'success': run(2)}))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, maxBuffer: 4 * 1024 * 1024,
+    env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+  const row = (name) => page.locator('.diagnostic[data-diagnostic-category="feedback_write_combine"]').filter({hasText: `${name}.q1asm:`});
+  const block = (id) => page.locator(`.timeline-block[data-block-id="${id}"]`);
+  for (const [name, {ir, html}] of Object.entries(fixtures)) {
+    const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+      /type=["']application\/json["']/i.test(attributes) ? tag : "");
+    await mount(page, "idle", ir, {}, {viewMode: "normal"}, shell);
+    if (name !== "collision") {
+      const links = page.locator("a[data-tb-evidence]:visible");
+      if (name === "partial") {
+        await expect(row("rx").getByRole("link", {name: "Show a contribution", exact: true})).toBeVisible();
+        await expect(row("rx").getByRole("link", {name: "Show b contribution", exact: true})).toHaveCount(0);
+        await expect(row("rx").getByRole("link", {name: "Show rx RT cutoff", exact: true})).toBeVisible();
+      } else await expect(links).toHaveCount(0);
+      continue;
+    }
+    const [a, b] = ir.events.filter((event) => event.kind === "feedback_contribution");
+    const cutoff = (sequencer) => ir.events.find((event) => event.sequencer_id === sequencer &&
+      event.kind === "wait" && event.meta.observation_cutoff_ns === 116);
+    const reveal = async (owner, label, target) => {
+      await page.evaluate(() => {window.messages = [];});
+      await row(owner).getByRole("link", {name: label, exact: true}).click();
+      await expect(block(target.id)).toHaveAttribute("aria-selected", "true");
+      expect(await page.evaluate(() => window.messages.filter((item) => item.type === "eventClick")))
+        .toEqual([{type: "eventClick", eventId: target.id}]);
+    };
+    await reveal("rx", "Show event", a);
+    for (const mode of ["Normal view", "Debug view"]) {
+      await page.getByRole("button", {name: mode, exact: true}).click();
+      await reveal("rx", "Show a contribution", a);
+      await reveal("rx", "Show b contribution", b);
+      await reveal("rx", "Show rx RT cutoff", cutoff("rx"));
+      await reveal("a", "Show a RT cutoff", cutoff("a"));
+    }
+    const filter = page.locator("#event-filter");
+    await filter.fill("feedback_contribution");
+    await expect(row("rx").getByRole("link", {name: "Show a contribution", exact: true})).toBeVisible();
+    await expect(row("rx").getByRole("link", {name: "Show rx RT cutoff", exact: true})).toHaveCount(0);
+    await expect(row("rx").getByRole("link", {name: "Show event", exact: true})).toBeVisible();
   }
 });

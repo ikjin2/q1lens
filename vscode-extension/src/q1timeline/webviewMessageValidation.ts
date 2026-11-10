@@ -1,5 +1,5 @@
 // @ts-nocheck
-const { validExternalTriggers } = require("./externalInputs");
+const { validExternalFeedback, validExternalTriggers } = require("./externalInputs");
 function hasOnlyKeys(message, keys) {
   const allowed = new Set(keys);
   return Object.keys(message).every((key) => allowed.has(key));
@@ -8,7 +8,7 @@ function hasOnlyKeys(message, keys) {
 const VALID_BRANCH_ASSUMPTION_PATHS = new Set(["collapsed", "taken", "fallthrough", "both"]);
 
 function parseDefRunMessage(message) {
-  const { action, project, revision, sequencer, uri, registers, observe_time, overrides, axes, token, sweepId, caseId, statistics_only } = message;
+  const { action, project, revision, sequencer, uri, registers, observe_time, overrides, axes, token, sweepId, caseId, statistics_only, sample_count } = message;
   const literal = (value) => typeof value === "string" && value.length <= 16384;
   const base = ["type", "action", "project"];
   const target = ["revision", "sequencer", "uri"];
@@ -26,13 +26,16 @@ function parseDefRunMessage(message) {
   const validObservations = Array.isArray(registers) && registers.length <= 64 &&
     registers.every((name) => typeof name === "string" && /^R(?:\d|[1-5]\d|6[0-3])$/.test(name)) &&
     new Set(registers).size === registers.length && typeof observe_time === "boolean";
-  if (!["run", "sweep"].includes(action) || !validObservations ||
+  if (!["run", "sweep", "estimate"].includes(action) || !validObservations ||
       !overrides || typeof overrides !== "object" || Array.isArray(overrides) || !Object.values(overrides).every(literal)) {
     return { valid: false };
   }
   const keys = [...base, ...target, "registers", "observe_time", "overrides"];
+  const validSampleCount = sample_count === undefined || (Number.isSafeInteger(sample_count) && sample_count >= 1 &&
+    sample_count <= (statistics_only ? 1_000_000 : 25_000));
   const valid = action === "run" ? hasOnlyKeys(message, keys) : (registers.length > 0 || observe_time) &&
-    validAxes && validStatistics && hasOnlyKeys(message, [...keys, "axes", "statistics_only"]);
+    validAxes && validStatistics && validSampleCount && hasOnlyKeys(message,
+      [...keys, "axes", "statistics_only", ...(action === "sweep" ? ["sample_count"] : [])]);
   return valid ? { ...message, valid: true } : { valid: false };
 }
 
@@ -72,8 +75,10 @@ function parseWebviewMessage(message) {
   }
 
   if (message.type === "setExternalInputs" && validExternalTriggers(message.triggers) &&
-      hasOnlyKeys(message, ["type", "triggers"])) {
-    return { valid: true, type: message.type, triggers: message.triggers };
+      (message.feedback === undefined || validExternalFeedback(message.feedback)) &&
+      hasOnlyKeys(message, ["type", "triggers", "feedback"])) {
+    return { valid: true, type: message.type, triggers: message.triggers,
+      ...(message.feedback === undefined ? {} : {feedback: message.feedback}) };
   }
 
   if (["saveExternalInputs", "resetExternalInputs"].includes(message.type) && hasOnlyKeys(message, ["type"])) {

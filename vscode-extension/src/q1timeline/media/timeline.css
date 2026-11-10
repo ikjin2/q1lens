@@ -47,6 +47,25 @@ body:not(.instruction-view) #timeline-root .timeline-connector-layer {
 
 .shared-timeline-stage .timeline-block.q1timeline-command-point .block-label { max-width: none; }
 
+.shared-timeline-stage .timeline-block.timeline-command-group {
+  border-style: dashed;
+}
+
+.shared-timeline-stage .timeline-block.timeline-command-group-open {
+  top: auto;
+  bottom: 0;
+  z-index: 5;
+  width: 18px !important;
+  height: 12px;
+  justify-content: center;
+  padding: 0;
+}
+
+.shared-timeline-stage .timeline-block.kind-q1_stall:not(.timeline-point-marker) {
+  border-color: var(--vscode-editorWarning-foreground, #a06016);
+  background-color: color-mix(in srgb, var(--vscode-editorWarning-foreground, #a06016) 20%, transparent);
+}
+
 #timeline-root .shared-timeline-stage .timeline-block.timeline-point-marker {
   z-index: 5;
   min-width: 0;
@@ -66,6 +85,18 @@ body:not(.instruction-view) #timeline-root .timeline-connector-layer {
   border-radius: 50%;
   transform: translateY(-50%);
   background: var(--vscode-editorInfo-foreground, #3794ff);
+}
+
+.shared-timeline-stage .timeline-point-marker.kind-q1_stall::after {
+  background: var(--vscode-editorWarning-foreground, #a06016);
+}
+
+.shared-timeline-stage .timeline-point-marker.comparison-terminal::after {
+  background: var(--vscode-editorWarning-foreground, #a06016);
+}
+
+.shared-timeline-stage .timeline-point-marker:is(.has-error, .comparison-terminal-error)::after {
+  background: var(--vscode-editorError-foreground, #f14c4c);
 }
 
 .shared-timeline-stage .hardware-time-cursor {
@@ -408,7 +439,8 @@ body.instruction-view.mode-normal .event.normal-feedback-collapsed {
   color: var(--vscode-descriptionForeground);
 }
 
-.q1timeline-trigger-source {
+.q1timeline-trigger-source,
+.q1timeline-feedback-source {
   margin: 0 0 8px;
   border: 1px solid var(--vscode-panel-border, #555);
 }
@@ -426,7 +458,9 @@ body.instruction-view.mode-normal .event.normal-feedback-collapsed {
   gap: 3px;
 }
 
-.q1timeline-trigger-fields input {
+.q1timeline-trigger-fields input,
+.q1timeline-trigger-fields select,
+.q1timeline-trigger-fields textarea {
   padding: 4px 6px;
   border: 1px solid var(--vscode-input-border, #555);
   background: var(--vscode-input-background, var(--vscode-editor-background, #fff));
@@ -910,6 +944,8 @@ body:not(.vscode-high-contrast, .vscode-high-contrast-light)
   box-shadow: inset 3px 0 0 var(--vscode-focusBorder);
 }
 
+.shared-timeline-stage .timeline-block.rt-time-nominal { border-style: dashed; }
+
 .shared-timeline-stage .timeline-block-branch_effect:hover,
 .shared-timeline-stage .timeline-block-branch_effect.is-selected {
   opacity: 1;
@@ -1249,6 +1285,8 @@ body:is(.vscode-dark, .vscode-high-contrast) .shared-timeline-stage .lane-track 
 #q1timeline-def-runs :is(.def-toolbar, [data-field="axes"], [data-field="plan"], [data-field="progress"], [data-field="table"], [data-field="trace-diags"], [data-field="steps"]) { margin-top: .55rem; }
 #q1timeline-def-runs [data-field="source"] { min-width: 0; overflow-wrap: anywhere; color: var(--def-muted); }
 #q1timeline-def-runs [data-field="plan"] { overflow-wrap: anywhere; }
+#q1timeline-def-runs [data-field="sample-count"] { width: 10ch; }
+#q1timeline-def-runs :is([data-field="estimate"], [data-field="progress-actions"], [data-field="setup-actions"]):empty { display: none; }
 #q1timeline-def-runs :is(button, input, select) { font: inherit; min-width: 0; border: 1px solid var(--vscode-input-border, #7778); border-radius: 3px; padding: .2rem .45rem; }
 #q1timeline-def-runs :is(input, select) { background: var(--vscode-input-background, #333); color: var(--vscode-input-foreground, #eee); }
 #q1timeline-def-runs input { box-sizing: border-box; font-family: var(--vscode-editor-font-family, monospace); }
@@ -1285,12 +1323,19 @@ body:is(.vscode-dark, .vscode-high-contrast) .shared-timeline-stage .lane-track 
 #q1timeline-def-runs .def-metrics dd { font-size: 1rem; font-weight: 600; overflow-wrap: anywhere; }
 #q1timeline-def-runs .def-metrics dd.def-muted { font-size: .75rem; font-weight: 400; }
 #q1timeline-def-runs [data-field="plot-controls"] { margin: .75rem 0 .45rem; }
-#q1timeline-def-runs .def-formula { display: flex; flex-wrap: wrap; align-items: center; gap: .3rem .5rem; margin: 0 0 .55rem; }
-#q1timeline-def-runs .def-formula input { flex: 1 1 12rem; max-width: 32rem; }
+#q1timeline-def-runs .def-formula { display: flex; flex-wrap: wrap; align-items: end; gap: .3rem .5rem; margin: 0 0 .55rem; }
+#q1timeline-def-runs .def-formula label { display: grid; gap: .2rem; flex: 1 1 12rem; min-width: 0; }
+#q1timeline-def-runs .def-formula label:has([data-field="tolerance"]) { flex: 0 1 9rem; }
 #q1timeline-def-runs .def-formula p { flex-basis: 100%; overflow-wrap: anywhere; }
 #q1timeline-def-runs [data-field="formula-status"]:empty { display: none; }
+#q1timeline-def-runs [data-field="comparison"] { margin: 0 0 .65rem; overflow-wrap: anywhere; }
+#q1timeline-def-runs [data-field="comparison"] h4 { margin-bottom: .2rem; }
+#q1timeline-def-runs :is(td[data-verdict="pass"], [data-comparison="pass"]) { color: var(--vscode-testing-iconPassed, #73c991); }
+#q1timeline-def-runs :is(td[data-verdict="fail"], [data-comparison="fail"]) { color: var(--vscode-testing-iconFailed, #f14c4c); }
 #q1timeline-def-runs .def-chart figcaption code { overflow-wrap: anywhere; }
 #q1timeline-def-runs .def-plots { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); gap: .65rem; }
+#q1timeline-def-runs .def-plots.def-paired-plots { grid-template-columns: repeat(auto-fit, minmax(min(100%, 20rem), 1fr)); }
+#q1timeline-def-runs .def-paired-plots > section { grid-column: 1 / -1; }
 #q1timeline-def-runs .def-chart { min-width: 0; margin: 0; border: 1px solid var(--def-border); border-radius: 4px; padding: .55rem; background: var(--vscode-editor-background, transparent); }
 #q1timeline-def-runs table { width: 100%; border-collapse: separate; border-spacing: 0; text-align: left; font-variant-numeric: tabular-nums; }
 #q1timeline-def-runs :is(th, td) { padding: .3rem .45rem; border-bottom: 1px solid var(--def-border); }
@@ -1318,6 +1363,8 @@ body:is(.vscode-dark, .vscode-high-contrast) .shared-timeline-stage .lane-track 
 #q1timeline-def-runs .def-plot-scroll text { fill: currentColor; font: 13px var(--vscode-editor-font-family, monospace); }
 #q1timeline-def-runs .def-plot-axis { fill: none; stroke: currentColor; opacity: .5; }
 #q1timeline-def-runs .def-plot-point { cursor: pointer; fill: #459dec; stroke: var(--vscode-editor-background, #1e1e1e); stroke-width: .75; }
+#q1timeline-def-runs .def-plot-point[data-verdict="fail"] { stroke: var(--vscode-testing-iconFailed, #f14c4c); stroke-width: 2; }
+#q1timeline-def-runs .def-outside-tolerance { box-sizing: border-box; border: 2px solid var(--vscode-testing-iconFailed, #f14c4c); }
 #q1timeline-def-runs .def-plot-point:is(:focus, :hover) { stroke: var(--vscode-focusBorder, #63b4ef); stroke-width: 2; vector-effect: non-scaling-stroke; }
 #q1timeline-def-runs .def-plot-unrun { fill: currentColor; background: currentColor; opacity: .22; }
 #q1timeline-def-runs .error { fill: #e45457; background-color: #e45457; }

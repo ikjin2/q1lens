@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 
-const { buildQ1TimelineSharedModel: buildModel } = require("../src/q1timeline/media/timelineAdapter.js");
+const { buildQ1TimelineSharedModel: buildModel, buildQ1TimelineSelectionIndex } = require("../src/q1timeline/media/timelineAdapter.js");
 
 function event(id: string, kind: string, start: number, end = start, extra: Record<string, unknown> = {}) {
   return {
@@ -15,6 +15,52 @@ function lane(model: any, id = "sequencer:Control") {
 function allBlocks(model: any): any[] { return model.lanes.flatMap((item: any) => item.blocks); }
 
 describe("Q1 timeline instruction layout", () => {
+  it("pairs RT wait auxiliaries by packet occurrence and comparison path with a unique legacy fallback", () => {
+    const compared = (path: string, packet?: string) => ({
+      lane: `branch_compare.${path}.rt.wait_trigger`,
+      meta: { branch_comparison_path: path, branch_comparison_branch_id: "gate",
+        branch_comparison_kind: "rt_condition", rt_packet_id: packet },
+    });
+    const ir = { events: [
+      event("first", "wait_trigger", 0, 24, {meta: {rt_packet_id: "p1"}}),
+      event("first-aux", "trigger_wait", 0, 20, {meta: {rt_packet_id: "p1"}}),
+      event("second", "wait_trigger", 30, 44, {meta: {rt_packet_id: "p2"}}),
+      event("second-legacy", "trigger_wait", 30, 40),
+      event("wrong-packet", "trigger_wait", 30, 40, {meta: {rt_packet_id: "missing"}}),
+      event("execute", "wait_trigger", 50, 64, compared("taken", "p3")),
+      event("execute-aux", "trigger_wait", 50, 60, compared("taken", "p3")),
+      event("skip-aux", "trigger_wait", 50, 60, compared("fallthrough", "p3")),
+      event("ambiguous-1", "wait_trigger", 70, 84),
+      event("ambiguous-2", "wait_trigger", 70, 88),
+      event("ambiguous-aux", "trigger_wait", 70, 80),
+    ] };
+    const original = JSON.stringify(ir);
+    for (const layout of ["instruction", "time"]) {
+      const blocks = new Map(allBlocks(buildModel(ir, {layout})).map((block) => [block.id, block]));
+      for (const [primary, aux] of [["first", "first-aux"], ["second", "second-legacy"], ["execute", "execute-aux"]]) {
+        assert.deepEqual(blocks.get(primary).eventIds, [primary, aux]);
+        assert.equal(blocks.has(aux), false);
+      }
+      for (const id of ["wrong-packet", "skip-aux", "ambiguous-aux"]) assert.ok(blocks.has(id));
+    }
+    assert.equal(buildQ1TimelineSelectionIndex(ir).get("second-legacy").rtNavigationEventId, "second");
+    assert.equal(JSON.stringify(ir), original);
+  });
+
+  it("navigates a pending RT wait from its own Q1 issue without treating it as an application", () => {
+    const ir = { events: [
+      event("prior", "wait", 0, 20),
+      event("issue", "q1_issue", 4, 8, {meta: {rt_packet_id: "p", op: "wait_trigger"}}),
+      event("pending", "trigger_wait", 20, 40, {meta: {rt_packet_id: "p", q1_issue_event_id: "issue", pending: true}}),
+    ] };
+    const index = buildQ1TimelineSelectionIndex(ir);
+    assert.deepEqual(index.get("issue").rtEventIds, ["pending"]);
+    assert.deepEqual(index.get("issue").appliedEventIds, []);
+    assert.equal(index.get("issue").rtNavigationEventId, "pending");
+    const pending = allBlocks(buildModel(ir, {mode: "debug"})).find((block) => block.id === "pending");
+    assert.equal(pending.rtDetails, undefined);
+  });
+
   it("gives each lane consecutive equal blocks while keeping Q1 and RT separate", () => {
     const ir = { events: [
       event("stop", "stop", 400_004), event("q1-last", "q1_issue", 12, 16),
@@ -66,6 +112,57 @@ describe("Q1 timeline instruction layout", () => {
     assert.ok(normal.ticks.every((tick: any) => tick.label.endsWith(" ns")));
     assert.deepEqual(buildModel(ir), normal);
     assert.deepEqual(buildModel(ir, { layout: "time" }), normal);
+  });
+
+  it("places selectable trigger and rejected LINQ arrivals inside the wait without adding slots", () => {
+    const aligned = (start: number, end = start, meta = {}) => ({ meta: { aligned_t0: start, aligned_t1: end, ...meta } });
+    const message = "Feedback queue overflow at 115 ns.";
+    const ir = {
+      events: [
+        event("wait", "wait", 60, 160, aligned(0, 100)),
+        event("trigger", "trigger_receive", 90, 94, aligned(30, 30, { address: 7 })),
+        event("reject", "feedback_rejected", 115, 115, aligned(55, 55, { id: 42, source_event_id: "send" })),
+        event("stop", "stop", 160, 160, aligned(100)),
+      ],
+      diagnostics: [
+        { severity: "error", category: "feedback_queue_overflow", related_events: ["reject"], message },
+        { severity: "error", category: "other_error", related_events: ["stop"], message: "Stop error" },
+      ],
+    };
+    const before = JSON.stringify(ir);
+    for (const layout of ["instruction", "time"]) {
+      const model = buildModel(ir, { layout, timeBasis: "aligned" });
+      const [wait, trigger, reject, stop] = lane(model).blocks;
+      assert.deepEqual([wait, trigger, reject, stop].map((block) => [block.id, block.start, block.duration]), layout === "instruction"
+        ? [["wait", 0, 1], ["trigger", 0.3, 0], ["reject", 0.55, 0], ["stop", 1, 1]]
+        : [["wait", 0, 100], ["trigger", 30, 0], ["reject", 55, 0], ["stop", 100, 0]]);
+      if (layout === "instruction") assert.deepEqual(model.viewport, { start: 0, end: 2 });
+      assert.equal(trigger.pointMarker, true);
+      assert.equal(trigger.title, "Trigger address 7 · 30 ns");
+      assert.equal(reject.pointMarker, true);
+      assert.equal(reject.title, "Rejected LINQ arrival · ID 42 · 55 ns");
+      assert.equal(reject.domain.meta.source_event_id, "send");
+      assert.deepEqual(reject.eventIds, ["reject"]);
+      assert.deepEqual(reject.diagnosticErrors, [{ eventId: "reject", message }]);
+      assert.deepEqual(stop.diagnosticErrors, [{ eventId: "stop", message: "Stop error" }]);
+    }
+    assert.equal(JSON.stringify(ir), before);
+  });
+
+  it("anchors arrivals at a comparison command boundary and past its last instruction", () => {
+    const scope = { branch_comparison_branch_id: "branch", branch_comparison_path: "taken" };
+    const model = buildModel({ events: [
+      event("branch", "branch_region", 0, 0, { meta: { branch_id: "branch" } }),
+      event("wait", "wait", 0, 100, { meta: scope }),
+      event("boundary", "trigger_receive", 100, 100, { meta: scope }),
+      event("stop", "stop", 100, 100, { meta: scope }),
+      event("after", "feedback_rejected", 150, 150, { meta: scope }),
+    ] }, { layout: "instruction" });
+    const comparison = model.lanes.find((item: any) => item.branchComparisonPath === "taken");
+    assert.deepEqual(comparison.blocks.map((block: any) => [block.id, block.start, block.duration]), [
+      ["wait", 1, 1], ["boundary", 2, 0], ["stop", 2, 1], ["after", 3, 0],
+    ]);
+    assert.deepEqual(model.viewport, { start: 0, end: 3 });
   });
 
   it("uses IR order for ties, including merged play blocks appended by the adapter", () => {

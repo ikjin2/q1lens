@@ -117,6 +117,9 @@ def _append_target_edge(
     edge["target"] = target["display"]
     if target["label"] is not None:
         edge["target_label"] = target["label"]
+    for field in ("compiled_target_pc", "target_interior_op"):
+        if field in target:
+            edge[field] = target[field]
     if target["pc"] is not None:
         edge["target_pc"] = target["pc"]
         target_node = node_by_start.get(target["pc"])
@@ -167,14 +170,27 @@ def _branch_target(instruction: Instr, state: AnalysisState) -> dict[str, Any]:
     arg = _branch_target_arg(instruction)
     if arg is None:
         return {"display": "", "pc": None, "label": None}
+    target = {"display": arg.raw, "pc": None, "label": None}
     if arg.kind == "label":
         label = str(arg.value)
-        return {"display": arg.raw, "pc": state.labels.get(label), "label": label}
+        target.update(pc=state.labels.get(label), label=label)
+        if state.compiled_addresses is not None and label in state.compiled_addresses.labels:
+            target["compiled_target_pc"] = state.compiled_addresses.labels[label]
+        return target
     if arg.kind == "imm":
-        return {"display": arg.raw, "pc": int(arg.value), "label": None}
-    if arg.kind == "reg":
-        return {"display": arg.raw, "pc": _event_target_pc(state, instruction), "label": None}
-    return {"display": arg.raw, "pc": None, "label": None}
+        address = int(arg.value)
+        if state.compiled_addresses is None:
+            target["pc"] = address
+        else:
+            target["compiled_target_pc"] = address
+            compiled = state.compiled_addresses.targets.get(address)
+            if compiled is not None:
+                if compiled.interior is None:
+                    target["pc"] = compiled.source_pc
+                else:
+                    target["target_interior_op"] = compiled.interior.op
+        return target
+    return {**target, **_observed_branch_target(state, instruction)}
 
 
 def _branch_target_arg(instruction: Instr) -> Arg | None:
@@ -197,19 +213,31 @@ def _arg_at(instruction: Instr, index: int) -> Arg | None:
     return instruction.args[index] if len(instruction.args) > index else None
 
 
-def _event_target_pc(state: AnalysisState, instruction: Instr) -> int | None:
+def _observed_branch_target(state: AnalysisState, instruction: Instr) -> dict[str, Any]:
+    targets = set()
     for event in state.events:
-        target_pc = event.meta.get("target_pc")
         if (
             event.kind == "q1_issue"
             and event.meta.get("op") == instruction.op
             and event.source.file == instruction.source.file
             and event.source.line == instruction.source.line
             and event.source.column == instruction.source.column
-            and type(target_pc) is int
         ):
-            return target_pc
-    return None
+            pc = event.meta.get("target_pc")
+            address = event.meta.get("compiled_target_pc")
+            interior = event.meta.get("target_interior_op")
+            if state.compiled_addresses is None and type(pc) is int:
+                return {"pc": pc}
+            targets.add((pc, address, interior))
+    if len(targets) != 1:
+        return {}
+    pc, address, interior = targets.pop()
+    target = {"pc": pc if type(pc) is int and interior is None else None}
+    if type(address) is int:
+        target["compiled_target_pc"] = address
+    if isinstance(interior, str):
+        target["target_interior_op"] = interior
+    return target
 
 
 def _terminates_block(instruction: Instr) -> bool:

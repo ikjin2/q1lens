@@ -21,6 +21,7 @@ class ExecutedStep:
     indirect: bool = False
     continuation: bool = False
     guard_only: bool = False
+    source_pc: int | None = None
 
 
 def observed_loops(sequencer_id: str, trace: list[ExecutedStep], *, stopped: bool, mode: str) -> list[dict]:
@@ -127,9 +128,11 @@ def observed_loops(sequencer_id: str, trace: list[ExecutedStep], *, stopped: boo
                 # An unconfirmed new path in a paused iteration stays visible.
             first = trace[spans[0][0]]
             tail = trace[spans[0][1] - 1]
+            start_pc = first.source_pc if first.source_pc is not None else header
+            end_pc = tail.source_pc if tail.source_pc is not None else tail.pc
             result.append({
-                "loop_id": f"{sequencer_id}:{mode}-loop:{first.issue_index}:{tail.pc}",
-                "start_pc": header, "end_pc": tail.pc, "complete": complete,
+                "loop_id": f"{sequencer_id}:{mode}-loop:{first.issue_index}:{end_pc}",
+                "start_pc": start_pc, "end_pc": end_pc, "complete": complete,
                 "ranges": [(trace[start].event_start, trace[end - 1].event_end,
                             trace[start].rt_start, trace[end - 1].rt_end) for start, end in spans],
             })

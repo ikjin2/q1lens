@@ -9,6 +9,8 @@ from typing import Any
 
 import yaml
 
+from q1timeline.analysis.alignment import SIMULATION_ALIGNMENT_MODE
+from q1timeline.analysis.trigger_counters import TRIGGER_COUNTER_PARAMETERS, trigger_counter_settings_valid
 from q1timeline.diagnostics import Diagnostic
 from q1timeline.external_inputs import validate_external_inputs
 from q1timeline.q1asm.ast import SourceLocation
@@ -34,7 +36,7 @@ class SequencerConfig:
     module: str | None = None
     sequence_json: Path | None = None
     module_type: str | None = None
-    hardware_parameters: dict[str, int | str] = field(default_factory=dict)
+    hardware_parameters: dict[str, int | str | bool] = field(default_factory=dict)
     sequencer_index: int | None = None
 
 
@@ -72,6 +74,16 @@ class ProjectConfig:
     diagnostics: list[Diagnostic] = field(default_factory=list)
     simulation: dict[str, Any] = field(default_factory=dict)
     external_inputs: dict[str, Any] = field(default_factory=dict)
+    alignment_mode_explicit: bool = False
+
+    def sequencer_metadata(self) -> dict[str, dict[str, str | int | None]]:
+        return {seq.id: {"module": seq.module, "module_type": seq.module_type, "sequencer_index": seq.sequencer_index}
+                for seq in self.sequencers}
+
+    def alignment_for_execution(self, execution_mode: str) -> str:
+        if execution_mode == "simulation" and self.alignment_mode == "first_wait_sync" and not self.alignment_mode_explicit:
+            return SIMULATION_ALIGNMENT_MODE
+        return self.alignment_mode
 
 
 class ConfigLoadError(Exception):
@@ -278,6 +290,7 @@ def load_project_config(project_file: str | Path) -> ProjectConfig:
         params_file=params_file,
         display_file=display_file,
         alignment_mode=alignment_mode,
+        alignment_mode_explicit=isinstance(data.get("alignment"), dict) and "mode" in data["alignment"],
         alignment_anchor_kinds=alignment_anchor_kinds,
         view=view_config,
         analysis=analysis_config,
@@ -427,8 +440,12 @@ def _load_sequencers(
             ))
             sequencer_index = None
         if (not isinstance(hardware_parameters, dict)
-                or set(hardware_parameters) - {"integration_length_acq", "scope_acq_sequencer_select",
-                                               "scope_acq_trigger_mode_path0", "scope_acq_trigger_mode_path1"}
+                or set(hardware_parameters) - (TRIGGER_COUNTER_PARAMETERS | {
+                    "integration_length_acq", "scope_acq_sequencer_select", "scope_acq_trigger_mode_path0",
+                    "scope_acq_trigger_mode_path1", "sync_en",
+                })
+                or not trigger_counter_settings_valid(hardware_parameters)
+                or ("sync_en" in hardware_parameters and type(hardware_parameters["sync_en"]) is not bool)
                 or ("integration_length_acq" in hardware_parameters
                     and (type(hardware_parameters["integration_length_acq"]) is not int
                          or hardware_parameters["integration_length_acq"] <= 0))
@@ -441,7 +458,8 @@ def _load_sequencers(
                 severity="error", category="invalid_argument_value",
                 message=(f"Sequencer {sequencer_id} hardware_parameters must be a mapping containing "
                          "integration_length_acq (positive integer ns), scope_acq_sequencer_select (0–5), "
-                         "or scope_acq_trigger_mode_path0/path1 ('sequencer' or 'level')."),
+                         "scope_acq_trigger_mode_path0/path1 ('sequencer' or 'level'), sync_en (boolean), "
+                         "triggerN_count_threshold (0–65535), or triggerN_threshold_invert (boolean), for N from 1 to 15."),
                 source=_source_for_yaml_key(project_path, "hardware_parameters"),
             ))
             hardware_parameters = {}
@@ -928,6 +946,7 @@ def is_valid_alignment_mode(mode: str) -> bool:
         "first_marker_rise",
         "first_play",
         "first_acquire",
+        SIMULATION_ALIGNMENT_MODE,
         "none",
     }:
         return True

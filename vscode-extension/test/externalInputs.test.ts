@@ -27,6 +27,30 @@ describe("shared external inputs", () => {
     assert.equal(parseWebviewMessage({ type: "setExternalInputs", triggers: [trigger, trigger] }).valid, false);
   });
 
+  it("round trips ordered LINQ words and a known-empty receiver alongside triggers", () => {
+    const feedback = [{ target: "readout", arrivals: [{time_ns: 16, id: 9, value: -1}, {time_ns: 16, id: 5, value: 0xffffffff}] },
+      {target: "drive", arrivals: []}];
+    const inputs = {triggers: [trigger], feedback};
+    const message = {type: "setExternalInputs", ...inputs};
+    assert.deepEqual(parseWebviewMessage(message), {valid: true, ...message});
+    const source = "sequencers: []\n";
+    const saved = writeProjectExternalInputs(source, inputs, readProjectExternalInputs(source).baseline);
+    assert.deepEqual(readProjectExternalInputs(saved).inputs, inputs);
+    const cleared = writeProjectExternalInputs(saved, {triggers: [trigger]}, readProjectExternalInputs(saved).baseline);
+    assert.deepEqual(parse(cleared).external_inputs, {triggers: [trigger]});
+  });
+
+  it("rejects invalid LINQ words, times and duplicated receivers", () => {
+    const entry = {time_ns: 0, id: 255, value: -1};
+    const message = {type: "setExternalInputs", triggers: []};
+    const receiver = {target: "readout", arrivals: [entry]};
+    for (const invalid of [{id: 0}, {id: 256}, {value: 2 ** 32}, {value: -(2 ** 31) - 1},
+      {value: true}, {time_ns: -1}, {time_ns: 2 ** 53}, {event_id: "external-linq:readout:0"}]) {
+      assert.equal(parseWebviewMessage({...message, feedback: [{...receiver, arrivals: [{...entry, ...invalid}]}]}).valid, false);
+    }
+    assert.equal(parseWebviewMessage({...message, feedback: [receiver, receiver]}).valid, false);
+  });
+
   it("preserves unrelated project data and comments, adding only external inputs", () => {
     const source = "# experiment\nversion: 1 # keep version\nsequencers: []\n";
     const { baseline } = readProjectExternalInputs(source);

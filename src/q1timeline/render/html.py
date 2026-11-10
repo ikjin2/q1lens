@@ -4,11 +4,13 @@ import base64
 import json
 import math
 import re
+from collections import Counter
 from html import escape
 from pathlib import Path
 from typing import Any
 
-from q1timeline.diagnostic_catalog import describe_diagnostic, underflow_label
+from q1timeline.analysis.alignment import SIMULATION_ALIGNMENT_MODE
+from q1timeline.diagnostic_catalog import RT_QUEUE_UNDERFLOW_DESCRIPTION, describe_diagnostic, underflow_label
 from q1timeline.q1asm.instruction_table import INSTRUCTION_TABLE, STATUS_BRANCH_OPS
 
 
@@ -16,6 +18,7 @@ DEBUG_LANES = {
     "debug.q1_issue",
     "debug.queue_depth",
     "debug.slack",
+    "debug.trigger_send",
     "debug.underflow",
 }
 NORMAL_Q1_ISSUE_LANE = "q1_issue"
@@ -36,7 +39,6 @@ FEEDBACK_OVERLAY_CATEGORIES = {
 NORMAL_FEEDBACK_COLLAPSED_EVENT_KINDS = frozenset(
     {
         "feedback_pop",
-        "feedback_com",
         "fb_acq_iq_id",
         "fb_acq_iq_shift",
         "fb_acq_tb_id",
@@ -91,11 +93,45 @@ def render_html(
     if default_mode not in {"normal", "debug"}:
         raise RenderError(f"Unsupported render mode: {default_mode!r}")
     source_events = ir.get("events", [])
-    control_flow_events = _control_flow_events(source_events) if default_mode == "debug" else []
-    render_events = list(source_events) + control_flow_events
+    q1_only_loop_ids = _q1_only_loop_ids(source_events)
+    rt_anchor = _shared_simulation_rt_anchor(ir, source_events)
+    project = ir.get("project") or {}
+    mode = project.get("alignment_mode")
+    rt_origin = (mode == SIMULATION_ALIGNMENT_MODE
+                 or mode == "first_anchor" and project.get("alignment_anchor_kinds") == ["rt_queue_dequeue"]
+                 or rt_anchor == "rt_queue_dequeue")
+    switch_geometry = bool(q1_only_loop_ids) or (rt_origin or rt_anchor is not None) and bool(ir.get("simulation"))
+    debug_events = [*source_events, *_control_flow_events(source_events)] if default_mode == "debug" or switch_geometry else source_events
+    render_events = debug_events if default_mode == "debug" else source_events
     events, lanes = _group_events(render_events, mode=default_mode)
-    event_dom_ids = _event_dom_ids(events)
-    diagnostics = ir.get("diagnostics", [])
+    if switch_geometry:
+        alternate_mode = "debug" if default_mode == "normal" else "normal"
+        alternate_source = debug_events if alternate_mode == "debug" else source_events
+        alternate_events, alternate_lanes = _group_events(alternate_source, mode=alternate_mode)
+        by_id = {event["id"]: event for event in [*events, *alternate_events]}
+        event_dom_ids = _event_dom_ids(list(by_id.values()))
+    else:
+        event_dom_ids = _event_dom_ids(events)
+    diagnostics = []
+    offset = _shared_simulation_offset(ir) if _default_time_basis(events) == "aligned" else 0
+    for index, diagnostic in enumerate(ir.get("diagnostics", [])):
+        details = diagnostic.get("details")
+        message = details.get("display_message") if isinstance(details, dict) else None
+        conflict = _network_conflict_display_message(diagnostic, offset)
+        if conflict is not None:
+            diagnostics.append({**diagnostic, "message": conflict, "_network_conflict_index": index})
+        else:
+            diagnostics.append({**diagnostic, "message": message} if message else diagnostic)
+    display_ir = {**ir, "diagnostics": diagnostics}
+    timeline_markup = _timeline_svg(display_ir, events, lanes, event_dom_ids, default_mode=default_mode,
+                                    switch_geometry=switch_geometry, highlight_event_id=highlight_event_id,
+                                    rt_origin=rt_origin, rt_anchor=rt_anchor, q1_only_loop_ids=q1_only_loop_ids)
+    if switch_geometry:
+        alternate_svg = _timeline_svg(display_ir, alternate_events, alternate_lanes, event_dom_ids, default_mode=alternate_mode,
+                                       switch_geometry=True, highlight_event_id=highlight_event_id,
+                                       rt_origin=rt_origin, rt_anchor=rt_anchor, q1_only_loop_ids=q1_only_loop_ids)
+        timeline_markup += (f'<template data-timeline-mode="{default_mode}"></template>'
+                            f'<template data-timeline-mode="{alternate_mode}">{alternate_svg}</template>')
     skipped_lines = {(item["source"]["file"], item["source"]["line"]) for item in diagnostics
                      if item.get("source") and item.get("details", {}).get("source_line_skipped")}
     recovery_banner = (
@@ -103,6 +139,124 @@ def render_html(
         f'line{"s" if len(skipped_lines) != 1 else ""}. Timing and state reflect the remaining lines.</p>'
         if skipped_lines else ""
     )
+
+    embedded_view_ir = dict(ir)
+    embedded_view_ir["events"] = debug_events if switch_geometry else render_events
+    embedded_ir = _json_script(embedded_view_ir)
+    analysis_panels = "\n        ".join(
+        panel
+        for panel in (
+            _confidence_legend(_visible_confidences(events, default_mode=default_mode)),
+            _feedback_balance_panel(ir.get("feedback_balance", {})),
+            _semantic_panel(ir.get("semantic", {}), event_dom_ids),
+        )
+        if panel
+    )
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Q1ASM Live Timeline</title>
+  <style>{_css()}</style>
+</head>
+<body class="mode-{default_mode}" data-mode="{default_mode}">
+  <main>
+    {recovery_banner}
+    <section id="timeline-root" class="timeline" aria-label="Timeline">
+      {timeline_markup}
+    </section>
+    {_parameters_panel(ir.get("analysis", {}))}
+    {_diagnostics_panel(diagnostics, event_dom_ids, source_events)}
+    <details id="q1timeline-analysis-details" class="analysis-details">
+      <summary>Analysis details</summary>
+      <div id="q1timeline-analysis-details-body">
+        <header>
+          <h1>Q1ASM Live Timeline</h1>
+          <div class="controls">
+            <input id="event-filter" type="search" placeholder="Filter source or kind" aria-label="Filter source or kind">
+            <div class="mode-toggle" role="group" aria-label="View mode">
+              <button id="mode-normal" type="button" data-mode="normal" aria-pressed="{str(default_mode == 'normal').lower()}">Normal</button>
+              <button id="mode-debug" type="button" data-mode="debug" aria-pressed="{str(default_mode == 'debug').lower()}">Debug</button>
+            </div>
+          </div>
+        </header>
+        <aside id="event-inspector" class="event-inspector" aria-live="polite">
+          <h2>Selected event</h2>
+          <dl id="event-inspector-fields"></dl>
+        </aside>
+        {analysis_panels}
+      </div>
+    </details>
+  </main>
+  <script id="timeline-ir" type="application/json">{embedded_ir}</script>
+  <script>{_js()}</script>
+</body>
+</html>
+"""
+
+
+def _timeline_svg(
+    ir: dict[str, Any], events: list[dict[str, Any]], lanes: list[str], event_dom_ids: dict[str, str],
+    *, default_mode: str, switch_geometry: bool, highlight_event_id: str | None, rt_origin: bool, rt_anchor: str | None,
+    q1_only_loop_ids: set[str],
+) -> str:
+    diagnostics = ir.get("diagnostics", [])
+    hidden_rt_ids = set(q1_only_loop_ids) if default_mode == "normal" else set()
+    if hidden_rt_ids:
+        hidden_lanes = {event["lane"] for event in events if event["id"] in hidden_rt_ids}
+        events = [event for event in events if event["id"] not in hidden_rt_ids]
+        occupied_lanes = {event["lane"] for event in events}
+        lanes = [lane for lane in lanes if lane not in hidden_lanes or lane in occupied_lanes or lane == _sequencer_from_lane(lane)]
+    if switch_geometry and default_mode == "normal":
+        lanes = [lane for lane in lanes if not _is_q1_issue_detail_lane(lane)]
+    width = 1100
+    lane_height = 34
+    top = 72
+    left = 190
+    height = top + lane_height * max(1, len(lanes)) + 40
+    time_basis = _default_time_basis(events)
+    rt_events = [event for event in events if re.match(r"(?:branch_compare\.(?:taken|fallthrough)\.)?rt\.", event["_base_lane"])]
+    extent_events = rt_events if hidden_rt_ids else events
+    t_min, t_max = _time_extent(extent_events, time_basis=time_basis)
+    local_min, local_max = _time_extent(extent_events, time_basis="local")
+    aligned_min, aligned_max = _time_extent(extent_events, time_basis="aligned")
+    explicit_rt_anchor = not rt_origin and rt_anchor is not None
+    q1_start = min((_event_time_number(event, "t0", fallback=t_max + 1, time_basis=time_basis)
+                    for event in events if event.get("kind") == "q1_issue"), default=t_max + 1)
+    rt_start = min((_event_time_number(event, "t0", fallback=t_max + 1, time_basis=time_basis)
+                    for event in rt_events if not explicit_rt_anchor or _event_confidence_visible(event, default_mode=default_mode)),
+                   default=t_max + 1)
+    if default_mode == "normal":
+        if rt_origin:
+            t_min, t_max = 0, max(1, t_max)
+        elif explicit_rt_anchor and rt_start <= t_max:
+            t_min, t_max = rt_start, max(rt_start + 1, t_max)
+        if rt_anchor is not None:
+            rt_end = -math.inf
+            for event in rt_events:
+                # Loop brackets remain visible even when the detailed event is hidden.
+                if event.get("kind") != "loop_block" and not _event_confidence_visible(event, default_mode=default_mode):
+                    continue
+                start = _event_time_number(event, "t0", fallback=-math.inf, time_basis=time_basis)
+                rt_end = max(rt_end, _event_time_number(event, "t1", fallback=start, time_basis=time_basis))
+            if math.isfinite(rt_end):
+                t_max = max(t_min + 1, rt_end)
+    if switch_geometry and default_mode == "normal" and rt_origin and time_basis == "aligned":
+        overlapping_ids = set()
+        for event in rt_events:
+            start = _event_time_number(event, "t0", fallback=t_min, time_basis=time_basis)
+            if start >= t_min:
+                continue
+            end = _event_time_number(event, "t1", fallback=start, time_basis=time_basis)
+            if end <= t_min:
+                hidden_rt_ids.update((event["id"], *event.get("_event_alias_ids", ())))
+            else:
+                overlapping_ids.add(event["id"])
+        events = [{**event, "_plot_t0": t_min} if event["id"] in overlapping_ids else event
+                  for event in events if event["id"] not in hidden_rt_ids]
+    hidden_rt_attr = (f' data-hidden-rt-event-ids="{escape(json.dumps(sorted(hidden_rt_ids)), quote=True)}"'
+                      if hidden_rt_ids else "")
     diagnostic_overlays_by_event = _diagnostic_overlays_by_event(diagnostics, events)
     q1_errors_by_sequencer: dict[str, list[tuple[str, list[dict[str, Any]]]]] = {}
     for event in events:
@@ -111,23 +265,9 @@ def render_html(
             q1_errors_by_sequencer.setdefault(_sequencer_from_lane(event["lane"]), []).append(
                 (event_id, diagnostic_overlays_by_event[event_id])
             )
-    width = 1100
-    lane_height = 34
-    top = 72
-    left = 190
-    height = top + lane_height * max(1, len(lanes)) + 40
-    time_basis = _default_time_basis(events)
-    t_min, t_max = _time_extent(events, time_basis=time_basis)
-    local_min, local_max = _time_extent(events, time_basis="local")
-    aligned_min, aligned_max = _time_extent(events, time_basis="aligned")
-    q1_start = min((_event_time_number(event, "t0", fallback=t_max + 1, time_basis=time_basis)
-                    for event in events if event.get("kind") == "q1_issue"), default=t_max + 1)
-    rt_start = min((_event_time_number(event, "t0", fallback=t_max + 1, time_basis=time_basis)
-                    for event in events if re.match(r"(?:branch_compare\.(?:taken|fallthrough)\.)?rt\.", event["_base_lane"])),
-                   default=t_max + 1)
-    ticks = _ticks(rt_start if q1_start < rt_start <= t_max else t_min, t_max)
+    ticks = _ticks(rt_start if not (rt_origin or explicit_rt_anchor) and q1_start < rt_start <= t_max else t_min, t_max)
     svg_parts = [
-        f'<svg class="timeline-svg" viewBox="0 0 {width} {height}" role="img" aria-label="Shared x-axis timeline" data-time-min="{t_min}" data-time-max="{t_max}" data-time-basis="{time_basis}" data-local-time-min="{local_min}" data-local-time-max="{local_max}" data-aligned-time-min="{aligned_min}" data-aligned-time-max="{aligned_max}" data-plot-left="{left}" data-plot-right="{width - 24}">',
+        f'<svg class="timeline-svg" viewBox="0 0 {width} {height}" role="img" aria-label="Shared x-axis timeline" data-time-min="{t_min}" data-time-max="{t_max}" data-time-basis="{time_basis}" data-local-time-min="{local_min}" data-local-time-max="{local_max}" data-aligned-time-min="{aligned_min}" data-aligned-time-max="{aligned_max}" data-plot-left="{left}" data-plot-right="{width - 24}"{hidden_rt_attr}>',
         '<defs><marker id="feedback-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" /></marker><marker id="control-flow-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" /></marker></defs>',
     ]
     for tick in ticks:
@@ -140,6 +280,8 @@ def render_html(
     for lane_index, lane in enumerate(lanes):
         y = top + lane_index * lane_height
         sequencer = _sequencer_from_lane(lane)
+        lane_events = sorted([event for event in events if event.get("lane") == lane],
+                             key=lambda event: _event_draw_order(event, mode=default_mode))
         if sequencer != current_sequencer:
             current_sequencer = sequencer
             mark = ""
@@ -168,7 +310,7 @@ def render_html(
             f'<g class="{lane_class}" data-lane="{escape(lane, quote=True)}" data-sequencer-id="{escape(sequencer_id, quote=True)}"{q1_issue_attrs}{lane_visibility}>'
         )
         if lane != sequencer:
-            label = _lane_display_label(lane)
+            label = _lane_display_label(lane, lane_events)
             if is_q1_issue_lane:
                 simulation = (ir.get("simulation") or {}).get(sequencer_id)
                 if simulation is not None:
@@ -181,10 +323,6 @@ def render_html(
                     label += f" · {assumed / 1e6:g}–{possible / 1e6:g} ms buffer"
             svg_parts.append(f'<text class="lane-label" x="16" y="{y + 20}">{escape(label)}</text>')
         svg_parts.append(f'<line class="lane-rule" x1="{left}" y1="{y + 10}" x2="{width - 24}" y2="{y + 10}" />')
-        lane_events = sorted(
-            [event for event in events if event.get("lane") == lane],
-            key=_event_draw_order,
-        )
         structural_events = [
             event for event in lane_events if event.get("kind") in {"loop_block", "branch_region"}
         ]
@@ -208,6 +346,8 @@ def render_html(
                         )
                     )
         for event in lane_events:
+            if switch_geometry and default_mode == "normal" and event.get("kind") == "latched_state_pending":
+                continue
             svg_parts.append(
                 _event_svg(
                     event,
@@ -261,61 +401,7 @@ def render_html(
         )
     )
     svg_parts.append("</svg>")
-
-    embedded_view_ir = dict(ir)
-    embedded_view_ir["events"] = render_events
-    embedded_ir = _json_script(embedded_view_ir)
-    analysis_panels = "\n        ".join(
-        panel
-        for panel in (
-            _confidence_legend(_visible_confidences(events, default_mode=default_mode)),
-            _feedback_balance_panel(ir.get("feedback_balance", {})),
-            _semantic_panel(ir.get("semantic", {}), event_dom_ids),
-        )
-        if panel
-    )
-    return f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Q1ASM Live Timeline</title>
-  <style>{_css()}</style>
-</head>
-<body class="mode-{default_mode}" data-mode="{default_mode}">
-  <main>
-    {recovery_banner}
-    <section id="timeline-root" class="timeline" aria-label="Timeline">
-      {''.join(svg_parts)}
-    </section>
-    {_parameters_panel(ir.get("analysis", {}))}
-    {_diagnostics_panel(diagnostics, event_dom_ids)}
-    <details id="q1timeline-analysis-details" class="analysis-details">
-      <summary>Analysis details</summary>
-      <div id="q1timeline-analysis-details-body">
-        <header>
-          <h1>Q1ASM Live Timeline</h1>
-          <div class="controls">
-            <input id="event-filter" type="search" placeholder="Filter source or kind" aria-label="Filter source or kind">
-            <div class="mode-toggle" role="group" aria-label="View mode">
-              <button id="mode-normal" type="button" data-mode="normal" aria-pressed="{str(default_mode == 'normal').lower()}">Normal</button>
-              <button id="mode-debug" type="button" data-mode="debug" aria-pressed="{str(default_mode == 'debug').lower()}">Debug</button>
-            </div>
-          </div>
-        </header>
-        <aside id="event-inspector" class="event-inspector" aria-live="polite">
-          <h2>Selected event</h2>
-          <dl id="event-inspector-fields"></dl>
-        </aside>
-        {analysis_panels}
-      </div>
-    </details>
-  </main>
-  <script id="timeline-ir" type="application/json">{embedded_ir}</script>
-  <script>{_js()}</script>
-</body>
-</html>
-"""
+    return "".join(svg_parts)
 
 
 def _event_svg(
@@ -334,7 +420,7 @@ def _event_svg(
 ) -> str:
     t0 = _event_time_number(event, "t0", fallback=t_min, time_basis=time_basis)
     t1 = _event_time_number(event, "t1", fallback=t0, time_basis=time_basis)
-    x = _scale(t0, t_min, t_max, left, right)
+    x = _scale(event.get("_plot_t0", t0), t_min, t_max, left, right)
     x1 = _scale(t1, t_min, t_max, left, right)
     width = max(6, x1 - x)
     y = top + lane_index * lane_height
@@ -347,7 +433,9 @@ def _event_svg(
     label = escape(inline_label)
     event_id = escape(str(event.get("id", "")))
     dom_id = escape(_event_dom_id(str(event.get("id", "")), event_dom_ids))
-    classes = _event_classes(event, confidence=confidence, kind=kind, selected=str(event.get("id")) == highlight_event_id)
+    aliases = event.get("_event_alias_ids", ())
+    selected = str(event.get("id")) == highlight_event_id or highlight_event_id in aliases
+    classes = _event_classes(event, confidence=confidence, kind=kind, selected=selected)
     classes = _with_diagnostic_classes(classes, event_diagnostics)
     label_x = x + INLINE_LABEL_X_PADDING + label_offset
     label_markup = f'<text class="event-label" x="{label_x:.2f}" y="{y + 15}">{label}</text>' if inline_label else ""
@@ -364,6 +452,11 @@ def _event_svg(
     data_attributes.extend(_diagnostic_data_attributes(event_diagnostics))
     aria_label = escape(f"{display_label} {kind} confidence {confidence}", quote=True)
     meta = event.get("meta", {}) if isinstance(event.get("meta"), dict) else {}
+    if kind in {"sync_wait", "trigger_wait"} and meta.get("pending") and meta.get("q1_issue_event_id"):
+        issue = escape(str(meta["q1_issue_event_id"]), quote=True)
+        data_attributes.append(f'data-wait-q1-issue-event-id="{issue}"')
+    if meta.get("rt_trigger_epoch") or (time_basis == "aligned" and meta.get("aligned_time_nominal")):
+        classes += " rt-time-nominal"
     loop_id = meta.get("loop_id")
     if loop_id:
         data_attributes.append(f'data-loop-id="{escape(str(loop_id), quote=True)}"')
@@ -401,15 +494,34 @@ def _event_svg(
     if diff_status:
         data_attributes.append(f'data-diff-status="{escape(str(diff_status), quote=True)}"')
     data_attribute_text = " ".join(data_attributes)
-    if kind == "trigger_receive":
-        title = escape(f"Trigger address {meta.get('address', 'unknown')} · {t0} ns")
+    terminal = meta.get("comparison_terminal")
+    if kind in {"trigger_receive", "feedback_rejected"} or isinstance(terminal, dict):
+        if aliases:
+            data_attribute_text += f' data-event-ids="{escape(" ".join(aliases), quote=True)}"'
+        if isinstance(terminal, dict):
+            status = str(terminal.get("status", "incomplete"))
+            identifier = f" · LINQ ID {meta.get('id', 'unknown')}" if kind == "feedback_rejected" else ""
+            title = escape(f"Execution {status.replace('_', ' ')} · {t0} ns · {terminal.get('reason', '')}{identifier}")
+            fill = "var(--vscode-editorError-foreground, #b3242f)" if status == "error" else "var(--vscode-editorWarning-foreground, #a06016)"
+        elif kind == "feedback_rejected":
+            title = escape(f"Rejected LINQ arrival · ID {meta.get('id', 'unknown')} · {t0} ns")
+            fill = "var(--vscode-editorError-foreground, #b3242f)"
+        else:
+            arrivals = event.get("_trigger_arrival_addresses")
+            if arrivals:
+                counts = Counter(str(address) if address is not None else "unknown" for address in arrivals)
+                addresses = ", ".join(address if count == 1 else f"{address} ×{count}" for address, count in counts.items())
+                title = escape(f"Trigger addresses {addresses} · {t0} ns")
+            else:
+                title = escape(f"Trigger address {meta.get('address', 'unknown')} · {t0} ns")
+            fill = "var(--vscode-editorInfo-foreground, #3794ff)"
         return (
             f'<g id="{dom_id}" class="{classes}" data-event-id="{event_id}" {data_attribute_text} '
             f'data-search="{search_text}" aria-label="{title}" role="button" tabindex="0"><title>{title}</title>'
-            f'<circle cx="{x:.2f}" cy="{y + 11}" r="3" fill="var(--vscode-editorInfo-foreground, #3794ff)" />'
+            f'<circle cx="{x:.2f}" cy="{y + 11}" r="3" fill="{fill}" />'
             '</g>'
         )
-    tooltip = escape(_tooltip_with_diagnostics(_tooltip(event), event_diagnostics))
+    tooltip = escape(_tooltip_with_diagnostics(_tooltip(event, time_basis=time_basis), event_diagnostics))
     if kind == "underflow_warning":
         if event.get("_diagnostic_target"):
             return ""
@@ -420,14 +532,17 @@ def _event_svg(
             f'<text class="timeline-error-mark" x="{x:.2f}" y="{y + 32}" text-anchor="middle" aria-hidden="true">!</text>'
             '</g>'
         )
-    error_ids = " ".join(str(item["underflow_event_id"]) for item in event_diagnostics if "underflow_event_id" in item)
+    related_ids = " ".join([*aliases,
+                            *(str(item["underflow_event_id"]) for item in event_diagnostics if "underflow_event_id" in item)])
     mark = (
         f'<text class="timeline-error-mark" x="{x + INLINE_LABEL_X_PADDING:.2f}" y="{y + 15}" aria-hidden="true">!</text>'
         if event_diagnostics else ""
     )
+    rt_lane = re.match(r"(?:branch_compare\.(?:taken|fallthrough)\.)*rt\.", event["_base_lane"])
+    role = ' role="button"' if kind == "q1_issue" or rt_lane else ""
     return (
-        f'<g id="{dom_id}" class="{classes}" data-event-id="{event_id}" data-event-ids="{escape(error_ids, quote=True)}" '
-        f'{data_attribute_text} data-search="{search_text}" aria-label="{aria_label}" tabindex="0">'
+        f'<g id="{dom_id}" class="{classes}" data-event-id="{event_id}" data-event-ids="{escape(related_ids, quote=True)}" '
+        f'{data_attribute_text} data-search="{search_text}" aria-label="{aria_label}"{role} tabindex="0">'
         f"<title>{tooltip}</title>"
         f'<rect x="{x:.2f}" y="{y}" width="{width:.2f}" height="22" rx="3" />'
         f"{mark}"
@@ -452,7 +567,7 @@ def _loop_bracket_svgs(
 ) -> list[str]:
     t0 = _event_time_number(event, "t0", fallback=t_min, time_basis=time_basis)
     t1 = _event_time_number(event, "t1", fallback=t0, time_basis=time_basis)
-    x_start = _scale(t0, t_min, t_max, left, right)
+    x_start = _scale(event.get("_plot_t0", t0), t_min, t_max, left, right)
     x_end = _scale(t1, t_min, t_max, left, right)
     if x_end <= x_start:
         return []
@@ -492,7 +607,7 @@ def _loop_bracket_svgs(
         f'data-event-id="{event_id}" data-kind="loop_block" data-loop-id="{loop_attr}" '
         f'data-loop-bracket-edge="start" data-t0-x="{x_start:.2f}" data-search="{search_text}" '
         f'data-loop-bracket-badge-y="{badge_y:.2f}"{diagnostic_attributes} '
-        f'aria-label="{aria_start}" tabindex="0">'
+        f'aria-label="{aria_start}" role="button" tabindex="0">'
         f"<title>{title}</title>"
         f'<line class="loop-bracket-guide" x1="{x_start:.2f}" y1="{guide_y:.2f}" x2="{x_end:.2f}" y2="{guide_y:.2f}" />'
         f'<rect class="loop-bracket-hitbox" x="{start_hitbox_x:.2f}" y="{bracket_top - 12:.2f}" width="48" height="{bracket_bottom - bracket_top + 20:.2f}" rx="2" />'
@@ -507,7 +622,7 @@ def _loop_bracket_svgs(
         f'data-event-id="{event_id}" data-kind="loop_block" data-loop-id="{loop_attr}" '
         f'data-loop-bracket-edge="end" data-t0-x="{x_end:.2f}" data-search="{search_text}" '
         f'data-loop-bracket-badge-y="{badge_y:.2f}"{diagnostic_attributes} '
-        f'aria-label="{aria_end}" tabindex="0">'
+        f'aria-label="{aria_end}" role="button" tabindex="0">'
         f"<title>{title}</title>"
         f'<rect class="loop-bracket-hitbox" x="{end_hitbox_x:.2f}" y="{bracket_top - 12:.2f}" width="48" height="{bracket_bottom - bracket_top + 20:.2f}" rx="2" />'
         f'<line class="loop-bracket-stem" x1="{x_end:.2f}" y1="{bracket_top:.2f}" x2="{x_end:.2f}" y2="{bracket_bottom:.2f}" />'
@@ -544,7 +659,7 @@ def _branch_marker_svgs(
 ) -> list[str]:
     t0 = _event_time_number(event, "t0", fallback=t_min, time_basis=time_basis)
     t1 = _event_time_number(event, "t1", fallback=t0, time_basis=time_basis)
-    x_start = _scale(t0, t_min, t_max, left, right)
+    x_start = _scale(event.get("_plot_t0", t0), t_min, t_max, left, right)
     x_end = _scale(t1, t_min, t_max, left, right)
     y = top + lane_index * lane_height
     center_y = y + 10
@@ -598,7 +713,7 @@ def _branch_marker_svgs(
             f'data-t0-x="{x_start:.2f}" data-branch-marker-center-y="{center_y:.2f}" '
             f'data-branch-marker-guide-y="{guide_y:.2f}"{diagnostic_attributes} data-search="{search_text}" '
             f'data-condition="{escape(condition, quote=True)}" '
-            f'aria-label="{aria_label}" tabindex="0">'
+            f'aria-label="{aria_label}" role="button" tabindex="0">'
             f"<title>{title}</title>"
             f"{guide}"
             f'<rect class="branch-marker-hitbox" x="{hitbox_x:.2f}" y="{y - 10:.2f}" width="{hitbox_width:.2f}" height="44" rx="2" />'
@@ -746,48 +861,285 @@ def _loop_repeat_count_text(value: Any) -> str:
     return text if len(text) <= 8 else "?"
 
 
-def _event_draw_order(event: dict[str, Any]) -> tuple[int, str]:
+def _event_draw_order(event: dict[str, Any], *, mode: str) -> tuple[int, str]:
     kind = str(event.get("kind", ""))
     if kind == "loop_block":
         return (0, str(event.get("id", "")))
     if kind == "loop_iteration_preview":
         return (1, str(event.get("id", "")))
-    return (2, str(event.get("id", "")))
+    if mode == "normal" and kind == "netzero_result":
+        return (2, str(event.get("id", "")))
+    return (3, str(event.get("id", "")))
 
 
-def _tooltip(event: dict[str, Any]) -> str:
+def _tooltip(event: dict[str, Any], *, time_basis: str) -> str:
     source = event.get("source") if isinstance(event.get("source"), dict) else {}
-    meta = event.get("meta", {})
+    meta = event.get("meta") if isinstance(event.get("meta"), dict) else {}
     source_display = f"{source.get('file')}:{source.get('line')}" if source.get("file") else "unavailable"
     raw_display = str(source.get("raw")) if source.get("raw") else "unavailable"
+    aligned = time_basis == "aligned"
+
+    def display_edge(edge: str) -> str:
+        value = _plain_number(meta.get(f"aligned_{edge}")) if aligned else None
+        return _display_value(value if value is not None else event.get(edge))
+
+    start, end = display_edge("t0"), display_edge("t1")
+    kind = event.get("kind")
+    pending = meta.get("pending") is True and kind in {"trigger_wait", "sync_wait"}
+    if pending:
+        arm = _event_time_number(event, "t0", fallback=math.nan, time_basis=time_basis)
+        cutoff = _event_time_number(event, "t1", fallback=math.nan, time_basis=time_basis)
+        target = "trigger" if kind == "trigger_wait" else "synchronization"
+        arm_text = f"{arm} ns" if math.isfinite(arm) else start
+        timing = f"Arm {arm_text} → waiting for {target} (completion unresolved)"
+        if math.isfinite(cutoff):
+            timing += f" · observation cutoff {cutoff} ns"
+    else:
+        timing = (f"{start} ns" if kind == "underflow_warning" and meta.get("diagnostic_message")
+                  else _incomplete_q1_timing_text(event, time_basis=time_basis)
+                  or _rt_command_timing_text(event, time_basis=time_basis)
+                  or _trigger_rt_timing_text(meta, start, end, aligned=aligned))
+    observation_cutoff = _metadata_time_in_basis(event, "observation_cutoff_ns", time_basis=time_basis)
+    observed = pending or (observation_cutoff is not None and
+                           observation_cutoff == _event_time_number(event, "t1", fallback=math.nan, time_basis=time_basis))
     lines = [
         f"label: {underflow_label(meta) if event.get('kind') == 'underflow_warning' else event.get('label', event.get('kind'))}",
         f"kind: {event.get('kind')}",
         f"sequencer: {event.get('sequencer_id')}",
         f"lane: {event.get('_base_lane', event.get('lane'))}",
-        f"time: {_display_value(event.get('t0'))} -> {_display_value(event.get('t1'))}",
-        f"duration: {_display_value(event.get('duration'))}",
+        f"{time_basis} time: {timing}",
+        f"{'observed duration' if observed else 'duration'}: {_display_value(event.get('duration'))}",
         f"confidence: {event.get('confidence')}",
     ]
-    if isinstance(meta, dict) and ("aligned_t0" in meta or "aligned_t1" in meta):
-        lines.append(f"aligned time: {meta.get('aligned_t0')} -> {meta.get('aligned_t1')}")
-        lines.append(f"local time: {meta.get('local_t0')} -> {meta.get('local_t1')}")
+    if not meta.get("pending") and kind != "q1_issue" and _plain_number(meta.get("queue_duration_ns")) == 0:
+        bound = _metadata_time_in_basis(event, "next_dequeue_not_before_ns", time_basis=time_basis)
+        if bound is not None:
+            label = "Nominal earliest next dequeue" if _rt_time_is_nominal(meta, aligned=aligned) else "Earliest next dequeue"
+            lines.append(f"{label}: {bound} ns")
+    if meta.get("trigger_arrival_unknown"):
+        lines.append(f"wait after trigger (ns): {meta.get('trigger_wait_duration_ns')}")
     if isinstance(meta, dict) and meta.get("status"):
         lines.append(f"status: {meta.get('status')}")
     lines.extend(
         [
             f"source: {source_display}",
             f"raw: {raw_display}",
-            f"meta: {json.dumps(meta, sort_keys=True)}",
         ]
     )
     return "\n".join(lines)
 
 
+def _metadata_time_in_basis(event: dict[str, Any], field: str, *, time_basis: str) -> int | float | None:
+    meta = event.get("meta") or {}
+    value = _plain_number(meta.get(field))
+    if value is None:
+        return None
+    offset = 0
+    if time_basis == "aligned":
+        for edge in ("t0", "t1"):
+            aligned = _plain_number(meta.get(f"aligned_{edge}"))
+            if aligned is not None:
+                local = _plain_number(meta.get(f"local_{edge}"))
+                if local is None:
+                    local = _value_number(event.get(edge), fallback=math.nan)
+                offset = aligned - local
+                if math.isfinite(offset):
+                    break
+    projected = value + offset
+    return projected if math.isfinite(projected) else None
+
+
+def _rt_time_is_nominal(meta: dict[str, Any], *, aligned: bool) -> bool:
+    return bool(meta.get("rt_trigger_epoch") or (aligned and meta.get("aligned_time_nominal")))
+
+
+def _incomplete_q1_timing_text(event: dict[str, Any], *, time_basis: str) -> str | None:
+    if event.get("kind") != "q1_issue":
+        return None
+    cutoff = _metadata_time_in_basis(event, "observation_cutoff_ns", time_basis=time_basis)
+    planned = _metadata_time_in_basis(event, "planned_q1_end_ns", time_basis=time_basis)
+    if cutoff is not None and planned is not None:
+        start = _event_time_number(event, "t0", fallback=math.nan, time_basis=time_basis)
+        end = _event_time_number(event, "t1", fallback=math.nan, time_basis=time_basis)
+        if start <= cutoff == end < planned:
+            return f"Issue {start} ns · Observation cutoff {cutoff} ns · Planned end {planned} ns"
+    return None
+
+
+def _released_wait_timing_text(event: dict[str, Any], *, time_basis: str) -> str | None:
+    label = {"wait_trigger": "Trigger arrival", "wait_sync": "Barrier release"}.get(event.get("kind"))
+    meta = event.get("meta") or {}
+    if (label is None or meta.get("pending") or meta.get("conditional_skipped") or meta.get("interrupted_by_fault")
+            or meta.get("playback") or meta.get("trigger_assumption") is not None
+            or meta.get("trigger_arrival_unknown") or _rt_time_is_nominal(meta, aligned=time_basis == "aligned")):
+        return None
+    phase = _metadata_time_in_basis(event, "rt_execution_ns", time_basis=time_basis)
+    arm = _event_time_number(event, "t0", fallback=math.nan, time_basis=time_basis)
+    end = _event_time_number(event, "t1", fallback=math.nan, time_basis=time_basis)
+    has_cutoff = "observation_cutoff_ns" in meta
+    if has_cutoff and _metadata_time_in_basis(event, "observation_cutoff_ns", time_basis=time_basis) != end:
+        return None
+    if phase is not None and arm <= phase <= end:
+        end_label = "Observation cutoff" if has_cutoff else "Complete"
+        return f"Arm {arm} ns · {label} {phase} ns · {end_label} {end} ns"
+    return None
+
+
+def _rt_command_timing_text(event: dict[str, Any], *, time_basis: str) -> str | None:
+    released_wait = _released_wait_timing_text(event, time_basis=time_basis)
+    meta = event.get("meta") or {}
+    lane = str(event.get("_base_lane", event.get("lane", "")))
+    if ("planned_rt_end_ns" not in meta or not re.match(r"(?:branch_compare\.(?:taken|fallthrough)\.)*rt\.", lane)
+            or meta.get("pending") or meta.get("interrupted_by_fault") or meta.get("trigger_arrival_unknown")
+            or _rt_time_is_nominal(meta, aligned=time_basis == "aligned")):
+        return released_wait
+    cutoff = _metadata_time_in_basis(event, "observation_cutoff_ns", time_basis=time_basis)
+    planned = _metadata_time_in_basis(event, "planned_rt_end_ns", time_basis=time_basis)
+    start = _event_time_number(event, "t0", fallback=math.nan, time_basis=time_basis)
+    end = _event_time_number(event, "t1", fallback=math.nan, time_basis=time_basis)
+    if cutoff is not None and planned is not None and start <= cutoff == end < planned:
+        observed = released_wait or f"Start {start} ns · Observation cutoff {cutoff} ns"
+        return f"{observed} · Planned end {planned} ns"
+    return released_wait
+
+
+def _trigger_rt_timing_text(meta: dict[str, Any], start: Any, end: Any, *, aligned: bool = False) -> str:
+    nominal = _rt_time_is_nominal(meta, aligned=aligned)
+    if meta.get("trigger_arrival_unknown"):
+        return f"{'Nominal arm' if nominal else 'Arm'} {start} → waiting for trigger (completion unresolved)"
+    if nominal:
+        return f"Nominal RT {start} → {end} (trigger arrival unresolved)"
+    return f"{start} -> {end}"
+
+
+def _wait_projection_key(event: dict[str, Any], kind: str, *, legacy: bool) -> tuple | None:
+    meta = event.get("meta") or {}
+    scope = (event.get("sequencer_id"), kind, *(meta.get(field) for field in (
+        "branch_comparison_kind", "branch_comparison_branch_id", "branch_comparison_path",
+        "loop_preview", "loop_iteration_index", "diff_status",
+    )))
+    if not legacy:
+        packet = meta.get("rt_packet_id")
+        return (*scope, "packet", packet) if packet is not None else None
+    source = event.get("source")
+    start = _value_number(event.get("t0"), fallback=math.nan)
+    if math.isfinite(start) and isinstance(source, dict) and source.get("file") and type(source.get("line")) is int:
+        return (*scope, "source", source["file"], source["line"], start)
+    return None
+
+
+def _completed_wait_aliases(events: list[dict[str, Any]]) -> dict[str, list[str]]:
+    primary_kinds = {"trigger_wait": "wait_trigger", "sync_wait": "wait_sync"}
+    candidates: dict[tuple, list[tuple[str, int | float]]] = {}
+    for event in events:
+        kind = event.get("kind")
+        if kind not in primary_kinds.values() or (event.get("meta") or {}).get("pending"):
+            continue
+        end = _value_number(event.get("t1"), fallback=math.nan)
+        if not math.isfinite(end):
+            continue
+        for legacy in (False, True):
+            key = _wait_projection_key(event, kind, legacy=legacy)
+            if key is not None:
+                candidates.setdefault(key, []).append((event["id"], end))
+    aliases: dict[str, list[str]] = {}
+    for event in events:
+        kind = primary_kinds.get(event.get("kind"))
+        meta = event.get("meta") or {}
+        if kind is None or meta.get("pending"):
+            continue
+        legacy = meta.get("rt_packet_id") is None
+        key = _wait_projection_key(event, kind, legacy=legacy)
+        matches = candidates.get(key, [])
+        if legacy:
+            end = _value_number(event.get("t1"), fallback=math.nan)
+            matches = [(primary, limit) for primary, limit in matches if end <= limit]
+        if len(matches) == 1:
+            aliases.setdefault(matches[0][0], []).append(event["id"])
+    return aliases
+
+
+def _merge_trigger_arrivals(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[tuple, list[dict[str, Any]]] = {}
+    consumed: set[tuple[tuple, str]] = set()
+    for event in events:
+        meta = event.get("meta", {})
+        scope = (event.get("sequencer_id"), *(meta.get(key) for key in (
+            "branch_comparison_kind", "branch_comparison_branch_id", "branch_comparison_path",
+            "loop_preview", "loop_iteration_index", "diff_status",
+        )))
+        if event.get("kind") == "wait_trigger" and isinstance(meta.get("input_event_ids"), list):
+            consumed.update((scope, str(event_id)) for event_id in meta["input_event_ids"])
+        if event.get("kind") != "trigger_receive" or any(meta.get(key) for key in (
+            "rt_trigger_epoch", "conditional_time_unknown", "comparison_terminal",
+        )):
+            continue
+        time = _value_number(event.get("t0"), fallback=math.nan)
+        if math.isfinite(time):
+            groups.setdefault((scope, event["lane"], time), []).append(event)
+
+    collapsed_ids: set[str] = set()
+    for (scope, _lane, _time), arrivals in groups.items():
+        if len(arrivals) < 2:
+            continue
+        matched = [event for event in arrivals if (scope, event["id"]) in consumed]
+        primary = matched[0] if len(matched) == 1 else arrivals[0]
+        aliases = [event["id"] for event in arrivals if event is not primary]
+        primary["_event_alias_ids"] = aliases
+        primary["_trigger_arrival_addresses"] = [event.get("meta", {}).get("address") for event in arrivals]
+        collapsed_ids.update(aliases)
+    return [event for event in events if event["id"] not in collapsed_ids]
+
+
+def _q1_only_loop_ids(events: list[dict[str, Any]]) -> set[str]:
+    loops = [event for event in events if event.get("kind") == "loop_block"]
+    if not loops:
+        return set()
+    by_id = {event["id"]: event for event in events}
+    hidden: set[str] = set()
+    preview_members = set()
+    for loop in loops:
+        meta = loop.get("meta", {})
+        period = meta.get("period")
+        if (not isinstance(period, dict) or period.get("kind") != "concrete" or _plain_number(period.get("value")) != 0
+                or meta.get("rt_packet_affine") or _value_number(loop.get("t0"), fallback=math.nan)
+                != _value_number(loop.get("t1"), fallback=math.nan)):
+            continue
+        if meta.get("playback"):
+            member_ids = meta.get("playback_event_ids") if meta.get("complete") is True else None
+        else:
+            member_ids = meta.get("first_iteration_event_ids") if meta.get("period_invariant") is True else None
+        if not isinstance(member_ids, list) or not member_ids:
+            continue
+        members = [by_id.get(event_id) for event_id in member_ids]
+        q1_ids = {event["id"] for event in members if event and event.get("kind") == "q1_issue"
+                  and event.get("meta", {}).get("emits_rt_packet") is False}
+        if not q1_ids or not all(event and event["sequencer_id"] == loop["sequencer_id"]
+                                and event.get("meta", {}).get("rt_packet_id") is None
+                                and (event["id"] in q1_ids or event.get("kind") == "latched_state_pending"
+                                     and event.get("meta", {}).get("q1_issue_event_id") in q1_ids)
+                                for event in members):
+            continue
+        hidden.add(loop["id"])
+        if isinstance(previews := meta.get("preview_iteration_event_ids"), dict):
+            preview_members.update((loop["sequencer_id"], meta.get("loop_id"), tuple(ids))
+                                   for ids in previews.values() if isinstance(ids, list))
+    for event in events:
+        meta = event.get("meta", {})
+        if (event.get("kind") == "loop_iteration_preview" and isinstance(ids := meta.get("event_ids"), list)
+                and (event["sequencer_id"], meta.get("loop_id"), tuple(ids)) in preview_members):
+            hidden.add(event["id"])
+    return hidden
+
+
 def _group_events(events: list[dict[str, Any]], *, mode: str) -> tuple[list[dict[str, Any]], list[str]]:
     grouped_events: list[dict[str, Any]] = []
     lanes: list[str] = []
+    wait_aliases = _completed_wait_aliases(events)
+    collapsed_wait_ids = {alias for aliases in wait_aliases.values() for alias in aliases}
     for event in events:
+        if event["id"] in collapsed_wait_ids:
+            continue
         if event.get("kind") == "underflow_warning" and (
             event.get("meta", {}).get("eventual") or event.get("meta", {}).get("status") == "possible_underflow"
         ):
@@ -831,24 +1183,30 @@ def _group_events(events: list[dict[str, Any]], *, mode: str) -> tuple[list[dict
         copied = dict(event)
         copied["_base_lane"] = lane
         copied["lane"] = grouped
+        if event["id"] in wait_aliases:
+            copied["_event_alias_ids"] = wait_aliases[event["id"]]
         if diagnostic_target:
             copied["_diagnostic_target"] = diagnostic_target
         grouped_events.append(copied)
-    return grouped_events, lanes
+    return _merge_trigger_arrivals(grouped_events), lanes
 
 
-def _lane_display_label(lane: str) -> str:
+def _lane_display_label(lane: str, events: list[dict[str, Any]]) -> str:
     base_lane = _debug_lane_candidate(lane)
     if base_lane in {NORMAL_Q1_ISSUE_LANE, "debug.q1_issue"}:
         return "Q1 core"
     if base_lane == "debug.underflow":
         return "RT underflow"
-    if base_lane.startswith("If "):
+    if base_lane.startswith("If ") or base_lane in {"Execute · RT", "Skip · RT"}:
         return base_lane
     parsed = _branch_comparison_lane_parts(lane)
     if parsed is None:
         return lane
     path, detail_lane = parsed
+    condition_label = next((_rt_condition_path_label(event, path) for event in events
+                            if event.get("meta", {}).get("branch_comparison_kind") == "rt_condition"), None)
+    if condition_label:
+        return f"{condition_label} / {detail_lane}"
     return f"{_branch_comparison_path_label(path)} / {detail_lane}"
 
 
@@ -858,6 +1216,9 @@ def _event_display_label(event: dict[str, Any]) -> str:
     if event.get("kind") == "underflow_warning":
         label = underflow_label(meta)
     path = meta.get("branch_comparison_path")
+    condition_label = _rt_condition_path_label(event, path)
+    if condition_label:
+        return f"[{condition_label}] {label}"
     if path == "taken":
         return f"[Taken] {label}"
     if path == "fallthrough":
@@ -931,7 +1292,16 @@ def _normal_branch_comparison_lane(event: dict[str, Any]) -> str | None:
         return None
     if _is_branch_comparison_debug_lane(str(event.get("lane", ""))):
         return None
+    condition_label = _rt_condition_path_label(event, path)
+    if condition_label:
+        return f"{condition_label} · RT"
     return _branch_comparison_path_label(path)
+
+
+def _rt_condition_path_label(event: dict[str, Any], path: str | None) -> str | None:
+    if event.get("meta", {}).get("branch_comparison_kind") != "rt_condition":
+        return None
+    return {"taken": "Execute", "fallthrough": "Skip"}.get(path)
 
 
 def _branch_comparison_path(event: dict[str, Any]) -> str | None:
@@ -1039,7 +1409,8 @@ def _feedback_flow_svgs(
         if from_lane_index is None or to_lane_index is None:
             continue
         x1 = _scale(_event_time_number(from_event, "t1", fallback=_event_time_number(from_event, "t0", fallback=t_min, time_basis=time_basis), time_basis=time_basis), t_min, t_max, left, right)
-        x2 = _scale(_event_time_number(to_event, "t0", fallback=t_min, time_basis=time_basis), t_min, t_max, left, right)
+        to_start = _event_time_number(to_event, "t0", fallback=t_min, time_basis=time_basis)
+        x2 = _scale(to_event.get("_plot_t0", to_start), t_min, t_max, left, right)
         y1 = top + from_lane_index * lane_height + 11
         y2 = top + to_lane_index * lane_height + 11
         delta = x2 - x1
@@ -1048,6 +1419,10 @@ def _feedback_flow_svgs(
         c1 = x1 + direction * control
         c2 = x2 - direction * control
         label = str(flow.get("label", "feedback flow"))
+        if any(event.get("meta", {}).get("rt_trigger_epoch")
+               or (time_basis == "aligned" and event.get("meta", {}).get("aligned_time_nominal"))
+               for event in (from_event, to_event)):
+            label += " · Logical FIFO link at nominal RT positions"
         visible_label = _feedback_flow_visible_label(flow)
         flow_diagnostics = _feedback_flow_diagnostics(flow, diagnostics)
         flow_classes = _with_diagnostic_classes("feedback-flow-group", flow_diagnostics)
@@ -1187,16 +1562,60 @@ def _parameters_panel(analysis: dict[str, Any]) -> str:
     )
 
 
-def _diagnostics_panel(diagnostics: list[dict[str, Any]], event_dom_ids: dict[str, str]) -> str:
+def _shared_simulation_offset(ir: dict[str, Any]) -> int | float:
+    alignment = ir.get("alignment")
+    if not isinstance(alignment, dict) or not alignment:
+        return 0
+    entries = list(alignment.values())
+    offset = _plain_number(entries[0].get("offset")) if isinstance(entries[0], dict) else None
+    if offset is not None and all(isinstance(entry, dict) and entry.get("clock") == "shared_simulation"
+                                  and entry.get("offset") == offset for entry in entries):
+        return offset
+    return 0
+
+
+def _network_conflict_display_message(diagnostic: dict[str, Any], offset: int | float) -> str | None:
+    category = diagnostic.get("category")
+    if category not in {"trigger_network_conflict", "trigger_network_possible_conflict"}:
+        return None
+    details = diagnostic.get("details")
+    if not isinstance(details, dict):
+        return None
+    ticks = details.get("launch_ticks")
+    network = details.get("network")
+    if not isinstance(network, str) or not isinstance(ticks, list) or len(ticks) != 2:
+        return None
+    first, second = ticks
+    if type(first) is not int or (second is not None and type(second) is not int):
+        return None
+
+    def slot(tick: int) -> str:
+        time = tick / 128 + offset
+        return f"{int(time) if time.is_integer() else time} ns"
+
+    if second is None:
+        return (f"Trigger network '{network}' could conflict with a request whose grid epoch is unknown. "
+                f"Known launch slot at {slot(first)}.")
+    qualifier = "potentially " if category == "trigger_network_possible_conflict" else ""
+    return f"Trigger network '{network}' has {qualifier}conflicting launch slots at {slot(first)} and {slot(second)}."
+
+
+def _diagnostics_panel(
+    diagnostics: list[dict[str, Any]], event_dom_ids: dict[str, str], events: list[dict[str, Any]],
+) -> str:
     counts = {severity: 0 for severity in ("error", "warning", "info", "hint")}
     for diagnostic in diagnostics:
         severity = str(diagnostic.get("severity", "info"))
         counts[severity] = counts.get(severity, 0) + 1
     summary = " · ".join(f"{counts[severity]} {severity}" + ("s" if counts[severity] != 1 else "")
                          for severity in ("error", "warning", "info", "hint") if counts[severity]) or "No issues"
-    error_items = "".join(_diagnostic_item(diagnostic, event_dom_ids) for diagnostic in diagnostics if diagnostic.get("severity") in {"error", "warning"})
+    tb_evidence_ids = {event_id for diagnostic in diagnostics if diagnostic.get("category") == "feedback_write_combine"
+                       for event_id in diagnostic.get("related_events", [])}
+    tb_evidence = {event["id"]: event for event in events if event["id"] in tb_evidence_ids} if tb_evidence_ids else {}
+    error_items = "".join(_diagnostic_item(diagnostic, event_dom_ids, tb_evidence)
+                          for diagnostic in diagnostics if diagnostic.get("severity") in {"error", "warning"})
     secondary_diagnostics = [diagnostic for diagnostic in diagnostics if diagnostic.get("severity") not in {"error", "warning"}]
-    secondary_items = "".join(_diagnostic_item(diagnostic, event_dom_ids) for diagnostic in secondary_diagnostics[:25])
+    secondary_items = "".join(_diagnostic_item(diagnostic, event_dom_ids, tb_evidence) for diagnostic in secondary_diagnostics[:25])
     critical_html = f'<ol class="diagnostics-critical">{error_items}</ol>' if error_items else ""
     secondary_html = ""
     if secondary_items:
@@ -1252,7 +1671,7 @@ def _feedback_balance_panel(feedback_balance: dict[str, Any]) -> str:
 def _feedback_balance_channel_has_issue(channel: dict[str, Any]) -> bool:
     if str(channel.get("status", "balanced")) != "balanced":
         return True
-    for field in ("unmatched_receives", "unconsumed_payloads"):
+    for field in ("unmatched_receives", "unconsumed_payloads", "ordering_unknown_receives"):
         try:
             if int(channel.get(field, 0)) > 0:
                 return True
@@ -1265,24 +1684,30 @@ def _feedback_balance_item(channel: dict[str, Any]) -> str:
     channel_id = escape(str(channel.get("channel", "default")))
     status = escape(str(channel.get("status", "balanced")))
     sends = escape(str(channel.get("sends", 0)))
-    send_payloads = escape(str(channel.get("send_payloads", 0)))
+    payload_count = channel.get("send_payloads", 0)
+    send_payloads = "unknown" if payload_count is None else escape(str(payload_count))
     receives = escape(str(channel.get("receives", 0)))
     matched = escape(str(channel.get("matched", 0)))
     discarded_payloads = escape(str(channel.get("discarded_payloads", 0)))
     unmatched_receives = escape(str(channel.get("unmatched_receives", 0)))
-    unconsumed_payloads = escape(str(channel.get("unconsumed_payloads", 0)))
+    unconsumed = channel.get("unconsumed_payloads", 0)
+    unconsumed_payloads = "unknown" if unconsumed is None else escape(str(unconsumed))
+    unknown_receives = channel.get("ordering_unknown_receives", 0)
+    uncertainty = f" · receive ordering unknown={escape(str(unknown_receives))}" if unknown_receives else ""
     return (
         f'<li class="feedback-balance-channel status-{status}">'
         f"<strong>ch {channel_id}</strong> "
         f"<code>{status}</code> "
         f"matched {matched}/{receives}; sends={sends}; payloads={send_payloads}; "
         f"discarded payloads={discarded_payloads}; unmatched receives={unmatched_receives}; "
-        f"unconsumed payloads={unconsumed_payloads}"
+        f"unconsumed payloads={unconsumed_payloads}{uncertainty}"
         "</li>"
     )
 
 
-def _diagnostic_item(diagnostic: dict[str, Any], event_dom_ids: dict[str, str]) -> str:
+def _diagnostic_item(
+    diagnostic: dict[str, Any], event_dom_ids: dict[str, str], tb_evidence: dict[str, dict[str, Any]],
+) -> str:
     severity = escape(str(diagnostic.get("severity", "info")))
     presentation = describe_diagnostic(diagnostic)
     title = escape(presentation["title"])
@@ -1291,6 +1716,8 @@ def _diagnostic_item(diagnostic: dict[str, Any], event_dom_ids: dict[str, str]) 
     filename = source_file.replace("\\", "/").rsplit("/", 1)[-1]
     location = f'{filename}:{source.get("line") or 1}' if filename else ""
     summary = presentation["summary"].strip()
+    if presentation["category"] == "rt_queue_underflow":
+        summary = RT_QUEUE_UNDERFLOW_DESCRIPTION
     details = diagnostic.get("details") or {}
     if presentation["category"] == "pending_hardware_state" and isinstance(details, dict) and isinstance(details.get("pending_fields"), list):
         summary = "Not applied: " + ", ".join(str(field) for field in details["pending_fields"])
@@ -1303,9 +1730,28 @@ def _diagnostic_item(diagnostic: dict[str, Any], event_dom_ids: dict[str, str]) 
     if (re.sub(r"\W+", "", summary).casefold() == re.sub(r"\W+", "", presentation["title"]).casefold()
             or summary == presentation["category"]):
         summary = ""
-    message = f'<p class="diagnostic-message">{escape(summary)}</p>' if summary else ""
+    conflict_index = diagnostic.get("_network_conflict_index")
+    message_attrs = f' data-network-conflict-index="{conflict_index}"' if type(conflict_index) is int else ""
+    message = f'<p class="diagnostic-message"{message_attrs}>{escape(summary)}</p>' if summary else ""
     related_events = diagnostic.get("related_events", [])
-    related = _related_event_link(related_events[0], event_dom_ids, label="Show event") if related_events else ""
+    related = _related_event_link(related_events, event_dom_ids, label="Show event") if related_events else ""
+    if presentation["category"] == "feedback_write_combine" and len(set(related_events)) > 1:
+        for event_id in dict.fromkeys(related_events):
+            evidence = tb_evidence.get(event_id)
+            if evidence is None:
+                continue
+            meta = evidence.get("meta", {})
+            cutoff = _plain_number(meta.get("observation_cutoff_ns"))
+            planned = _plain_number(meta.get("planned_rt_end_ns"))
+            if evidence["kind"] == "feedback_contribution":
+                role = "contribution"
+            elif (evidence["lane"].startswith("rt.") and cutoff is not None and planned is not None
+                  and cutoff == _value_number(evidence.get("t1"), fallback=math.nan) < planned):
+                role = "RT cutoff"
+            else:
+                continue
+            related += _related_event_link([event_id], event_dom_ids,
+                                           label=f'Show {evidence["sequencer_id"]} {role}', tb_evidence=True)
     return (
         f'<li class="diagnostic severity-{severity}" data-diagnostic-category="{escape(presentation["category"], quote=True)}">'
         '<div class="diagnostic-heading">'
@@ -1389,11 +1835,15 @@ def _semantic_event_link(event_id: Any, event_dom_ids: dict[str, str]) -> str:
     )
 
 
-def _related_event_link(event_id: Any, event_dom_ids: dict[str, str], *, label: str | None = None) -> str:
-    raw_id = str(event_id)
+def _related_event_link(
+    event_ids: list[str], event_dom_ids: dict[str, str], *, label: str | None = None, tb_evidence: bool = False,
+) -> str:
+    raw_id = event_ids[0]
+    candidates = escape(json.dumps(event_ids), quote=True)
+    attrs = " data-tb-evidence hidden" if tb_evidence else ""
     return (
         f' <a href="#{escape(_event_dom_id(raw_id, event_dom_ids), quote=True)}" '
-        f'data-related-event-id="{escape(raw_id, quote=True)}">{escape(label or raw_id)}</a>'
+        f'data-related-event-id="{escape(raw_id, quote=True)}" data-related-event-ids="{candidates}"{attrs}>{escape(label or raw_id)}</a>'
     )
 
 
@@ -1418,6 +1868,9 @@ def _event_dom_ids(events: list[dict[str, Any]]) -> dict[str, str]:
             index += 1
         mapping[event_id] = unique_dom_id
         used.add(unique_dom_id)
+    for event in events:
+        for alias in event.get("_event_alias_ids", ()):
+            mapping[alias] = mapping[event["id"]]
     return mapping
 
 
@@ -1454,14 +1907,17 @@ def _validate_ir(ir: dict[str, Any]) -> None:
                     f"TimelineIR field {field!r} entry {index} must be a JSON object, got {type(item).__name__}"
                 )
     valid_event_ids = _validate_unique_event_ids(ir.get("events", []))
+    simulations = ir.get("simulation", {})
     for index, event in enumerate(ir.get("events", [])):
         _validate_event_required_fields(event, index=index)
+        simulation = simulations.get(event["sequencer_id"]) if isinstance(simulations, dict) else None
+        fractional = isinstance(simulation, dict) and simulation.get("clock_tick_ns") == 1 / 128
         concrete_times = {
-            field: _validate_concrete_time_value(event.get(field))
+            field: _validate_concrete_time_value(event.get(field), fractional=fractional)
             for field in ("t0", "t1", "duration")
         }
         _validate_event_time_range(event, concrete_times)
-        _validate_event_time_metadata(event)
+        _validate_event_time_metadata(event, fractional=fractional)
     for index, diagnostic in enumerate(ir.get("diagnostics", [])):
         related_events = diagnostic.get("related_events", [])
         if not isinstance(related_events, list):
@@ -1574,7 +2030,7 @@ def _validate_event_required_fields(event: dict[str, Any], *, index: int) -> Non
             )
 
 
-def _validate_concrete_time_value(value: Any) -> int | None:
+def _validate_concrete_time_value(value: Any, *, fractional: bool = False) -> int | float | None:
     if value is None:
         return None
     if not isinstance(value, dict):
@@ -1587,12 +2043,13 @@ def _validate_concrete_time_value(value: Any) -> int | None:
     raw_value = value.get("value")
     if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
         raise RenderError(f"TimelineIR concrete time value must be numeric, got {raw_value!r}")
-    if not isinstance(raw_value, int):
-        raise RenderError(f"TimelineIR concrete time value must be integer nanoseconds, got {raw_value!r}")
+    if not _valid_time_number(raw_value, fractional=fractional):
+        unit = "integer nanoseconds or exact simulation ticks" if fractional else "integer nanoseconds"
+        raise RenderError(f"TimelineIR concrete time value must be {unit}, got {raw_value!r}")
     return raw_value
 
 
-def _validate_event_time_range(event: dict[str, Any], concrete_times: dict[str, int | None]) -> None:
+def _validate_event_time_range(event: dict[str, Any], concrete_times: dict[str, int | float | None]) -> None:
     t0 = concrete_times["t0"]
     t1 = concrete_times["t1"]
     duration = concrete_times["duration"]
@@ -1608,14 +2065,14 @@ def _validate_event_time_range(event: dict[str, Any], concrete_times: dict[str, 
         )
 
 
-def _validate_event_time_metadata(event: dict[str, Any]) -> None:
+def _validate_event_time_metadata(event: dict[str, Any], *, fractional: bool) -> None:
     meta = event.get("meta")
     if not isinstance(meta, dict):
         return
     for field in ("aligned_t0", "aligned_t1", "local_t0", "local_t1"):
         if field in meta:
             edge = "t0" if field.endswith("_t0") else "t1"
-            _validate_integer_time_metadata_value(meta[field], field=field, source_value=event.get(edge))
+            _validate_time_metadata_value(meta[field], field=field, source_value=event.get(edge), fractional=fractional)
     _validate_time_metadata_pair(event, meta, start_field="aligned_t0", end_field="aligned_t1")
     _validate_time_metadata_pair(event, meta, start_field="local_t0", end_field="local_t1")
     _validate_time_metadata_range(meta, start_field="aligned_t0", end_field="aligned_t1")
@@ -1640,16 +2097,20 @@ def _is_concrete_time_value_object(value: Any) -> bool:
 
 
 def _validate_time_metadata_range(meta: dict[str, Any], *, start_field: str, end_field: str) -> None:
-    start = meta.get(start_field)
-    end = meta.get(end_field)
-    if type(start) is int and type(end) is int and end < start:
+    start = _plain_number(meta.get(start_field))
+    end = _plain_number(meta.get(end_field))
+    if start is not None and end is not None and end < start:
         raise RenderError(f"TimelineIR meta.{end_field} must not be before meta.{start_field}: {end} < {start}")
 
 
-def _validate_integer_time_metadata_value(value: Any, *, field: str, source_value: Any) -> None:
-    if type(value) is not int:
-        if not _is_symbolic_time_metadata_string(value, source_value=source_value):
-            raise RenderError(f"TimelineIR meta.{field} time value must be integer nanoseconds, got {value!r}")
+def _valid_time_number(value: Any, *, fractional: bool) -> bool:
+    return type(value) is int or fractional and type(value) is float and (value * 128).is_integer()
+
+
+def _validate_time_metadata_value(value: Any, *, field: str, source_value: Any, fractional: bool) -> None:
+    if not _valid_time_number(value, fractional=fractional) and not _is_symbolic_time_metadata_string(value, source_value=source_value):
+        unit = "integer nanoseconds or exact simulation ticks" if fractional else "integer nanoseconds"
+        raise RenderError(f"TimelineIR meta.{field} time value must be {unit}, got {value!r}")
 
 
 def _is_symbolic_time_metadata_string(value: Any, *, source_value: Any) -> bool:
@@ -1733,7 +2194,7 @@ def _sequencer_from_lane(lane: str) -> str:
     return lane.split(" / ", 1)[0]
 
 
-def _time_extent(events: list[dict[str, Any]], *, time_basis: str) -> tuple[int, int]:
+def _time_extent(events: list[dict[str, Any]], *, time_basis: str) -> tuple[int | float, int | float]:
     values = []
     for event in events:
         t0 = _event_time_number(event, "t0", fallback=0, time_basis=time_basis)
@@ -1752,16 +2213,27 @@ def _default_time_basis(events: list[dict[str, Any]]) -> str:
     return "aligned" if any(_has_aligned_time(event) for event in events) else "local"
 
 
+def _shared_simulation_rt_anchor(ir: dict[str, Any], events: list[dict[str, Any]]) -> str | None:
+    alignment = ir.get("alignment")
+    if not isinstance(alignment, dict):
+        return None
+    anchors = {entry["anchor_event_id"] for entry in alignment.values() if isinstance(entry, dict)
+               and entry.get("clock") == "shared_simulation"
+               and isinstance(entry.get("anchor_event_id"), str)}
+    return next((event["kind"] for event in events if event["id"] in anchors
+                 and (event.get("kind") == "rt_queue_dequeue" or str(event.get("lane", "")).startswith("rt."))), None)
+
+
 def _has_aligned_time(event: dict[str, Any]) -> bool:
     meta = event.get("meta") if isinstance(event.get("meta"), dict) else {}
     return _plain_number(meta.get("aligned_t0")) is not None or _plain_number(meta.get("aligned_t1")) is not None
 
 
-def _ticks(t_min: int, t_max: int) -> list[int]:
+def _ticks(t_min: int | float, t_max: int | float) -> list[int | float]:
     if t_max <= t_min:
         return [t_min]
     step = max(1, (t_max - t_min) // 4)
-    ticks = [t_min + step * index for index in range(5)]
+    ticks = [tick for index in range(5) if (tick := t_min + step * index) <= t_max]
     if ticks[-1] != t_max:
         ticks.append(t_max)
     return sorted(set(ticks))
@@ -1773,28 +2245,16 @@ def _scale(value: int, t_min: int, t_max: int, left: int, right: int) -> float:
     return left + (right - left) * ((value - t_min) / (t_max - t_min))
 
 
-def _value_number(value: Any, *, fallback: int) -> int:
+def _value_number(value: Any, *, fallback: int | float) -> int | float:
     if isinstance(value, dict) and value.get("kind") == "concrete":
-        try:
-            raw_value = value["value"]
-            if isinstance(raw_value, bool):
-                raise TypeError
-            if not isinstance(raw_value, (int, float)):
-                raise TypeError
-            if not isinstance(raw_value, int):
-                raise ValueError("fractional time")
-            return raw_value
-        except (KeyError, TypeError, ValueError) as exc:
-            raw_value = value.get("value")
-            if isinstance(raw_value, (int, float)) and not isinstance(raw_value, bool):
-                raise RenderError(
-                    f"TimelineIR concrete time value must be integer nanoseconds, got {raw_value!r}"
-                ) from exc
-            raise RenderError(f"TimelineIR concrete time value must be numeric, got {raw_value!r}") from exc
+        number = _plain_number(value.get("value"))
+        if number is None:
+            raise RenderError(f"TimelineIR concrete time value must be numeric, got {value.get('value')!r}")
+        return number
     return fallback
 
 
-def _event_time_number(event: dict[str, Any], edge: str, *, fallback: int, time_basis: str) -> int:
+def _event_time_number(event: dict[str, Any], edge: str, *, fallback: int | float, time_basis: str) -> int | float:
     if time_basis == "aligned":
         meta = event.get("meta") if isinstance(event.get("meta"), dict) else {}
         aligned = _plain_number(meta.get(f"aligned_{edge}"))
@@ -1803,12 +2263,8 @@ def _event_time_number(event: dict[str, Any], edge: str, *, fallback: int, time_
     return _value_number(event.get(edge), fallback=fallback)
 
 
-def _plain_number(value: Any) -> int | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    return None
+def _plain_number(value: Any) -> int | float | None:
+    return value if type(value) in (int, float) else None
 
 
 def _display_value(value: Any) -> str:
@@ -1883,10 +2339,12 @@ def _diagnostic_overlays_by_event(
         if event.get("kind") != "underflow_warning":
             continue
         target = str(event.get("_diagnostic_target", event)["id"])
+        message = event.get("meta", {}).get("diagnostic_message")
         overlays.setdefault(target, []).append({
-            "severity": "error", "category": "definite_underflow",
-            "message": _event_display_label(event), "underflow_event_id": event_id,
+            "severity": "error", "category": "rt_queue_underflow" if message else "definite_underflow",
+            "message": message or _event_display_label(event), "underflow_event_id": event_id,
         })
+    event_by_id.update((alias, event) for event in events for alias in event.get("_event_alias_ids", ()))
     for diagnostic in diagnostics if isinstance(diagnostics, list) else []:
         if not isinstance(diagnostic, dict) or diagnostic.get("severity") != "error":
             continue
@@ -1902,7 +2360,7 @@ def _diagnostic_overlays_by_event(
                               and event.get("source", {}).get("line") == source.get("line")]
         event_id = next((event_id for event_id in related_events if isinstance(event_id, str) and event_id in event_by_id), None)
         if event_id:
-            overlays.setdefault(event_id, []).append(diagnostic)
+            overlays.setdefault(event_by_id[event_id]["id"], []).append(diagnostic)
     return overlays
 
 
@@ -2003,6 +2461,8 @@ def _search_text(event: dict[str, Any]) -> str:
         source.get("file", "") if isinstance(source, dict) else "",
         str(source.get("line", "")) if isinstance(source, dict) else "",
         source.get("raw", "") if isinstance(source, dict) else "",
+        *event.get("_event_alias_ids", ()),
+        *event.get("_trigger_arrival_addresses", ()),
     ]
     meta = event.get("meta", {})
     if isinstance(meta, dict):
@@ -2203,15 +2663,11 @@ body.mode-debug .q1-error-marker { display: none; }
 .event-inspector dt { color: var(--vscode-descriptionForeground, #374151); font-weight: 700; }
 .event-inspector dd { margin: 0; overflow-wrap: anywhere; }
 .event-inspector button { margin-top: 8px; }
-.branch-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 10px; }
-.branch-actions-title, .branch-actions-condition, .branch-actions-status { flex-basis: 100%; font-size: 12px; }
-.branch-actions-title { font-weight: 700; color: var(--vscode-foreground, #17202a); }
-.branch-actions-condition { color: var(--vscode-descriptionForeground, #374151); }
-.branch-actions-status { color: var(--vscode-descriptionForeground, #4b5563); }
 .event.confidence-symbolic > rect { fill: var(--q1asm-event-fill, #f7d774); stroke-dasharray: 5 3; }
 .event.confidence-assumed > rect { fill: var(--q1asm-event-fill, #b8c2cc); stroke-dasharray: 4 3; }
 .event.confidence-unknown > rect { fill: var(--q1asm-event-fill, #c9ced6); stroke-dasharray: 2 2; }
 .event.confidence-runtime_dependent > rect { fill: var(--q1asm-event-fill, #e5a0a0); stroke-dasharray: 6 2; }
+.event.rt-time-nominal > rect { stroke-dasharray: 4 3; }
 .kind-loop_block rect, .kind-control_flow_loop rect { stroke-width: 2; }
 .kind-control_flow_branch rect { stroke-width: 2; stroke-dasharray: 7 4; }
 .branch-path-taken rect { stroke-width: 2; }
@@ -2253,7 +2709,8 @@ body.mode-normal .event.normal-feedback-collapsed { display: none; }
 
 def _js() -> str:
     return """
-const modeButtons = document.querySelectorAll('[data-mode]');
+const modeButtons = document.querySelectorAll('button[data-mode]');
+const timelineRoot = document.getElementById('timeline-root');
 const timelineIrNode = document.getElementById('timeline-ir');
 let timelineIr = { events: [] };
 try {
@@ -2262,11 +2719,67 @@ try {
   timelineIr = { events: [] };
 }
 const eventsById = new Map((timelineIr.events || []).map((event) => [String(event.id), event]));
+const setterApplicationLinks = buildSetterApplicationLinks();
 const timelineEventSelector = '.event, .loop-bracket, .branch-marker';
 const selectedTimelineEventSelector = '.event.is-selected, .loop-bracket.is-selected, .branch-marker.is-selected';
 const relatedTimelineEventSelector = '.event.is-related, .loop-bracket.is-related, .branch-marker.is-related';
 const eventInspector = document.getElementById('event-inspector');
 const inspectorFields = document.getElementById('event-inspector-fields');
+const boundTimelineEvents = new WeakSet();
+let selectedTimelineEvent;
+function buildSetterApplicationLinks() {
+  const links = new Map();
+  const committedScopes = new Set();
+  const firstApplications = new Map();
+  function link(issueId, applicationId) {
+    for (const [source, target] of [[issueId, applicationId], [applicationId, issueId]]) {
+      if (!links.has(source)) links.set(source, new Set());
+      links.get(source).add(target);
+    }
+  }
+  function sharesPath(source, target) {
+    return !source.branch_comparison_path ||
+      (source.branch_comparison_path === target.branch_comparison_path &&
+       source.branch_comparison_branch_id === target.branch_comparison_branch_id);
+  }
+  for (const [applicationId, event] of eventsById) {
+    const meta = event.meta || {};
+    if (!/^(?:branch_compare[.](?:taken|fallthrough)[.])*rt[.]/.test(event.lane) ||
+        event.kind === 'conditional_skip' || meta.conditional_skipped) continue;
+    const hasCommitEvidence = Object.hasOwn(meta, 'committed_setter_event_ids');
+    const setters = hasCommitEvidence ? meta.committed_setter_event_ids : meta.applied_setter_event_ids;
+    for (const [field, setterId] of Object.entries(setters || {})) {
+      if (!hasCommitEvidence && !Object.hasOwn(meta.applied_state || {}, field)) continue;
+      const setter = eventsById.get(String(setterId));
+      if (setter?.kind !== 'latched_state_pending' || setter.meta?.field !== field ||
+          setter.sequencer_id !== event.sequencer_id || !sharesPath(setter.meta, meta)) continue;
+      const issueId = String(setter.meta.q1_issue_event_id);
+      const issue = eventsById.get(issueId);
+      if (issue?.kind !== 'q1_issue' || issue.sequencer_id !== event.sequencer_id || !sharesPath(issue.meta || {}, meta)) continue;
+      const scope = JSON.stringify([setterId, field, meta.branch_comparison_branch_id,
+        meta.branch_comparison_path, meta.diff_status === 'removed']);
+      if (hasCommitEvidence) {
+        committedScopes.add(scope);
+        link(issueId, applicationId);
+        continue;
+      }
+      // Legacy snapshots can retain a setter after the first observed application in a path.
+      const start = event.t0?.kind === 'concrete' ? event.t0.value : undefined;
+      const packet = JSON.stringify([meta.rt_packet_id ?? meta.q1_issue_event_id ?? applicationId,
+        meta.loop_preview, meta.loop_iteration_index, start]);
+      const previous = firstApplications.get(scope);
+      if (!previous || (Number.isFinite(start) && Number.isFinite(previous.start) && start < previous.start)) {
+        firstApplications.set(scope, {issueId, start, packet, applications: []});
+      }
+      const first = firstApplications.get(scope);
+      if (first.packet === packet) first.applications.push(applicationId);
+    }
+  }
+  for (const [scope, {issueId, applications}] of firstApplications) {
+    if (!committedScopes.has(scope)) for (const applicationId of applications) link(issueId, applicationId);
+  }
+  return links;
+}
 function querySelectorAllWithFallback(selector) {
   const nodes = Array.from(document.querySelectorAll(selector));
   if (nodes.length || !selector.includes(',')) {
@@ -2336,6 +2849,11 @@ function formatBranchAssumption(meta) {
     return undefined;
   }
   const path = meta.assumed_branch_path;
+  if (meta.rt_condition_control) {
+    if (path === 'both') return 'Execute / Skip';
+    if (path === 'taken') return 'Execute';
+    if (path === 'fallthrough') return 'Skip';
+  }
   if (!path) {
     return meta.branch_taken;
   }
@@ -2397,11 +2915,180 @@ function formatLoopPreviewProgress(meta) {
   }
   return `${visible}/${loopPreviewCap(meta)} cap`;
 }
-function canShowNextLoopIteration(meta) {
-  const visible = loopPreviewVisibleIterations(meta);
-  const total = loopPreviewTotalIterations(meta);
-  const cap = loopPreviewCap(meta);
-  return visible < cap && (total === undefined || visible < total);
+function inspectorTimeEdge(event, edge, timeBasis) {
+  const aligned = event.meta?.[`aligned_${edge}`];
+  if (timeBasis === 'aligned' && Number.isFinite(aligned)) return aligned;
+  const local = event[edge];
+  return local?.kind === 'concrete' ? local.value : local?.display;
+}
+function inspectorMetadataTime(event, field, timeBasis) {
+  const meta = event.meta || {};
+  const value = meta[field];
+  if (!Number.isFinite(value)) return undefined;
+  let offset = 0;
+  if (timeBasis === 'aligned') {
+    for (const edge of ['t0', 't1']) {
+      const aligned = meta[`aligned_${edge}`];
+      if (!Number.isFinite(aligned)) continue;
+      const local = Number.isFinite(meta[`local_${edge}`]) ? meta[`local_${edge}`] : inspectorTimeEdge(event, edge, 'local');
+      offset = Number.isFinite(local) ? aligned - local : NaN;
+      if (Number.isFinite(offset)) break;
+    }
+  }
+  const projected = value + offset;
+  return Number.isFinite(projected) ? projected : undefined;
+}
+function inspectorRtTimeIsNominal(meta, timeBasis) {
+  return Boolean(meta?.rt_trigger_epoch || timeBasis === 'aligned' && meta?.aligned_time_nominal);
+}
+function inspectorTimeRange(event, timeBasis) {
+  const hasModeTemplate = timeBasis && timelineRoot?.querySelector('template[data-timeline-mode]');
+  if ((event.kind === 'underflow_warning' && event.meta?.diagnostic_message && !event.meta?.comparison_terminal) ||
+      (event.kind === 'feedback_rejected' && !event.meta?.comparison_terminal)) {
+    const time = inspectorTimeEdge(event, 't0', timeBasis);
+    return Number.isFinite(time) ? `${time} ns` : time || 'unknown';
+  }
+  if (event.kind === 'q1_issue') {
+    const cutoff = inspectorMetadataTime(event, 'observation_cutoff_ns', timeBasis);
+    const planned = inspectorMetadataTime(event, 'planned_q1_end_ns', timeBasis);
+    const start = inspectorTimeEdge(event, 't0', timeBasis), end = inspectorTimeEdge(event, 't1', timeBasis);
+    if ([start, cutoff, planned].every(Number.isFinite) && start <= cutoff && cutoff === end && end < planned) {
+      return `Issue ${start} ns · Observation cutoff ${cutoff} ns · Planned end ${planned} ns`;
+    }
+  }
+  const nominal = inspectorRtTimeIsNominal(event.meta, timeBasis);
+  const unresolved = event.meta?.trigger_arrival_unknown;
+  const pending = event.meta?.pending === true && (event.kind === 'trigger_wait' || event.kind === 'sync_wait');
+  const displayEdge = (edge) => {
+    const time = inspectorTimeEdge(event, edge, timeBasis);
+    if (!hasModeTemplate && !nominal && !unresolved && !pending) {
+      return displayInspectorValue(timeBasis === 'aligned' && Number.isFinite(time) ? time : event[edge]);
+    }
+    return Number.isFinite(time) ? `${time} ns` : time || 'unknown';
+  };
+  const start = displayEdge('t0'), end = displayEdge('t1');
+  if (pending) {
+    const target = event.kind === 'trigger_wait' ? 'trigger' : 'synchronization';
+    const cutoff = Number.isFinite(inspectorTimeEdge(event, 't1', timeBasis)) ? ` · observation cutoff ${end}` : '';
+    return `Arm ${start} → waiting for ${target} (completion unresolved)${cutoff}`;
+  }
+  if (unresolved) {
+    return `${nominal ? 'Nominal arm' : 'Arm'} ${start} → waiting for trigger (completion unresolved)`;
+  }
+  if (nominal) return `Nominal RT ${start} → ${end} (trigger arrival unresolved)`;
+  const meta = event.meta || {};
+  const startTime = inspectorTimeEdge(event, 't0', timeBasis), endTime = inspectorTimeEdge(event, 't1', timeBasis);
+  const hasCutoff = Object.hasOwn(meta, 'observation_cutoff_ns');
+  const cutoff = hasCutoff ? inspectorMetadataTime(event, 'observation_cutoff_ns', timeBasis) : undefined;
+  const planned = !meta.pending && !meta.interrupted_by_fault && /^(?:branch_compare[.](?:taken|fallthrough)[.])*rt[.]/.test(event.lane)
+    ? inspectorMetadataTime(event, 'planned_rt_end_ns', timeBasis) : undefined;
+  const plannedEnd = [startTime, cutoff, planned].every(Number.isFinite) && startTime <= cutoff && cutoff === endTime && endTime < planned
+    ? ` · Planned end ${planned} ns` : '';
+  if ((event.kind === 'wait_trigger' || event.kind === 'wait_sync') &&
+      !meta.pending && !meta.conditional_skipped && !meta.interrupted_by_fault && !meta.playback && meta.trigger_assumption == null) {
+    const phase = inspectorMetadataTime(event, 'rt_execution_ns', timeBasis);
+    if ([startTime, phase, endTime].every(Number.isFinite) && startTime <= phase && phase <= endTime && (!hasCutoff || cutoff === endTime)) {
+      const label = event.kind === 'wait_trigger' ? 'Trigger arrival' : 'Barrier release';
+      const endLabel = hasCutoff ? 'Observation cutoff' : 'Complete';
+      return `Arm ${startTime} ns · ${label} ${phase} ns · ${endLabel} ${endTime} ns${plannedEnd}`;
+    }
+  }
+  if (plannedEnd) return `Start ${startTime} ns · Observation cutoff ${cutoff} ns${plannedEnd}`;
+  if (!hasModeTemplate) return `${start} -> ${end}`;
+  return start === end ? start : `${start} → ${end}`;
+}
+function matchesComparison(evidence, owner) {
+  const { branch_comparison_branch_id: branch, branch_comparison_path: path } = evidence.meta || {};
+  return (branch == null && path == null) ||
+    (branch === owner.meta?.branch_comparison_branch_id && path === owner.meta?.branch_comparison_path);
+}
+function appendRecordedConditionFields(fields, issue, timeBasis) {
+  const meta = issue.meta || {};
+  if (!timelineIr.simulation?.[issue.sequencer_id] || issue.kind !== 'q1_issue' || meta.op !== 'set_cond' ||
+      !meta.branch_id || meta.branch_comparison_path || meta.diff_status === 'removed') return;
+  if (meta.assumed_branch_path === 'taken' || meta.assumed_branch_path === 'fallthrough') {
+    addInspectorField(fields, 'Recorded RT decisions', 'Unavailable under a forced assumption');
+    return;
+  }
+  const packets = new Set();
+  const buttons = [];
+  for (const event of eventsById.values()) {
+    const rt = event.meta || {};
+    const armed = rt.pending === true && rt.rt_condition_decision === true &&
+      (event.kind === 'trigger_wait' || event.kind === 'sync_wait');
+    if (event.sequencer_id !== issue.sequencer_id || !event.lane.startsWith('rt.') ||
+        rt.rt_condition_issue_event_id !== issue.id || !rt.rt_packet_id || packets.has(rt.rt_packet_id) ||
+        (!armed && !Number.isFinite(rt.rt_execution_ns)) || rt.branch_comparison_path || rt.diff_status === 'removed') continue;
+    const time = inspectorTimeEdge(event, 't0', timeBasis);
+    if (!Number.isFinite(time)) continue;
+    packets.add(rt.rt_packet_id);
+    const decision = rt.conditional_skipped === true || event.kind === 'conditional_skip' ? 'Skip' : 'Execute';
+    buttons.push(`<button type="button" data-related-event-id="${escapeHtml(event.id)}">${decision} at ${time} ns</button>`);
+  }
+  fields.push(`<dt>Recorded RT decisions</dt><dd>${buttons.length ? buttons.join(' ') : 'None observed'}</dd>`);
+}
+function netzeroResultActions(command) {
+  const meta = command.meta || {};
+  if (typeof meta.rt_packet_id !== 'string' || !meta.rt_packet_id || meta.conditional_skipped) return '';
+  const buttons = [];
+  for (const result of eventsById.values()) {
+    const evidence = result.meta || {};
+    if (result.kind !== 'netzero_result' || result.sequencer_id !== command.sequencer_id ||
+        evidence.source_event_id !== command.id || evidence.rt_packet_id !== meta.rt_packet_id ||
+        !matchesComparison(command, result) || (evidence.diff_status === 'removed') !== (meta.diff_status === 'removed')) continue;
+    const output = evidence.output == null ? 'result' : `output ${evidence.output}`;
+    const paths = evidence.branch_comparison_kind === 'rt_condition'
+      ? {taken: 'Execute', fallthrough: 'Skip'} : {taken: 'Taken', fallthrough: 'Fallthrough'};
+    const path = !meta.branch_comparison_path && Object.hasOwn(paths, evidence.branch_comparison_path)
+      ? ` (${paths[evidence.branch_comparison_path]})` : '';
+    buttons.push(`<button type="button" data-related-event-id="${escapeHtml(result.id)}">Show NetZero ${escapeHtml(output + path)}</button>`);
+  }
+  return buttons.length ? `<dt>NetZero results</dt><dd>${buttons.join(' ')}</dd>` : '';
+}
+function terminalEvidenceActions(event) {
+  const ids = event.meta.comparison_terminal.source_event_ids;
+  const excluded = hiddenRtEventIds();
+  const evidence = [...new Set(Array.isArray(ids) ? ids.map(String) : [])]
+    .filter((id) => !excluded.has(id))
+    .map((id) => eventsById.get(id))
+    .filter((item) => item && item !== event && matchesComparison(item, event));
+  if (!evidence.length) return '';
+  const fallback = evidence.map((item) => item.id);
+  const buttons = [`<button type="button" data-related-event-id="${escapeHtml(fallback[0])}" data-related-event-ids="${escapeHtml(JSON.stringify(fallback))}">Show evidence</button>`];
+  const visible = new Set();
+  for (const item of evidence) {
+    const node = findEventNodeById(item.id);
+    if (!isTimelineEventVisible(node) || visible.has(node)) continue;
+    visible.add(node);
+    if (visible.size === 1) continue;  // The primary button opens the first visible node.
+    const cutoff = Number.isFinite(item.meta?.observation_cutoff_ns);
+    const label = item.kind === 'q1_issue' ? (cutoff ? 'Q1 cutoff' : 'Q1 issue')
+      : cutoff ? 'RT cutoff' : item.kind.replaceAll('_', ' ');
+    buttons.push(`<button type="button" data-related-event-id="${escapeHtml(item.id)}" data-related-visible-only>Show ${escapeHtml(label)}</button>`);
+  }
+  return `<dt>Evidence</dt><dd>${buttons.join(' ')}</dd>`;
+}
+function rejectionSenderEvents(rejection) {
+  const meta = rejection.meta || {};
+  if (typeof meta.source_event_id !== 'string' || meta.input_event_id != null || meta.input_index != null) return [];
+  const send = eventsById.get(meta.source_event_id);
+  if (send?.kind !== 'feedback_send' || send.meta?.write_combine) return [];
+  if (!matchesComparison(send, rejection)) return [];
+  const evidence = [];
+  const packetId = send.meta?.source_packet_id;
+  if (typeof packetId === 'string' && packetId) {
+    const commands = [...eventsById.values()].filter((event) => {
+      const command = event.meta || {};
+      return event.sequencer_id === send.sequencer_id && command.rt_packet_id === packetId &&
+        /^(?:branch_compare[.](?:taken|fallthrough)[.])*rt[.]/.test(event.lane) &&
+        event.kind !== 'conditional_skip' && !command.conditional_skipped &&
+        (Number.isFinite(command.rt_execution_ns) || ['feedback_com', 'fb_com_data'].includes(event.kind)) &&
+        matchesComparison(event, send) && isTimelineEventVisible(findEventNodeById(event.id));
+    });
+    if (commands.length === 1) evidence.push(commands[0].id);
+  }
+  if (isTimelineEventVisible(findEventNodeById(send.id))) evidence.push(send.id);
+  return evidence;
 }
 function renderInspector(eventId, diagnosticMessage) {
   if (!inspectorFields) {
@@ -2411,7 +3098,6 @@ function renderInspector(eventId, diagnosticMessage) {
   if (!event) {
     inspectorFields.innerHTML = '<dt>Selected event</dt><dd>None</dd>';
     renderLoopPreviewAction(null);
-    renderBranchActions(null);
     clearRelatedControlFlow();
     return;
   }
@@ -2424,12 +3110,88 @@ function renderInspector(eventId, diagnosticMessage) {
     if (meta.slack_ns < 0) label += ` · ${-meta.slack_ns} ns late`;
   }
   addInspectorField(fields, 'Label', label);
+  const terminal = meta.comparison_terminal;
+  if (terminal) {
+    addInspectorField(fields, 'Execution status', terminal.status?.replaceAll('_', ' '));
+    addInspectorField(fields, 'Reason', terminal.reason);
+    fields.push(terminalEvidenceActions(event));
+  }
   for (const message of diagnosticMessage?.split('\\n') || []) {
     addInspectorField(fields, 'Error', message, 'diagnostic-error-message');
   }
   addInspectorField(fields, 'Sequencer', event.sequencer_id);
   addInspectorField(fields, 'Lane', event.lane);
-  addInspectorField(fields, 'Time range', `${displayInspectorValue(event.t0)} -> ${displayInspectorValue(event.t1)}`);
+  const timeBasis = timelineRoot?.querySelector(':scope > svg')?.dataset.timeBasis;
+  const timeRange = inspectorTimeRange(event, timeBasis);
+  if (event.kind === 'loop_block' && !meta.observed && !meta.playback &&
+      ['first_iteration_only', 'requested_iterations'].includes(meta.preview_policy)) {
+    const edge = (key) => {
+      const time = inspectorTimeEdge(event, key, timeBasis);
+      return Number.isFinite(time) ? `${time} ns` : 'Unknown';
+    };
+    addInspectorField(fields, 'RT preview range', `${edge('t0')} → ${edge('t1')}`);
+    const total = meta.total_duration?.kind === 'concrete' ? meta.total_duration.value : undefined;
+    const period = meta.period?.kind === 'concrete' ? meta.period.value : undefined;
+    const exactForever = event.confidence === 'exact' && meta.count === 'forever' && meta.period_invariant === true;
+    let totalText = 'Unknown';
+    if (Number.isFinite(total) && total >= 0) totalText = `${total} ns`;
+    else if (exactForever && Number.isFinite(period) && period >= 0) totalText = period > 0 ? 'Unbounded' : '0 ns';
+    addInspectorField(fields, 'Total RT duration', totalText);
+    const slope = meta.period_affine?.slope;
+    const durations = Array.isArray(meta.iteration_durations) ? meta.iteration_durations : [];
+    const first = period ?? durations[0];
+    const count = meta.count;
+    const exactFirst = event.confidence === 'exact' && Number.isSafeInteger(count) && count > 0 &&
+      Number.isSafeInteger(first) && first >= 0;
+    const repeatedTotal = exactFirst ? first * count : undefined;
+    const varying = (Number.isFinite(slope) && slope !== 0) || new Set(durations.filter(Number.isFinite)).size > 1 ||
+      (count > 1 && Number.isSafeInteger(repeatedTotal) && Number.isSafeInteger(total) && total >= 0 && repeatedTotal !== total);
+    const equalSamples = exactFirst && durations.length === count && durations.every((duration) => duration === first);
+    const invariantPeriod = meta.period_invariant === true ? period : first;
+    addInspectorField(fields, 'RT period', meta.period_invariant === true || equalSamples && !varying
+      ? (Number.isFinite(invariantPeriod) && invariantPeriod >= 0 ? `Invariant · ${invariantPeriod} ns` : 'Invariant')
+      : varying ? 'Varying' : 'Unknown');
+  } else {
+    addInspectorField(fields, 'Time range', timeRange);
+  }
+  if (event.kind === 'unknown_region' && meta.reason === 'unverified_instruction' &&
+      Number.isSafeInteger(meta.planned_duration_ns) && meta.planned_duration_ns >= 0) {
+    addInspectorField(fields, 'Planned duration', `${meta.planned_duration_ns} ns`);
+  }
+  if (event.kind === 'play_netzero') fields.push(netzeroResultActions(event));
+  if (event.kind === 'netzero_result' && meta.status === 'incomplete') {
+    const start = inspectorTimeEdge(event, 't0', timeBasis), end = inspectorTimeEdge(event, 't1', timeBasis);
+    const cutoff = inspectorMetadataTime(event, 'observation_cutoff_ns', timeBasis);
+    const planned = inspectorMetadataTime(event, 'planned_end_ns', timeBasis);
+    if ([start, end, cutoff, planned].every(Number.isFinite) && start <= cutoff && cutoff === end && end <= planned) {
+      addInspectorField(fields, 'Compensation timing', `Observation cutoff ${cutoff} ns · Planned end ${planned} ns`);
+      if (Number.isFinite(meta.compensation_area)) {
+        addInspectorField(fields, 'Observed compensation area', `${meta.compensation_area} normalized full scale × ns`);
+      }
+      if (Number.isFinite(meta.planned_compensation_area)) {
+        addInspectorField(fields, 'Planned compensation area', `${meta.planned_compensation_area} normalized full scale × ns`);
+      }
+    }
+  }
+  if (event.kind !== 'q1_issue' && !meta.pending && meta.queue_duration_ns === 0) {
+    const bound = inspectorMetadataTime(event, 'next_dequeue_not_before_ns', timeBasis);
+    const label = inspectorRtTimeIsNominal(meta, timeBasis) ? 'Nominal earliest next dequeue' : 'Earliest next dequeue';
+    if (Number.isFinite(bound)) addInspectorField(fields, label, `${bound} ns`);
+  }
+  if (event.kind === 'trigger_receive') addInspectorField(fields, 'Trigger address', meta.address);
+  if (event.kind === 'feedback_rejected') {
+    if (!terminal) {
+      addInspectorField(fields, 'Input event', meta.input_event_id);
+      addInspectorField(fields, 'LINQ ID', meta.id);
+    }
+    const sender = rejectionSenderEvents(event);
+    if (sender.length) {
+      fields.push(`<dt>Sender</dt><dd><button type="button" data-related-event-id="${escapeHtml(sender[0])}" data-related-event-ids="${escapeHtml(JSON.stringify(sender))}" data-related-visible-only>Show sender</button></dd>`);
+    }
+  }
+  if (meta.trigger_arrival_unknown) {
+    addInspectorField(fields, 'Wait after trigger (ns)', meta.trigger_wait_duration_ns);
+  }
   const integration = meta.acquisition_window;
   if (event.kind === 'acquire' && integration) {
     const duration = integration.effective_duration_ns;
@@ -2437,13 +3199,29 @@ function renderInspector(eventId, diagnosticMessage) {
       : integration.source === 'instruction_duration_fallback' ? `${duration} ns (assumed from RT duration)`
       : `${duration} ns / ${integration.configured_duration_ns} ns configured`);
   }
+  if (event.kind === 'acquire') {
+    addInspectorField(fields, 'Integration source', ({
+      __proto__: null,
+      configured: 'Physical model · integration_length_ns',
+      hardware_parameters: 'hardware parameters · integration_length_acq',
+      weight_memory: 'Weight memory',
+      instruction_duration_fallback: 'Assumed from RT duration',
+    })[integration?.source] ?? 'unknown');
+  }
   addInspectorField(fields, 'Source', source.file ? `${source.file.replace(/\\\\/g, '/').split('/').pop()}:${source.line || 1}` : 'unavailable');
   addInspectorField(fields, 'Confidence', event.confidence);
-  addInspectorField(fields, 'Q1 core', event.kind === 'q1_issue' ? `${displayInspectorValue(event.t0)} -> ${displayInspectorValue(event.t1)}` : meta.q1_issue_event_id);
+  addInspectorField(fields, 'Stop code', meta.stop_code);
+  addInspectorField(fields, 'Fault flag', meta.fault?.flag);
+  if (meta.fault) {
+    addInspectorField(fields, 'Fault edge (ns)', inspectorTimeEdge(event, 't1', timeBasis) ?? meta.fault.q1_time_ns);
+  }
+  addInspectorField(fields, 'Q1 core', event.kind === 'q1_issue' ? timeRange : meta.q1_issue_event_id);
   addInspectorField(fields, 'RT packet', meta.rt_packet_id);
   addInspectorField(fields, 'Queue depth', meta.estimated_depth ?? meta.depth);
   addInspectorField(fields, 'Late by', event.kind === 'underflow_warning' && meta.slack_ns < 0 ? `${-meta.slack_ns} ns` : '');
-  addInspectorField(fields, 'Branch condition', meta.condition);
+  addInspectorField(fields, 'Branch condition', meta.condition || (meta.rt_condition_control ? String(source.raw ?? '').trim() : undefined));
+  if (meta.branch_id) addInspectorField(fields, 'Recorded branch path', recordedBranchPath(meta));
+  appendRecordedConditionFields(fields, event, timeBasis);
   addInspectorField(fields, 'Branch decision', meta.branch_decision);
   addInspectorField(fields, 'Runtime dependency', meta.runtime_dependency);
   addInspectorField(fields, 'Branch policy', meta.branch_policy);
@@ -2455,7 +3233,6 @@ function renderInspector(eventId, diagnosticMessage) {
   addInspectorField(fields, 'Duration expression', displayDurationProvenance(meta.duration_provenance));
   inspectorFields.innerHTML = fields.join('');
   renderLoopPreviewAction(event);
-  renderBranchActions(event);
 }
 function findEventNodeById(eventId) {
   const matches = [];
@@ -2476,104 +3253,37 @@ function renderLoopPreviewAction(event) {
   }
   const meta = event.meta || {};
   const previewEventIds = Array.isArray(meta.first_iteration_event_ids) ? meta.first_iteration_event_ids : [];
-  if (!previewEventIds.length && !meta.loop_preview_key) {
+  const previewEventId = previewEventIds.find((id) => isTimelineEventVisible(findEventNodeById(id)));
+  if (!previewEventId) {
     return;
   }
   const group = document.createElement('div');
   group.id = 'q1timeline-loop-preview-actions';
   group.className = 'loop-preview-actions';
-  if (previewEventIds.length) {
-    const button = document.createElement('button');
-    button.id = 'q1timeline-open-loop-preview';
-    button.type = 'button';
-    button.textContent = 'Open first iteration';
-    button.dataset.previewEventIds = JSON.stringify(previewEventIds);
-    button.addEventListener('click', () => {
-      const previewNode = findEventNodeById(previewEventIds[0]);
-      if (!previewNode) {
-        return;
-      }
-      selectEventNode(previewNode);
-      previewNode.scrollIntoView({ block: 'center', inline: 'center' });
-    });
-    group.append(button);
-  }
-  if (meta.loop_preview_key) {
-    const nextVisibleIterations = loopPreviewVisibleIterations(meta) + 1;
-    const nextButton = document.createElement('button');
-    nextButton.id = 'q1timeline-show-next-loop-iteration';
-    nextButton.type = 'button';
-    nextButton.textContent = 'Show next iteration';
-    nextButton.disabled = !canShowNextLoopIteration(meta);
-    if (nextButton.disabled) {
-      nextButton.title = 'All available preview iterations are visible.';
-    }
-    nextButton.addEventListener('click', () => {
-      window.dispatchEvent(new CustomEvent('q1timeline:setLoopPreviewDepth', {
-        detail: { loopKey: meta.loop_preview_key, visibleIterations: nextVisibleIterations }
-      }));
-    });
-    group.append(nextButton);
-  }
+  const button = document.createElement('button');
+  button.id = 'q1timeline-open-loop-preview';
+  button.type = 'button';
+  button.textContent = 'Open first iteration';
+  button.addEventListener('click', () => {
+    const previewNode = findEventNodeById(previewEventId);
+    if (!isTimelineEventVisible(previewNode)) return;
+    selectEventNode(previewNode, previewEventId);
+    previewNode.scrollIntoView({ block: 'center', inline: 'center' });
+  });
+  group.append(button);
   eventInspector.append(group);
 }
-function renderBranchActions(event) {
-  const existing = document.getElementById('q1timeline-branch-actions');
-  if (existing) {
-    existing.remove();
+function recordedBranchPath(meta) {
+  const [taken, fallthrough] = meta.rt_condition_control ? ['Execute', 'Skip'] : ['Jump', 'Continue'];
+  if (typeof meta.branch_taken === 'boolean' && (meta.branch_decision === 'concrete' || !meta.assumed_branch_path)) {
+    return meta.branch_taken ? taken : fallthrough;
   }
-  const branchId = event && event.meta && event.meta.branch_id;
-  if (!eventInspector || !branchId) {
-    return;
-  }
-  const meta = event.meta || {};
-  const group = document.createElement('div');
-  group.id = 'q1timeline-branch-actions';
-  group.className = 'branch-actions';
-  const title = document.createElement('div');
-  title.className = 'branch-actions-title';
-  title.textContent = 'Branch decision';
-  group.append(title);
-  const condition = document.createElement('div');
-  condition.className = 'branch-actions-condition';
-  condition.textContent = meta.condition ? `Condition: ${meta.condition}` : 'Condition: runtime dependent';
-  group.append(condition);
-  const status = document.createElement('div');
-  status.className = 'branch-actions-status';
-  status.textContent = branchDecisionStatus(meta);
-  group.append(status);
-  const actions = [
-    ['taken', 'Condition true: jump target'],
-    ['fallthrough', 'Condition false: continue'],
-    ['collapsed', 'Clear branch override'],
-  ];
-  for (const [path, label] of actions) {
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.textContent = label;
-    button.addEventListener('click', () => {
-      window.dispatchEvent(new CustomEvent('q1timeline:setBranchAssumption', {
-        detail: { branchId: event.meta.branch_id, path }
-      }));
-    });
-    group.append(button);
-  }
-  eventInspector.append(group);
-}
-function branchDecisionStatus(meta) {
-  if (!meta || !meta.assumed_branch_path) {
-    return 'Choose how to continue from this runtime-dependent branch.';
-  }
+  if (meta.assumed_branch_path === 'taken') return taken;
+  if (meta.assumed_branch_path === 'fallthrough') return fallthrough;
   if (meta.assumed_branch_path === 'both') {
-    return 'Showing true and false comparison.';
+    return meta.comparison_paths?.length === 2 ? `${taken} and ${fallthrough}` : 'Comparison unavailable';
   }
-  if (meta.assumed_branch_path === 'taken') {
-    return 'Showing condition true: jump target.';
-  }
-  if (meta.assumed_branch_path === 'fallthrough') {
-    return 'Showing condition false: continue.';
-  }
-  return 'Branch is collapsed until a path is selected.';
+  return meta.rt_condition_control ? 'Recorded trigger input' : 'Unresolved';
 }
 function clearRelatedControlFlow() {
   querySelectorAllWithFallback(relatedTimelineEventSelector).forEach((node) => node.classList.remove('is-related'));
@@ -2603,12 +3313,19 @@ function highlightRelatedControlFlow(eventNode) {
   }
   const eventId = eventNode.dataset.eventId;
   const sourceEventId = eventNode.dataset.controlFlowSourceEventId;
-  const branchId = eventNode.dataset.branchId;
+  const waitIssueId = eventNode.dataset.waitQ1IssueEventId;
   const loopId = eventNode.dataset.loopId;
+  const setterLinks = setterApplicationLinks.get(eventId);
+  // Comparison membership alone does not make a setter or commit a branch control.
+  const branchId = setterLinks ? eventsById.get(eventId)?.meta?.branch_id : eventNode.dataset.branchId;
+  const setterRelatedIds = document.body.dataset.mode === 'debug' ? setterLinks : undefined;
   for (const node of timelineEventNodes()) {
     if (
       (eventId && node.dataset.controlFlowSourceEventId === eventId) ||
       (sourceEventId && node.dataset.eventId === sourceEventId) ||
+      (eventId && node.dataset.waitQ1IssueEventId === eventId) ||
+      (waitIssueId && node.dataset.eventId === waitIssueId) ||
+      (setterRelatedIds?.has(node.dataset.eventId) && isTimelineEventVisible(node)) ||
       (branchId && node.dataset.branchId === branchId) ||
       (loopId && node.dataset.loopId === loopId) ||
       (loopId && node.dataset.loopPreviewId === loopId)
@@ -2618,26 +3335,76 @@ function highlightRelatedControlFlow(eventNode) {
   }
   highlightRelatedControlFlowConnectors(eventNode);
 }
-function selectEventNode(eventNode, linkedEventId) {
-  if (!eventNode) {
-    querySelectorAllWithFallback(selectedTimelineEventSelector).forEach((node) => node.classList.remove('is-selected'));
+function selectEventNode(eventNode, linkedEventId, announce = true) {
+  if (eventNode && !isTimelineEventVisible(eventNode)) return;
+  querySelectorAllWithFallback(selectedTimelineEventSelector).forEach((node) => node.classList.remove('is-selected'));
+  if (eventNode) {
+    eventNode.classList.add('is-selected');
+    highlightRelatedControlFlow(eventNode);
+  } else {
     clearRelatedControlFlow();
+  }
+  const nodeId = eventNode?.dataset.eventId;
+  const eventId = linkedEventId || nodeId;
+  if (!eventId) {
+    selectedTimelineEvent = undefined;
     renderInspector(null);
     return;
   }
-  if (!isTimelineEventVisible(eventNode)) {
-    return;
-  }
-  querySelectorAllWithFallback(selectedTimelineEventSelector).forEach((node) => node.classList.remove('is-selected'));
-  eventNode.classList.add('is-selected');
-  highlightRelatedControlFlow(eventNode);
-  const eventId = linkedEventId || eventNode.dataset.eventId;
-  renderInspector(eventId, eventNode.dataset.diagnosticMessage);
+  selectedTimelineEvent = { nodeId, eventId };
+  renderInspector(eventId, eventNode?.dataset.diagnosticMessage);
   const details = document.getElementById('q1timeline-analysis-details');
   if (details) details.open = true;
-  window.dispatchEvent(new CustomEvent('q1timeline:eventClick', { detail: { eventId } }));
+  if (announce) window.dispatchEvent(new CustomEvent('q1timeline:eventClick', { detail: { eventId } }));
+}
+function switchTimelineGeometry(mode) {
+  const previousMode = document.body.dataset.mode;
+  if (!timelineRoot || previousMode === mode) return false;
+  const previous = timelineRoot.querySelector(`template[data-timeline-mode="${previousMode}"]`);
+  const next = timelineRoot.querySelector(`template[data-timeline-mode="${mode}"]`);
+  const activeSvg = timelineRoot.querySelector(':scope > svg');
+  const nextSvg = next?.content.firstElementChild;
+  if (!previous || !activeSvg || !nextSvg) return false;
+  hideTimeCursor();
+  previous.content.append(activeSvg);
+  timelineRoot.prepend(nextSvg);
+  return true;
+}
+function refreshInspectorNavigation() {
+  const { nodeId, eventId } = selectedTimelineEvent || {};
+  const event = eventsById.get(eventId);
+  if (event?.meta?.comparison_terminal) {
+    renderInspector(eventId, findEventNodeById(nodeId)?.dataset.diagnosticMessage);
+  } else if (event?.kind === 'loop_block') {
+    renderLoopPreviewAction(event);
+  }
+}
+function hiddenRtEventIds() {
+  const active = timelineRoot?.querySelector(':scope > svg');
+  return new Set(JSON.parse(active?.dataset.hiddenRtEventIds || '[]'));
+}
+function refreshRelatedEventLinks() {
+  const excluded = hiddenRtEventIds();
+  const visible = new Map();
+  function isVisible(id) {
+    if (!visible.has(id)) visible.set(id, isTimelineEventVisible(findEventNodeById(id)));
+    return visible.get(id);
+  }
+  for (const link of document.querySelectorAll('a[data-related-event-id]')) {
+    if (link.hasAttribute('data-tb-evidence')) {
+      link.hidden = !isVisible(link.dataset.relatedEventId);
+    } else if (excluded.size || link.hidden) {
+      const candidates = JSON.parse(link.dataset.relatedEventIds || '[]');
+      link.hidden = candidates.some((id) => excluded.has(id)) && !candidates.some(isVisible);
+    }
+  }
+}
+function isNormalPendingEvidence(eventId) {
+  return document.body.dataset.mode === 'normal' && timelineRoot?.querySelector('template[data-timeline-mode]') &&
+    eventsById.get(String(eventId))?.kind === 'latched_state_pending';
 }
 function setMode(mode) {
+  const switched = switchTimelineGeometry(mode);
   document.body.classList.toggle('mode-debug', mode === 'debug');
   document.body.classList.toggle('mode-normal', mode === 'normal');
   document.body.dataset.mode = mode;
@@ -2648,12 +3415,33 @@ function setMode(mode) {
   for (const button of modeButtons) {
     button.setAttribute('aria-pressed', String(button.dataset.mode === mode));
   }
+  if (!switched) {
+    if (setterApplicationLinks.has(selectedTimelineEvent?.nodeId)) {
+      highlightRelatedControlFlow(findEventNodeById(selectedTimelineEvent.nodeId));
+    }
+    refreshInspectorNavigation();
+    refreshRelatedEventLinks();
+    return;
+  }
+  bindTimelineEvents();
+  applyEventFilter();
+  if (selectedTimelineEvent) {
+    const { nodeId, eventId } = selectedTimelineEvent;
+    const selected = findEventNodeById(nodeId) || findEventNodeById(eventId);
+    if (isTimelineEventVisible(selected) || !selected && isNormalPendingEvidence(eventId)) {
+      selectEventNode(selected, eventId, false);
+    } else {
+      querySelectorAllWithFallback(selectedTimelineEventSelector).forEach((node) => node.classList.remove('is-selected'));
+      clearRelatedControlFlow();
+      renderInspector(null);
+    }
+  }
 }
-function isTimelineEventVisible(eventNode) {
+function isTimelineEventVisible(eventNode, { allowCollapsedFeedback = false } = {}) {
   if (!eventNode) {
     return false;
   }
-  if (eventNode.closest('.debug-lane') && document.body.dataset.mode === 'normal') {
+  if (document.body.dataset.mode === 'normal' && eventNode.closest('.debug-lane, [data-lane-role="q1-issue"]')) {
     return false;
   }
   if (eventNode.classList.contains('q1-error-marker') && document.body.dataset.mode === 'debug') {
@@ -2665,7 +3453,7 @@ function isTimelineEventVisible(eventNode) {
   if (eventNode.classList.contains('loop-collapsed') && document.body.dataset.mode === 'normal') {
     return false;
   }
-  if (eventNode.classList.contains('normal-feedback-collapsed') && document.body.dataset.mode === 'normal') {
+  if (!allowCollapsedFeedback && eventNode.classList.contains('normal-feedback-collapsed') && document.body.dataset.mode === 'normal') {
     return false;
   }
   if (eventNode.classList.contains('branch-collapsed')) {
@@ -2676,8 +3464,8 @@ function isTimelineEventVisible(eventNode) {
   }
   return !eventNode.classList.contains('is-filtered');
 }
-const timeCursor = document.getElementById('time-cursor');
 function moveTimeCursor(eventNode) {
+  const timeCursor = document.getElementById('time-cursor');
   if (!timeCursor || !eventNode || !eventNode.dataset.t0X) {
     return;
   }
@@ -2689,6 +3477,7 @@ function moveTimeCursor(eventNode) {
   timeCursor.removeAttribute('hidden');
 }
 function hideTimeCursor() {
+  const timeCursor = document.getElementById('time-cursor');
   if (timeCursor) {
     timeCursor.setAttribute('hidden', '');
   }
@@ -2699,54 +3488,91 @@ for (const button of modeButtons) {
   });
 }
 const filterInput = document.getElementById('event-filter');
-if (filterInput) {
-  filterInput.addEventListener('input', () => {
-    const query = filterInput.value.trim().toLowerCase();
-    for (const eventNode of timelineEventNodes()) {
-      const searchable = eventNode.dataset.search || '';
-      eventNode.classList.toggle('is-filtered', query !== '' && !searchable.includes(query));
-    }
-  });
+function applyEventFilter() {
+  const query = filterInput?.value.trim().toLowerCase() || '';
+  for (const eventNode of timelineEventNodes()) {
+    const searchable = eventNode.dataset.search || '';
+    eventNode.classList.toggle('is-filtered', query !== '' && !searchable.includes(query));
+  }
+  refreshRelatedEventLinks();
 }
-for (const eventNode of timelineEventNodes()) {
-  eventNode.addEventListener('mouseenter', () => {
-    moveTimeCursor(eventNode);
-  });
-  eventNode.addEventListener('focus', () => {
-    moveTimeCursor(eventNode);
-  });
-  eventNode.addEventListener('mouseleave', () => {
-    hideTimeCursor();
-  });
-  eventNode.addEventListener('blur', () => {
-    hideTimeCursor();
-  });
-  eventNode.addEventListener('click', () => {
-    selectEventNode(eventNode);
-  });
-  if (eventNode.getAttribute('role') === 'button') {
-    eventNode.addEventListener('keydown', (event) => {
-      if (event.key !== 'Enter' && event.key !== ' ') return;
-      event.preventDefault();
-      selectEventNode(eventNode);
-    });
+filterInput?.addEventListener('input', () => {
+  applyEventFilter();
+  refreshInspectorNavigation();
+});
+function bindTimelineEvents() {
+  for (const eventNode of timelineEventNodes()) {
+    if (boundTimelineEvents.has(eventNode)) continue;
+    boundTimelineEvents.add(eventNode);
+    eventNode.addEventListener('mouseenter', () => moveTimeCursor(eventNode));
+    eventNode.addEventListener('focus', () => moveTimeCursor(eventNode));
+    eventNode.addEventListener('mouseleave', hideTimeCursor);
+    eventNode.addEventListener('blur', hideTimeCursor);
+    eventNode.addEventListener('click', () => selectEventNode(eventNode));
+    if (eventNode.getAttribute('role') === 'button') {
+      eventNode.addEventListener('keydown', (event) => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        event.preventDefault();
+        selectEventNode(eventNode);
+      });
+    }
   }
 }
+bindTimelineEvents();
+refreshRelatedEventLinks();
+function relatedEventId(link) {
+  const excluded = hiddenRtEventIds();
+  const candidates = JSON.parse(link.dataset.relatedEventIds || '[]').filter((id) => !excluded.has(id));
+  const primary = link.dataset.relatedEventId;
+  return candidates.find((id) => isTimelineEventVisible(findEventNodeById(id))) ?? (excluded.has(primary) ? undefined : primary);
+}
 for (const link of document.querySelectorAll('[data-related-event-id]')) {
-  link.addEventListener('click', () => {
-    const eventId = link.dataset.relatedEventId;
+  link.addEventListener('click', (event) => {
+    const primary = link.dataset.relatedEventId;
+    const eventId = relatedEventId(link);
+    if (!eventId) {
+      event.preventDefault();
+      return;
+    }
     const eventNode = findEventNodeById(eventId);
+    const exact = link.hasAttribute('data-tb-evidence');
+    if (exact && !isTimelineEventVisible(eventNode)) {
+      event.preventDefault();
+      return;
+    }
+    const collapsedFeedback = eventId === primary && document.body.dataset.mode === 'normal' &&
+      eventNode?.classList.contains('normal-feedback-collapsed') && isTimelineEventVisible(eventNode, { allowCollapsedFeedback: true });
+    if ((!eventNode && isNormalPendingEvidence(eventId)) || collapsedFeedback) {
+      event.preventDefault();
+      selectEventNode(undefined, eventId);
+      return;
+    }
     if (eventNode) {
       selectEventNode(eventNode, eventId);
+      if (exact || eventId !== primary) {
+        event.preventDefault();
+        eventNode.scrollIntoView({ block: 'center', inline: 'center' });
+      }
     }
   });
 }
+inspectorFields?.addEventListener('click', (event) => {
+  const button = event.target.closest('button[data-related-event-id]');
+  if (!button) return;
+  const eventId = relatedEventId(button);
+  if (!eventId) return;
+  const eventNode = findEventNodeById(eventId);
+  const visibleNode = isTimelineEventVisible(eventNode) ? eventNode : undefined;
+  if (button.hasAttribute('data-related-visible-only') && !visibleNode) return;
+  selectEventNode(visibleNode, eventId);
+  visibleNode?.scrollIntoView({ block: 'center', inline: 'center' });
+});
 for (const link of document.querySelectorAll('[data-semantic-event-id]')) {
   link.addEventListener('click', () => {
     const eventId = link.dataset.semanticEventId;
     const eventNode = findEventNodeById(eventId);
     if (eventNode) {
-      selectEventNode(eventNode);
+      selectEventNode(eventNode, eventId);
     }
   });
 }

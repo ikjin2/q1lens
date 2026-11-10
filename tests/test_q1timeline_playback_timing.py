@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from q1timeline.analysis.api import analyze_text
 from q1timeline.analysis.interpreter import interpret_program
 from q1timeline.analysis.playback_timing import annotate_playback_queue_timing
 from q1timeline.analysis.queue_timing import replay_queues
@@ -79,6 +80,36 @@ def test_zero_duration_has_four_ns_minimum_even_when_next_packet_is_ready():
 
     assert result.failure is None
     assert [record.dequeue_ns for record in result.records] == [4, 8, 12]
+
+
+@pytest.mark.parametrize("mode", ["analysis", "concrete", "playback", "simulation"])
+@pytest.mark.parametrize("register_wait", [False, True])
+def test_zero_packet_timeline_and_nominal_duration_agree_across_modes(mode, register_wait):
+    prefix = "move 0,R7\nnop\n" if register_wait else ""
+    first_wait = "wait R7" if register_wait else "wait 0"
+    source = f"{prefix}{first_wait}\nwait 0\nupd_param 4\nstop"
+    if mode == "playback":
+        playback = PlaybackSession({"seq0": ("zero.q1asm", source)})
+        _finished(playback)
+        ir = playback.snapshot()
+    else:
+        ir = analyze_text(source, sequencer_id="seq0", execution_mode=mode)
+    rt = [event for event in ir["events"] if event["kind"] in {"wait", "upd_param", "stop"}]
+    assert [(event["kind"], event["meta"]["aligned_t0"], event["meta"]["aligned_t1"], event["duration"]["value"])
+            for event in rt] == [("wait", 0, 0, 0), ("wait", 4, 4, 0), ("upd_param", 8, 12, 4), ("stop", 12, 12, 0)]
+    assert [event["meta"]["queue_duration_ns"] for event in rt[:2]] == [0, 0]
+    assert [event["meta"]["next_dequeue_not_before_ns"] - event["t1"]["value"] for event in rt[:2]] == [4, 4]
+    issues = [event["t0"]["value"] for event in ir["events"] if event["kind"] == "q1_issue"]
+    assert issues == ([0, 4, 8, 12, 16, 20] if register_wait else [0, 4, 8, 12])
+
+
+def test_static_zero_trigger_preserves_unknown_arrival():
+    ir = analyze_text("wait_trigger 1,0\nwait 4\nstop", sequencer_id="seq0")
+    wait, = [event for event in ir["events"] if event["kind"] == "wait_trigger"]
+    assert wait["duration"]["value"] == 0
+    assert "next_dequeue_not_before_ns" not in wait["meta"]
+    assert any(item["category"] == "analysis_incomplete" and item["details"]["reason"] == "trigger_arrival_unknown"
+               for item in ir["diagnostics"])
 
 
 def test_nonzero_duration_restores_guard_after_suspended_wait():
@@ -168,6 +199,46 @@ def test_partial_trace_cannot_authorize_sync_prefetch():
     assert not [item for item in state.diagnostics if item.category == "playback_queue_underflow"]
 
 
+@pytest.mark.parametrize("capacity,expected", [(1, "error"), (2, "completed")])
+@pytest.mark.parametrize("paired", [False, True])
+def test_failed_stop_cannot_authorize_sync_prefetch(capacity, expected, paired):
+    # Finish the unaffected peer's stop first so only the overflow runner is incomplete.
+    documents = {"peer": ("peer.q1asm", "wait_sync 4\nstop")} if paired else {}
+    documents["seq"] = ("input.q1asm", "wait_sync 4\nstop" if paired else "wait 100\nstop")
+    playback = PlaybackSession(documents, feedback_queue_capacity=capacity, external_inputs={
+        "feedback": [{"target": "seq", "arrivals": [
+            {"time_ns": 5, "id": 9, "value": 81}, {"time_ns": 6, "id": 5, "value": 25},
+        ]}],
+    })
+    _finished(playback)
+    assert all(runner.state.stopped for runner in playback.runners)
+    ir = playback.snapshot()
+    execution = ir["execution"]["seq"]
+    timing = execution["queue_timing"]
+    assert ir["playback"]["status"] == execution["status"] == expected
+    assert timing["earliest_failure"] is timing["prefetched_failure"] is None
+    overflows = [item for item in ir["diagnostics"] if item["category"] == "feedback_queue_overflow"]
+    if expected == "error":
+        assert timing["status"] == "analysis_incomplete"
+        assert "The recorded execution is incomplete." in timing["reasons"]
+        overflow, = overflows
+        assert overflow["source"]["line"] == 2
+        assert not any(event["kind"] == "stop" and event["sequencer_id"] == "seq" for event in ir["events"])
+    else:
+        assert timing["status"] == "not_detected_in_recorded_packets"
+        assert not timing["reasons"] and not overflows
+        assert execution["stop_code"] == 0
+    if paired:
+        peer = ir["execution"]["peer"]
+        assert peer["status"] == "completed"
+        assert peer["queue_timing"]["status"] == timing["status"]
+        if expected == "error":
+            assert peer["queue_timing"]["reasons"] == ["Maximal prefetch before wait_sync peer:p0 is unknown."]
+            sync, = [item for item in ir["diagnostics"] if item["category"] == "analysis_incomplete"
+                     and item.get("source", {}).get("file") == "peer.q1asm"]
+            assert sync["details"]["replay_scenarios"] == ["prefetched"]
+
+
 def test_feedback_after_final_packet_is_explicitly_outside_model():
     playback = PlaybackSession({"seq0": ("input.q1asm", "wait 100\nfb_pop_data 50,R0\nnop\nstop")})
     state = _finished(playback)
@@ -236,6 +307,105 @@ def test_trigger_at_dequeue_time_is_accepted():
     assert [record.dequeue_ns for record in result.records] == [4, 12]
     assert result.failure is None
     assert result.incomplete_reason is None
+
+
+@pytest.mark.parametrize("arrival", [1, 4])
+def test_playback_reports_trigger_rejected_before_first_dequeue_at_its_source(arrival):
+    playback = PlaybackSession({"a": ("a.q1asm", "wait_trigger 1,4\nwait 4\nstop")}, external_inputs={
+        "triggers": [{"id": "edge", "address": 1, "targets": ["a"], "times_ns": [arrival]}],
+    })
+    _finished(playback)
+    ir = playback.snapshot()
+    assert ir["playback"]["status"] == "completed"
+    wait, = [event for event in ir["events"] if event["kind"] == "wait_trigger"]
+    assert (wait["t0"]["value"], wait["t1"]["value"]) == (0, arrival + 4)
+    assert wait["meta"]["trigger_assumption"]["event_id"] == "external:edge:0"
+    timing = ir["execution"]["a"]["queue_timing"]
+    diagnostics = [item for item in ir["diagnostics"] if item["category"] == "analysis_incomplete"]
+    if arrival == 4:
+        assert timing["status"] == "not_detected_in_recorded_packets"
+        assert diagnostics == []
+    else:
+        assert timing["status"] == "analysis_incomplete"
+        diagnostic, = diagnostics
+        assert diagnostic["source"] == wait["source"] and diagnostic["source"]["line"] == 1
+        assert diagnostic["details"]["rt_packet_id"] == wait["meta"]["rt_packet_id"] == "a:p0"
+        assert (diagnostic["details"]["arrival_ns"], diagnostic["details"]["dequeue_ns"]) == (1, 4)
+        assert diagnostic["details"]["replay_scenarios"] == ["earliest", "prefetched"]
+        assert diagnostic["message"] == timing["reasons"][0]
+
+
+def test_playback_distinguishes_prefetched_only_trigger_rejection():
+    playback = PlaybackSession({"a": ("a.q1asm", "wait_sync 4\nwait_trigger 1,4\nwait 4\nstop"),
+                                "b": ("b.q1asm", "wait_sync 4\nstop")}, external_inputs={
+        "triggers": [{"id": "edge", "address": 1, "targets": ["a"], "times_ns": [10]}],
+    })
+    _finished(playback)
+    ir = playback.snapshot()
+    assert ir["playback"]["status"] == "completed"
+    diagnostic, = [item for item in ir["diagnostics"] if item["category"] == "analysis_incomplete"]
+    assert (diagnostic["source"]["file"], diagnostic["source"]["line"]) == ("a.q1asm", 2)
+    assert "prefetched replay" in diagnostic["message"]
+    details = diagnostic["details"]
+    assert (details["rt_packet_id"], details["arrival_ns"], details["dequeue_ns"]) == ("a:p1", 10, 16)
+    assert details["replay_scenarios"] == ["prefetched"]
+    assert details["replay_statuses"] == {"earliest": "not_detected_in_recorded_packets", "prefetched": "analysis_incomplete"}
+
+
+@pytest.mark.parametrize("paired", [True, False])
+def test_playback_unmatched_sync_diagnostic_points_to_the_waiting_barrier(paired):
+    playback = PlaybackSession({"a": ("a.q1asm", "nop\nwait_sync 4\nwait 4\nstop"),
+                                "b": ("b.q1asm", "wait_sync 4\nstop" if paired else "wait 4\nstop")})
+    _finished(playback)
+    ir = playback.snapshot()
+    assert ir["playback"]["status"] == "completed"
+    diagnostics = [item for item in ir["diagnostics"] if item["category"] == "analysis_incomplete"]
+    assert ir["execution"]["b"]["queue_timing"]["status"] == "not_detected_in_recorded_packets"
+    if paired:
+        assert diagnostics == []
+        assert ir["execution"]["a"]["queue_timing"]["status"] == "not_detected_in_recorded_packets"
+    else:
+        diagnostic, = diagnostics
+        assert (diagnostic["source"]["file"], diagnostic["source"]["line"]) == ("a.q1asm", 2)
+        assert diagnostic["details"]["rt_packet_id"] == "a:p0"
+        assert diagnostic["details"]["missing_sync_participants"] == ["b"]
+        assert diagnostic["details"]["replay_scenarios"] == ["earliest", "prefetched"]
+        assert "no matching reachable barrier for: b" in diagnostic["message"]
+
+
+def test_unmatched_sync_preserves_earlier_peer_rejection():
+    playback = PlaybackSession({"a": ("a.q1asm", "wait_sync 4\nstop"),
+                                "b": ("b.q1asm", "wait_trigger 1,4\nwait_sync 4\nstop")}, external_inputs={
+        "triggers": [{"id": "edge", "address": 1, "targets": ["b"], "times_ns": [1]}],
+    })
+    _finished(playback)
+    ir = playback.snapshot()
+    diagnostics = {item["source"]["file"]: item for item in ir["diagnostics"] if item["category"] == "analysis_incomplete"}
+    assert set(diagnostics) == {"a.q1asm", "b.q1asm"}
+    assert diagnostics["a.q1asm"]["details"]["missing_sync_participants"] == ["b"]
+    assert "arrived at 1 ns" in diagnostics["b.q1asm"]["message"]
+    for seq in ("a", "b"):
+        diagnostic = diagnostics[f"{seq}.q1asm"]
+        assert diagnostic["details"]["rt_packet_id"] == f"{seq}:p0"
+        assert diagnostic["source"]["line"] == 1
+        assert diagnostic["message"] == ir["execution"][seq]["queue_timing"]["reasons"][0]
+
+
+def test_unmatched_sync_diagnostics_preserve_waiting_and_partial_trace_reasons():
+    playback = PlaybackSession({"a": ("a.q1asm", "wait_sync 4\nstop"),
+                                "b": ("b.q1asm", "wait_trigger 1,4\nwait_sync 4\nstop")})
+    assert playback.run(max_steps=1)["status"] == "paused"
+    partial = playback.snapshot()
+    reasons = partial["execution"]["a"]["queue_timing"]["reasons"]
+    assert any("Unknown packet timing" in reason for reason in reasons)
+    assert "The recorded execution is incomplete." in reasons
+    _finished(playback)
+    waiting = playback.snapshot()
+    assert waiting["playback"]["status"] == "waiting"
+    assert "No connected trigger source" in waiting["execution"]["b"]["reason"]
+    diagnostic, = [item for item in waiting["diagnostics"] if item["category"] == "analysis_incomplete"]
+    assert diagnostic["source"]["file"] == "a.q1asm"
+    assert diagnostic["details"]["missing_sync_participants"] == ["b"]
 
 
 def test_missed_trigger_stops_queue_check_without_stopping_independent_peer():

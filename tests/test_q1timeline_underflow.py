@@ -5,7 +5,7 @@ import pytest
 from q1timeline.analysis.api import analyze_documents, analyze_text
 from q1timeline.analysis.interpreter import interpret_program
 from q1timeline.analysis.queue_timing import replay_queues
-from q1timeline.analysis.values import Unknown
+from q1timeline.analysis.values import Concrete, Unknown
 from q1timeline.analysis.underflow import analyze_underflow, _emit_underflow_warning
 from q1timeline.q1asm.parser import parse_q1asm
 
@@ -437,6 +437,7 @@ def test_runtime_branch_cannot_prove_safe_or_starved_timing_from_one_path(starvi
     "peer_tail,reason",
     [
         ("fb_pop_data 0,R0\nstop\n", "feedback_arrival_unknown"),
+        ("sw_req 1\nupd_param 4\nstop\n", "q1_proof_cutoff"),
         ("move 2,R0\nmove 100,R1\nnop\nbody: wait R1\nmulu16 R7,2,R1\nloop R0,@body\nstop\n", "compact_loop_timing_unexpanded"),
     ],
 )
@@ -451,6 +452,72 @@ def test_incomplete_peer_cannot_authorize_optimistic_sync_prefetch(peer_tail: st
     assert any(event["sequencer_id"] == "peer" and event["meta"].get("reason") == reason for event in incomplete)
     assert not [event for event in ir["events"] if event["kind"] == "underflow_warning"]
     assert not [item for item in ir["diagnostics"] if item["category"] in UNDERFLOW_CATEGORIES]
+
+
+@pytest.mark.parametrize(("source", "prefix_packet_count", "reason"), [
+    ("wait 8\nsw_req 1\nupd_param 4\nstop", 1, "unverified_instruction"),
+    ("wait 8\nplay_pulse 0,4\nupd_param 4\nstop", 1, "unverified_instruction"),
+    ("wait 8\nmove 2,R0\nnop\nset_latch_en R0,4\nstop", 1, "unsupported_rt_register_value"),
+    ("wait 8\nfb_pop_data 257,R0\nstop", 1, "unsupported_feedback_selector"),
+    ("move 1,R0\nnop\nbody: wait 4\ncmp R0,1\njz @body\nstop", 2, "analytical_back_edge_limit"),
+])
+def test_q1_proof_cutoff_keeps_known_queue_prefix_and_source(source, prefix_packet_count, reason) -> None:
+    state = interpret_program(parse_q1asm(source, file="program.q1asm"), sequencer_id="seq0", max_steps=1)
+    cutoff, = [event for event in state.events if event.meta.get("q1_proof_cutoff")]
+    packets = list(state.rt_packets)
+    result = analyze_underflow(state)
+    marker, = [event for event in state.events if event.kind == "analysis_incomplete"]
+    diagnostic, = [item for item in state.diagnostics if item.details.get("analysis_scope") == "rt_queue"]
+
+    assert result.status == "analysis_incomplete"
+    assert marker.t0 == cutoff.t0 == Concrete(8)
+    assert marker.source == diagnostic.source == cutoff.source
+    assert marker.meta["reason"] == diagnostic.details["reason"] == "q1_proof_cutoff"
+    assert marker.meta["source_reason"] == diagnostic.details["source_reason"] == reason
+    assert marker.meta["source_event_id"] == cutoff.id
+    assert cutoff.id in diagnostic.related_events and marker.id in diagnostic.related_events
+    assert marker.meta["q1_issue_event_id"] == cutoff.meta["q1_issue_event_id"]
+    assert "rt_packet_id" not in marker.meta
+    assert state.rt_packets == packets
+    for kind in ("queue_depth", "slack"):
+        assert [event.meta["rt_packet_id"] for event in state.events if event.kind == kind] == [
+            packet.id for packet in packets[:prefix_packet_count]
+        ]
+
+
+def test_q1_proof_cutoff_does_not_hide_an_underflow_in_the_known_prefix() -> None:
+    state, result = _analyze("wait 4\nmove 100000,R0\nnop\nbody: nop\nloop R0,@body\nwait 4\nsw_req 1\nstop")
+    cutoff, = [event for event in state.events if event.meta.get("q1_proof_cutoff")]
+    warning, = [event for event in state.events if event.kind == "underflow_warning"]
+
+    assert result.status == "definite_underflow"
+    assert warning.t0 == Concrete(4) and cutoff.t0 == Concrete(8)
+    assert warning.source == state.rt_packets[1].source
+    assert not any(event.kind == "analysis_incomplete" for event in state.events)
+
+
+def test_q1_only_cutoff_leaves_packet_free_queue_proof_unchanged() -> None:
+    program = parse_q1asm("move 1,R0\nnop\nbody: nop\ncmp R0,1\njz @body\nstop")
+    state = interpret_program(program, sequencer_id="seq0", max_steps=1)
+
+    assert any(event.meta.get("q1_proof_cutoff") for event in state.events)
+    assert analyze_underflow(state).status == "not_detected_under_current_assumptions"
+    assert not state.rt_packets
+    assert not any(event.kind in {"queue_depth", "analysis_incomplete"} for event in state.events)
+
+
+def test_q1_proof_cutoff_before_barrier_does_not_prove_peer_release() -> None:
+    ir = analyze_documents({
+        "main.q1asm": "wait 8\nwait_sync 4\nupd_param 4\nstop",
+        "peer.q1asm": "wait 8\nsw_req 1\nwait_sync 4\nupd_param 4\nstop",
+    })
+    incomplete = {event["sequencer_id"]: event for event in ir["events"] if event["kind"] == "analysis_incomplete"}
+
+    assert set(incomplete) == {"main", "peer"}
+    assert incomplete["peer"]["meta"]["reason"] == "q1_proof_cutoff"
+    assert "no matching reachable barrier for: peer" in incomplete["main"]["meta"]["reason"]
+    assert all(event["t0"]["value"] == 8 for event in incomplete.values())
+    assert not any(event["kind"] == "slack" and event["source"]["line"] > 2 for event in ir["events"])
 
 
 def test_queue_analysis_preserves_original_q1_and_rt_coordinates() -> None:

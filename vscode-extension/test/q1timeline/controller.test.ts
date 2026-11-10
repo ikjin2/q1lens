@@ -7122,6 +7122,85 @@ describe("q1timeline controller", () => {
     }));
   });
 
+  it("opens source diagnostics and leaves synthetic arrivals on the timeline", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const { controller, source } = loopSourceNavigation(vscode, TimelineController, ["wait 4", "stop"]);
+      const opened: unknown[] = [];
+      controller.openSourceLocation = async (location: unknown) => { opened.push(location); };
+      controller.analyzerDiagnostics = [
+        { source: { file: "<simulation>", line: 1 }, related_events: ["rejected"] },
+        { source: source(2) },
+      ];
+      await controller.handleWebviewMessage({ type: "diagnosticClick", diagnosticIndex: 0 });
+      await controller.handleWebviewMessage({ type: "diagnosticClick", diagnosticIndex: 1 });
+      assert.deepEqual(opened, [source(2)]);
+      controller.dispose();
+    });
+  });
+
+  it("reveals only the executed consumers of selected external arrivals", async () => {
+    const cases = [
+      {
+        lines: ["wait 20", "wait_trigger 2,4", "stop"],
+        arrivals: [{ address: 1, time_ns: 120 }, { address: 2, time_ns: 120 }],
+        inputKind: "triggers", eventKind: "trigger_receive", key: "address",
+        selections: [[2, undefined, 2], [1, undefined, undefined]],
+      },
+      {
+        lines: ["wait 100", "fb_pop_data 5,R0", "fb_pull_data R1,R2", "stop"],
+        arrivals: [4, 5, 6].map((id) => ({ id, time_ns: 50, value: id * 2 })),
+        inputKind: "feedback", eventKind: "feedback_receive", key: "id",
+        selections: [[5, undefined, 2], [6, undefined, 3], [4, undefined, undefined]],
+      },
+      {
+        lines: ["set_cond 1,1,0,4", "wait_trigger 2,4", "set_cond 0,0,0,0", "wait_trigger 1,4", "stop"],
+        arrivals: [{ address: 2, time_ns: 120 }, { address: 1, time_ns: 140 }],
+        inputKind: "triggers", eventKind: "trigger_receive", key: "address",
+        branches: { "seq0:set_cond:0:1": "both" },
+        selections: [[2, "taken", 2], [1, "taken", 4], [1, "fallthrough", 4], [2, "fallthrough", undefined]],
+      },
+    ];
+    const repoRoot = require("node:path").resolve(__dirname, "../../../..");
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      for (const { lines, arrivals, inputKind, eventKind, key, branches, selections } of cases) {
+        const setup = loopSourceNavigation(vscode, TimelineController, lines);
+        const { controller, sourcePath, editor, decorated, posted } = setup;
+        const inputs = { [inputKind]: arrivals.map((arrival) => ({ target: "seq0", ...arrival })) };
+        const ir = JSON.parse(require("node:child_process").execFileSync("python", ["-c", [
+          "import json, sys",
+          "from q1timeline.analysis.api import analyze_text",
+          "print(json.dumps(analyze_text(sys.argv[1], file=sys.argv[2], sequencer_id='seq0', execution_mode='simulation',",
+          "  branch_assumptions=json.loads(sys.argv[3]), simulation={'startup_delay_ns': 100, 'inputs': json.loads(sys.argv[4])})))",
+        ].join("\n"), lines.join("\n"), sourcePath, JSON.stringify(branches ?? {}), JSON.stringify(inputs)],
+        { cwd: repoRoot, env: { ...process.env, PYTHONPATH: join(repoRoot, "src") }, encoding: "utf8", windowsHide: true }));
+        assert.deepEqual(ir.feedback_flows, []);
+        controller.timelineIr = ir;
+        for (const [address, branchPath, line] of selections) {
+          const arrival = ir.events.find((event) => event.kind === eventKind && event.meta[key] === address &&
+            event.meta.branch_comparison_path === branchPath);
+          assert.ok(arrival, `missing ${eventKind} ${address} on ${branchPath ?? "baseline"}`);
+          const rawArrival = JSON.stringify(arrival);
+          assert.equal(arrival.source.file, "<simulation>");
+          const previousCount = decorated.length;
+          await controller.handleWebviewMessage({ type: "eventClick", eventId: arrival.id });
+          if (typeof line === "number") {
+            assert.equal(editor.selection.active.line, line - 1);
+            assert.deepEqual(decorated.at(-1).map((range) => range.start.line), [line - 1]);
+            setup.activeEvent();
+            setup.selectionEvent(vscode.TextEditorSelectionChangeKind.Command);
+          } else {
+            assert.equal(decorated.length, previousCount);
+          }
+          assert.deepEqual(posted, [], "source reveal must retain the selected arrival on the timeline");
+          assert.equal(JSON.stringify(arrival), rawArrival);
+        }
+        controller.dispose();
+      }
+    });
+  });
+
   it("opens each feedback marker's endpoint and ignores unknown or malformed flows", async () => {
     const vscode = createMockVscode();
     await withMockedVscode(vscode, async ({ TimelineController }) => {
@@ -7141,6 +7220,53 @@ describe("q1timeline controller", () => {
       await controller.handleWebviewMessage({ type: "feedbackFlowClick", flowId: "flow", role: "both" });
       assert.equal(decorated.length, decorationCount);
       assert.deepEqual(posted, []);
+      controller.dispose();
+    });
+  });
+
+  it("opens the executed consumer and skips a synthetic arrival with no consumer", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const setup = loopSourceNavigation(vscode, TimelineController, ["fb_com_data 1,7,4", "wait 4", "fb_pop_data 1,R0", "stop"]);
+      const { controller, source, editor, decorated } = setup;
+      const arrival = { file: "<simulation>", line: 1, column: 1, raw: "" };
+      controller.timelineIr = {
+        events: [{ id: "send", source: source(1) }, { id: "arrival", source: arrival },
+          { id: "consumer", source: source(3) }, { id: "unread", source: arrival }],
+        feedback_flows: [
+          { id: "received", from_event_id: "send", to_event_id: "arrival", consumer_event_id: "consumer" },
+          { id: "unread", from_event_id: "send", to_event_id: "unread" },
+        ],
+      };
+      await controller.handleWebviewMessage({ type: "feedbackFlowClick", flowId: "received", role: "target" });
+      assert.equal(editor.selection.active.line, 2);
+      assert.deepEqual(decorated.at(-1).map((range) => range.start.line), [2]);
+      const decorationCount = decorated.length;
+      await controller.handleWebviewMessage({ type: "feedbackFlowClick", flowId: "unread", role: "target" });
+      assert.equal(decorated.length, decorationCount);
+      await controller.handleWebviewMessage({ type: "feedbackFlowClick", flowId: "unread", role: "source" });
+      assert.equal(editor.selection.active.line, 0);
+      controller.dispose();
+    });
+  });
+
+  it("opens both TB contributors from the source marker and only the consumer from the target marker", async () => {
+    const vscode = createMockVscode();
+    await withMockedVscode(vscode, async ({ TimelineController }) => {
+      const { controller, source } = loopSourceNavigation(vscode, TimelineController, ["wait_sync 4", "acquire 0,0,16"]);
+      const second = { file: "C:\\repo\\q1asm\\seq1.q1asm", line: 3 };
+      const consumer = { file: "C:\\repo\\q1asm\\seq2.q1asm", line: 4 };
+      const opened: any[] = [];
+      controller.openSourceLocation = async (location, options) => { opened.push([location.file, options.sourceLines]); };
+      controller.timelineIr = {
+        events: [{ id: "a", source: source(2) }, { id: "b", source: second }, { id: "pop", source: consumer }],
+        feedback_flows: [{ id: "round", from_event_id: "a", to_event_id: "receipt", consumer_event_id: "pop",
+          source_event_ids: ["a", "b"] }],
+      };
+      await controller.handleWebviewMessage({ type: "feedbackFlowClick", flowId: "round", role: "source" });
+      assert.deepEqual(opened.splice(0), [[source(2).file, [1]], [second.file, [2]]]);
+      await controller.handleWebviewMessage({ type: "feedbackFlowClick", flowId: "round", role: "target" });
+      assert.deepEqual(opened, [[consumer.file, [3]]]);
       controller.dispose();
     });
   });

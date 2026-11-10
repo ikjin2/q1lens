@@ -5,7 +5,10 @@ import math
 
 import pytest
 
+from q1timeline.analysis.interpreter import prepare_def_program
 from q1timeline.analysis.values import Concrete
+from q1timeline.feedback_fifo import take_feedback
+from q1timeline.ir.serialize import timeline_ir_from_states
 from q1timeline.q1asm.parser import parse_q1asm
 from q1timeline.simulation.runtime import simulate_programs
 
@@ -176,10 +179,89 @@ def test_scenario_feedback_does_not_invent_a_q1_producer() -> None:
     assert status(state) == "completed"
     receive, = events(state, "feedback_receive")
     assert receive.meta["input_index"] == 0
+    assert receive.source.file == "<simulation>" and receive.source.raw == ""
     assert "q1_issue_event_id" not in receive.meta
     assert "source_packet_id" not in receive.meta
     assert "source_event_id" not in receive.meta
     assert not events(state, "feedback_send")
+
+
+def test_unread_feedback_arrival_does_not_claim_stop_source() -> None:
+    state, = run({"receiver": "wait 100\nstop"}, inputs={"feedback": [
+        {"target": "receiver", "time_ns": 225, "id": 7, "value": 42},
+    ]})
+    arrival, = events(state, "feedback_receive")
+    ir = timeline_ir_from_states([state])
+    stop_events = ir["source_map"]["by_source"]["receiver:2"]
+    assert arrival.t0 == Concrete(225)
+    assert arrival.id not in stop_events
+    assert stop_events == [event.id for event in state.events if event.source.raw == "stop"]
+    assert ir["feedback_flows"] == []
+
+
+@pytest.mark.parametrize("prepared", [False, True])
+def test_feedback_overflow_records_rejected_input_at_arrival_time(prepared: bool) -> None:
+    program = parse_q1asm("wait 100\nstop", file="receiver")
+    bindings = {"receiver": prepare_def_program(program, params={}, strict_q1asm=False, varying=set())} if prepared else None
+    state, = simulate_programs({"receiver": program}, prepared_programs=bindings, simulation={
+        "startup_delay_ns": 20, "feedback_queue_capacity": 1,
+        "inputs": {"feedback": [{"target": "receiver", "time_ns": time, "id": identifier, "value": value}
+                                for time, identifier, value in ((22, 5, 11), (23, 6, 22))]},
+    })
+    assert status(state) == "error"
+    rejected, = events(state, "feedback_rejected")
+    assert rejected.t0 == rejected.t1 == Concrete(23)
+    assert rejected.meta == {"target": "receiver", "time_ns": 23, "id": 6, "value": 22, "input_index": 1,
+                             "receiver_sequencer_id": "receiver", "depth": 1, "capacity": 1, "reason": "queue_full"}
+    assert rejected.source.file == "<simulation>" and rejected.source.raw == ""
+    overflow, = [item for item in state.diagnostics if item.category == "feedback_queue_overflow"]
+    assert overflow.source == rejected.source and overflow.related_events == [rejected.id]
+    assert overflow.message == "Simulation execution error: Feedback queue overflow at 23 ns."
+    assert overflow.details["display_message"] == "LINQ feedback queue overflow (capacity 1)."
+    assert state.metadata["execution"]["reason"] == "Feedback queue overflow at 23 ns."
+    ir = timeline_ir_from_states([state])
+    assert rejected.id in ir["source_map"]["by_source"]["<simulation>:1"]
+    stop_events = ir["source_map"]["by_source"].get("receiver:2", [])
+    assert rejected.id not in stop_events
+    if not prepared:
+        accepted, = events(state, "feedback_receive")
+        assert accepted.t0 == Concrete(22) and accepted.meta["id"] == 5
+        assert accepted.source == rejected.source and accepted.id not in stop_events
+    assert ir["feedback_flows"] == []
+
+
+def test_routed_overflow_keeps_sender_provenance_and_other_receiver_progress() -> None:
+    sender, receiver, peer = run({
+        "sender": "fb_com_data 5,11,4\nfb_com_data 6,22,4\nstop",
+        "receiver": "wait 100\nstop",
+        "peer": "wait 0\nfb_pull_data R0,R1\nnop\nfb_pull_data R2,R3\nnop\nstop",
+    }, startup_delay_ns=20, feedback_queue_capacity=1, routes=[
+        {"source": "sender", "target": target, "latency_ns": 2} for target in ("receiver", "peer")
+    ])
+    first_send, second_send = events(sender, "feedback_send")
+    accepted, = events(receiver, "feedback_receive")
+    rejected, = events(receiver, "feedback_rejected")
+    assert accepted.meta["source_event_id"] == first_send.id
+    assert rejected.meta["source_event_id"] == second_send.id and rejected.t0 == Concrete(26)
+    assert rejected.meta["id"] == 6 and rejected.meta["receiver_sequencer_id"] == "receiver"
+    assert status(receiver) == "error" and status(sender) == status(peer) == "completed"
+    assert peer.registers == {"R0": Concrete(5), "R1": Concrete(11), "R2": Concrete(6), "R3": Concrete(22)}
+    flows = timeline_ir_from_states([sender, receiver, peer])["feedback_flows"]
+    assert {flow["to_event_id"] for flow in flows} == {accepted.id, *(event.id for event in events(peer, "feedback_receive"))}
+
+
+def test_routed_feedback_arrival_links_to_the_later_fifo_consumer() -> None:
+    states = run({"sender": "fb_com_data 17,7,4\nstop",
+                  "receiver": "wait 500\n" + "nop\n" * 60 + "fb_pull_data R0,R1\nnop\nstop"},
+                 routes=[{"source": "sender", "target": "receiver", "id": 17, "latency_ns": 2}])
+    sender, receiver = states
+    flow, = timeline_ir_from_states(states)["feedback_flows"]
+    arrival, = events(receiver, "feedback_receive")
+    consumer = next(event for event in events(receiver, "q1_issue") if event.meta["op"] == "fb_pull_data")
+    assert flow["from_event_id"] == events(sender, "feedback_send")[0].id
+    assert flow["to_event_id"] == arrival.id
+    assert flow["consumer_event_id"] == consumer.id
+    assert (arrival.t0, consumer.t0) == (Concrete(202), Concrete(244))
 
 
 def test_feedback_pull_reads_fifo_id_and_data_without_filtering_by_destination_register() -> None:
@@ -193,6 +275,39 @@ def test_feedback_pull_reads_fifo_id_and_data_without_filtering_by_destination_r
     pull = next(event for event in events(state, "q1_issue") if event.meta["op"] == "fb_pull_data")
     assert "R0" not in pull.meta["register_reads"]
     assert {write.register for write in state.register_history if write.source.line == 4} == {"R0", "R1"}
+
+
+@pytest.mark.parametrize("selector", [1, 257])
+@pytest.mark.parametrize("parameterized", [False, True])
+@pytest.mark.parametrize("prepared", [False, True])
+def test_simulation_wide_feedback_pop_does_not_enter_fifo_selection(monkeypatch, selector, parameterized, prepared):
+    operand = "SELECTOR" if parameterized else str(selector)
+    program = parse_q1asm(f"fb_pop_data {operand},R0\nnop\nstop", file="linq.q1asm")
+    params = {"SELECTOR": selector}
+    bindings = ({"seq": prepare_def_program(program, params=params, strict_q1asm=False, varying=set())}
+                if prepared else None)
+    selections = []
+
+    def select(queue, identifier):
+        selections.append((identifier, [entry["id"] for entry in queue]))
+        return take_feedback(queue, identifier)
+
+    monkeypatch.setattr("q1timeline.simulation.runtime.take_feedback", select)
+    state, = simulate_programs({"seq": program}, params=params, prepared_programs=bindings, simulation={
+        "inputs": {"feedback": [{"target": "seq", "time_ns": 0, "id": 1, "value": 42}]},
+    })
+
+    assert not events(state, "feedback_discard")
+    if selector == 1:
+        assert status(state) == "completed" and state.registers["R0"] == Concrete(42)
+        assert selections == [(1, [1])]
+    else:
+        assert status(state) == "blocked" and "R0" not in state.registers
+        assert state.metadata["execution"]["steps"] == 0
+        assert not selections and not events(state, "q1_stall")
+        diagnostic, = [item for item in state.diagnostics if item.category == "analysis_incomplete"]
+        assert (diagnostic.source.file, diagnostic.source.line) == ("linq.q1asm", 1)
+        assert "selector 257" in diagnostic.message and "unverified" in diagnostic.message
 
 
 @pytest.mark.parametrize("receive", ["fb_pop_data 16,R1", "fb_pull_data R0,R1"])
@@ -385,6 +500,9 @@ def test_threshold_result_can_route_an_explicit_delayed_trigger() -> None:
     assert trigger.t0 == Concrete(220)
     assert trigger.meta["source_event_id"] == events(readout, "acquisition_result")[0].id
     assert control.rt_time_ns == Concrete(224)
+    flow, = timeline_ir_from_states([readout, control])["feedback_flows"]
+    assert flow["to_event_id"] == trigger.id
+    assert flow["consumer_event_id"] == events(control, "wait_trigger")[0].id
 
 
 def test_weighted_acquisition_completes_at_weight_window_not_rt_duration() -> None:
@@ -450,7 +568,7 @@ def test_finite_iq_inputs_with_overflowing_scale_return_structured_error() -> No
             {"sequencer": "seq", "acquisition_index": 0, "bin_index": 0, "i": 1e308, "q": 0},
         ]})
     assert status(state) == "error"
-    assert "outside signed 32-bit range" in state.metadata["execution"]["reason"]
+    assert "outside signed 48-bit range" in state.metadata["execution"]["reason"]
     assert not events(state, "feedback_send")
 
 

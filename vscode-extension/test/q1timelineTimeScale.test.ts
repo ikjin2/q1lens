@@ -198,7 +198,7 @@ describe("Q1 timeline wait folding", () => {
 
   it("waits for a matched physical acquisition result instead of using the RT duration", () => {
     const events = [zeroState(), event("acquire", 100, 104, { meta: { rt_packet_id: "acq0" } }), event("wait", 104, 1004)];
-    for (const integration_length_source of ["configured", "weight_memory"]) {
+    for (const integration_length_source of ["configured", "hardware_parameters", "weight_memory"]) {
       const scale = buildWaitTimeScale({ events: [...events, event("acquisition_result", 600, 600, { meta: {
         rt_packet_id: "acq0", start_ns: 100, duration_ns: 500, integration_length_source,
       } })] });

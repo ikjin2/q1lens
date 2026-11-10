@@ -53,6 +53,70 @@ describe("Q1 timeline issue markers", () => {
     assert.equal(end.title, "stop | 80 ns -> 80 ns");
   });
 
+  it("groups only coincident arrivals in the same sequencer and comparison context", () => {
+    const arrival = (id: string, address: number, time = 120, meta = {}, extra = {}) =>
+      event(id, "trigger_receive", time, { address, aligned_t0: time - 100, aligned_t1: time - 100, ...meta }, extra);
+    const comparison = { branch_comparison_kind: "rt_condition", branch_comparison_branch_id: "first" };
+    const ir = { events: [
+      event("wait", "wait", 100, { aligned_t0: 0, aligned_t1: 100 }, {
+        t1: { kind: "concrete", value: 200 }, duration: { kind: "concrete", value: 100 },
+      }),
+      arrival("one", 1), arrival("two", 2), arrival("duplicate", 1), arrival("later", 3, 140),
+      arrival("peer", 4, 120, {}, { sequencer_id: "Peer" }),
+      arrival("taken", 5, 120, { ...comparison, branch_comparison_path: "taken" }),
+      arrival("skipped", 6, 120, { ...comparison, branch_comparison_path: "fallthrough" }),
+      arrival("other-taken", 7, 120, { ...comparison, branch_comparison_branch_id: "other", branch_comparison_path: "taken" }),
+      event("stop", "stop", 200, { aligned_t0: 100, aligned_t1: 100 }),
+    ] };
+    const original = JSON.stringify(ir);
+    for (const layout of ["time", "instruction"]) for (const timeBasis of ["aligned", "local"]) {
+      const model = buildModel(ir, { layout, timeBasis });
+      const points = blocks(model).filter((block) => block.kind === "trigger_receive");
+      assert.deepEqual(sorted(points.map((block) => block.id)), ["later", "one", "other-taken", "peer", "skipped", "taken"]);
+      const point = points.find((block) => block.id === "one");
+      assert.deepEqual(point.eventIds, ["one", "two", "duplicate"]);
+      assert.deepEqual(point.domain.eventIds, point.eventIds);
+      assert.equal(point.duration, 0);
+      assert.equal(point.start, layout === "instruction" ? 0.2 : timeBasis === "aligned" ? 20 : 120);
+      assert.equal(point.title, `Trigger addresses 1 ×2, 2 · ${timeBasis === "aligned" ? 20 : 120} ns`);
+      assert.equal(points.find((block) => block.id === "later").title, `Trigger address 3 · ${timeBasis === "aligned" ? 40 : 140} ns`);
+      if (layout === "instruction") assert.equal(blocks(model).find((block) => block.id === "stop").start, 1);
+    }
+    assert.equal(JSON.stringify(ir), original);
+  });
+
+  it("defaults to the unique consumed arrival only in its own comparison context", () => {
+    const arrivals = [event("one", "trigger_receive", 20, { address: 1 }), event("two", "trigger_receive", 20, { address: 2 })];
+    for (const alternate of [false, true]) {
+      const comparison = alternate ? { branch_comparison_kind: "rt_condition", branch_comparison_branch_id: "branch",
+        branch_comparison_path: "taken" } : {};
+      const consumer = event("consumer", "wait_trigger", 20, { input_event_ids: ["two"], ...comparison });
+      const point = blocks(buildModel({ events: [...arrivals, consumer] })).find((block) => block.pointMarker);
+      assert.deepEqual(point.eventIds, alternate ? ["one", "two"] : ["two", "one"]);
+      assert.equal(point.title, "Trigger addresses 1, 2 · 20 ns");
+    }
+  });
+
+  it("keeps arrival metadata out of Q1 issue targets and RT latched state", () => {
+    const packet = { q1_issue_event_id: "issue", rt_packet_id: "packet" };
+    const events = [
+      event("issue", "q1_issue", 0, { op: "play", rt_packet_id: "packet" }),
+      event("prior", "play", 4, { applied_state: { frequency: 10 } }),
+      event("trigger", "trigger_receive", 8, { ...packet, address: 1, applied_state: { frequency: 20 } }),
+      event("reject", "feedback_rejected", 12, { ...packet, id: 42, applied_state: { frequency: 30 } }),
+      event("rt", "play", 16, { ...packet, applied_state: { frequency: 10 } }),
+    ];
+    const { model } = assertTargets(events, { issue: ["rt"] });
+    const baseline = buildModel({ events: events.filter((item) => !["trigger", "reject"].includes(item.id)) });
+    const find = (model: any, id: string) => blocks(model).find((item) => item.eventId === id);
+    assert.deepEqual(find(model, "rt").rtDetails, find(baseline, "rt").rtDetails);
+    assert.deepEqual(find(model, "rt").parameterChanges, find(baseline, "rt").parameterChanges);
+    for (const id of ["trigger", "reject"]) {
+      assert.equal(find(model, id).rtDetails, undefined);
+      assert.equal(find(model, id).parameterChanges, undefined);
+    }
+  });
+
   it("shows the initial buffer only in the Q1 lane label", () => {
     const events = [event("issue", "q1_issue", 0, { op: "wait" }), event("rt", "wait", 4)];
     const options = { mode: "debug" };

@@ -6,13 +6,13 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from q1timeline.analysis.alignment import align_timelines
+from q1timeline.analysis.alignment import SIMULATION_ALIGNMENT_MODE, align_timelines
 from q1timeline.analysis.hardware_readiness import analyze_hardware_readiness
 from q1timeline.analysis.interpreter import AnalysisState, interpret_program
 from q1timeline.analysis.underflow import analyze_underflows
-from q1timeline.ir.serialize import timeline_ir_from_states
 from q1timeline.project import is_valid_alignment_mode, is_valid_branch_policy, validate_params_json_mapping
 from q1timeline.q1asm.parser import parse_q1asm
+from q1timeline.sequence import sequence_weight_lengths
 from q1timeline.simulation.config import validate_simulation
 
 
@@ -22,7 +22,7 @@ def analyze_text(
     file: str = "<untitled>",
     sequencer_id: str | None = None,
     params: dict[str, Any] | None = None,
-    alignment_mode: str = "none",
+    alignment_mode: str | None = None,
     alignment_anchor_kinds: list[str] | tuple[str, ...] | None = None,
     branch_policy: str = "collapse_unresolved",
     branch_assumptions: Mapping[str, str] | None = None,
@@ -32,9 +32,13 @@ def analyze_text(
     sequence: dict[str, Any] | None = None,
     hardware_readiness: bool = False,
 ) -> dict[str, Any]:
+    from q1timeline.ir import timeline_ir_from_states
+
     validated_text, validated_file, sequencer = _validate_analyze_text_inputs(text, file, sequencer_id)
     _validate_branch_policy(branch_policy)
     _validate_execution_options(execution_mode, max_steps)
+    if alignment_mode is None:
+        alignment_mode = SIMULATION_ALIGNMENT_MODE if execution_mode == "simulation" else "none"
     anchor_kinds = _validate_alignment_options(alignment_mode, alignment_anchor_kinds)
     _validate_params(params)
     state = _analyze_program_text(
@@ -68,7 +72,7 @@ def analyze_documents(
     documents: Mapping[str, str],
     *,
     params: dict[str, Any] | None = None,
-    alignment_mode: str = "first_wait_sync",
+    alignment_mode: str | None = None,
     alignment_anchor_kinds: list[str] | tuple[str, ...] | None = None,
     branch_policy: str = "collapse_unresolved",
     branch_assumptions: Mapping[str, str] | None = None,
@@ -78,8 +82,12 @@ def analyze_documents(
     sequences: dict[str, dict[str, Any]] | None = None,
     hardware_readiness: bool = False,
 ) -> dict[str, Any]:
+    from q1timeline.ir import timeline_ir_from_states
+
     _validate_branch_policy(branch_policy)
     _validate_execution_options(execution_mode, max_steps)
+    if alignment_mode is None:
+        alignment_mode = SIMULATION_ALIGNMENT_MODE if execution_mode == "simulation" else "first_wait_sync"
     anchor_kinds = _validate_alignment_options(alignment_mode, alignment_anchor_kinds)
     _validate_params(params)
     validated_documents = _validate_documents(documents)
@@ -93,6 +101,7 @@ def analyze_documents(
         states = simulate_programs(programs, params=params, max_steps=max_steps,
                                    simulation=scenario, sequences=sequences, branch_assumptions=branch_assumptions)
     else:
+        sequence_by_id = sequences if isinstance(sequences, Mapping) else {}
         states = [
             _analyze_program_text(
                 text,
@@ -103,6 +112,7 @@ def analyze_documents(
                 branch_assumptions=branch_assumptions,
                 execution_mode=execution_mode,
                 max_steps=max_steps,
+                sequence=sequence_by_id.get(sequencer_ids[file]),
             )
             for file, text in validated_documents.items()
         ]
@@ -152,6 +162,7 @@ def _analyze_program_text(
         execution_mode=execution_mode,
         max_steps=max_steps,
     )
+    state.metadata["weight_lengths"] = sequence_weight_lengths(sequence)
     return state
 
 

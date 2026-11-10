@@ -260,10 +260,9 @@ def test_unknown_or_unsupported_conditional_controls_remain_conservative(configu
     assert not any(event.kind in {"play", "conditional_skip"} for event in state.events)
 
 
-@pytest.mark.parametrize("operation, else_duration", [("wait_sync 40", 20), ("wait_trigger 1,40", 20),
-                                                     ("play_netzero 0,40", 20)])
+@pytest.mark.parametrize("operation, else_duration", [("wait_sync 40", 20), ("play_netzero 0,40", 20)])
 @pytest.mark.parametrize("operator", [0, 1])
-def test_known_predicate_does_not_expand_sync_trigger_or_unsupported_timing(operation: str, else_duration: int, operator: int) -> None:
+def test_known_predicate_does_not_expand_sync_or_unsupported_timing(operation: str, else_duration: int, operator: int) -> None:
     state = analyze(f"set_cond 1,0,{operator},{else_duration}\n{operation}\nstop")
 
     assert isinstance(state.rt_time_ns, Unknown)
@@ -276,15 +275,26 @@ def test_known_predicate_uses_only_the_selected_duration(operator: int, nominal:
     source = f"set_mrk 3\nset_cond 1,0,{operator},{else_duration}\nplay 0,1,{nominal}\nset_cond 0,0,0,4\nupd_param 4\nstop"
     state = analyze(source)
     actual = nominal if operator else else_duration
+    spacing = actual or 4
 
-    assert state.rt_time_ns == Concrete(actual + 4)
+    assert state.rt_time_ns == Concrete(spacing + 4)
     assert [packet.duration for packet in state.rt_packets] == [Concrete(actual), Concrete(4)]
     assert len([event for event in state.events if event.kind == "conditional_skip"]) == (not operator)
     marker, = [event for event in state.events if event.kind == "marker_state"]
-    assert marker.t0 == Concrete(0 if operator else actual)
+    assert marker.t0 == Concrete(0 if operator else spacing)
     issue = next(event for event in state.events if event.kind == "q1_issue" and event.source.raw.startswith("play"))
     assert issue.meta["conditional_timing_known"]
     assert not any(event.kind == "unknown_region" for event in state.events)
+    assert analyze_underflow(state).status == "not_detected_under_current_assumptions"
+
+
+def test_unresolved_condition_with_both_zero_durations_keeps_time_and_output_separate():
+    state = analyze("set_mrk 3\nset_cond 1,1,0,0\nupd_param 0\nset_cond 0,0,0,4\nwait 4\nstop")
+    region, = [event for event in state.events if event.kind == "unknown_region"]
+    assert (region.t0, region.t1, region.duration) == (Concrete(0), Concrete(0), Concrete(0))
+    assert region.meta["conditional_timing_known"] and region.meta["output_state_unknown"]
+    assert region.meta["next_dequeue_not_before_ns"] == 4
+    assert state.rt_time_ns == Concrete(8)
     assert analyze_underflow(state).status == "not_detected_under_current_assumptions"
 
 
@@ -617,3 +627,18 @@ def test_compact_loop_preserves_an_explicit_disable_before_rt_work(configuration
     assert state.rt_time_ns == Concrete(20)
     loop, = [event for event in state.events if event.kind == "loop_block"]
     assert loop.confidence == "exact"
+
+
+@pytest.mark.parametrize("tail_else,expected", [(0, Concrete(16)), (8, None)])
+def test_compact_loop_checks_zero_skip_duration_carried_from_tail(tail_else, expected):
+    source = ("set_cond 1,0,0,0\nmove 3,R0\nnop\nbody: wait 20\n"
+              f"set_cond 1,0,0,{tail_else}\nloop R0,@body\nset_cond 0,0,0,4\nupd_param 4\nstop")
+    state = analyze(source)
+    loop, = [event for event in state.events if event.kind == "loop_block"]
+    assert state.rt_packets[0].duration == Concrete(0)
+    if expected is None:
+        assert isinstance(state.rt_time_ns, Unknown)
+        assert loop.meta["period_invariant"] is False
+    else:
+        assert state.rt_time_ns == expected
+        assert loop.meta["period"]["value"] == 4

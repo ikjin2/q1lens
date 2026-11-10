@@ -32,6 +32,53 @@ function selection(index: Map<string, any>, id: string) {
 const empty = { relatedEventIds: [], appliedEventIds: [] };
 
 describe("Q1 timeline latched selection", () => {
+  it("selects explicit commits without treating branch snapshot provenance as an application", () => {
+    const events = [
+      event("first-issue", "q1_issue", 0), pending("first-setter", "first-issue"),
+      event("second-issue", "q1_issue", 4), pending("second-setter", "second-issue"),
+      event("first-rt", "upd_param", 100, { ...applied("first-setter", "p0"),
+        committed_setter_event_ids: { frequency: "first-setter" } }),
+    ];
+    for (const path of ["taken", "fallthrough"]) {
+      const branch = { branch_comparison_branch_id: "branch", branch_comparison_path: path };
+      events.push(
+        event(`${path}-carry`, "upd_param", 104, { ...branch, ...applied("first-setter", `${path}-p1`),
+          committed_setter_event_ids: {} }),
+        event(`${path}-commit`, "upd_param", 108, { ...branch, ...applied("second-setter", `${path}-p2`),
+          committed_setter_event_ids: { frequency: "second-setter" } }),
+        event(`${path}-later`, "upd_param", 112, { ...branch, ...applied("second-setter", `${path}-p3`),
+          committed_setter_event_ids: {} }),
+      );
+    }
+    const index = buildIndex({ events });
+    assert.deepEqual(selection(index, "first-issue"), { relatedEventIds: ["first-rt"], appliedEventIds: ["first-rt"] });
+    assert.deepEqual(selection(index, "second-issue"), {
+      relatedEventIds: ["fallthrough-commit", "taken-commit"], appliedEventIds: ["fallthrough-commit", "taken-commit"],
+    });
+    assert.deepEqual(selection(index, "fallthrough-carry"), empty);
+    assert.deepEqual(selection(index, "taken-later"), empty);
+  });
+
+  it("links a skipped one-shot phase capture without reporting a parameter application", () => {
+    const events = [
+      event("delta", "q1_issue", 0), pending("delta-latch", "delta", "phase_delta"),
+      event("reset", "q1_issue", 4), pending("reset-latch", "reset", "phase_reset"),
+      event("frequency", "q1_issue", 8), pending("frequency-latch", "frequency"),
+      event("skip", "conditional_skip", 12, {conditional_skipped: true,
+        captured_state: {phase_delta: 100, phase_reset: true, frequency: 100},
+        captured_setter_event_ids: {phase_delta: "delta-latch", phase_reset: "reset-latch", frequency: "frequency-latch"},
+        applied_state: {}, applied_setter_event_ids: {}, committed_setter_event_ids: {}}),
+      event("apply", "upd_param", 16, applied("frequency-latch", "next")),
+    ];
+    const index = buildIndex({events});
+    for (const id of ["delta", "reset"]) {
+      assert.deepEqual(selection(index, id), {relatedEventIds: ["skip"], appliedEventIds: []});
+      assert.deepEqual(index.get(id).capturedEventIds, ["skip"]);
+      assert.equal(index.get(id).rtNavigationEventId, "skip");
+    }
+    assert.deepEqual(selection(index, "frequency"), {relatedEventIds: ["apply"], appliedEventIds: ["apply"]});
+  });
+
   it("navigates equal-duration conditional RT commands to their own uncertain-output block", () => {
     const events = [event("wait-issue", "q1_issue", 0),
       event("wait", "wait", 100, { q1_issue_event_id: "wait-issue" }),

@@ -126,7 +126,7 @@ def test_plan_counts_exact_integer_grid():
     plan = sweep_plan([axis(upper="5", step="2"), axis("Y", "10", "10", "3")], defs)
     assert plan == {"axes": [{"name": "X", "count": "3", "min": "0", "step": "2", "last": "4"},
                              {"name": "Y", "count": "1", "min": "10", "step": "3", "last": "10"}],
-                    "total": "3", "allowed": True, "limit": 4096}
+                    "total": "3", "allowed": True, "limit": 4096, "sample_limit": 25_000}
     assert sweep_plan([axis(upper="4095")], defs)["allowed"]
     assert not sweep_plan([axis(upper="4096")], defs)["allowed"]
     assert sweep_plan([axis(upper="999999")], defs, statistics_only=True)["allowed"]
@@ -363,6 +363,32 @@ def test_worker_batches_and_reproduces_selected_case(tmp_path):
         assert summary["registers"] == {}
         assert summary["time"] == {"count": 3, "min": 40, "max": 40, "mean": 40, "deviation": 0}
         assert "error" in call("sweep", **{**time_only, "observe_time": False}, axes=[axis()])
+
+        sampled = {**multi, "observe_time": True}
+        axes = [axis(lower="-100", upper="100", step="3"), axis("Y", "-70", "60", "2")]
+        for invalid in (0, -1, 1.5, "4", True, None, 25_001):
+            assert "Sample count" in call("sweep", **sampled, axes=axes, sample_count=invalid)["error"]
+        assert "error" in call("batch")
+        assert call("sweep", **sampled, axes=axes, sample_count=25_000)["plan"]["total"] == "25000"
+        plan = call("sweep", **sampled, axes=axes, sample_count=6)["plan"]
+        assert plan["sampling"] == "random" and plan["total"] == "6" and plan["allowed"]
+        rows = call("batch")["rows"]
+        assert len(rows) == 6
+        for case_id, row in enumerate(rows, 1):
+            x, y = (int(row["defs"][name]) for name in ("X", "Y"))
+            assert x in range(-100, 101, 3) and y in range(-70, 61, 2)
+            assert row["id"] == case_id and row["words"]["R2"] == (x + y) % (2**32) and row["q1_ns"] == 40
+        assert not call("batch")["rows"]
+        detail = call("run", **{**sampled, "overrides": rows[-1]["defs"]}, case_id=6)
+        assert detail["case"] == rows[-1] and "ir" in detail
+
+        singleton = [axis(lower="-1", upper="-1")]
+        plan = call("sweep", **sampled, axes=singleton, sample_count=8, statistics_only=True)["plan"]
+        assert plan["sampling"] == "random" and plan["total"] == "8"
+        summary = call("batch")["summary"]
+        assert summary["count"] == 8 and summary["time"]["count"] == 8
+        assert summary["registers"]["R2"]["signed"] == {"count": 8, "min": 9, "max": 9, "mean": 9, "deviation": 0}
+
         assert "error" in call("run", **{**multi, "registers": ["R1", "R1"]})
         (tmp_path / "sum.q1asm").write_text("stop\n", encoding="utf-8")
         assert "changed" in call("run", **base)["error"]

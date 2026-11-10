@@ -405,7 +405,7 @@
       classes.push("is-related");
     }
     const node = element("div", classes.join(" "));
-    if (style.tiny) {
+    if (style.tiny && !block.foldGroup?.expanded) {
       node.classList.add("is-tiny");
     }
     if (style.compact) {
@@ -414,6 +414,10 @@
     node.setAttribute("role", "button");
     node.tabIndex = 0;
     node.dataset.eventId = String(block.eventId || block.id);
+    if (block.foldGroup) {
+      node.setAttribute("aria-label", block.foldGroup.action);
+      node.setAttribute("aria-expanded", String(block.foldGroup.expanded));
+    }
     if (Array.isArray(block.eventIds) && block.eventIds.length) {
       node.dataset.eventIds = block.eventIds.map((eventId) => String(eventId)).join(" ");
     }

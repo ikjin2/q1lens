@@ -17,7 +17,7 @@ def analyze(source: str, **kwargs):
     ("set_freq 400", "frequency", 400),
     ("set_ph 100", "phase", 100),
     ("set_ph_delta 100", "phase_delta", 100),
-    ("reset_ph", "phase", 0),
+    ("reset_ph", "phase_reset", True),
     ("set_digital 1,0,0", "digital", [1, 0, 0]),
     ("set_scope_en 1", "scope_enable", 1),
 ])

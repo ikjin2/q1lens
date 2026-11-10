@@ -105,6 +105,74 @@ test("saved integration settings and feedback setup alone do not create an ACQ r
   await expect(page.locator('[data-lane-role="acquisition"]')).toHaveCount(0);
 });
 
+test("both inspectors show acquisition integration sources independently of RT timing", async ({ page }) => {
+  const datasets = JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json",
+    "from q1timeline.analysis.alignment import align_timelines",
+    "from q1timeline.analysis.api import analyze_documents",
+    "from q1timeline.ir.serialize import timeline_ir_from_states",
+    "from q1timeline.q1asm.parser import parse_q1asm",
+    "from q1timeline.render.html import render_html",
+    "from q1timeline.simulation.runtime import simulate_programs",
+    "plain = 'acquire 0,0,8\\nwait 64\\nstop'",
+    "weighted = 'acquire_weighted 0,0,0,0,8\\nwait 64\\nstop'",
+    "memory = {'weights': {'w': {'index': 0, 'data': [1] * 32}}}",
+    "sources = {'fallback': plain, 'hardware': plain, 'weighted': weighted, 'physical': plain}",
+    "programs = {name: parse_q1asm(text, file=f'{name}.q1asm') for name, text in sources.items()}",
+    "states = simulate_programs(programs, sequences={'weighted': memory},",
+    "    hardware_parameters={'hardware': {'integration_length_acq': 24}},",
+    "    simulation={'startup_delay_ns': 20, 'physical': {'sequencers': {'physical': {'integration_length_ns': 16}}},",
+    "        'inputs': {'acquisitions': [{'sequencer': name, 'acquisition_index': 0, 'bin_index': 0, 'i': 1} for name in sources]}})",
+    "alignment = 'manual:-20'",
+    "align_timelines(states, mode=alignment)",
+    "simulated = timeline_ir_from_states(states, project={'alignment_mode': alignment})",
+    "analytic = analyze_documents({'analytic.q1asm': weighted, 'missing.q1asm': plain, 'unsupported.q1asm': plain},",
+    "    sequences={'analytic': memory}, alignment_mode='none')",
+    "for event in analytic['events']:",
+    "    if event['kind'] == 'acquire' and event['sequencer_id'] == 'missing':",
+    "        event['meta'].pop('acquisition_window')",
+    "    if event['kind'] == 'acquire' and event['sequencer_id'] == 'unsupported':",
+    "        event['meta']['acquisition_window']['source'] = 'constructor'",
+    "print(json.dumps([{'ir': ir, 'html': render_html(ir)} for ir in (simulated, analytic)]))",
+  ].join("\n")], { cwd: repo, encoding: "utf8", env: { ...process.env, PYTHONPATH: path.join(repo, "src") } }));
+  const labels = {
+    fallback: "Assumed from RT duration", hardware: "hardware parameters · integration_length_acq",
+    weighted: "Weight memory", physical: "Physical model · integration_length_ns",
+    analytic: "Weight memory", missing: "unknown", unsupported: "unknown",
+  };
+  const inspector = page.locator("#event-inspector-fields");
+  const field = (label) => inspector.getByText(label, { exact: true }).locator("xpath=following-sibling::dd[1]");
+  for (const data of datasets) {
+    const acquisitions = data.ir.events.filter((event) => event.kind === "acquire");
+    await page.setContent(data.html);
+    for (const event of acquisitions) {
+      await page.locator(`#timeline-root > svg [data-event-id="${event.id}"]`).click();
+      await expect(field("Integration source")).toHaveText(labels[event.sequencer_id]);
+      if (event.sequencer_id === "physical") {
+        await expect(field("Time range")).toHaveText("0 -> 8");
+        await expect(field("Effective integration")).toHaveText("16 ns / 16 ns configured");
+      }
+    }
+    await mount(page, data);
+    for (const event of acquisitions) {
+      await page.locator(`.timeline-block[data-block-id="${event.id}"]`).click();
+      await expect(field("Integration source")).toHaveText(labels[event.sequencer_id]);
+      await expect(field("RT wait")).toHaveText("8 ns");
+      if (event.sequencer_id === "physical") {
+        await expect(field("Integration window")).toHaveText("0 ns → 16 ns");
+        await page.getByRole("button", { name: "Local time basis" }).click();
+        await expect(field("Integration window")).toHaveText("20 ns → 36 ns");
+        await expect(field("Integration source")).toHaveText(labels.physical);
+        await expect(field("RT wait")).toHaveText("8 ns");
+        expect(await page.evaluate(() => window.messages.filter(message => message.type === "eventClick").at(-1).eventId))
+          .toBe(event.id);
+        await page.getByRole("button", { name: "Aligned time basis" }).click();
+        await expect(field("Integration window")).toHaveText("0 ns → 16 ns");
+      }
+    }
+  }
+});
+
 test("acquisition duration moves to its fold tab and returns to the bracket on expansion", async ({ page }) => {
   const data = fixture("examples/time-fold-demo/q1timeline.yml");
   await mount(page, data);

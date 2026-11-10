@@ -206,7 +206,17 @@ test("the open cursor project replays its recorded prefix and shows its input wa
   await page.clock.runFor(13000);
   await expect(value(page, "replay-progress")).toHaveText("128 / 128 instructions");
   await expect(replayRegister(page, "R0")).not.toHaveText("?");
-  await expect(value(page, "replay-status")).toContainText(/Recorded trace ended.*queue_full/);
+  await expect(value(page, "replay-status")).toContainText(/Recorded trace ended.*No scheduled input can resume trigger_wait\..*Observation end 964 ns/);
+  const evidence = await page.evaluate(() => {
+    const ir = window.demoIr;
+    const pending = ir.events.filter((event) => event.sequencer_id === "blue_peak" && event.meta.pending);
+    const wait = pending.find((event) => event.kind === "trigger_wait");
+    const stall = pending.find((event) => event.kind === "q1_stall" && event.meta.reason === "queue_full");
+    const diagnostic = ir.diagnostics.find((item) => item.related_events.includes(wait.id));
+    return {wait: [wait.t0.value, wait.t1.value, wait.source.line], stall: [stall.t0.value, stall.t1.value, stall.source.line],
+      diagnosticLine: diagnostic.source.line};
+  });
+  expect(evidence).toEqual({wait: [932, 964, 47], stall: [952, 964, 93], diagnosticLine: 47});
   await page.screenshot({ path: test.info().outputPath("current-project-replay.png"), fullPage: true });
 });
 
@@ -290,14 +300,27 @@ test("joint generation requires simulation and restores all cards after refresh"
 test("joint replay retains an unresolved barrier instead of releasing it", async ({ page }) => {
   await freezeClock(page);
   await openJoint(page, "joint-sync-blocked");
+  await page.evaluate(() => window.hardwarePreview.setTime(235));
+  await expect(projectValue(page, "early", "rt")).toContainText(/waiting.*wait_sync/);
+  await expect(projectCard(page, "early").locator('.is-rt-wait')).toHaveAttribute("data-source-line", "3");
   await page.getByRole("combobox", { name: "Execution replay speed" }).selectOption("100");
   await run(page).click();
   await page.clock.runFor(5000);
   await expect(value(page, "replay-status")).toContainText("Recorded trace ended");
-  await expect(projectValue(page, "early", "execution")).toContainText(/blocked.*sync_wait/);
-  await expect(projectValue(page, "early", "rt")).toContainText(/waiting.*wait_sync/);
-  await expect(projectCard(page, "early").locator('.is-rt-wait')).toHaveCount(1);
+  await expect(page.getByRole("spinbutton")).toHaveValue("236");
+  await expect(projectValue(page, "early", "execution")).toContainText(/blocked.*No matching wait_sync barrier for: late\..*Observation end 236 ns/);
+  await expect(projectValue(page, "early", "rt")).toContainText("observation ended");
+  await expect(projectCard(page, "early").locator('.is-rt-wait')).toHaveCount(0);
   await expect(projectValue(page, "late", "rt")).toContainText(/stopped.*stop/);
+  const barrier = await page.evaluate(() => {
+    const ir = window.demoIr;
+    const events = ir.events.filter((event) => event.sequencer_id === "early");
+    const pending = events.find((event) => event.kind === "sync_wait");
+    const diagnostic = ir.diagnostics.find((item) => item.related_events.includes(pending.id));
+    return {pending: pending.meta.pending, time: [pending.t0.value, pending.t1.value], line: diagnostic.source.line,
+      released: events.some((event) => event.kind === "wait_sync")};
+  });
+  expect(barrier).toEqual({pending: true, time: [208, 236], line: 3, released: false});
 });
 
 test("all four open-project sequencers remain visible on the common clock", async ({ page }) => {

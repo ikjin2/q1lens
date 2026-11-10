@@ -2,16 +2,23 @@
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 import heapq
 from itertools import count
 
 from q1timeline.analysis.interpreter import RtPacket
+from q1timeline.analysis.trigger_counters import ScheduledTriggerCounters, TriggerSchedule
 from q1timeline.analysis.values import Concrete
 
 
 ASSUMED_INITIAL_BUFFER_NS = 1_000_000
 POSSIBLE_INITIAL_BUFFER_NS = 2_000_000
+DISABLED_SYNC_REASON = "wait_sync requires SYNQ participation, but this sequencer has sync_en disabled"
+
+
+def synchronization_participants(names: Iterable[str], hardware_parameters: Mapping[str, Mapping[str, object]]) -> set[str]:
+    return {name for name in names if hardware_parameters.get(name, {}).get("sync_en") is not False}
 
 
 @dataclass(frozen=True)
@@ -36,6 +43,8 @@ class QueueReplayResult:
     failure: QueueTimingFailure | None = None
     incomplete_reason: str | None = None
     required_buffer_ns: int = 0
+    incomplete_packet: RtPacket | None = None
+    incomplete_details: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -50,7 +59,9 @@ class _Queue:
     rt_waiting: bool = False
     underflow_suspended: bool = False
     sync: RtPacket | None = None
-    trigger_missed: bool = False
+    timing_incomplete: bool = False
+    trigger_counters: ScheduledTriggerCounters | None = None
+    consumed_trigger_ids: set[str] = field(default_factory=set)
 
 
 def replay_queues(
@@ -60,6 +71,8 @@ def replay_queues(
     prefill_sync: bool = False,
     prefill_startup: bool = False,
     initial_buffer_ns: int = 0,
+    sync_participants: set[str] | None = None,
+    trigger_schedules: Mapping[str, TriggerSchedule] | None = None,
 ) -> dict[str, QueueReplayResult]:
     """Replay buffered startup, optionally holding sync for maximal prefetch.
 
@@ -72,24 +85,34 @@ def replay_queues(
     It is spent only when the FIFO would starve, never added as startup idle,
     and never replenished. This is an explicit timing assumption, not FIFO space.
 
-    When any stream uses wait_sync, all supplied streams participate. Each
-    barrier matches their next wait_sync; a missing round is incomplete. This bounded packet replay
-    does not infer trigger arrivals, omitted loop iterations, or terminal stops.
+    When any stream executes wait_sync, all supplied streams participate by
+    default. Each barrier matches the selected participants' next wait_sync.
+    A missing round is incomplete. This bounded replay does not infer trigger
+    arrivals, omitted loop iterations, or terminal stops.
     Trigger arrivals keep their shared analytical receiver times; a missed
     arrival makes that scenario incomplete rather than inventing a time shift.
+    Replay also checks whether moved dequeues still select recorded conditions.
     Callers must supply a complete, deterministic packet prefix.
     """
     if isinstance(queue_depth_limit, bool) or not isinstance(queue_depth_limit, int) or queue_depth_limit < 1:
         raise ValueError("queue_depth_limit must be a positive integer")
     if type(initial_buffer_ns) is not int or initial_buffer_ns < 0:
         raise ValueError("initial_buffer_ns must be a nonnegative integer")
+    if sync_participants is not None and sync_participants - streams.keys():
+        raise ValueError("sync_participants must name supplied streams")
     results = {name: QueueReplayResult() for name in streams}
     queues: dict[str, _Queue] = {}
-    participants = set(streams) if any(packet.op == "wait_sync" for packets in streams.values() for packet in packets) else set()
+    participants = set(streams) if sync_participants is None else sync_participants
+    has_sync = any(packet.op == "wait_sync" and packet.meta.get("conditional_skipped") is not True
+                   for name in participants for packet in streams[name])
     for name, packets in streams.items():
         prefix: list[RtPacket] = []
         previous_end = None
         for packet in packets:
+            if packet.op == "wait_sync" and packet.meta.get("conditional_skipped") is not True and name not in participants:
+                results[name].incomplete_reason = DISABLED_SYNC_REASON
+                results[name].incomplete_packet = packet
+                break
             times = (packet.q1_issue_t0, packet.q1_issue_t1, packet.duration)
             if not all(isinstance(value, Concrete) and type(value.value) is int for value in times):
                 results[name].incomplete_reason = f"Unknown packet timing at {packet.id}."
@@ -98,12 +121,17 @@ def replay_queues(
             if end <= start or duration < 0 or (previous_end is not None and start < previous_end):
                 results[name].incomplete_reason = f"Invalid packet timing at {packet.id}."
                 break
-            if packet.op == "wait_trigger" and _trigger_timing(packet) is None:
+            if (packet.op == "wait_trigger" and packet.meta.get("conditional_skipped") is not True
+                    and _trigger_timing(packet) is None):
                 results[name].incomplete_reason = f"External trigger timing is unknown at {packet.id}."
                 break
             prefix.append(packet)
             previous_end = end
-        queues[name] = _Queue(prefix, results[name])
+        schedule_inputs = (trigger_schedules or {}).get(name)
+        counters = ScheduledTriggerCounters(schedule_inputs) if schedule_inputs and any(
+            "trigger_counter_assumption" in packet.meta for packet in prefix
+        ) else None
+        queues[name] = _Queue(prefix, results[name], trigger_counters=counters)
 
     events: list[tuple[int, int, int, str, str]] = []
     order = count()
@@ -119,7 +147,7 @@ def replay_queues(
         schedule(time, 2, name, "issue")
 
     def release_sync(time: int) -> None:
-        if not participants or not all(queues[name].sync is not None for name in participants):
+        if not has_sync or not all(queues[name].sync is not None for name in participants):
             return
         if prefill_sync and not all(
             queues[name].blocked or (
@@ -141,7 +169,7 @@ def replay_queues(
     while events:
         time, _, _, name, action = heapq.heappop(events)
         queue = queues[name]
-        if queue.result.failure is not None or queue.trigger_missed:
+        if queue.result.failure is not None or queue.timing_incomplete:
             continue
         if action == "issue":
             if len(queue.pending) >= queue_depth_limit:
@@ -156,7 +184,13 @@ def replay_queues(
             queue.index += 1
             queue.ready_ns = None
             if queue.index < len(queue.packets):
-                gap = queue.packets[queue.index].q1_issue_t0.value - packet.q1_issue_t1.value
+                following = queue.packets[queue.index]
+                if following.meta.get("scheduled_feedback_gap") and time != packet.q1_issue_t1.value:
+                    queue.result.incomplete_reason = f"Shifted Q1 timing leaves the scheduled LINQ receipt before {following.id} unverified"
+                    queue.result.incomplete_packet = following
+                    queue.timing_incomplete = True
+                    continue
+                gap = following.q1_issue_t0.value - packet.q1_issue_t1.value
                 issue_at(name, time + gap)
             startup_ready = not prefill_startup or len(queue.pending) >= queue_depth_limit or (
                 queue.index == len(queue.packets) and queue.result.incomplete_reason is None
@@ -179,31 +213,43 @@ def replay_queues(
                 continue
             packet, enqueued = queue.pending.popleft()
             queue.result.records.append(QueueTimingRecord(packet, enqueued, time, len(queue.pending)))
-            trigger = _trigger_timing(packet) if packet.op == "wait_trigger" else None
+            skipped = packet.meta.get("conditional_skipped") is True
+            trigger = _trigger_timing(packet) if packet.op == "wait_trigger" and not skipped else None
             duration = packet.duration.value if trigger is None else trigger[1]
             if trigger is not None and time > trigger[0]:
                 queue.result.incomplete_reason = (
                     f"Scenario trigger arrived at {trigger[0]} ns before {packet.id} dequeued at {time} ns."
                 )
-                queue.trigger_missed = True
+                queue.result.incomplete_packet = packet
+                queue.result.incomplete_details = {"arrival_ns": trigger[0], "dequeue_ns": time}
+                queue.timing_incomplete = True
+                continue
+            reason = _replay_trigger_counters(queue, packet, time, skipped, trigger is not None)
+            if reason is not None:
+                queue.result.incomplete_reason = reason
+                queue.result.incomplete_packet = packet
+                queue.timing_incomplete = True
                 continue
             # A zero duration suspends the guard, but the next pop is still
             # attempted after 4 ns. Any nonzero duration restores the guard.
             queue.underflow_suspended = duration == 0
             if queue.blocked:
                 issue_at(name, time)
-            if packet.op == "wait_sync":
+            if packet.op == "wait_sync" and not skipped:
                 queue.sync = packet
             else:
                 schedule((time if trigger is None else trigger[0]) + (duration or 4), 1, name, "rt")
         release_sync(time)
 
-    for name, queue in queues.items():
-        if queue.sync is not None:
-            missing = ", ".join(sorted(peer for peer in participants if queues[peer].sync is None))
-            reason = (f"wait_sync {queue.sync.id} has no matching reachable barrier for: {missing}." if missing
-                      else f"Maximal prefetch before wait_sync {queue.sync.id} is unknown.")
-            queue.result.incomplete_reason = queue.result.incomplete_reason or reason
+    for queue in queues.values():
+        if queue.sync is not None and queue.result.incomplete_reason is None:
+            missing = sorted(peer for peer in participants if queues[peer].sync is None)
+            queue.result.incomplete_reason = (
+                f"wait_sync {queue.sync.id} has no matching reachable barrier for: {', '.join(missing)}." if missing
+                else f"Maximal prefetch before wait_sync {queue.sync.id} is unknown."
+            )
+            queue.result.incomplete_packet = queue.sync
+            queue.result.incomplete_details = {"missing_sync_participants": missing}
     return results
 
 
@@ -213,3 +259,26 @@ def _trigger_timing(packet: RtPacket) -> tuple[int, int] | None:
         return None
     values = (assumption.get("arrival_ns"), assumption.get("duration_ns"))
     return values if all(type(value) is int and value >= 0 for value in values) else None
+
+
+def _replay_trigger_counters(queue: _Queue, packet: RtPacket, time_ns: int, skipped: bool, waits: bool) -> str | None:
+    counters = queue.trigger_counters
+    assumption = packet.meta.get("trigger_counter_assumption")
+    if counters is None:
+        return f"Trigger-counter inputs for {packet.id} are unavailable in queue replay." if assumption is not None else None
+    counters.advance(time_ns)
+    if assumption is not None:
+        taken = counters.decide(assumption["mask"], assumption["operator"])
+        if taken != assumption["taken"]:
+            return f"The set_cond decision for {packet.id} cannot be confirmed at its replay dequeue at {time_ns} ns."
+    if waits:
+        trigger = packet.meta["trigger_assumption"]
+        event_id = next((event_id for arrival, address, event_id in counters.schedule.arrivals
+                         if arrival >= time_ns and address == trigger["address"]
+                         and event_id not in queue.consumed_trigger_ids), None)
+        if event_id != trigger["event_id"]:
+            return f"A different scenario trigger would release {packet.id} at its replay dequeue at {time_ns} ns."
+        queue.consumed_trigger_ids.add(event_id)
+    if not skipped:
+        counters.apply(packet.op, packet.meta.get("trigger_latch_enable"))
+    return None

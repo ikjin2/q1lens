@@ -49,7 +49,13 @@ def test_adaptive_array_demo_has_expected_signals(adaptive_array_ir: dict) -> No
         "upd_param",
     } <= kinds
     assert applied_events
-    assert {"feedback_latency_violation", "unresolved_branch"} <= categories
+    assert "unresolved_branch" in categories
+    events = {event["id"]: event for event in ir["events"]}
+    nominal_flows = [flow for flow in ir["feedback_flows"] if events[flow["from_event_id"]]["meta"].get("rt_trigger_epoch")]
+    assert nominal_flows and all(flow["timing"]["arrival_ns"] is None for flow in nominal_flows)
+    unknown_receives = {diagnostic["related_events"][0] for diagnostic in ir["diagnostics"]
+                        if diagnostic["details"].get("reason") == "feedback_timing_unknown"}
+    assert {flow["to_event_id"] for flow in nominal_flows} <= unknown_receives
 
 
 def test_adaptive_array_demo_feedback_balance(adaptive_array_ir: dict) -> None:

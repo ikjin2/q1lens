@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { parseWebviewMessage } from "../src/q1timeline/webviewMessageValidation";
 
-const { interpret, statistics, compileFormula, summarize } = require("../src/q1timeline/media/defRuns.js");
+const { interpret, statistics, compileFormula, summarize, parseTolerance, compareValues } = require("../src/q1timeline/media/defRuns.js");
 
 describe("DEF run messages and register statistics", () => {
   it("keeps literal precision on the wire and validates register and sweep shape", () => {
@@ -20,6 +20,15 @@ describe("DEF run messages and register statistics", () => {
     assert.equal(parseWebviewMessage({ ...sweep, statistics_only: "true" }).valid, false);
     assert.equal(parseWebviewMessage({ ...sweep, registers: [], observe_time: false }).valid, false);
     assert.equal(parseWebviewMessage({ ...sweep, registers: [], observe_time: true }).valid, true);
+    assert.equal(parseWebviewMessage({ ...sweep, sample_count: 1_000_000 }).valid, true);
+    assert.equal(parseWebviewMessage({ ...sweep, sample_count: 1_000_001 }).valid, false);
+    assert.equal(parseWebviewMessage({ ...sweep, sample_count: 25_000, statistics_only: false }).valid, true);
+    assert.equal(parseWebviewMessage({ ...sweep, sample_count: 25_001, statistics_only: false }).valid, false);
+    assert.equal(parseWebviewMessage({ ...sweep, action: "estimate" }).valid, true);
+    assert.equal(parseWebviewMessage({ ...sweep, action: "estimate", sample_count: 32 }).valid, false);
+    for (const sample_count of [0, -1, 0.5, "12", null]) {
+      assert.equal(parseWebviewMessage({ ...sweep, sample_count }).valid, false);
+    }
   });
 
   it("weights every valid case and computes population deviation", () => {
@@ -90,5 +99,21 @@ describe("DEF run messages and register statistics", () => {
     assert.equal(wide.mean, 0);
     assert.equal(wide.deviation, 1e308);
     assert.deepEqual(wide.bins.map((bin: { count: number }) => bin.count), [1, 1]);
+  });
+
+  it("uses an inclusive absolute tolerance and separates unavailable comparisons", () => {
+    assert.equal(parseTolerance(""), null);
+    assert.equal(parseTolerance("3.1e-5"), 3.1e-5);
+    assert.equal(parseTolerance("0"), 0);
+    for (const text of ["-1", "Infinity", "NaN", "1e400", "1 + 2"]) {
+      assert.throws(() => parseTolerance(text), /non-negative absolute tolerance/);
+    }
+    assert.deepEqual(compareValues(2, 2.5, 0.5), { formula: 2, reference: 2.5, error: -0.5, verdict: "pass" });
+    assert.equal(compareValues(2.5, 2, 0.5).verdict, "pass");
+    assert.equal(compareValues(2, 2.5, 0.499).verdict, "fail");
+    assert.equal(compareValues(2, 2, 0).verdict, "pass");
+    assert.equal(compareValues(2, 2.5, null).verdict, "compared");
+    assert.deepEqual(compareValues(2, null, 0.5), { formula: 2, reference: null, error: null, verdict: "unavailable" });
+    assert.equal(compareValues(1e308, -1e308, 1).verdict, "unavailable");
   });
 });

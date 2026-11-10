@@ -97,10 +97,39 @@ def test_one_iteration_loop_keeps_body_value_and_records_zero_counter() -> None:
     assert not any(write["meta"].get("invalidated") for write in ir["register_history"])
 
 
-def test_outer_compact_loop_invalidates_inner_loop_counter() -> None:
-    ir = analyze_text("move 2,R0\nmove 2,R1\nnop\nouter: nop\ninner: nop\nloop R1,@inner\nloop R0,@outer\nstop")
-    assert _writes(ir, "R1")[-1]["value"]["kind"] == "unknown"
-    assert _writes(ir, "R0")[-1]["value"]["value"] == 0
+def test_unreset_inner_loop_preserves_observed_decrements_before_unknown_tail() -> None:
+    source = "move 2,R0\nmove 2,R1\nnop\nouter: nop\ninner: nop\nloop R1,@inner\nloop R0,@outer\nstop"
+    ir = analyze_text(source)
+    child, = [event for event in ir["events"] if event["kind"] == "loop_block"]
+    assert child["meta"]["count"] == 2
+    inner = _writes(ir, "R1")
+    first_completion, = [write for write in inner if write["meta"].get("loop_complete")]
+    assert first_completion["event_id"] == child["meta"]["loop_q1_issue_event_id"]
+    assert (first_completion["value"]["value"], first_completion["time"]["value"]) == (0, 52)
+
+    outer = _writes(ir, "R0")
+    first_decrement, = [write for write in outer if write["meta"].get("op") == "loop"]
+    assert (first_decrement["value"]["value"], first_decrement["time"]["value"]) == (1, 76)
+    assert not first_decrement["meta"].get("loop_complete")
+    outer_issue = next(event for event in ir["events"] if event["id"] == first_decrement["event_id"])
+    assert (outer_issue["t0"]["value"], outer_issue["t1"]["value"], outer_issue["meta"]["branch_taken"]) == (52, 76, True)
+    boundary, = [event for event in ir["events"] if event["kind"] == "unknown_region"]
+    assert boundary["source"]["line"] == 7 and boundary["t0"]["value"] == 0
+    assert boundary["meta"]["q1_issue_event_id"] == first_decrement["event_id"]
+    assert boundary["meta"]["reason"] == "analytical_nested_loop_counter_varies"
+    assert boundary["meta"]["q1_proof_cutoff"] is True
+    assert any(item["category"] == "analysis_incomplete" and boundary["id"] in item["related_events"]
+               for item in ir["diagnostics"])
+    assert all(writes[-1]["meta"]["invalidated"] and writes[-1]["time"]["value"] == 76 for writes in (inner, outer))
+    assert not any(event["kind"] == "stop" for event in ir["events"])
+
+    concrete = analyze_text(source, execution_mode="concrete", max_steps=16)
+    execution, = concrete["execution"].values()
+    assert execution["status"] == "step_limit"
+    assert _writes(concrete, "R0")[-1]["value"]["value"] == 1
+    wrap, = [write for write in _writes(concrete, "R1") if write["value"].get("value") == 0xFFFFFFFF]
+    assert wrap["meta"]["previous_value"]["value"] == 0 and wrap["time"]["value"] == 108
+    assert not any(event["kind"] == "stop" for event in concrete["events"])
 
 
 def test_loop_counter_history_carries_assumed_branch_context() -> None:

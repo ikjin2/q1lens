@@ -29,7 +29,7 @@ export class DefRuns {
       this.state = {};
     } else if (Object.keys(this.state).length) {
       const message = "Source or project settings changed. Reload DEFs before starting a new run.";
-      this.publish({ info: null, busy: null, message,
+      this.publish({ info: null, busy: null, estimate: null, message,
         sweep: this.state.sweep && { ...this.state.sweep, status: "stale",
           incompleteBatch: this.state.sweep.incompleteBatch || this.state.sweep.status === "running" },
         trace: this.state.trace && { ...this.state.trace, stale: true } });
@@ -59,7 +59,7 @@ export class DefRuns {
     const owner = this.owner;
     if (!owner.panel || !owner.webviewReady || !owner.projectUri || message.project !== owner.projectUri.fsPath) return;
     if (message.action === "cancel") {
-      if (this.job?.action === "sweep") {
+      if (["sweep", "estimate"].includes(this.job?.action)) {
         this.job.cancelled = true;
         this.publish({ message: "Stopping after the current batch…" });
       }
@@ -107,7 +107,8 @@ export class DefRuns {
     const current = () => this.job === job && owner.sourceRevision === revision && owner.projectSessionId === session;
     this.job = job;
     this.optionsKey = key;
-    this.publish({ busy: job.action, message: "" });
+    const startedAt = performance.now();
+    this.publish({ busy: job.action, sampling: message.sample_count !== undefined, message: "" });
     let workingSweep;
     try {
       if (!this.client || this.client.failure) {
@@ -136,10 +137,23 @@ export class DefRuns {
       };
       const metadata = { id: job.id, revision: inputs.revision, sequencer: inputs.sequencer, uri: inputs.uri,
         registers: inputs.registers, observeTime: inputs.observe_time, mode: this.state.info.mode, maxSteps: this.state.info.max_steps };
-      if (job.action === "sweep") {
+      if (job.action === "sweep" || job.action === "estimate") {
         const statisticsOnly = message.statistics_only === true;
-        const { plan, defs } = await request({ ...inputs, command: "sweep", axes: message.axes, statistics_only: statisticsOnly });
+        const sweepInputs = { ...inputs, axes: message.axes, statistics_only: statisticsOnly };
+        const estimating = job.action === "estimate";
+        const { plan, defs } = await request({ ...sweepInputs, command: "sweep", sample_count: estimating ? 32 : message.sample_count });
         if (!current()) return;
+        if (estimating) {
+          if (job.cancelled) return;
+          const batchStartedAt = performance.now();
+          const { rows, summary } = await request({ command: "batch" });
+          if (!current() || job.cancelled) return;
+          const count = summary?.count ?? rows?.length;
+          if (!Number.isSafeInteger(count) || count < 1) throw new Error("No samples were reported for the time estimate.");
+          this.publish({ estimate: { inputs: sweepInputs, count, setupMs: batchStartedAt - startedAt,
+            sampleMs: (performance.now() - batchStartedAt) / count } });
+          return;
+        }
         workingSweep = { ...metadata, inputs, plan, defs, statisticsOnly, status: "running", rows: [] };
         this.publish({ sweep: { ...workingSweep, rows: [] } });
         this.state.sweep = workingSweep;
@@ -185,7 +199,7 @@ export class DefRuns {
     } finally {
       if (current()) {
         this.job = undefined;
-        this.publish({ busy: null });
+        this.publish({ busy: null, ...(job.cancelled && job.action === "estimate" ? { message: "" } : {}) });
       }
     }
   }

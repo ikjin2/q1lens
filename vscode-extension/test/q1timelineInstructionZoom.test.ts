@@ -45,7 +45,8 @@ function loadInstructionRuntime(options: { count?: number; clientWidth?: number;
     });
     return stage;
   }
-  const names = ["clamp", "instructionPlotWidth", "setInstructionView", "fitInstructionSelection", "handleInstructionWheel", "installTimelineMouseInteractions", "renderSharedTimelineIfAvailable", "applyTimelineEventFilter", "setTimelineLayout", "timelineControlChipLeft"];
+  const names = ["clamp", "instructionPlotWidth", "setInstructionView", "fitInstructionSelection", "handleInstructionWheel", "installTimelineMouseInteractions", "renderSharedTimelineIfAvailable", "applyTimelineEventFilter", "setTimelineLayout", "timelineControlChipLeft",
+    "eventHasBranchControl", "eventHasFeedbackControl", "formatFoldDuration"];
   const noops = ["renderTimelineLayoutToggle", "renderTimelineWindowStatus", "renderTimeBasisToggle", "installSharedQ1IssueControls", "installRtPreparationMarkers", "syncSharedSequencerFoldControls", "installTimelineControlChips", "applySharedSelection", "renderWaitFolds", "renderPlaybackFolds", "positionTimelineFoldToggles", "renderHardwareCursor"];
   return Function("createStage", "adapter", "count", `
     let stage = createStage(count);
@@ -58,6 +59,9 @@ function loadInstructionRuntime(options: { count?: number; clientWidth?: number;
     const selectedSourceEventIds = new Set(["rt-4", "q1-9"]);
     const expandedQ1IssueSequencers = new Set();
     const expandedPlaybackLoops = new Set();
+    const expandedTimelineCommandGroups = new Set();
+    let timelineCommandGroupByEvent = new Map();
+    const timelineEvidenceBlocks = new Map();
     const realState = { window: { min: 400000, max: 401000 }, selection: { start: 400200, end: 400400 }, cursor: 400300 };
     const revealed = [];
     const timelineIr = { events: Array.from({ length: count }, (_, index) => ({
@@ -65,8 +69,10 @@ function loadInstructionRuntime(options: { count?: number; clientWidth?: number;
     })).concat(Array.from({ length: Math.ceil(count / 2) }, (_, index) => ({
       id: "q1-" + index, kind: "q1_issue", sequencer_id: "Control", t0: index * 4, t1: (index + 1) * 4,
     }))) };
+    const timelineEventsById = new Map(timelineIr.events.map(event => [String(event.id), event]));
+    const q1OnlyLoops = adapter.q1OnlyLoopIds(timelineEventsById);
     const root = { querySelector: selector => selector === ".shared-timeline-stage" ? stage : undefined, querySelectorAll: () => [] };
-    const document = { getElementById: id => id === "timeline-root" ? root : undefined };
+    const document = { getElementById: id => id === "timeline-root" ? root : undefined, querySelectorAll: () => [] };
     const window = { q1timelineTimelineAdapter: adapter, q1lensSharedTimeline: {
       renderTimeline(_root, model) {
         stage.isConnected = false;
@@ -200,6 +206,7 @@ describe("Q1 timeline instruction zoom", () => {
     runtime.stage().scrollLeft = 750;
     runtime.switchLayout("time");
     assert.deepEqual(Object.keys(runtime.stage().listeners).sort(), ["pointerdown", "wheel"]);
+    assert.ok(runtime.stage().nodes.some((node: any) => node.dataset.blockId === "command-group:rt-0"));
     runtime.switchLayout("instruction");
     assert.deepEqual(runtime.view(), { cellWidth: 150, leftOrdinal: 5 }, "Switching before a queued scroll event must still capture the latest offset");
     assert.equal(runtime.stage().scrollLeft, 750);

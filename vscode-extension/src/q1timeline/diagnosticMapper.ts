@@ -29,7 +29,7 @@ function relatedInformation(item, resolveSourcePath) {
     return [];
   }
   return relatedItems
-    .filter((related) => related && typeof related === "object" && related.source && related.source.file)
+    .filter((related) => related?.source?.file && related.source.file !== "<simulation>")
     .map((related) => ({
       file: resolveSourcePath(related.source.file),
       range: sourceRange(related.source),
@@ -38,7 +38,7 @@ function relatedInformation(item, resolveSourcePath) {
 }
 
 function mapAnalyzerDiagnostic(item, resolveSourcePath) {
-  if (!item || !item.source || !item.source.file) {
+  if (!item?.source?.file || item.source.file === "<simulation>") {
     return undefined;
   }
   const file = resolveSourcePath(item.source.file);

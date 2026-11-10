@@ -4,7 +4,7 @@ Semantics source (read 2026-10-03):
 https://docs.qblox.com/en/main/products/qblox_instruments/q1/index.html
 The jge description says >= although its displayed action repeats jg's formula;
 the test explicitly follows the description, not the contradictory action line.
-This is the declared source-PC model, not assembled firmware address parity.
+Macro address layouts have separate assembler golden vectors.
 """
 from __future__ import annotations
 
@@ -24,12 +24,12 @@ ALU = ("add", "sub", "and", "or", "xor", "asl", "asr", "lsl", "lsr", "mulu16", "
 # Explicit operand examples, not generated from the production signature table.
 # The table is used only as a coverage inventory guard, never as a numeric oracle.
 SIGNATURE_EXAMPLES = {
-    "nop": [""], "stop": ["", "1", "R1"], "move": ["1,R5", "R0,R5"], "not": ["1,R5", "R0,R5"],
+    "nop": [""], "stop": ["", "1", "R1"], "illegal": [""], "move": ["1,R5", "R0,R5"], "not": ["1,R5", "R0,R5"],
     "jmp": ["@done", "9", "R4"],
     "loop": ["R1,@done", "R1,9", "R1,R4"],
     "jlt": ["R0,1,@done", "R0,1,9", "R0,1,R4"],
     "cmp": ["R0,1", "R0,R1", "1,R0"], "test": ["R0,1", "R0,R1", "1,R0"],
-    "reset_ph": [""],
+    "reset_ph": [""], "reset_netzero": [""], "play_netzero": ["8,4", "R0,4"],
     "set_mrk": ["8", "R0"], "set_freq": ["8", "R0"], "set_ph": ["8", "R0"], "set_ph_delta": ["8", "R0"],
     "set_awg_gain": ["8,1", "R0,R1"], "set_awg_offs": ["8,1", "R0,R1"],
     "set_digital": ["1,1,0", "R1,1,R3"], "set_scope_en": ["1", "R1"],
@@ -44,9 +44,19 @@ SIGNATURE_EXAMPLES = {
     "fb_com_data": ["1,8,4", "1,R0,4"],
     "fb_acq_tb_id": ["1,4", "R1,4"], "fb_acq_tb_valid": ["1,4", "R1,4"],
     "fb_acq_iq_id": ["1,4", "R1,4"], "fb_acq_iq_shift": ["1,4", "R1,4"],
+    "set_time_ref": [""], "acquire_ttl": ["0,0,1,4", "0,R3,1,4"],
+    "acquire_timetags": ["0,0,1,0,4", "0,R3,1,R3,4"],
+    "acquire_digital": ["0,0,4", "0,R3,4"], "upd_thres": ["0,1,4", "0,R1,4"],
+    "fb_cmd": ["0x12a,7,4", "0x12a,R1,4"],
+    "fb_com_cfg": ["0,0,0,4", "R3,4"], "fb_acq_tb_cfg": ["1,0,1,4", "R3,4"],
+    "fb_com_extra": ["0,0,4", "R3,4"], "fb_acq_tb_extra": ["0,0,4", "R3,4"],
+    "fb_llp_tags_id": ["0,4", "R1,4"], "fb_llp_ttls_id": ["0,4", "R1,4"],
+    "fb_tdc_tags_id": ["0,4", "R1,4"], "fb_tdc_tdelta_id": ["16,4", "R1,4"],
 }
 for _op in ALU:
     SIGNATURE_EXAMPLES[_op] = ["1,R0,R5", "R0,1,R5", "R0,R1,R5"]
+for _op in ("mulu32", "muls32"):
+    SIGNATURE_EXAMPLES[_op] = ["1,R0,R5,R6", "R0,1,R5,R6", "R0,R1,R5,R6"]
 for _op in BRANCHES:
     SIGNATURE_EXAMPLES[_op] = ["@done", "9", "R4"]
 SIGNATURE_EXAMPLES["jge"] += ["R0,1,@done", "R0,1,9", "R0,1,R4"]
@@ -95,22 +105,21 @@ def test_every_runtime_supported_opcode_and_signature_has_an_explicit_case():
 
 
 @pytest.mark.parametrize("op,args", [(op, args) for op, examples in SIGNATURE_EXAMPLES.items() for args in examples])
-def test_supported_signature_executes_or_explicitly_blocks_compiled_address_form(op, args):
-    # Subject at PC7, done at PC9. No label-value expression is needed in setup,
-    # so legacy direct-label branches do not depend on compiled address support.
-    source = f"move 8,R0\nmove 1,R1\nmove 4,R2\nmove 0,R3\nmove 9,R4\nnop\ncmp R0,1\n{op} {args}\nnop\ndone: stop\n"
+def test_supported_signature_executes(op, args):
+    # The subject starts at PC7. Numeric target 9 reaches the NOP for a macro
+    # and reaches the terminal instruction for a single-slot subject.
+    tail = {"acquire_timetags": "acquire_timetags 0,0,0,0,4\nstop", "acquire_ttl": "acquire_ttl 0,0,0,4\nstop"}.get(op, "stop")
+    source = f"move 8,R0\nmove 1,R1\nmove 4,R2\nmove 0,R3\nmove 9,R4\nnop\ncmp R0,1\n{op} {args}\nnop\ndone: {tail}\n"
     state = execute(source, simulation={"inputs": {
         "feedback": [{"target": "s", "time_ns": 0, "id": 1, "value": 42}],
         "triggers": [{"target": "s", "time_ns": 200, "address": 1}],
         "acquisitions": [{"sequencer": "s", "acquisition_index": 0, "bin_index": 0, "i": 2, "q": -1}],
-    }})
-    expanded = op in {"loop", "jlt"} or (op == "jge" and args.count(",") == 2)
-    if expanded and "@done" not in args:
-        assert status(state) == "blocked"
-        assert "Compiled instruction-address mapping" in state.metadata["execution"]["reason"]
-        return
-    assert status(state) == "completed", state.metadata["execution"]
+        "digital": {"s": {"initial_level": 0, "transitions": []}},
+    }}, sequences={"s": {"acquisitions": {"bins": {"index": 0, "num_bins": 2}}}})
+    assert status(state) == ("error" if op == "illegal" else "completed"), state.metadata["execution"]
     assert any(event.kind == "q1_issue" and event.source.line == 8 for event in state.events)
+    if op == "illegal":
+        assert state.metadata["execution"]["fault"]["flag"] == "SEQUENCE_PROCESSOR_RT_EXEC_ILLEGAL_INSTRUCTION"
     if op == "move":
         assert state.registers["R5"] == Concrete(1 if args.startswith("1,") else 8)
     if op == "not":
@@ -124,7 +133,7 @@ def test_supported_signature_executes_or_explicitly_blocks_compiled_address_form
         assert state.registers["R5"] == Concrete(42)
     if op == "fb_com_data":
         assert next(event for event in state.events if event.kind == "feedback_send").meta["value"] == 8
-    if op.startswith("acquire"):
+    if op in {"acquire", "acquire_weighed", "acquire_weighted"}:
         result = next(event for event in state.events if event.kind == "acquisition_result")
         assert (result.t0, result.meta["i"], result.meta["q"]) == (Concrete(52), 2, -1)
 
@@ -251,9 +260,9 @@ def test_unsupported_shift_counts_never_silently_mask_to_five_bits(op, shift, mo
 
 
 @pytest.mark.parametrize("instruction,expected", [
-    ("reset_netzero", "blocked"), ("set_time_ref", "blocked"), ("sw_req 1", "blocked"),
-    ("mulu32 R0,R1,R2,R3", "blocked"), ("acquire_ttl 0,0,1,4", "blocked"),
-    ("illegal", "error"), ("unknown_matrix_instruction", "completed"), ("add R0,R1", "completed"),
+    ("reset_netzero", "completed"), ("set_time_ref", "completed"), ("sw_req 1", "blocked"),
+    ("mulu32 R0,R1,R2,R3", "completed"), ("acquire_ttl 0,0,1,4", "blocked"),
+    ("unknown_matrix_instruction", "completed"), ("add R0,R1", "completed"),
 ])
 def test_unimplemented_instructions_block_and_malformed_source_lines_are_excluded(instruction, expected):
     state = execute(f"move 1,R0\nmove 1,R1\nnop\n{instruction}\nstop")

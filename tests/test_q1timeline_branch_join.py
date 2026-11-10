@@ -11,7 +11,7 @@ def analyze(source: str, **kwargs):
 
 
 @pytest.mark.parametrize("prefix", ["", "wait 100\n"])
-@pytest.mark.parametrize("target", ["@join", "3"])
+@pytest.mark.parametrize("target", ["@join", "4"])
 def test_side_effect_free_equal_q1_paths_resume_a_common_exact_suffix(prefix: str, target: str) -> None:
     target = str(int(target) + 1) if prefix and target.isdigit() else target
     source = prefix + f"jge R7,1,{target}\nnop\njmp @join\njoin: wait 100\nwait 40\nstop"
@@ -127,14 +127,22 @@ def test_equal_join_q1_time_proves_queue_timing_only_when_wait_packet_arrivals_a
 
 
 def test_different_zero_guard_packet_sequences_require_separate_safe_queue_replays() -> None:
-    state = analyze("jge R7,1,@other\nwait 0\nwait 100\njmp @join\nother: wait 100\njoin: wait 40\nstop")
+    state = analyze("jge R7,1,@other\nwait 0\nwait 100\njmp @join\nother: wait 104\njoin: wait 40\nstop")
     branch = next(event for event in state.events if event.kind == "q1_issue" and event.meta.get("op") == "jge")
 
     assert branch.meta["branch_rt_join_proven"]
     assert not branch.meta["branch_join_proven"]
-    assert state.rt_time_ns == Concrete(140)
+    assert branch.meta["join_rt_duration_ns"] == 104
+    assert state.rt_time_ns == Concrete(144)
     assert analyze_underflow(state).status == "not_detected_under_current_assumptions"
     assert state.metadata["underflow"]["all_paths_safe"]
+
+
+def test_zero_guard_spacing_can_prevent_an_rt_time_join() -> None:
+    state = analyze("jge R7,1,@other\nwait 0\nwait 100\njmp @join\nother: wait 100\njoin: wait 40\nstop")
+    branch = next(event for event in state.events if event.kind == "q1_issue" and event.meta.get("op") == "jge")
+    assert not branch.meta.get("branch_rt_join_proven")
+    assert analyze_underflow(state).status == "analysis_incomplete"
 
 
 @pytest.mark.parametrize("nominal", [100, "{NOMINAL}"])
@@ -282,8 +290,8 @@ def test_unknown_trigger_predicate_with_equal_positive_wait_costs_can_reach_a_co
     assert analyze_underflow(state).status == ("not_detected_under_current_assumptions" if disable_at_join else "analysis_incomplete")
 
 
-@pytest.mark.parametrize("operator, duration, else_duration", [(6, 100, 100), (7, 100, 100), (0, 0, 0), (0, 100, 40)])
-def test_equal_wait_join_does_not_expand_reserved_zero_or_different_conditional_costs(operator: int, duration: int, else_duration: int) -> None:
+@pytest.mark.parametrize("operator, duration, else_duration", [(6, 100, 100), (7, 100, 100), (0, 100, 40), (0, 0, 4)])
+def test_equal_wait_join_does_not_expand_reserved_or_different_conditional_costs(operator: int, duration: int, else_duration: int) -> None:
     state = analyze(f"set_cond 1,1,{operator},{else_duration}\njge R7,1,@other\nwait {duration}\njmp @join\n"
                     f"other: wait {duration}\njoin: set_cond 0,0,0,4\nwait 40\nstop")
     branch = next(event for event in state.events if event.kind == "q1_issue" and event.meta.get("op") == "jge")

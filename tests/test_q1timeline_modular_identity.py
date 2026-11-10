@@ -113,13 +113,14 @@ def test_unknown_loop_iterations_invalidate_the_observed_first_iterations_linear
 
 @pytest.mark.parametrize("prefix,expected", [
     ("and R7,5,R1", 0),
-    ("or R7,4294967290,R1", 2),
+    ("or R7,4294967290,R1", 8),
 ])
 def test_inverse_arithmetic_recovers_a_ready_peers_sparse_bits(prefix, expected):
-    state = analyze(f"{prefix}\nnop\nadd R1,R8,R2\nnop\nsub R2,R8,R3\nnop\nand R3,2,R4\nnop\nwait R4\nstop")
+    state = analyze(f"{prefix}\nnop\nadd R1,R8,R2\nnop\nsub R2,R8,R3\nnop\nand R3,8,R4\nnop\nwait R4\nstop")
 
     assert state.registers["R4"] == Concrete(expected)
-    assert state.rt_time_ns == Concrete(expected)
+    assert state.rt_packets[-1].duration == Concrete(expected)
+    assert state.rt_time_ns == Concrete(expected or 4)
 
 
 def test_complementary_ready_peer_facts_are_inverted_before_reduction():
@@ -167,7 +168,7 @@ def test_branch_promoted_concrete_peer_retains_its_original_snapshot_relation():
                     "sub R2,R8,R3\nnop\njmp @join\nother: move 0,R3\nnop\njoin: wait R3\nstop")
 
     assert state.registers["R3"] == Concrete(0)
-    assert state.rt_time_ns == Concrete(0)
+    assert state.rt_time_ns == Concrete(4)
 
 
 @pytest.mark.parametrize("iterations", [16, 32])

@@ -5,12 +5,27 @@ import re
 from typing import Any
 
 
+RT_QUEUE_UNDERFLOW_DESCRIPTION = "The RT queue ran out of commands."
+
+
 class _SafeFormatDict(UserDict):
     def __missing__(self, key: str) -> str:
         return "unknown"
 
 
 DIAGNOSTIC_PRESENTATIONS: dict[str, dict[str, str]] = {
+    "trigger_network_conflict": {
+        "group": "Trigger Network", "title": "Trigger launch slots conflict", "summary": "{message}",
+        "fix": "Separate launch slots by at least 252 ns on the shared network.",
+    },
+    "trigger_network_unknown_epoch": {
+        "group": "Trigger Network", "title": "Trigger launch grid is unresolved", "summary": "{message}",
+        "fix": "Configure the grid epoch or schedule the request after a shared SYNQ release.",
+    },
+    "trigger_network_outcome_unknown": {
+        "group": "Trigger Network", "title": "Trigger delivery could change RT execution", "summary": "{message}",
+        "fix": "Resolve the grid epoch or launch conflict for the affected trigger address.",
+    },
     "template_expression_syntax": {
         "group": "Q1ASM Lint", "title": "Template expression may be malformed", "summary": "{message}",
         "fix": "Check expression operators and separators, or provide this exact parameter name if it is intentional.",
@@ -226,6 +241,12 @@ DIAGNOSTIC_PRESENTATIONS: dict[str, dict[str, str]] = {
         "title": "Possible RT underflow",
         "summary": "The RT command may be {late_ns} ns late, depending on runtime alignment.",
         "fix": "Increase the wait gap or inspect the sync/trigger relationship around this packet.",
+    },
+    "possible_netzero_overlap": {
+        "group": "Timing",
+        "title": "Possible net-zero pulse overlap",
+        "summary": "{message}",
+        "fix": "Allow at least {shortfall_ns} ns more RT time before starting the next pulse.",
     },
     "pending_hardware_state": {
         "group": "Hardware Readiness",

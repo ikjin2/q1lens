@@ -11,6 +11,7 @@ from q1timeline.analysis.values import Concrete
 from q1timeline.playback import PlaybackSession
 from q1timeline.external_inputs import validate_external_inputs
 from q1timeline.project import ConfigLoadError, load_project_config
+from q1timeline.render.html import render_html
 
 
 def inputs(*times, targets=("a", "b"), address=1):
@@ -25,6 +26,10 @@ def run(session):
     pytest.fail("Playback did not reach a bounded outcome")
 
 
+def trigger_markers(ir):
+    return [event for event in ir["events"] if event["kind"] == "trigger_receive"]
+
+
 def test_shared_event_is_broadcast_with_independent_post_trigger_durations():
     session = PlaybackSession({"a": ("a.q1asm", "wait_trigger 1,4\nstop"),
                                "b": ("b.q1asm", "wait 20\nwait_trigger 1,12\nstop")},
@@ -36,6 +41,51 @@ def test_shared_event_is_broadcast_with_independent_post_trigger_durations():
     assert [runner.state.rt_time_ns for runner in session.runners] == [Concrete(104), Concrete(112)]
     assert all(event["confidence"] == "assumed" for event in waits)
     assert all(event["meta"]["trigger_assumption"]["arrival_ns"] == 100 for event in waits)
+    markers = trigger_markers(ir)
+    assert len(markers) == len({event["id"] for event in markers}) == 2
+    assert {event["meta"]["trigger_assumption"]["event_id"] for event in markers} == {"external:shot_start:0"}
+    waits_by_receiver = {event["sequencer_id"]: event for event in waits}
+    for marker in markers:
+        wait = waits_by_receiver[marker["sequencer_id"]]
+        assert marker["meta"]["consumer_event_id"] == wait["id"]
+        assert wait["meta"]["input_event_ids"] == [marker["id"]]
+        assert wait["meta"]["trigger_assumption"]["arrival_event_id"] == marker["id"]
+
+
+@pytest.mark.parametrize("alignment,display", [("none", 16), ("manual:-8", 8)])
+def test_consumed_trigger_is_a_selectable_point_on_the_displayed_clock(alignment, display):
+    session = PlaybackSession({"a": ("a.q1asm", "wait 12\nwait_trigger 1,4\nwait 4\nstop")},
+                              external_inputs=inputs(16, 30, targets=("a",)), alignment_mode=alignment)
+    ir = run(session)
+    marker, = trigger_markers(ir)
+    assert marker["confidence"] == "assumed" and marker["source"]["file"] == "<simulation>"
+    assert marker["source"]["raw"] == ""
+    assert "source_pc" not in marker["meta"] and "execution_index" not in marker["meta"]
+    assert marker["t0"]["value"] == marker["t1"]["value"] == 16 and marker["duration"]["value"] == 0
+    assert marker["meta"]["aligned_t0"] == marker["meta"]["aligned_t1"] == display
+    assert marker["meta"]["address"] == 1
+    wait, = [event for event in ir["events"] if event["kind"] == "wait_trigger"]
+    assert (wait["meta"]["aligned_t0"], wait["meta"]["aligned_t1"]) == (display - 4, display + 4)
+    assert ir["playback"]["triggers"][0]["arrival_event_id"] == marker["id"]
+    html = render_html(ir)
+    assert f'data-event-id="{marker["id"]}"' in html
+    assert f'aria-label="Trigger address 1 · {display} ns" role="button" tabindex="0"' in html
+
+
+def test_paused_play_retains_one_trigger_marker_across_snapshots_resume_and_replay():
+    session = PlaybackSession({"a": ("a.q1asm", "wait 12\nwait_trigger 1,0\nwait 4\nstop")},
+                              external_inputs=inputs(16, targets=("a",)))
+    assert session.run(budget_ms=1000, max_steps=2)["status"] == "paused"
+    partial = session.snapshot()
+    marker, = trigger_markers(partial)
+    assert marker["t0"]["value"] == marker["t1"]["value"] == 16
+    assert session.snapshot() == partial
+    final = run(session)
+    assert trigger_markers(final) == [marker]
+    assert [event["t0"]["value"] for event in final["events"] if event["kind"] == "wait"] == [0, 20]
+    assert not trigger_markers(session.set_external_inputs(inputs(20, targets=("a",))))
+    replayed, = trigger_markers(run(session))
+    assert replayed["t0"]["value"] == 20 and replayed["meta"]["consumer_event_id"] == marker["meta"]["consumer_event_id"]
 
 
 def test_waiting_peer_does_not_stop_independent_progress_and_no_timeout_is_invented():
@@ -49,6 +99,7 @@ def test_waiting_peer_does_not_stop_independent_progress_and_no_timeout_is_inven
     wait = next(event for event in ir["events"] if event["kind"] == "wait_trigger")
     assert wait["meta"]["trigger_assumption"]["status"] == "waiting"
     assert "address 1" in ir["playback"]["reason"]
+    assert not trigger_markers(ir)
 
 
 @pytest.mark.parametrize("arrival,expected", [(19, "waiting"), (20, "completed"), (21, "completed")])
@@ -148,7 +199,34 @@ def test_zero_duration_still_consumes_shared_occurrence_only_once_per_recipient(
                               external_inputs=inputs(100, targets=("a",)))
     assert run(session)["playback"]["status"] == "waiting"
     assert session.runners[0].state.pc == 1
-    assert session.runners[0].state.rt_time_ns == Concrete(100)
+    assert session.runners[0].state.rt_time_ns == Concrete(104)
+
+
+@pytest.mark.parametrize("final_arrival,status", [(40, "completed"), (24, "completed"), (None, "waiting")])
+def test_zero_duration_trigger_uses_arrival_plus_four_for_next_wait(final_arrival, status):
+    times = [20, 21] if final_arrival is None else [20, 21, final_arrival]
+    session = PlaybackSession({"a": ("a.q1asm", "wait_trigger 1,0\nwait_trigger 1,4\nwait 4\nstop")},
+                              external_inputs=inputs(*times, targets=("a",)))
+    ir = run(session)
+    assert ir["playback"]["status"] == status
+    first, second = [event for event in ir["events"] if event["kind"] == "wait_trigger"]
+    first_input = first["meta"]["trigger_assumption"]
+    assert (first["t0"]["value"], first["t1"]["value"], first_input["duration_ns"]) == (0, 20, 0)
+    assert first_input["arrival_ns"] == first_input["resume_ns"] == 20
+    assert first["meta"]["next_dequeue_not_before_ns"] == 24
+    assert second["t0"]["value"] == second["meta"]["trigger_assumption"]["armed_at_ns"] == 24
+    assert second["meta"]["trigger_assumption"]["duration_ns"] == 4
+    issues = [event["t0"]["value"] for event in ir["events"] if event["kind"] == "q1_issue"]
+    if final_arrival is None:
+        assert [item["event_id"] for item in ir["playback"]["triggers"]] == ["external:shot_start:0"]
+        assert second["t1"] is None and issues == [0]
+        assert "No unused trigger" in ir["playback"]["reason"]
+    else:
+        assert [item["event_id"] for item in ir["playback"]["triggers"]] == ["external:shot_start:0", "external:shot_start:2"]
+        assert second["meta"]["trigger_assumption"]["arrival_ns"] == final_arrival
+        assert second["t1"]["value"] == final_arrival + 4
+        assert issues == [0, 4, 8, 12]
+        assert ir["execution"]["a"]["queue_timing"]["status"] == "not_detected_in_recorded_packets"
 
 
 @pytest.mark.parametrize("source,status", [

@@ -3,8 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Any, Literal
 
-from q1timeline.analysis.interpreter import AnalysisState, _physical_read_register, _register_write_operands
-from q1timeline.analysis.queue_timing import ASSUMED_INITIAL_BUFFER_NS, POSSIBLE_INITIAL_BUFFER_NS, replay_queues
+from q1timeline.analysis.interpreter import (
+    AnalysisState, RtPacket, TimelineEvent, _physical_read_register, _register_write_operands, _rt_dequeue_spacing_ns,
+)
+from q1timeline.analysis.queue_timing import (
+    ASSUMED_INITIAL_BUFFER_NS, POSSIBLE_INITIAL_BUFFER_NS, replay_queues, synchronization_participants,
+)
 from q1timeline.analysis.values import Concrete, Unknown, subtract_values
 from q1timeline.diagnostics import Diagnostic
 from q1timeline.diagnostic_catalog import underflow_label
@@ -49,23 +53,28 @@ def analyze_underflows(
     all_path_safety = {}
     if len(states) == 1:
         state = states[0]
-        safety = _all_path_queue_safety(state, queue_depth_limit)
-        if safety is not None:
-            all_path_safety[state.sequencer_id] = safety
+        if not isinstance(prepared[state.sequencer_id][2], TimelineEvent):
+            safety = _all_path_queue_safety(state, queue_depth_limit)
+            if safety is not None:
+                all_path_safety[state.sequencer_id] = safety
         certification = _infinite_wait_cadence(state, prepared[state.sequencer_id])
         if certification is not None:
             prepared[state.sequencer_id], cadences[state.sequencer_id] = certification
     streams = {}
-    for name, (packets, reason, boundary_packet) in prepared.items():
+    for name, (packets, reason, boundary) in prepared.items():
         streams[name] = list(packets)
         # A truncated trace is not a completed Q1 program: in particular it
         # cannot authorize an optimistic SYNQ release as if prefetch finished.
-        boundary = boundary_packet or (packets[-1] if packets else None)
-        if reason and boundary is not None:
-            streams[name].append(replace(boundary, duration=Unknown(reason)))
-    earliest = replay_queues(streams, queue_depth_limit=queue_depth_limit, initial_buffer_ns=ASSUMED_INITIAL_BUFFER_NS)
+        packet = boundary if isinstance(boundary, RtPacket) else (packets[-1] if packets else None)
+        if reason and packet is not None:
+            streams[name].append(replace(packet, duration=Unknown(reason)))
+    participants = synchronization_participants(streams, {
+        state.sequencer_id: state.metadata.get("hardware_parameters", {}) for state in states
+    })
+    earliest = replay_queues(streams, queue_depth_limit=queue_depth_limit, initial_buffer_ns=ASSUMED_INITIAL_BUFFER_NS,
+                             sync_participants=participants)
     prefetched = replay_queues(streams, queue_depth_limit=queue_depth_limit, prefill_sync=True,
-                              initial_buffer_ns=POSSIBLE_INITIAL_BUFFER_NS)
+                              initial_buffer_ns=POSSIBLE_INITIAL_BUFFER_NS, sync_participants=participants)
     results = []
     assumptions = {
         "queue_depth_limit": queue_depth_limit,
@@ -75,7 +84,8 @@ def analyze_underflows(
         "initial_buffer_basis": "user_assumption; not_measured",
         "buffer_duration": "one_time_cumulative_q1_supply_gap_credit; never_replenished",
         "same_time_order": "enqueue_before_dequeue",
-        "sync": "all_supplied_sequencers; earliest_release_to_maximum_prefetch",
+        "sync": "configured_sync_en; earliest_release_to_maximum_prefetch",
+        "sync_participants": sorted(participants),
         "unknown_branches": "all_feasible_paths_verified" if all_path_safety else "incomplete",
         "wait_trigger": "external_arrival_unknown",
         "alignment": "queue_model_separate_from_display_coordinates",
@@ -83,7 +93,7 @@ def analyze_underflows(
     for state in states:
         name = state.sequencer_id
         low, high = earliest[name], prefetched[name]
-        _packets, reason, boundary_packet = prepared[name]
+        _packets, reason, boundary = prepared[name]
         failure = high.failure if low.failure and high.failure else None
         cadence = cadences.get(name)
         safety = all_path_safety.get(name)
@@ -96,13 +106,15 @@ def analyze_underflows(
             reason = None
         elif reason or low.incomplete_reason or high.incomplete_reason:
             status = "analysis_incomplete"
-            reason = reason or low.incomplete_reason or high.incomplete_reason
+            if reason is None:
+                reason = low.incomplete_reason or high.incomplete_reason
+                boundary = low.incomplete_packet or high.incomplete_packet or boundary
         elif low.failure and not high.failure:
             status = "possibly_safe_with_initial_buffer"
         elif high.failure:
             status = "analysis_incomplete"
             reason = "startup_prefill_uncertain"
-            boundary_packet = boundary_packet or high.failure.packet
+            boundary = boundary or high.failure.packet
         else:
             status = "not_detected_under_current_assumptions"
         initial_buffer = {
@@ -157,7 +169,7 @@ def analyze_underflows(
                 details={"analysis_scope": "rt_queue", **initial_buffer},
             ))
         elif status == "analysis_incomplete":
-            _emit_analysis_incomplete(state, assumptions, packet=boundary_packet, reason=reason)
+            _emit_analysis_incomplete(state, assumptions, boundary=boundary, reason=reason)
         _attach_loop_queue_slack_summaries(state)
         results.append(UnderflowResult(status=status, assumptions=assumptions))
     return results
@@ -223,6 +235,17 @@ def _infinite_wait_cadence(state: AnalysisState, prepared):
     return (packets + [second], None, None), cadence
 
 
+def _q1_proof_boundary(events_by_id: dict[str, TimelineEvent]) -> tuple[TimelineEvent | None, TimelineEvent | None]:
+    for event in events_by_id.values():
+        if (event.kind != "unknown_region" or event.meta.get("q1_proof_cutoff") is not True
+                or event.meta.get("preview_source_event_id") or event.meta.get("branch_comparison_path")):
+            continue
+        issue = events_by_id.get(event.meta.get("q1_issue_event_id"))
+        if issue is not None and issue.kind == "q1_issue":
+            return event, issue
+    return None, None
+
+
 def _queue_packets(state: AnalysisState):
     """Expand constant loop timing; stop before an unmodeled timing boundary."""
     packets = list(state.rt_packets)
@@ -230,10 +253,15 @@ def _queue_packets(state: AnalysisState):
                                or get_instruction_spec(item.op).category == "unknown"
                                for item in state.instructions_by_pc.values()):
         return [], None, None
-    cutoff = None
-    reason = None
+    events_by_id = {event.id: event for event in state.events}
+    boundary, issue = _q1_proof_boundary(events_by_id)
+    cutoff = issue.t1.value if issue is not None and isinstance(issue.t1, Concrete) else None
+    reason = "q1_proof_cutoff" if boundary is not None else None
     for event in state.events:
         if event.kind != "q1_issue" or not isinstance(event.t0, Concrete):
+            continue
+        if event is issue and boundary is not None and boundary.meta.get("op") == event.meta.get("op"):
+            # The explicitly unsupported operation already supplies a more precise reason and RT location.
             continue
         boundary_reason = None
         spec = get_instruction_spec(event.meta.get("op", ""))
@@ -244,6 +272,8 @@ def _queue_packets(state: AnalysisState):
             boundary_reason = "conditional_execution_unknown"
         elif event.meta.get("op") in {"fb_pop_data", "fb_pull_data"}:
             boundary_reason = "feedback_arrival_unknown"
+        elif event.meta.get("fault"):
+            boundary_reason = "illegal_fault_rt_boundary_unverified"
         elif event.meta.get("branch_decision") == "runtime_dependent" and not event.meta.get("branch_join_proven"):
             boundary_reason = "runtime_branch_unknown"
         elif event.meta.get("reason") in {
@@ -252,10 +282,9 @@ def _queue_packets(state: AnalysisState):
         }:
             boundary_reason = event.meta["reason"]
         if boundary_reason and (cutoff is None or event.t0.value < cutoff):
-            cutoff, reason = event.t0.value, boundary_reason
+            cutoff, reason, boundary = event.t0.value, boundary_reason, None
     if not packets:
-        return [], reason, None
-    events_by_id = {event.id: event for event in state.events}
+        return [], reason, boundary
     for loop in (event for event in state.events if event.kind == "loop_block"):
         meta = loop.meta
         body = [events_by_id[event_id] for event_id in meta.get("first_iteration_event_ids", [])
@@ -295,7 +324,7 @@ def _queue_packets(state: AnalysisState):
                              and len(evaluated_packets[packet.id]) == len(periods)
                              and all(type(value) is int and 0 <= value <= 65535 for value in evaluated_packets[packet.id])
                              for packet in loop_packets)
-                     and all(sum(evaluated_packets[packet.id][index] for packet in loop_packets) == value
+                     and all(sum(_rt_dequeue_spacing_ns(evaluated_packets[packet.id][index]) for packet in loop_packets) == value
                              for index, value in enumerate(periods)))
         for instruction in instructions:
             spec = get_instruction_spec(instruction.op)
@@ -323,7 +352,7 @@ def _queue_packets(state: AnalysisState):
             if edge is not None and isinstance(edge.t1, Concrete):
                 hidden_start = max(hidden_start, edge.t1.value)
             if cutoff is None or hidden_start < cutoff:
-                cutoff, reason = hidden_start, "compact_loop_timing_unexpanded"
+                cutoff, reason, boundary = hidden_start, "compact_loop_timing_unexpanded", None
             continue
         q1_period = max(event.t1.value for event in q1)-start + meta.get("loop_q1_jump_runtime_ns", 24)
         evaluated_elapsed = periods[0] if evaluated else 0
@@ -333,7 +362,7 @@ def _queue_packets(state: AnalysisState):
             for packet in loop_packets:
                 if not all(isinstance(value, Concrete) for value in
                            (packet.q1_issue_t0, packet.q1_issue_t1, packet.rt_t0, packet.rt_t1)):
-                    cutoff, reason = start, "unknown_rt_timing"
+                    cutoff, reason, boundary = start, "unknown_rt_timing", None
                     break
                 duration = packet.duration
                 offset = iteration * period
@@ -347,29 +376,41 @@ def _queue_packets(state: AnalysisState):
                     index = min(iteration, len(periods) - 1)
                     duration = Concrete(evaluated_packets[packet.id][index])
                     rt_t0 = Concrete(loop.t0.value + evaluated_elapsed + evaluated_prefix)
-                    evaluated_prefix += duration.value
+                    evaluated_prefix += _rt_dequeue_spacing_ns(duration.value)
                 else:
                     rt_t0 = Concrete(packet.rt_t0.value + offset)
+                packet_meta = dict(packet.meta)
+                if duration == Concrete(0):
+                    packet_meta.update(queue_duration_ns=0,
+                                       next_dequeue_not_before_ns=rt_t0.value + _rt_dequeue_spacing_ns(0))
+                else:
+                    packet_meta.pop("queue_duration_ns", None)
+                    packet_meta.pop("next_dequeue_not_before_ns", None)
                 packets.append(replace(packet, id=f"{packet.id}:iteration{iteration}", duration=duration,
                     q1_issue_t0=Concrete(packet.q1_issue_t0.value+iteration*q1_period),
                     q1_issue_t1=Concrete(packet.q1_issue_t1.value+iteration*q1_period),
-                    rt_t0=rt_t0, rt_t1=Concrete(rt_t0.value + duration.value)))
+                    rt_t0=rt_t0, rt_t1=Concrete(rt_t0.value + duration.value), meta=packet_meta))
             if evaluated:
                 evaluated_elapsed += periods[min(iteration, len(periods) - 1)]
     packets.sort(key=lambda packet: packet.q1_issue_t0.value if isinstance(packet.q1_issue_t0, Concrete) else float("inf"))
     known = []
     for packet in packets:
+        if boundary is not None and packet.id == boundary.meta.get("rt_packet_id"):
+            return known, reason, boundary
         if cutoff is not None and (not isinstance(packet.q1_issue_t0, Concrete) or packet.q1_issue_t0.value >= cutoff):
-            return known, reason, packet
-        if packet.op == "wait_trigger":
+            return known, reason, boundary or packet
+        if packet.op == "wait_trigger" and packet.meta.get("conditional_skipped") is not True:
             return known, "trigger_arrival_unknown", packet
         if _packet_has_unknown_rt_timing(packet) or not all(isinstance(value, Concrete) for value in
                 (packet.q1_issue_t0, packet.q1_issue_t1, packet.rt_t0, packet.rt_t1)):
             return known, "unknown_rt_timing", packet
-        if known and packet.rt_t0.value != known[-1].rt_t1.value:
-            return known, "unrepresented_rt_commands", packet
+        if known:
+            previous = known[-1]
+            gap = _rt_dequeue_spacing_ns(0) if previous.duration == Concrete(0) else 0
+            if packet.rt_t0.value != previous.rt_t1.value + gap:
+                return known, "unrepresented_rt_commands", packet
         known.append(packet)
-    return known, reason, None
+    return known, reason, boundary
 
 
 def _packet_has_unknown_rt_timing(packet) -> bool:
@@ -452,10 +493,13 @@ def _emit_underflow_warning(
     )
 
 
-def _emit_analysis_incomplete(state: AnalysisState, assumptions: dict[str, object], *, packet=None, reason="unknown_rt_timing") -> None:
-    source = (packet.source if packet is not None else state.rt_packets[0].source if state.rt_packets
+def _emit_analysis_incomplete(
+    state: AnalysisState, assumptions: dict[str, object], *, boundary: TimelineEvent | RtPacket | None = None,
+    reason="unknown_rt_timing",
+) -> None:
+    source = (boundary.source if boundary is not None else state.rt_packets[0].source if state.rt_packets
               else next(event.source for event in reversed(state.events) if event.kind == "q1_issue"))
-    t0 = packet.rt_t0 if packet is not None and isinstance(packet.rt_t0, Concrete) else Concrete(0)
+    t0 = Concrete(0)
     meta: dict[str, Any] = {
         "status": "analysis_incomplete",
         "reason": reason,
@@ -466,9 +510,17 @@ def _emit_analysis_incomplete(state: AnalysisState, assumptions: dict[str, objec
         # Queue replay may stop where the event dependency graph remains usable.
         # Unknown RT timing, triggers, and unmatched barriers remain execution uncertainty.
         meta["analysis_scope"] = details["analysis_scope"] = "rt_queue"
-    if packet is not None:
-        meta["rt_packet_id"] = packet.id
-        details["rt_packet_id"] = packet.id
+    if isinstance(boundary, TimelineEvent):
+        t0 = boundary.t0
+        evidence = {"analysis_scope": "rt_queue", "source_event_id": boundary.id, "source_reason": boundary.meta.get("reason"),
+                    "q1_issue_event_id": boundary.meta["q1_issue_event_id"]}
+        meta.update(evidence)
+        details.update(evidence)
+    elif boundary is not None:
+        if isinstance(boundary.rt_t0, Concrete):
+            t0 = boundary.rt_t0
+        meta["rt_packet_id"] = boundary.id
+        details["rt_packet_id"] = boundary.id
     event = _event_like(
         state,
         lane="debug.underflow",
@@ -487,7 +539,7 @@ def _emit_analysis_incomplete(state: AnalysisState, assumptions: dict[str, objec
             message=("Underflow depends on the unknown initial RT queue prefill or synchronization dwell; the startup scenarios disagree."
                      if reason == "startup_prefill_uncertain" else f"Underflow analysis incomplete: {reason.replace('_', ' ')}."),
             source=source,
-            related_events=[event.id],
+            related_events=[event.id, boundary.id] if isinstance(boundary, TimelineEvent) else [event.id],
             details=details,
         )
     )

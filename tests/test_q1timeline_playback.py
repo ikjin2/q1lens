@@ -10,6 +10,7 @@ import pytest
 
 from q1timeline.analysis.interpreter import interpret_program
 from q1timeline.analysis.values import Concrete, Unknown
+from q1timeline.diagnostics import Diagnostic
 from q1timeline.playback import PlaybackSession
 from q1timeline.q1asm.parser import parse_q1asm
 
@@ -240,9 +241,58 @@ def test_failed_top_of_loop_guard_is_not_counted_as_another_iteration(body) -> N
     ir = finish(session(source))
     loop, = ir["playback"]["loops"]
     assert loop["count"] == 3 and loop["complete"]
-    assert loop["period"]["kind"] == "concrete"
+    assert loop["period"]["value"] == {"wait 100": 100, "wait 0": 4, "nop": 0}[body]
     last_checks = [event for event in ir["events"] if event["kind"] == "q1_issue" and event["source"]["line"] in {3, 4}][-2:]
     assert all(event["id"] not in loop["playback_event_ids"] for event in last_checks)
+
+
+@pytest.mark.parametrize("source,expected", [
+    ("wait 0\nwait 0\nwait 4\nstop", [("wait", 0, 0, 4), ("wait", 4, 0, 8), ("wait", 8, 4, None)]),
+    ("wait_sync 0\nwait 4\nstop", [("wait_sync", 0, 0, 4), ("wait", 4, 4, None)]),
+    ("set_freq 400\nupd_param 0\nwait 4\nstop", [("upd_param", 0, 0, 4), ("wait", 4, 4, None)]),
+    ("set_cond 1,1,0,0\nwait 8\nset_cond 0,0,0,0\nwait 4\nstop",
+     [("conditional_skip", 0, 0, 4), ("wait", 4, 4, None)]),
+    ("set_cond 1,1,0,8\nwait 0\nset_cond 0,0,0,0\nwait 4\nstop",
+     [("conditional_skip", 0, 8, None), ("wait", 8, 4, None)]),
+])
+def test_zero_effective_duration_advances_only_the_next_rt_cursor(source, expected):
+    playback = PlaybackSession({"seq0": ("zero.q1asm", source)}, external_inputs={
+        "triggers": [{"id": "gate", "address": 1, "targets": ["seq0"], "times_ns": []}],
+    })
+    ir = finish(playback)
+    assert ir["playback"]["status"] == "completed"
+    rt = [event for event in ir["events"] if event["kind"] in {"wait", "wait_sync", "upd_param", "conditional_skip"}]
+    assert [(event["kind"], event["t0"]["value"], event["duration"]["value"],
+             event["meta"].get("next_dequeue_not_before_ns")) for event in rt] == expected
+    packets = playback.runners[0].state.rt_packets
+    assert [(packet.rt_t0.value, packet.duration.value, packet.meta.get("next_dequeue_not_before_ns"))
+            for packet in packets] == [item[1:] for item in expected]
+    assert [event["t0"]["value"] for event in ir["events"] if event["kind"] == "q1_issue"] == list(range(0, 4 * len(source.splitlines()), 4))
+    if source.startswith("set_freq"):
+        assert rt[0]["meta"]["applied_state"]["frequency"] == 400
+
+
+def test_terminal_zero_packet_preserves_zero_duration_until_nominal_drain_check():
+    ir = finish(session("wait 0\nstop 17"))
+    wait, stop = [event for event in ir["events"] if event["kind"] != "q1_issue"]
+    assert wait["kind"] == "wait" and wait["t0"]["value"] == wait["t1"]["value"] == 0
+    assert stop["kind"] == "stop" and stop["t0"]["value"] == 4
+    assert stop["meta"]["stop_code"] == 17
+
+
+def test_zero_duration_gap_can_change_next_conditional_packet():
+    source = "set_latch_en 1,4\nwait 0\nset_cond 1,1,0,4\nupd_param 4\nstop"
+    playback = PlaybackSession({"seq0": ("zero.q1asm", source)}, external_inputs={
+        "triggers": [{"id": "gate", "address": 1, "targets": ["seq0"], "times_ns": [6]}],
+    })
+    ir = finish(playback)
+    update, = [event for event in ir["events"] if event["kind"] == "upd_param"]
+    assumption = update["meta"]["trigger_counter_assumption"]
+    assert update["t0"]["value"] == assumption["time_ns"] == 8
+    assert assumption["taken"] is True and assumption["counts"] == {"1": 1}
+    assert assumption["input_event_ids"] == ["external:gate:0"]
+    assert not any(event["kind"] == "conditional_skip" for event in ir["events"])
+    assert ir["execution"]["seq0"]["queue_timing"]["status"] == "not_detected_in_recorded_packets"
 
 
 def test_zero_time_q1_only_loop_still_counts_final_untaken_latch_iteration() -> None:
@@ -301,15 +351,107 @@ def test_disabled_condition_keeps_playback_timing_and_outputs_unconditional(cond
     assert not playback.runners[0].state.diagnostics
 
 
-@pytest.mark.parametrize("condition", ["set_cond 1,1,0,20", "set_cond R0,R0,R0,20"])
-def test_active_or_unknown_condition_retains_only_the_supported_playback_prefix(condition: str) -> None:
-    playback = session(f"wait 100\n{condition}\nupd_param 4\nstop")
+def test_unknown_condition_operands_retain_only_the_supported_playback_prefix() -> None:
+    playback = session("wait 100\nset_cond R0,R0,R0,20\nupd_param 4\nstop")
     result = playback.run()
     assert result["status"] == "blocked" and result["steps"] == 1
     assert "trigger-counter" in result["reason"]
     state = playback.runners[0].state
     assert state.rt_time_ns == Concrete(100)
     assert [event.meta["op"] for event in state.events if event.kind == "q1_issue"] == ["wait"]
+
+
+def test_blocked_playback_has_a_q1_edge_independent_of_rt_and_peer() -> None:
+    playback = PlaybackSession({
+        "blocked": ("blocked.q1asm", "set_latch_en 1,4\nwait 100\nset_cond 1,1,0,4\nupd_param 4\nstop"),
+        "peer": ("peer.q1asm", "wait 1000\n" + "nop\n" * 10 + "stop"),
+    }, alignment_mode="manual:-4")
+    paused = playback.run(max_steps=1)
+    assert paused["status"] == "paused" and paused["can_resume"]
+    assert all(execution["status"] == "paused" and "terminal" not in execution
+               for execution in playback.snapshot()["execution"].values())
+    ir = finish(playback)
+    execution = ir["execution"]["blocked"]
+    assert execution["status"] == "blocked" and execution["pc"] == 3
+    assert ir["playback"]["status"] == "blocked" and ir["playback"]["reason"] == execution["reason"]
+    assert not ir["playback"]["can_resume"]
+    assert execution["source"]["line"] == 4 and execution["source"]["raw"] == "upd_param 4"
+    assert execution["terminal"] == {"core": "q1", "local_time_ns": 12, "category": "playback_boundary",
+                                     "display_reason": execution["reason"]}
+    peer = ir["execution"]["peer"]
+    assert peer["status"] == "partial" and peer["steps"] == 3
+    assert not {"reason", "source", "terminal"}.intersection(peer)
+    peer_wait, = [event for event in ir["events"] if event["sequencer_id"] == "peer" and event["kind"] == "wait"]
+    assert (peer_wait["t0"]["value"], peer_wait["t1"]["value"]) == (0, 1000)
+    wait, boundary = [event for event in ir["events"] if event["sequencer_id"] == "blocked"
+                      and event["kind"] in {"wait", "unknown_region"}]
+    assert wait["meta"]["aligned_t1"] == boundary["meta"]["aligned_t0"] == 100
+    assert boundary["source"] == execution["source"]
+
+
+def test_playback_error_keeps_each_peers_existing_status() -> None:
+    playback = PlaybackSession({
+        "done": ("done.q1asm", "stop"),
+        "waiting": ("waiting.q1asm", "wait_trigger 1,4\nstop"),
+        "error": ("error.q1asm", "wait 2\nstop"),
+        "peer": ("peer.q1asm", "wait 100\nstop"),
+    })
+    ir = finish(playback)
+    execution = ir["execution"]
+    assert ir["playback"]["status"] == "error" and ir["playback"]["reason"] == execution["error"]["reason"]
+    assert not ir["playback"]["can_resume"]
+    assert {seq: item["status"] for seq, item in execution.items()} == {
+        "done": "completed", "waiting": "waiting", "error": "error", "peer": "partial",
+    }
+    assert execution["waiting"]["reason"].startswith("No connected trigger source")
+    assert execution["error"]["terminal"]["local_time_ns"] == 0
+    assert all("terminal" not in execution[seq] for seq in ("done", "waiting", "peer"))
+    assert execution["peer"]["steps"] == 0
+
+
+def test_playback_attributes_a_setup_diagnostic_without_a_runtime_edge() -> None:
+    playback = PlaybackSession({"error": ("error.q1asm", "stop"), "peer": ("peer.q1asm", "stop")})
+    program = playback.programs["error"]
+    diagnostic = Diagnostic(severity="error", category="unresolved_symbol", message="Unresolved setup value.",
+                            source=program.instructions[0].source)
+    program.diagnostics.append(diagnostic)
+    ir = playback.set_external_inputs(None)
+    assert ir["playback"]["status"] == "error" and ir["playback"]["reason"] == diagnostic.message
+    execution = ir["execution"]["error"]
+    assert execution["status"] == "error" and execution["reason"] == diagnostic.message
+    assert execution["source"] == ir["diagnostics"][0]["source"]
+    assert ir["execution"]["peer"]["status"] == "partial"
+    assert not ir["events"] and all("terminal" not in item for item in ir["execution"].values())
+
+
+def test_playback_terminal_distinguishes_validation_fault_and_normal_stop() -> None:
+    invalid = finish(session("wait 2\nstop"))
+    execution = invalid["execution"]["seq0"]
+    assert execution["status"] == "error" and execution["steps"] == 0
+    assert execution["terminal"]["local_time_ns"] == 0 and execution["terminal"]["core"] == "q1"
+    assert execution["source"] == invalid["diagnostics"][0]["source"]
+    assert not any(event["kind"] == "q1_issue" for event in invalid["events"])
+
+    illegal = finish(session("move 3,R0\nnop\nwait 100\nillegal\nstop"))
+    execution = illegal["execution"]["seq0"]
+    fault = execution["fault"]
+    issue, = [event for event in illegal["events"] if event["kind"] == "q1_issue" and event["meta"]["op"] == "illegal"]
+    assert execution["status"] == "error" and fault["flag"] == "SEQUENCE_PROCESSOR_RT_EXEC_ILLEGAL_INSTRUCTION"
+    assert fault["q1_time_ns"] == issue["t1"]["value"] == execution["terminal"]["local_time_ns"] == 16
+    assert execution["terminal"]["category"] == "illegal_instruction" and execution["terminal"]["core"] == "q1"
+    write, = illegal["register_history"]
+    assert write["register"] == "R0" and write["value"]["value"] == 3
+
+    completed = finish(session("wait 4\nstop"))["execution"]["seq0"]
+    assert completed["status"] == "completed" and "terminal" not in completed
+
+
+def test_playback_missing_pc_error_uses_last_observed_q1_edge() -> None:
+    ir = finish(session("nop"))
+    execution = ir["execution"]["seq0"]
+    issue, = [event for event in ir["events"] if event["kind"] == "q1_issue"]
+    assert execution["status"] == "error" and "without an instruction" in execution["reason"]
+    assert execution["terminal"]["core"] == "q1" and execution["terminal"]["local_time_ns"] == issue["t1"]["value"] == 4
 
 
 @pytest.mark.parametrize("condition", [

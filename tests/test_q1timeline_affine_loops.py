@@ -19,8 +19,9 @@ def compensated_source(*, initial=40, step=4, count=3, suffix="stop", ready=True
 
 @pytest.mark.parametrize("masked_each_iteration", [False, True])
 def test_bounded_unknown_waits_can_prove_their_canceling_total_without_packet_times(masked_each_iteration):
-    prefix = "" if masked_each_iteration else "and R7,15,R1\nnop\n"
-    body = ("and R7,15,R1\nnop\n" if masked_each_iteration else "")
+    positive_wait = "and R7,15,R1\nnop\nadd R1,4,R1\nnop\n"
+    prefix = "" if masked_each_iteration else positive_wait
+    body = positive_wait if masked_each_iteration else ""
     changed = "R7" if masked_each_iteration else "R1"
     source = (prefix + "move 100,R2\nmove 3,R0\nnop\nbody: " + body
               + f"wait R1\nsub R2,R1,R3\nnop\nwait R3\nadd {changed},4,{changed}\nnop\nloop R0,@body\nwait 8\nstop")
@@ -42,7 +43,7 @@ def test_bounded_unknown_waits_can_prove_their_canceling_total_without_packet_ti
 
 
 def test_a_canceling_total_can_depend_on_the_known_iteration_counter():
-    source = ("move 3,R0\nmove 100,R2\nnop\nbody: and R7,15,R1\nnop\nwait R1\n"
+    source = ("move 3,R0\nmove 100,R2\nnop\nbody: and R7,15,R1\nnop\nadd R1,4,R1\nnop\nwait R1\n"
               "sub R2,R1,R3\nnop\nadd R3,R0,R3\nnop\nwait R3\nadd R7,4,R7\nnop\nloop R0,@body\nstop")
     state = analyze(source)
     loop = next(event for event in state.events if event.kind == "loop_block")
@@ -66,13 +67,24 @@ def test_total_only_loop_proofs_reject_independent_inputs_and_modular_cancellati
 
 
 def test_total_only_proof_does_not_recover_an_unknown_loop_entry_time():
-    state = analyze("wait R9\nand R7,15,R1\nnop\nmove 100,R2\nmove 3,R0\nnop\n"
+    state = analyze("wait R9\nand R7,15,R1\nnop\nadd R1,4,R1\nmove 100,R2\nmove 3,R0\nnop\n"
                     "body: wait R1\nsub R2,R1,R3\nnop\nwait R3\nadd R1,4,R1\nnop\nloop R0,@body\nstop")
     loop = next(event for event in state.events if event.kind == "loop_block")
 
     assert loop.meta["total_duration"]["value"] == 300
     assert not isinstance(loop.t0, Concrete)
     assert not isinstance(state.rt_time_ns, Concrete)
+
+
+def test_bounded_canceling_sum_cannot_ignore_a_possible_zero_wait():
+    source = ("and R7,15,R1\nnop\nmove 100,R2\nmove 3,R0\nnop\n"
+              "body: wait R1\nsub R2,R1,R3\nnop\nwait R3\nadd R1,4,R1\nnop\nloop R0,@body\nstop")
+    state = analyze(source)
+    loop, = [event for event in state.events if event.kind == "loop_block"]
+    assert isinstance(state.rt_time_ns, Unknown)
+    assert "total_duration" not in loop.meta
+    assert [analyze(f"move {seed},R7\nnop\n" + source, execution_mode="concrete").rt_time_ns.value
+            for seed in (0, 4)] == [304, 300]
 
 
 def test_bounded_total_rejects_a_later_invalid_wait_even_when_the_formal_sum_cancels():
@@ -92,7 +104,7 @@ def test_bounded_total_cannot_hide_a_future_unsupported_shift_behind_masked_canc
     assert not isinstance(state.rt_time_ns, Concrete)
     assert not next(event for event in state.events if event.kind == "loop_block").meta.get("total_only")
     assert concrete.metadata["execution"]["status"] == "blocked"
-    assert concrete.rt_time_ns == Concrete(200)
+    assert concrete.rt_time_ns == Concrete(204)
 
 
 @pytest.mark.parametrize("initial,step,count", [(40, 4, 3), (60, -4, 5), (80, -1, 4), (8, 4, 10)])
@@ -169,14 +181,14 @@ def test_pending_counter_at_entry_is_safe_when_only_the_later_real_loop_edge_rea
 
 
 def test_pending_counter_at_entry_can_be_read_after_it_is_ready_inside_the_body():
-    source = "move 3,R0\nbody: nop\nwait R0\nloop R0,@body\nstop\n"
+    source = "move 3,R0\nbody: nop\nadd R0,4,R1\nnop\nwait R1\nloop R0,@body\nstop\n"
     state = analyze(source)
     concrete = analyze(source, execution_mode="concrete")
     packets, reason, _ = _queue_packets(state)
 
-    assert state.rt_time_ns == concrete.rt_time_ns == Concrete(6)
+    assert state.rt_time_ns == concrete.rt_time_ns == Concrete(18)
     assert reason is None
-    assert [packet.duration for packet in packets] == [Concrete(3), Concrete(2), Concrete(1)]
+    assert [packet.duration for packet in packets] == [Concrete(7), Concrete(6), Concrete(5)]
     assert not any(item.category == "register_not_ready" for item in state.diagnostics)
 
 
@@ -315,9 +327,27 @@ def test_affine_queue_expansion_retains_real_zero_duration_guard_behavior():
     actual = replay_queues({"seq0": concrete.rt_packets})["seq0"]
 
     assert reason is None
+    loop, = [event for event in state.events if event.kind == "loop_block"]
+    assert loop.meta["iteration_durations"] == [4, 4, 8]
+    assert loop.meta["total_duration"]["value"] == 16
+    assert state.rt_time_ns == concrete.rt_time_ns == Concrete(16)
     assert [packet.duration for packet in packets] == [Concrete(0), Concrete(4), Concrete(8)]
+    assert [packet.rt_t0 for packet in packets] == [Concrete(0), Concrete(4), Concrete(8)]
     assert replay.required_buffer_ns == actual.required_buffer_ns
     assert (replay.failure.slack_ns if replay.failure else None) == (actual.failure.slack_ns if actual.failure else None)
+
+
+def test_compact_constant_zero_loop_keeps_zero_packets_and_four_ns_period():
+    state = analyze("move 3,R0\nbody: wait 0\nloop R0,@body\nupd_param 4\nstop",
+                    loop_preview_counts={"seq0:loop:affine.q1asm:2:3": 3})
+    loop, = [event for event in state.events if event.kind == "loop_block"]
+    packets, reason, _ = _queue_packets(state)
+    assert loop.meta["period"]["value"] == 4 and loop.meta["total_duration"]["value"] == 12
+    assert [(packet.rt_t0.value, packet.rt_t1.value) for packet in packets] == [(0, 0), (4, 4), (8, 8), (12, 16)]
+    assert [event.meta["next_dequeue_not_before_ns"] for event in state.events if event.kind == "wait"] == [4, 8, 12]
+    assert state.rt_time_ns == Concrete(16)
+    assert reason is None
+    assert replay_queues({"seq0": packets})["seq0"].failure is None
 
 
 def test_exact_total_does_not_bypass_the_private_packet_expansion_limit():

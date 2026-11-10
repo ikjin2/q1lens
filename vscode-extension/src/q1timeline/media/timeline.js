@@ -2,6 +2,7 @@
   const vscode = acquireVsCodeApi();
   const timelineIr = readTimelineIr();
   const timelineEventsById = new Map((timelineIr.events || []).map((event) => [String(event.id), event]));
+  const q1OnlyLoops = window.q1timelineTimelineAdapter?.q1OnlyLoopIds?.(timelineEventsById) || new Set();
   let sharedTimelineActive = false;
   let selectedTimelineEventId = undefined;
   let selectedSourceEventIds = new Set();
@@ -116,8 +117,8 @@
       const scalar = (value) => value && typeof value === "object" ? value.display ?? value.value ?? value : value;
       addInspectorField(fields, `${prefix} label`, snapshot.label || snapshot.kind);
       addInspectorField(fields, `${prefix} lane`, snapshot.lane);
-      addInspectorField(fields, `${prefix} start (ns)`, scalar(snapshot.t0 ?? snapshot.t0_ns));
-      addInspectorField(fields, `${prefix} end (ns)`, scalar(snapshot.t1 ?? snapshot.t1_ns));
+      addInspectorField(fields, `${prefix} start (ns)`, eventTime(snapshot, "t0") ?? scalar(snapshot.t0 ?? snapshot.t0_ns));
+      addInspectorField(fields, `${prefix} end (ns)`, eventTime(snapshot, "t1") ?? scalar(snapshot.t1 ?? snapshot.t1_ns));
       addInspectorField(fields, `${prefix} duration (ns)`, scalar(snapshot.duration ?? snapshot.duration_ns));
       addInspectorField(fields, `${prefix} instruction`, snapshot.source && snapshot.source.raw);
       const args = snapshot.meta?.resolved_args || snapshot.resolved_args || snapshot.resolvedArgs;
@@ -128,18 +129,155 @@
     }
   }
 
-  function appendTriggerInspectorFields(fields, meta) {
+  function externalInputDisplayTime(event, localTime) {
+    const offset = timelineIr.alignment?.[event.sequencer_id]?.offset;
+    return timelineTimeBasis === "aligned" && Number.isFinite(offset) && Number.isFinite(localTime)
+      ? localTime + offset : localTime;
+  }
+
+  function triggerWaitReason(event, trigger) {
+    const armed = externalInputDisplayTime(event, trigger.armed_at_ns);
+    return trigger.status === "waiting" && armed !== trigger.armed_at_ns
+      ? trigger.reason?.replace(` at ${trigger.armed_at_ns} ns.`, ` at ${armed} ns.`) : trigger.reason;
+  }
+
+  function appendTriggerInspectorFields(fields, event) {
+    const meta = event.meta || {};
+    if (event.kind === "trigger_receive" && !meta.trigger_assumption) addInspectorField(fields, "Trigger address", meta.address);
+    if (meta.trigger_arrival_unknown) {
+      addInspectorField(fields, "Trigger status", "Waiting for unresolved arrival");
+      addInspectorField(fields, "Wait after trigger (ns)", meta.trigger_wait_duration_ns);
+    }
     const trigger = meta.trigger_assumption;
     if (!trigger) return;
     addInspectorField(fields, "Trigger input", "≈ Scenario input");
     addInspectorField(fields, "Trigger source", trigger.source_id || "No matching source");
     addInspectorField(fields, "Trigger address", trigger.address);
     addInspectorField(fields, "Shared event", trigger.event_id);
-    addInspectorField(fields, "Wait armed (project ns)", trigger.armed_at_ns);
-    addInspectorField(fields, "Trigger arrival (project ns)", trigger.arrival_ns);
-    addInspectorField(fields, "Resume (project ns)", trigger.resume_ns);
+    addInspectorField(fields, "Wait armed (project ns)", externalInputDisplayTime(event, trigger.armed_at_ns));
+    addInspectorField(fields, "Trigger arrival (project ns)", externalInputDisplayTime(event, trigger.arrival_ns));
+    addInspectorField(fields, "Resume (project ns)", externalInputDisplayTime(event, trigger.resume_ns));
     addInspectorField(fields, "Wait after trigger (ns)", trigger.duration_ns);
-    addInspectorField(fields, "Trigger status", trigger.reason || trigger.status);
+    addInspectorField(fields, "Trigger status", triggerWaitReason(event, trigger) || trigger.status);
+  }
+
+  function inspectorTimeRange(event) {
+    const start = eventTime(event, "t0");
+    if ((event.kind === "underflow_warning" && event.meta?.diagnostic_message && !event.meta?.comparison_terminal) ||
+        (event.kind === "feedback_rejected" && !event.meta?.comparison_terminal)) {
+      return Number.isFinite(start) ? `${start} ns` : displayInspectorValue(start);
+    }
+    const from = displayInspectorValue(start);
+    const to = displayInspectorValue(eventTime(event, "t1"));
+    const adapter = window.q1timelineTimelineAdapter;
+    const options = {timeBasis: timelineTimeBasis, alignment: timelineIr.alignment};
+    return adapter.q1IssueTimingText(event, options) || adapter.rtTimingText(event, from, to, options) || `${from} -> ${to}`;
+  }
+
+  function appendInspectorTimingFields(fields, event) {
+    const meta = event.meta || {};
+    if (event.kind !== "loop_block" || meta.observed || meta.playback ||
+        !["first_iteration_only", "requested_iterations"].includes(meta.preview_policy)) {
+      addInspectorField(fields, "Time range", inspectorTimeRange(event));
+      if (event.kind === "unknown_region" && meta.reason === "unverified_instruction" &&
+          Number.isSafeInteger(meta.planned_duration_ns) && meta.planned_duration_ns >= 0) {
+        addInspectorField(fields, "Planned duration", `${meta.planned_duration_ns} ns`);
+      }
+      return;
+    }
+    const edge = (key) => {
+      const time = eventTime(event, key);
+      return Number.isFinite(time) ? `${time} ns` : "Unknown";
+    };
+    addInspectorField(fields, "RT preview range", `${edge("t0")} → ${edge("t1")}`);
+    const total = meta.total_duration?.kind === "concrete" ? meta.total_duration.value : undefined;
+    const period = meta.period?.kind === "concrete" ? meta.period.value : undefined;
+    const exactForever = event.confidence === "exact" && meta.count === "forever" && meta.period_invariant === true;
+    let totalText = "Unknown";
+    if (Number.isFinite(total) && total >= 0) totalText = `${total} ns`;
+    else if (exactForever && Number.isFinite(period) && period >= 0) totalText = period > 0 ? "Unbounded" : "0 ns";
+    addInspectorField(fields, "Total RT duration", totalText);
+    const slope = meta.period_affine?.slope;
+    const durations = Array.isArray(meta.iteration_durations) ? meta.iteration_durations : [];
+    const first = period ?? durations[0];
+    const count = meta.count;
+    const exactFirst = event.confidence === "exact" && Number.isSafeInteger(count) && count > 0 &&
+      Number.isSafeInteger(first) && first >= 0;
+    const repeatedTotal = exactFirst ? first * count : undefined;
+    const varying = (Number.isFinite(slope) && slope !== 0) || new Set(durations.filter(Number.isFinite)).size > 1 ||
+      (count > 1 && Number.isSafeInteger(repeatedTotal) && Number.isSafeInteger(total) && total >= 0 && repeatedTotal !== total);
+    const equalSamples = exactFirst && durations.length === count && durations.every((duration) => duration === first);
+    const invariantPeriod = meta.period_invariant === true ? period : first;
+    addInspectorField(fields, "RT period", meta.period_invariant === true || equalSamples && !varying
+      ? (Number.isFinite(invariantPeriod) && invariantPeriod >= 0 ? `Invariant · ${invariantPeriod} ns` : "Invariant")
+      : varying ? "Varying" : "Unknown");
+  }
+
+  function appendFaultInspectorFields(fields, event) {
+    const fault = event.meta?.fault;
+    if (!fault) return;
+    addInspectorField(fields, "Fault flag", fault.flag);
+    addInspectorField(fields, "Fault edge (ns)", eventTime(event, "t1") ?? fault.q1_time_ns);
+  }
+
+  function appendNetZeroInspectorFields(fields, event) {
+    if (event.kind !== "netzero_result") return;
+    const timing = window.q1timelineTimelineAdapter.netzeroResultTimingText(event, {
+      timeBasis: timelineTimeBasis, alignment: timelineIr.alignment,
+    });
+    if (!timing) return;
+    addInspectorField(fields, "Compensation timing", timing);
+    const area = (value) => Number.isFinite(value) ? `${value} normalized full scale × ns` : undefined;
+    addInspectorField(fields, "Observed compensation area", area(event.meta.compensation_area));
+    addInspectorField(fields, "Planned compensation area", area(event.meta.planned_compensation_area));
+  }
+
+  function rejectedLinqSender(event) {
+    const send = timelineEventsById.get(String(event.meta?.source_event_id));
+    const meta = send?.meta || {};
+    if (send?.kind !== "feedback_send" || meta.source_packet_id == null || meta.diff_status === "removed") return undefined;
+    const sameComparison = (other) => other.branch_comparison_branch_id === meta.branch_comparison_branch_id &&
+      other.branch_comparison_path === meta.branch_comparison_path;
+    if ((meta.branch_comparison_branch_id != null || meta.branch_comparison_path != null) && !sameComparison(event.meta || {})) {
+      return undefined;
+    }
+
+    const selection = currentTimelineSelectionIndex();
+    let sender;
+    for (const candidate of timelineEventsById.values()) {
+      const other = candidate.meta || {};
+      if (candidate.sequencer_id !== send.sequencer_id || other.rt_packet_id !== meta.source_packet_id ||
+          !sameComparison(other) || other.loop_preview !== meta.loop_preview || other.loop_iteration_index !== meta.loop_iteration_index ||
+          other.diff_status === "removed" || other.conditional_skipped || candidate.kind === "conditional_skip" ||
+          selection.get(String(candidate.id))?.rtNavigationEventId !== String(candidate.id)) continue;
+      if (sender) return undefined;
+      sender = candidate;
+    }
+    return sender;
+  }
+
+  function appendLinqInspectorFields(fields, event) {
+    if (event.kind === "feedback_rejected") {
+      if (!event.meta?.comparison_terminal) {
+        addInspectorField(fields, "Input event", event.meta?.input_event_id);
+        addInspectorField(fields, "LINQ ID", event.meta?.id);
+      }
+      const sender = rejectedLinqSender(event);
+      if (sender) fields.push(`<dt>Sender</dt><dd><button type="button" data-related-event-id="${escapeHtml(sender.id)}">Show sender</button></dd>`);
+      return;
+    }
+    const input = event.meta?.feedback_input;
+    if (!input) return;
+    addInspectorField(fields, "LINQ input", "≈ Scenario input");
+    addInspectorField(fields, "Input event", input.input_event_id);
+    addInspectorField(fields, "LINQ ID", input.id ?? input.requested_id);
+    addInspectorField(fields, "Data word", input.value);
+    addInspectorField(fields, "Destinations", Object.entries(input.destinations || {}).map(([role, register]) => `${role} → ${register}`).join(", "));
+    addInspectorField(fields, "Wait armed (Q1 ns)", externalInputDisplayTime(event, input.armed_at_ns));
+    addInspectorField(fields, "LINQ arrival (Q1 ns)", externalInputDisplayTime(event, input.arrival_ns));
+    addInspectorField(fields, "Read completed (Q1 ns)", externalInputDisplayTime(event, input.completed_at_ns));
+    addInspectorField(fields, "Discarded input events", input.discarded_input_event_ids?.join(", "));
+    addInspectorField(fields, "LINQ status", input.reason || input.status);
   }
 
   function currentTimelineMode() {
@@ -184,13 +322,18 @@
       : `${ns(window.effective_duration_ns)} / ${ns(window.configured_duration_ns)} configured`);
     addInspectorField(fields, "Integration status", window.status === "interrupted" ? "Interrupted by next Acquire" : window.status);
     addInspectorField(fields, "RT wait", ns(eventTime(event, "t1") - eventTime(event, "t0")));
-    addInspectorField(fields, "Integration window", `${ns(window.start)} → ${ns(window.end)}`);
+    addInspectorField(fields, "Integration window", `${ns(window.start)} → ${ns(window.end)}${window.time_basis === "nominal" ? " (nominal)" : ""}`);
     addInspectorField(fields, "Acquisition target", `index ${displayInspectorValue(event.meta?.acquisition_index)} · bin ${displayInspectorValue(event.meta?.bin_index)}`);
-    addInspectorField(fields, "Integration source", assumed ? "Assumed from RT duration"
-      : window.source === "hardware_parameters" ? "hardware parameters · integration_length_acq" : "unknown");
+    addInspectorField(fields, "Integration source", ({
+      __proto__: null,
+      configured: "Physical model · integration_length_ns",
+      hardware_parameters: "hardware parameters · integration_length_acq",
+      weight_memory: "Weight memory",
+      instruction_duration_fallback: "Assumed from RT duration",
+    })[window.source] ?? "unknown");
     if (event.meta?.scope_acquisition_window) {
       const scope = globalThis.q1timelineTimelineAdapter.acquisitionWindow(event, { timeBasis: timelineTimeBasis }, "scope_acquisition_window");
-      addInspectorField(fields, "Scope window", `${ns(scope.start)} → ${ns(scope.end)}`);
+      addInspectorField(fields, "Scope window", `${ns(scope.start)} → ${ns(scope.end)}${scope.time_basis === "nominal" ? " (nominal)" : ""}`);
       addInspectorField(fields, "Scope capture", `${ns(scope.effective_duration_ns)} / ${ns(scope.configured_duration_ns)} configured · paths ${(scope.paths || []).join(", ")}`);
       addInspectorField(fields, "Scope status", scope.status === "retriggered" ? "Retriggered by next Acquire" : scope.status);
     }
@@ -198,6 +341,114 @@
 
   function windowAcquisition(event) {
     return window.q1timelineTimelineAdapter.acquisitionWindow(event, { timeBasis: timelineTimeBasis });
+  }
+
+  function currentTimelineEvidence() {
+    const lanes = new Map(Array.from(document.querySelectorAll(".shared-timeline-stage [data-lane]"), (lane) => [lane.dataset.lane, lane]));
+    const query = document.getElementById("event-filter")?.value.trim().toLowerCase() || "";
+    return (id, node) => {
+      const event = timelineEventsById.get(id);
+      if (!event || event.meta?.diff_status === "removed") return undefined;
+      const projection = timelineEvidenceBlocks.get(id) ?? timelineEvidenceBlocks.get(String(visiblePlaybackEvent(event).id));
+      if (!node && !isTimelineEventVisible(lanes.get(projection?.laneId))) return undefined;
+      if (query && !(node?.dataset.search || projection?.block.search || "").includes(query)) return undefined;
+      return {node, block: projection?.block};
+    };
+  }
+
+  function appendComparisonTerminalFields(fields, event) {
+    const terminal = event.meta?.comparison_terminal;
+    if (!terminal) return;
+    addInspectorField(fields, "Execution status", terminal.status?.replaceAll("_", " "));
+    addInspectorField(fields, "Reason", terminal.reason);
+    const ids = Array.isArray(terminal.source_event_ids) ? terminal.source_event_ids : [];
+    const evidence = [...new Set(ids.map(String))].filter((id) => {
+      const target = timelineEventsById.get(id);
+      if (!target || target === event || target.meta?.diff_status === "removed") return false;
+      const branch = target.meta?.branch_comparison_branch_id;
+      const path = target.meta?.branch_comparison_path;
+      return branch == null && path == null || branch === event.meta.branch_comparison_branch_id && path === event.meta.branch_comparison_path;
+    });
+    if (!evidence.length) return;
+
+    const nodes = new Map(evidence.map((id) => [id, findVisibleEventNodeByIds([id])]));
+    const primary = evidence.find((id) => nodes.get(id)) ?? evidence[0];
+    const actions = [`<button type="button" data-related-event-id="${escapeHtml(evidence[0])}" data-related-event-ids="${escapeHtml(JSON.stringify(evidence))}">Show evidence</button>`];
+    const usedNodes = new Set([nodes.get(primary)]);
+    const usedBlocks = new Set([timelineEvidenceBlocks.get(primary)?.block]);
+    const resolve = currentTimelineEvidence();
+    for (const id of evidence) {
+      if (id === primary) continue;
+      const target = timelineEventsById.get(id);
+      const presentation = resolve(id, nodes.get(id));
+      if (!presentation) continue;
+      const {node, block} = presentation;
+      if (node && usedNodes.has(node) || block && usedBlocks.has(block)) continue;
+      if (node) usedNodes.add(node);
+      if (block) usedBlocks.add(block);
+      const meta = target.meta || {};
+      const label = Number.isFinite(meta.planned_rt_end_ns) ? "RT cutoff" : Number.isFinite(meta.planned_q1_end_ns) ? "Q1 cutoff"
+        : target.kind === "q1_issue" ? "Q1 issue" : String(target.kind || "event").replaceAll("_", " ");
+      const source = target.source?.file ? `${target.source.file}:${target.source.line || 1}` : target.sequencer_id;
+      actions.push(`<button type="button" data-related-event-id="${escapeHtml(id)}" title="${escapeHtml(source)}">Show ${escapeHtml(label)}</button>`);
+    }
+    fields.push(`<dt>Evidence</dt><dd>${actions.join(" ")}</dd>`);
+  }
+
+  function recordedConditionDecisions(issue) {
+    const meta = issue.meta || {};
+    if (!timelineIr.simulation?.[issue.sequencer_id] || issue.kind !== "q1_issue" || meta.op !== "set_cond" ||
+        !meta.branch_id || meta.branch_comparison_path || meta.diff_status === "removed") return;
+    if (meta.assumed_branch_path === "taken" || meta.assumed_branch_path === "fallthrough") {
+      return {status: "Unavailable under a forced assumption", decisions: []};
+    }
+    const packets = new Map();
+    for (const event of timelineEventsById.values()) {
+      const rt = event.meta || {};
+      const armed = rt.pending === true && rt.rt_condition_decision === true &&
+        (event.kind === "trigger_wait" || event.kind === "sync_wait");
+      if (event.sequencer_id !== issue.sequencer_id || !event.lane.startsWith("rt.") ||
+          rt.rt_condition_issue_event_id !== issue.id || !rt.rt_packet_id || packets.has(rt.rt_packet_id) ||
+          (!armed && !Number.isFinite(rt.rt_execution_ns)) || rt.branch_comparison_path || rt.diff_status === "removed") continue;
+      const time = eventTime(event, "t0");
+      if (!Number.isFinite(time)) continue;
+      const decision = rt.conditional_skipped === true || event.kind === "conditional_skip" ? "Skip" : "Execute";
+      packets.set(rt.rt_packet_id, {id: event.id, label: `${decision} at ${time} ns`});
+    }
+    return {status: packets.size ? "" : "None observed", decisions: [...packets.values()]};
+  }
+
+  function appendRecordedConditionFields(fields, event) {
+    const record = recordedConditionDecisions(event);
+    if (!record) return;
+    if (record.status) {
+      addInspectorField(fields, "Recorded RT decisions", record.status);
+      return;
+    }
+    const links = record.decisions.map(({id, label}) =>
+      `<button type="button" data-related-event-id="${escapeHtml(id)}">${escapeHtml(label)}</button>`);
+    fields.push(`<dt>Recorded RT decisions</dt><dd>${links.join(" ")}</dd>`);
+  }
+
+  function appendRecordedConditionControls(popover, event) {
+    const record = recordedConditionDecisions(event);
+    if (!record) return;
+    const heading = document.createElement("div");
+    heading.className = "q1timeline-branch-status";
+    heading.textContent = record.status ? `Recorded RT decisions · ${record.status}` : "Recorded RT decisions";
+    popover.append(heading);
+    if (record.decisions.length) {
+      const entries = document.createElement("div");
+      entries.style.maxHeight = "min(10rem, 30vh)";
+      entries.style.overflowY = "auto";
+      for (const {id, label} of record.decisions) {
+        addTimelineControlAction(entries, "", label, () => {
+          closeTimelineControlPopover();
+          revealTimelineLinkedEvent(id);
+        }, {text: true});
+      }
+      popover.append(entries);
+    }
   }
 
   function renderSharedEventInspector(eventId, diagnosticMessage = findVisibleEventNodeByIds([eventId])?.dataset.diagnosticMessage) {
@@ -215,15 +466,20 @@
     const fields = [];
     appendAcquisitionInspectorFields(fields, event);
     appendDiffInspectorFields(fields, event);
-    appendTriggerInspectorFields(fields, meta);
+    appendTriggerInspectorFields(fields, event);
+    appendLinqInspectorFields(fields, event);
+    appendNetZeroInspectorFields(fields, event);
     addInspectorField(fields, "Label", event.kind === "underflow_warning" ? window.q1timelineTimelineAdapter.underflowLabel(event) : event.label || event.kind);
+    appendComparisonTerminalFields(fields, event);
     for (const message of diagnosticMessage?.split("\n") || []) {
       addInspectorField(fields, "Error", message, "diagnostic-error-message");
     }
     addInspectorField(fields, "Sequencer", event.sequencer_id);
     addInspectorField(fields, "Lane", event.lane);
-    addInspectorField(fields, "Time range", `${displayInspectorValue(eventTime(event, "t0"))} -> ${displayInspectorValue(eventTime(event, "t1"))}`);
+    appendInspectorTimingFields(fields, event);
     addInspectorField(fields, "Source", source.file ? `${source.file.replace(/\\/g, "/").split("/").pop()}:${source.line || 1}` : "unavailable");
+    addInspectorField(fields, "Stop code", meta.stop_code);
+    appendFaultInspectorFields(fields, event);
     addInspectorField(fields, "Confidence", event.confidence);
     addInspectorField(fields, "Q1 issue", meta.q1_issue_event_id);
     addInspectorField(fields, "RT packet", meta.rt_packet_id);
@@ -232,6 +488,7 @@
       addInspectorField(fields, "Branch condition", meta.condition);
       addInspectorField(fields, "Branch policy", meta.branch_policy);
       addInspectorField(fields, "Branch assumption", branchAssumptionDisplay(meta));
+      appendRecordedConditionFields(fields, event);
       addInspectorField(fields, "Loop context", meta.loop_context || meta.loop_id);
       inspectorFields.innerHTML = fields.join("");
   }
@@ -299,6 +556,7 @@
     if (!event) return;
     openAnalysisDetails();
     const visibleEvent = visiblePlaybackEvent(event);
+    expandTimelineCommandGroupsForEvents([String(visibleEvent.id)]);
     expandQ1IssueLanesForHighlight([String(visibleEvent.id)]);
     zoomTimelineToHighlightedEvent(visibleEvent);
     const target = findVisibleEventNodeByIds([String(visibleEvent.id), String(event.id)]);
@@ -389,12 +647,14 @@
   }
 
   function sourceNavigationEvent(event) {
+    if (event?.meta?.feedback_input || event?.meta?.fault) return event;
     const targetId = event && currentTimelineSelectionIndex().get(String(event.id))?.rtNavigationEventId;
     return timelineEventsById.get(targetId) || event;
   }
 
   function setterApplicationEventIds(event) {
-    return event?.kind === "q1_issue" ? currentTimelineSelectionIndex().get(String(event.id))?.appliedEventIds || [] : [];
+    const entry = event?.kind === "q1_issue" && currentTimelineSelectionIndex().get(String(event.id));
+    return entry ? [...entry.appliedEventIds, ...(entry.capturedEventIds || [])] : [];
   }
 
   function installRtPreparationMarkers() {
@@ -428,6 +688,19 @@
       });
       label.append(marker);
     }
+  }
+
+  function expandTimelineCommandGroupsForEvents(eventIds) {
+    let changed = false;
+    for (const eventId of eventIds) {
+      const group = timelineCommandGroupByEvent.get(String(eventId));
+      if (group && !expandedTimelineCommandGroups.has(group)) {
+        expandedTimelineCommandGroups.add(group);
+        changed = true;
+      }
+    }
+    if (changed) renderSharedTimelineIfAvailable();
+    return changed;
   }
 
   function expandQ1IssueLanesForHighlight(eventIds) {
@@ -645,8 +918,9 @@
   }
 
   function branchComparisonSupported(meta, target) {
-    return meta.branch_decision === "runtime_dependent" && !meta.branch_comparison_path &&
-      ["jge", "jlt"].includes(meta.op) && !String(meta.condition || "").endsWith("status flags") &&
+    if (meta.branch_decision !== "runtime_dependent" || meta.branch_comparison_path) return false;
+    if (typeof meta.branch_comparison_supported === "boolean") return meta.branch_comparison_supported;
+    return ["jge", "jlt"].includes(meta.op) && !String(meta.condition || "").endsWith("status flags") &&
       Boolean(target.edge && target.targetNode && target.fromNode) &&
       Number.isInteger(target.edge.target_pc) && Number.isInteger(target.fromNode.end_pc) &&
       target.edge.target_pc > target.fromNode.end_pc;
@@ -939,6 +1213,7 @@
     const scope = [];
     if (meta.loop_iteration_index !== undefined) scope.push(`Iteration ${Number(meta.loop_iteration_index) + 1}`);
     if (meta.branch_comparison_path) scope.push(window.q1timelineTimelineAdapter.branchComparisonLabel(meta.branch_comparison_path, meta.branch_comparison_kind));
+    if (meta.rt_trigger_epoch || timelineTimeBasis === "aligned" && meta.aligned_time_nominal) scope.push("Nominal RT position");
     if (event.confidence === "assumed" || meta.assumed_branch_path || meta.feedback_assumptions?.length) scope.push("Assumed execution");
     if (scope.length) {
       const context = document.createElement("p");
@@ -1061,6 +1336,7 @@
     const restoreLoopFocus = () => findVisibleEventNodeByIds([String(event.id)])?.focus({ preventScroll: true });
     if (actionKind === "branch") {
       renderBranchControls(popover, event);
+      appendRecordedConditionControls(popover, event);
     } else if (actionKind === "feedback") {
       renderFeedbackControls(popover, event);
     } else if (actionKind === "rt-details") {
@@ -1607,9 +1883,11 @@
     const selectedEvent = timelineEventsById.get(String(selectedTimelineEventId));
     const applied = setterApplicationEventIds(selectedEvent);
     const selectedNode = selectedTimelineEventId ? findVisibleEventNodeByIds([selectedTimelineEventId, ...applied]) : undefined;
-    if (selectedNode) {
+    if (selectedNode || selectedEvent?.meta?.feedback_input) {
+      const preserveRawSelection = !selectedNode || applied.length || selectedNode.dataset.rtPreparation === "true" ||
+        selectedEvent?.kind === "trigger_receive";
       selectEventNode(selectedNode, { notify: false, syncHardware: false,
-        ...(applied.length || selectedNode.dataset.rtPreparation === "true" ? { eventId: selectedTimelineEventId } : {}) });
+        ...(preserveRawSelection ? { eventId: selectedTimelineEventId } : {}) });
       return;
     }
     syncTimelineRelatedSelection(undefined);
@@ -1642,17 +1920,37 @@
       mode,
       layout: timelineLayout,
       timeBasis: timelineTimeBasis,
+      q1OnlyLoops,
       expandedQ1IssueSequencers: Array.from(expandedQ1IssueSequencers || []),
       expandedPlaybackLoops: Array.from(expandedPlaybackLoops),
     });
     rtDetailsByEvent = new Map(model.lanes.flatMap((lane) => lane.blocks.filter((block) => block.rtDetails)
       .flatMap((block) => (block.eventIds || [block.eventId]).map((id) => [String(id), block.rtDetails]))));
+    // Capture the mode's event blocks before folding and viewport clipping.
+    timelineEvidenceBlocks.clear();
+    for (const lane of model.lanes) {
+      if (lane.hidden) continue;
+      for (const block of lane.blocks) {
+        for (const id of block.eventIds || [block.eventId]) {
+          if (id != null && !timelineEvidenceBlocks.has(String(id))) {
+            timelineEvidenceBlocks.set(String(id), {laneId: lane.id, block});
+          }
+        }
+      }
+    }
+    timelineCommandGroupByEvent = window.q1timelineTimelineAdapter.foldTimelineCommands(model, {
+      mode, timeBasis: timelineTimeBasis, eventsById: timelineEventsById, expandedGroups: expandedTimelineCommandGroups,
+      expandedLoops: expandedPlaybackLoops,
+      hasQ1Control: (event) => eventHasBranchControl(event) || eventHasFeedbackControl(event),
+    });
     if (timelineLayout !== "instruction") {
       timelineCommandWidths = [];
       for (const lane of model.lanes.filter((lane) => ["runtime", "branch-runtime", "runtime-path"].includes(lane.kind))) {
         for (const block of lane.blocks.filter((block) => !block.diagnosticPlacement && !["underflow_warning", "analysis_incomplete", "unknown_region"].includes(block.kind))) {
-          if (block.pointMarker) continue;
-          block.commandLabel = block.commandToken || block.label;
+          if (block.pointMarker || block.foldGroup?.expanded) continue;
+          block.commandLabel = block.foldGroup?.waits
+            ? `wait ${formatFoldDuration(block.duration)} × ${block.foldGroup.count}`
+            : block.commandToken || block.label;
           block.classNames += " q1timeline-command-name";
           if (!block.duration) block.classNames += " q1timeline-command-point";
           const label = block.diagnosticErrors?.length ? `! ${block.commandLabel}` : block.commandLabel;
@@ -1693,6 +1991,13 @@
         if (event && typeof event.stopPropagation === "function") {
           event.stopPropagation();
         }
+        if (block.foldGroup) {
+          if (block.foldGroup.expanded) expandedTimelineCommandGroups.delete(block.id);
+          else expandedTimelineCommandGroups.add(block.id);
+          renderSharedTimelineIfAvailable();
+          findVisibleEventNodeByIds([block.id])?.focus({ preventScroll: true });
+          return;
+        }
         selectEventNode(node, { preserveFocus: Boolean(block.rtDetails || node.dataset.diagnosticMessage) });
         if (block.rtDetails) {
           const target = findVisibleEventNodeByIds([String(block.eventId)]);
@@ -1725,13 +2030,15 @@
       stage.dataset.instructionCount = String(model.viewport.end);
       const blocks = new Map(model.lanes.flatMap((lane) => lane.blocks.map((block) => [String(block.id), block])));
       stage.querySelectorAll(".timeline-block").forEach((node) => {
-        const index = blocks.get(node.dataset.blockId).start;
+        const block = blocks.get(node.dataset.blockId);
+        const index = block.start;
         node.dataset.instructionIndex = String(index);
         // Use exact slots, without the time renderer's minimum width or rounded percentages.
         node.style.left = `calc(var(--instruction-cell-width) * ${index})`;
-        node.style.width = blocks.get(node.dataset.blockId).diagnosticPlacement && !blocks.get(node.dataset.blockId).duration
-          ? "10px" : node.dataset.issueMarker === "true"
-          ? "min(24px, var(--instruction-cell-width))" : "var(--instruction-cell-width)";
+        node.style.width = block.foldGroup ? `calc(var(--instruction-cell-width) * ${block.duration})` :
+          block.pointMarker || (block.diagnosticPlacement && !block.duration)
+            ? "10px" : node.dataset.issueMarker === "true"
+            ? "min(24px, var(--instruction-cell-width))" : "var(--instruction-cell-width)";
         node.classList.remove("is-tiny", "is-compact");
       });
       stage.querySelectorAll(".timeline-parameter-marker[data-instruction-index]").forEach((node) => {
@@ -1773,11 +2080,20 @@
 
   function applyTimelineEventFilter() {
     const filterInput = document.getElementById("event-filter");
-    if (!filterInput) return;
-    const query = filterInput.value.trim().toLowerCase();
-    for (const eventNode of document.querySelectorAll(".event")) {
-      const searchable = eventNode.dataset.search || "";
-      eventNode.classList.toggle("is-filtered", query !== "" && !searchable.includes(query));
+    if (filterInput) {
+      const query = filterInput.value.trim().toLowerCase();
+      for (const eventNode of document.querySelectorAll(".event")) {
+        const searchable = eventNode.dataset.search || "";
+        eventNode.classList.toggle("is-filtered", query !== "" && !searchable.includes(query));
+      }
+    }
+    const links = document.querySelectorAll("a[data-tb-evidence]");
+    if (links.length) {
+      const resolve = currentTimelineEvidence();
+      for (const link of links) {
+        const id = link.dataset.relatedEventId;
+        link.hidden = !resolve(id, findVisibleEventNodeByIds([id]));
+      }
     }
   }
 
@@ -1898,12 +2214,17 @@
       const fields = [];
       appendAcquisitionInspectorFields(fields, event);
       appendDiffInspectorFields(fields, event);
-      appendTriggerInspectorFields(fields, meta);
+      appendTriggerInspectorFields(fields, event);
+      appendLinqInspectorFields(fields, event);
+      appendNetZeroInspectorFields(fields, event);
       addInspectorField(fields, "Label", event.kind === "underflow_warning" ? window.q1timelineTimelineAdapter.underflowLabel(event) : event.label || event.kind);
+      appendComparisonTerminalFields(fields, event);
       addInspectorField(fields, "Sequencer", event.sequencer_id);
       addInspectorField(fields, "Lane", event.lane);
-      addInspectorField(fields, "Time range", `${displayInspectorValue(eventTime(event, "t0"))} -> ${displayInspectorValue(eventTime(event, "t1"))}`);
+      appendInspectorTimingFields(fields, event);
       addInspectorField(fields, "Source", source.file ? `${source.file}:${source.line || 1}` : "unavailable");
+      addInspectorField(fields, "Stop code", meta.stop_code);
+      appendFaultInspectorFields(fields, event);
       addInspectorField(fields, "Confidence", event.confidence);
       addInspectorField(fields, "Q1 issue", meta.q1_issue_event_id);
       addInspectorField(fields, "RT packet", meta.rt_packet_id);
@@ -1912,6 +2233,7 @@
       addInspectorField(fields, "Branch condition", meta.condition);
       addInspectorField(fields, "Branch policy", meta.branch_policy);
       addInspectorField(fields, "Branch assumption", branchAssumptionDisplay(meta));
+      appendRecordedConditionFields(fields, event);
       addInspectorField(fields, "Loop context", meta.loop_context || meta.loop_id);
       addInspectorField(fields, "Latched state", meta.field ? `${meta.field}=${displayInspectorValue(meta.value)}` : meta.applied_state);
       addInspectorField(fields, "Duration role", meta.duration_provenance && meta.duration_provenance.role);
@@ -2083,12 +2405,21 @@
 
     installDiagnosticBadgeInteractions();
 
+    function revealRelatedEvent(link) {
+      const candidates = JSON.parse(link.dataset.relatedEventIds || "[]");
+      const eventId = candidates.find((id) => findVisibleEventNodeByIds([id])) ?? link.dataset.relatedEventId;
+      revealTimelineLinkedEvent(eventId);
+    }
     for (const link of document.querySelectorAll("[data-related-event-id]")) {
       link.addEventListener("click", (event) => {
         event.preventDefault();
-        revealTimelineLinkedEvent(link.dataset.relatedEventId);
+        revealRelatedEvent(link);
       });
     }
+    inspectorFields?.addEventListener("click", (event) => {
+      const button = event.target.closest("button[data-related-event-id]");
+      if (button) revealRelatedEvent(button);
+    });
 
     for (const link of document.querySelectorAll("[data-semantic-event-id]")) {
       link.addEventListener("click", (event) => {
@@ -2156,6 +2487,9 @@
   let timelineSelectionDrag = undefined;
   const collapsedSequencers = new Set();
   const expandedQ1IssueSequencers = new Set(initialExpandedQ1IssueSequencers());
+  const expandedTimelineCommandGroups = new Set();
+  let timelineCommandGroupByEvent = new Map();
+  const timelineEvidenceBlocks = new Map();
   const minInlineLabelWidth = 20;
   const inlineLabelXPadding = 2;
   const defaultLaneHeight = 34;
@@ -2514,6 +2848,33 @@
     node.innerHTML = toolbarSvgIcon(iconName);
   }
 
+  function executionDisplayReason(execution) {
+    const snapshot = timelineIr.playback;
+    const reason = execution.reason;
+    if (!snapshot || snapshot.status !== execution.status ||
+        snapshot.steps !== execution.steps || snapshot.reason !== reason) return reason;
+    if (execution.status === "error") {
+      const overflow = timelineIr.diagnostics?.find((item) =>
+        item.category === "feedback_queue_overflow" && item.message === reason);
+      return overflow?.details?.display_message || reason;
+    }
+    if (timelineTimeBasis !== "aligned" || execution.status !== "waiting") return reason;
+
+    const waiters = new Map();
+    for (const event of timelineIr.events || []) {
+      if (!event.meta?.playback || event.t1 != null) continue;
+      const trigger = event.kind === "wait_trigger" ? event.meta.trigger_assumption : undefined;
+      const input = trigger || (event.kind === "feedback_pop" ? event.meta.feedback_input : undefined);
+      if (input?.status === "waiting" && input.reason) {
+        waiters.set(event.sequencer_id, { raw: input.reason, display: trigger ? triggerWaitReason(event, trigger) : input.reason });
+      }
+    }
+    const reasons = [...waiters.values()];
+    const summary = (field) => `${waiters.size} sequencer(s) waiting. ${[...new Set(reasons.map((entry) => entry[field]))].join(" ")}`;
+    // Match the raw summary before using events from the mounted snapshot.
+    return waiters.size && summary("raw") === reason ? summary("display") : reason;
+  }
+
   function renderExecutionControls() {
     const button = document.getElementById("q1timeline-execution-button");
     const indicator = document.getElementById("q1timeline-execution-status");
@@ -2523,14 +2884,15 @@
     const labels = { idle: "Ready", running: "Running", paused: "Paused", waiting: "Waiting for external input", blocked: "Blocked", completed: "Completed", limit: "Instruction limit reached", error: "Execution stopped" };
     const details = [labels[execution.status] || "Ready"];
     if (Number.isFinite(execution.steps)) details.push(`${execution.steps} instructions`);
-    if (execution.reason) details.push(execution.reason);
+    const reason = executionDisplayReason(execution);
+    if (reason) details.push(reason);
     const completed = execution.status === "completed";
     const cannotResume = execution.status === "waiting" || ["blocked", "limit"].includes(execution.status) && execution.can_resume === false;
     const label = running ? "Pause execution" : completed ? "Execution complete" : cannotResume ? labels[execution.status] : "Run execution";
     setIconOnlyToolbarButton(button, running ? "pause" : "play", label);
     button.disabled = completed || cannotResume;
     if (completed) button.title = "Execution complete. Change a branch, feedback, or external input assumption to recalculate.";
-    if (cannotResume) button.title = `${execution.reason || labels[execution.status]} Change a branch, feedback, or external input assumption to recalculate.`;
+    if (cannotResume) button.title = `${reason || labels[execution.status]} Change a branch, feedback, or external input assumption to recalculate.`;
     button.setAttribute("aria-pressed", String(running));
     indicator.dataset.executionStatus = execution.status || "idle";
     indicator.title = details.join(" · ");
@@ -2587,15 +2949,18 @@
       if (resolved !== undefined && resolved !== trigger.address) parameters.push(`${trigger.id}: ${trigger.address} → ${resolved}`);
       return `${trigger.id} · address ${address} · ${trigger.targets.length} sequencers · ${trigger.times_ns.length ? `${trigger.times_ns.join(", ")} ns` : "no events"}`;
     });
-    summary.textContent = triggers.length ? `≈ Scenario input · ${descriptions[0]}${triggers.length > 1 ? ` · +${triggers.length - 1} sources` : ""}` : "External inputs · not configured";
+    for (const receiver of externalInputsState.feedback || []) {
+      descriptions.push(`LINQ · ${receiver.target} · ${receiver.arrivals.length ? `${receiver.arrivals.length} arrivals` : "no arrivals"}`);
+    }
+    summary.textContent = descriptions.length ? `≈ Scenario input · ${descriptions[0]}${descriptions.length > 1 ? ` · +${descriptions.length - 1} sources` : ""}` : "External inputs · not configured";
     if (externalInputsState.overridden) summary.textContent += " · Unsaved changes";
-    summary.title = descriptions.length ? `${[...descriptions, ...parameters].join("\n")}\nEvent times use the project clock. Configured scenario inputs are assumptions.` : "Configure shared trigger events for this project.";
+    summary.title = descriptions.length ? `${[...descriptions, ...parameters].join("\n")}\nTriggers use the shared RT clock. LINQ uses the receiver's Q1 clock.` : "Configure shared triggers and LINQ inputs for this project.";
   }
 
   function syncExternalInputsActions(error = "") {
     const form = document.getElementById("q1timeline-external-inputs-form");
     if (!form) return;
-    for (const control of form.querySelectorAll("input, button")) control.disabled = externalInputsPending;
+    for (const control of form.querySelectorAll("input, textarea, select, button")) control.disabled = externalInputsPending;
     form.querySelector('[data-trigger-action="save"]').disabled = externalInputsPending || externalInputsDirty || !externalInputsState.overridden || !externalInputsState.canSave;
     form.querySelector('[data-trigger-action="reset"]').disabled = externalInputsPending || !externalInputsDirty && !externalInputsState.overridden;
     const status = form.querySelector('[role="status"]');
@@ -2608,7 +2973,7 @@
     if (!form) return;
     const triggers = externalInputsState.triggers || [];
     const sequencers = (timelineIr.sequencers || []).map((item) => String(item.id));
-    form.innerHTML = '<p class="q1timeline-input-help">Times are receiver arrivals on the shared project clock (ns), before display alignment. Each selected sequencer can receive the same scenario event. An empty times list supplies no events.</p><div class="q1timeline-trigger-sources"></div>';
+    form.innerHTML = '<p class="q1timeline-input-help">Trigger arrivals use the shared RT clock. LINQ arrivals use each receiver’s Q1 clock. Both are in ns before display alignment.</p><div class="q1timeline-trigger-sources"></div><div class="q1timeline-feedback-sources"></div>';
     const sources = form.querySelector(".q1timeline-trigger-sources");
     let nextSourceIndex = 1;
     const addSource = (trigger) => {
@@ -2628,11 +2993,36 @@
       sources.append(card);
     };
     triggers.forEach(addSource);
+    const feedbackSources = form.querySelector(".q1timeline-feedback-sources");
+    let nextReceiverIndex = 1;
+    const addReceiver = (receiver) => {
+      const index = nextReceiverIndex++;
+      const card = document.createElement("fieldset");
+      card.className = "q1timeline-feedback-source";
+      const targets = [...new Set([...sequencers, receiver.target])];
+      card.innerHTML = `<legend>LINQ receiver ${index}</legend><div class="q1timeline-trigger-fields">
+        <label>Sequencer<select data-feedback-target aria-label="LINQ receiver ${index} sequencer" required>${targets.map((target) => `<option value="${escapeHtml(target)}"${target === receiver.target ? " selected" : ""}>${escapeHtml(target)}</option>`).join("")}</select></label>
+        <label>Arrivals (Q1 ns, ID, word per line)<textarea data-feedback-arrivals aria-label="LINQ receiver ${index} arrivals" rows="3" placeholder="1000, 9, 123">${escapeHtml(receiver.arrivals.map((entry) => `${entry.time_ns}, ${entry.id}, ${entry.value}`).join("\n"))}</textarea></label>
+        <button type="button" data-feedback-remove aria-label="Remove LINQ receiver ${index}">Remove</button></div>
+        <p class="q1timeline-input-help">Leave arrivals empty to model an empty FIFO.</p>`;
+      card.querySelector("[data-feedback-remove]").addEventListener("click", () => {
+        card.remove(); externalInputsDirty = true; syncExternalInputsActions();
+      });
+      feedbackSources.append(card);
+    };
+    (externalInputsState.feedback || []).forEach(addReceiver);
     const actions = document.createElement("div");
     actions.className = "q1timeline-input-actions";
-    actions.innerHTML = '<button type="button" data-trigger-action="add">Add trigger</button><button type="submit">Apply &amp; rerun</button><button type="button" data-trigger-action="save">Save to project</button><button type="button" data-trigger-action="reset">Reset changes</button><span role="status" aria-live="polite"></span>';
+    actions.innerHTML = '<button type="button" data-trigger-action="add">Add trigger</button><button type="button" data-feedback-add>Add LINQ receiver</button><button type="submit">Apply &amp; rerun</button><button type="button" data-trigger-action="save">Save to project</button><button type="button" data-trigger-action="reset">Reset changes</button><span role="status" aria-live="polite"></span>';
     actions.querySelector('[data-trigger-action="add"]').addEventListener("click", () => {
       addSource({id: `trigger_${nextSourceIndex}`, address: 1, targets: sequencers, times_ns: [1000]});
+      externalInputsDirty = true; syncExternalInputsActions();
+    });
+    actions.querySelector("[data-feedback-add]").addEventListener("click", () => {
+      const used = new Set([...feedbackSources.querySelectorAll("[data-feedback-target]")].map((select) => select.value));
+      const target = sequencers.find((sequencer) => !used.has(sequencer));
+      if (target === undefined) { syncExternalInputsActions("Each sequencer can have one LINQ schedule."); return; }
+      addReceiver({target, arrivals: []});
       externalInputsDirty = true; syncExternalInputsActions();
     });
     for (const [action, type] of [["save", "saveExternalInputs"], ["reset", "resetExternalInputs"]]) {
@@ -2656,7 +3046,7 @@
     const form = document.createElement("form");
     form.id = "q1timeline-external-inputs-form";
     form.className = "q1timeline-external-inputs-form";
-    form.setAttribute("aria-label", "External trigger configuration");
+    form.setAttribute("aria-label", "External input configuration");
     form.hidden = !readPersistedWebviewState().externalInputsOpen;
     toolbar.insertAdjacentElement("afterend", form);
     const configure = group.querySelector("button");
@@ -2686,8 +3076,24 @@
       if (triggers.some((trigger) => trigger.times_ns.some((time) => !Number.isSafeInteger(time) || time < 0))) {
         syncExternalInputsActions("Event times must be nonnegative integers in ns."); return;
       }
+      const feedback = [];
+      for (const card of form.querySelectorAll(".q1timeline-feedback-source")) {
+        const target = card.querySelector("[data-feedback-target]").value;
+        const lines = card.querySelector("[data-feedback-arrivals]").value.split(/\r?\n/).filter((line) => line.trim());
+        const arrivals = [];
+        for (const line of lines) {
+          const match = line.match(/^\s*(\d+)\s*,\s*(\d+)\s*,\s*(-?\d+|0x[0-9a-f]+)\s*$/i);
+          if (!match) { syncExternalInputsActions("Each LINQ arrival needs a time, ID and data word separated by commas."); return; }
+          const [time_ns, id, value] = match.slice(1).map(Number);
+          if (!Number.isSafeInteger(time_ns) || id < 1 || id > 255 || value < -(2 ** 31) || value > 2 ** 32 - 1) {
+            syncExternalInputsActions("LINQ arrivals require a safe time, ID from 1 to 255 and a 32-bit data word."); return;
+          }
+          arrivals.push({time_ns, id, value});
+        }
+        feedback.push({target, arrivals});
+      }
       externalInputsPending = true; syncExternalInputsActions();
-      vscode.postMessage({type: "setExternalInputs", triggers});
+      vscode.postMessage({type: "setExternalInputs", triggers, ...(feedback.length ? {feedback} : {})});
     });
     renderExternalInputsSummary();
     renderExternalInputsEditor();
@@ -2966,7 +3372,7 @@
   function renderModeToggle(mode) {
     ensureToolbarNode();
     const currentMode = mode === "debug" ? "debug" : "normal";
-    if (rtTimeOriginEnabled() && currentMode !== currentTimelineMode()) {
+    if ((q1OnlyLoops.size || rtTimeOriginEnabled() || sharedSimulationRtAnchor()) && currentMode !== currentTimelineMode()) {
       timelineWindow = undefined;
       timelineSelectionRange = undefined;
       timelineTimeScales.clear();
@@ -2998,7 +3404,7 @@
 
   function renderTimeBasisToggle() {
     const group = document.getElementById("q1timeline-time-basis-toggle");
-    if (group && rtTimeOriginEnabled()) group.style.display = "none";
+    if (group) group.style.display = rtTimeOriginEnabled() ? "none" : "";
     for (const button of document.querySelectorAll("[data-time-basis]")) {
       const basis = button.getAttribute("data-time-basis");
       const enabled = basis === "local" || hasAlignedTimelineTimes();
@@ -3338,21 +3744,47 @@
 
   function rtTimeOriginEnabled() {
     const anchors = timelineIr.project?.alignment_anchor_kinds;
-    return timelineIr.project?.alignment_mode === "first_anchor" && anchors?.length === 1 && anchors[0] === "rt_queue_dequeue";
+    const mode = timelineIr.project?.alignment_mode;
+    if (mode === "first_rt_dequeue" || mode === "first_anchor" && anchors?.length === 1 && anchors[0] === "rt_queue_dequeue") {
+      return true;
+    }
+    return sharedSimulationRtAnchor() === "rt_queue_dequeue";
+  }
+
+  function sharedSimulationRtAnchor() {
+    for (const entry of Object.values(timelineIr.alignment || {})) {
+      if (entry?.clock !== "shared_simulation" || typeof entry.anchor_event_id !== "string") continue;
+      const anchor = timelineEventsById.get(entry.anchor_event_id);
+      if (anchor?.kind === "rt_queue_dequeue" || /^rt\./.test(anchor?.lane || "")) return anchor.kind;
+    }
   }
 
   function fullTimelineWindow() {
     const svg = timelineSvg();
     const geometry = timelineGeometry(svg);
-    if (rtTimeOriginEnabled() && currentTimelineMode() === "normal" && geometry.min < 0 && geometry.max > 0) {
-      return { min: 0, max: geometry.max };
+    if (currentTimelineMode() === "normal") {
+      const zeroOrigin = rtTimeOriginEnabled();
+      if (q1OnlyLoops.size || sharedSimulationRtAnchor()) {
+        const extent = window.q1timelineTimelineAdapter?.visibleRtExtent(timelineEventsById, {
+          timeBasis: timelineTimeBasis, feedbackFlows: timelineIr.feedback_flows, alignment: timelineIr.alignment,
+          excludedEventIds: q1OnlyLoops,
+        });
+        if (extent) {
+          const min = zeroOrigin ? 0 : extent.min;
+          return { min, max: Math.max(min + 1, extent.max) };
+        }
+        if (q1OnlyLoops.size) return { min: 0, max: 1 };
+      }
+      if (zeroOrigin) return { min: 0, max: Math.max(1, geometry.max) };
     }
     return { min: geometry.min, max: geometry.max };
   }
 
   function initialTimelineWindow(full) {
+    const normal = currentTimelineMode() === "normal";
     const compactLoops = Array.from(timelineEventsById.values()).filter((event) =>
       event.kind === "loop_block" &&
+      (!normal || !q1OnlyLoops.has(String(event.id))) &&
       ["first_iteration_only", "requested_iterations"].includes(event.meta?.preview_policy) &&
       Number(event.meta.count) > (Number(event.meta.visible_iteration_count) || 1));
     if (!compactLoops.length) return full;
@@ -3519,7 +3951,7 @@
 
   function visibleTimelineTicks(window) {
     let min = window.min;
-    if (currentTimelineMode() === "normal" && !rtTimeOriginEnabled()) {
+    if (currentTimelineMode() === "normal" && !rtTimeOriginEnabled() && !sharedSimulationRtAnchor()) {
       let q1Start = Infinity;
       let rtStart = Infinity;
       for (const event of timelineEventsById.values()) {
@@ -4506,7 +4938,17 @@
 
   function zoomTimelineToSelectedEvent() {
     const event = selectedTimelineEventId ? timelineEventsById.get(String(selectedTimelineEventId)) : undefined;
+    if (event) expandTimelineCommandGroupsForEvents([event.id]);
     zoomTimelineToEvent(event);
+  }
+
+  function renderNetworkConflictTimes() {
+    const format = window.q1timelineTimelineAdapter?.networkConflictDisplayMessage;
+    if (!format) return;
+    for (const node of document.querySelectorAll("[data-network-conflict-index]")) {
+      const diagnostic = timelineIr.diagnostics?.[node.dataset.networkConflictIndex];
+      if (diagnostic) node.textContent = format(diagnostic, timelineIr.alignment, timelineTimeBasis) ?? diagnostic.message;
+    }
   }
 
   function setTimelineTimeBasis(basis) {
@@ -4522,6 +4964,8 @@
       return;
     }
     timelineTimeBasis = basis;
+    renderNetworkConflictTimes();
+    renderExecutionControls();
     if (hardwareView) {
       hardwareView.setTimeBasis(basis);
     }
@@ -4959,6 +5403,7 @@
   renderComparisonStatus(state.comparison);
   renderAlignmentPolicy(initialAlignmentPolicy);
   renderTimeBasisToggle();
+  renderNetworkConflictTimes();
   renderModeToggle(initialViewMode);
   renderSequencerFoldControls();
   renderRelatedBlockSummary([]);
@@ -5072,6 +5517,7 @@
     if (event.data.zoomToRange) {
       if (timelineLayout === "instruction") {
         const ids = new Set((event.data.highlightEventIds || []).map((id) => visiblePlaybackEvent(timelineEventsById.get(String(id)))?.id || String(id)));
+        expandTimelineCommandGroupsForEvents(ids);
         selectedSourceEventIds = ids;
         const selected = [];
         document.querySelectorAll(".shared-timeline-stage .timeline-block[data-event-id]").forEach((node) => {
@@ -5099,6 +5545,7 @@
         if (details) details.open = true;
         return;
       }
+      expandTimelineCommandGroupsForEvents(range.eventIds);
       expandQ1IssueLanesForHighlight(range.eventIds);
       const ids = new Set(range.eventIds);
       selectedSourceEventIds = ids;
@@ -5119,11 +5566,15 @@
     const setterId = setterApplicationEventIds(sourceEvent).length ? String(sourceEvent.id) : undefined;
     const highlightedEvent = sourceNavigationEvent(sourceEvent);
     const visibleEvent = visiblePlaybackEvent(highlightedEvent);
+    expandTimelineCommandGroupsForEvents(visibleEvent ? [visibleEvent.id, ...highlightEventIds] : highlightEventIds);
     zoomTimelineToHighlightedEvent(visibleEvent);
     const target = findVisibleEventNodeByIds(visibleEvent ? [visibleEvent.id, ...highlightEventIds] : highlightEventIds);
     if (target) {
+      const arrivalAlias = highlightedEvent?.kind === "trigger_receive" &&
+        target.dataset.eventId !== String(highlightedEvent.id) && eventNodeMatchesId(target, highlightedEvent.id);
       selectEventNode(target, { notify: false, syncHardware: visibleEvent === highlightedEvent,
-        ...(setterId || target.dataset.rtPreparation === "true" ? { eventId: setterId || String(highlightedEvent.id) } : {}) });
+        ...(setterId || target.dataset.rtPreparation === "true" || arrivalAlias
+          ? { eventId: setterId || String(highlightedEvent.id) } : {}) });
       if (visibleEvent !== highlightedEvent && highlightedEvent) {
         if (hardwareView) hardwareView.selectEvent(highlightedEvent.id);
         renderSharedEventInspector(highlightedEvent.id);

@@ -9,18 +9,20 @@ for (const profile of ["01-feedback-missing", "06-feedback-too-late"]) {
     await expect(value(page, "q1-event")).toContainText("stalled");
     await expect(value(page, "communications")).not.toContainText("feedback receive");
     await expect(value(page, "communications")).not.toContainText("value 7");
-    await at(page, 1200);
-    await expect(value(page, "execution")).toContainText("error");
-    await expect(value(page, "execution")).toContainText("RT queue underflow at 1200 ns.");
-    await expect(page.getByRole("button", { name: "Next at 1600 ns", exact: true })).toHaveCount(0);
-    await tab(page, "Registers");
-    await page.getByRole("checkbox", { name: "All 64" }).check();
-    await expect(register(page, "R0")).toHaveText("?");
     await page.locator('[data-block="q1"]').click();
     await page.getByRole("button", { name: "Open source", exact: true }).click();
     const source = await page.evaluate(() => window.revealedSource);
     expect(source.line).toBe(2);
     expect(source.file.replaceAll("\\", "/")).toContain(`/faults/${profile}/program.q1asm`);
+    await at(page, 1200);
+    await expect(value(page, "execution")).toContainText("error");
+    await expect(value(page, "execution")).toContainText("RT queue underflow · Observation end 1200 ns");
+    await expect(value(page, "q1-event")).toContainText("observation ended");
+    await tab(page, "Simulation");
+    await expect(page.getByRole("button", { name: "Next at 1600 ns", exact: true })).toHaveCount(0);
+    await tab(page, "Registers");
+    await page.getByRole("checkbox", { name: "All 64" }).check();
+    await expect(register(page, "R0")).toHaveText("?");
   });
 }
 
@@ -82,18 +84,25 @@ test("duplicate feedback preserves FIFO occurrences even when two payloads are e
   await expect(receives.nth(2)).toContainText("id 5 · value 9");
 });
 
-test("missing trigger remains blocked and waiting at its source without fabricating an arrival", async ({ page }) => {
+test("missing trigger ends observation and retains its pending wait without fabricating an arrival", async ({ page }) => {
   await open(page, "fault-04-trigger-missing", "QCM0", "seq");
+  await at(page, 199);
+  await expect(value(page, "rt-event")).toContainText("not started");
   await at(page, 200);
   await expect(value(page, "execution")).toContainText("blocked");
-  await expect(value(page, "execution")).toContainText("trigger_wait");
-  await expect(value(page, "rt-event")).toContainText("waiting");
+  await expect(value(page, "execution")).toContainText("No scheduled input can resume trigger_wait. · Observation end 200 ns");
+  await expect(value(page, "rt-event")).toContainText("observation ended");
   await tab(page, "Simulation");
-  await expect(value(page, "communications")).toContainText("200 ns · trigger wait");
+  await value(page, "communications").getByRole("button", {name: "200 ns · trigger wait", exact: true}).click();
   await expect(value(page, "communications")).not.toContainText("trigger receive");
-  await page.locator('[data-block="rt"]').click();
-  await page.getByRole("button", { name: "Open source", exact: true }).click();
-  expect((await page.evaluate(() => window.revealedSource)).line).toBe(1);
+  const evidence = await page.evaluate(() => {
+    const ir = window.demoIr;
+    const wait = ir.events.find((event) => event.id === window.selectedEventId);
+    const diagnostic = ir.diagnostics.find((item) => item.related_events.includes(wait.id));
+    return {kind: wait.kind, pending: wait.meta.pending, line: wait.source.line, diagnosticLine: diagnostic.source.line,
+      time: [wait.t0.value, wait.t1.value]};
+  });
+  expect(evidence).toEqual({kind: "trigger_wait", pending: true, line: 1, diagnosticLine: 1, time: [200, 200]});
 });
 
 test("feedback queue overflow exposes accepted inputs and no uncommitted register result", async ({ page }) => {
@@ -103,7 +112,7 @@ test("feedback queue overflow exposes accepted inputs and no uncommitted registe
   await expect(value(page, "communications")).not.toContainText("feedback receive");
   await at(page, 400);
   await expect(value(page, "execution")).toContainText("error");
-  await expect(value(page, "execution")).toContainText("Feedback queue overflow at 400 ns.");
+  await expect(value(page, "execution")).toContainText("LINQ feedback queue overflow (capacity 2). · Observation end 400 ns");
   const receives = page.locator(".hardware-communication").filter({ has: page.getByRole("button", { name: "400 ns · feedback receive", exact: true }) });
   await expect(receives).toHaveCount(2);
   await expect(receives.nth(0)).toContainText("id 5 · value 11");
@@ -111,6 +120,13 @@ test("feedback queue overflow exposes accepted inputs and no uncommitted registe
   await expect(receives.nth(1)).toContainText("id 5 · value 22");
   await expect(receives.nth(1)).toContainText("Scenario input 1");
   await expect(value(page, "communications")).not.toContainText("value 33");
+  const rejection = await page.evaluate(() => {
+    const ir = window.demoIr;
+    const event = ir.events.find((item) => item.kind === "feedback_rejected");
+    const diagnostic = ir.diagnostics.find((item) => item.category === "feedback_queue_overflow");
+    return {time: event.t0.value, value: event.meta.value, input: event.meta.input_index, linked: diagnostic.related_events.includes(event.id)};
+  });
+  expect(rejection).toEqual({time: 400, value: 33, input: 2, linked: true});
   await tab(page, "Registers");
   await page.getByRole("checkbox", { name: "All 64" }).check();
   await expect(register(page, "R0")).toHaveText("?");
@@ -152,10 +168,10 @@ test("four-bin preview retains the previous result until wrapped acquisition com
   await expect(bin0).toContainText("I 24576000 · Q -4096000");
   await expect(bin0).not.toContainText("I 28672000");
   await page.locator('[data-bin="0:0"]').click();
-  await expect(value(page, "bin-history")).toContainText("ready 6072 ns");
+  await expect(value(page, "bin-history")).toContainText("Ready at 6072 ns");
   await at(page, 84072);
   await expect(bin0).toContainText("I 28672000 · Q -4096000");
-  await expect(value(page, "bin-history")).toContainText("ready 84072 ns");
+  await expect(value(page, "bin-history")).toContainText("Ready at 84072 ns");
   await expect(value(page, "bin-history")).toContainText("Scenario input");
   await bin0.locator("td").nth(4).getByRole("button").click();
   await expect(page.getByRole("spinbutton")).toHaveValue("84072");
@@ -168,6 +184,6 @@ test("four-bin preview retains the previous result until wrapped acquisition com
   expect((await page.evaluate(() => window.revealedSource)).line).toBe(92);
   await at(page, 84071);
   await expect(bin0).toContainText("I 24576000 · Q -4096000");
-  await expect(value(page, "bin-history")).toContainText("ready 6072 ns");
+  await expect(value(page, "bin-history")).toContainText("Ready at 6072 ns");
   await expect(value(page, "bin-history")).not.toContainText("28672000");
 });

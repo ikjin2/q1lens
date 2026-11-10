@@ -21,8 +21,12 @@ function controls(initial: any) {
   const node = () => ({dataset: {}, attributes: {} as Record<string, string>, title: "", innerHTML: "",
     classList: {add() {}}, setAttribute(name: string, value: string) {this.attributes[name] = value;} });
   const button = node(), status = node(), messages: any[] = [];
+  const functions = ["toolbarSvgIcon", "setIconOnlyToolbarButton", "externalInputDisplayTime", "triggerWaitReason",
+    "executionDisplayReason", "renderExecutionControls", "requestExecutionControl"];
   const runtime = Function("document", "vscode", "timelineExecutionState", `
-    ${["toolbarSvgIcon", "setIconOnlyToolbarButton", "renderExecutionControls", "requestExecutionControl"].map(name => sourceFunction(script, name)).join("\n")}
+    const timelineIr = {};
+    const timelineTimeBasis = "aligned";
+    ${functions.map(name => sourceFunction(script, name)).join("\n")}
     return {render: renderExecutionControls, click: requestExecutionControl,
       update(state) {timelineExecutionState = state; renderExecutionControls();}};
   `)({getElementById: (id: string) => id.endsWith("button") ? button : status}, {postMessage: (message: any) => messages.push(message)}, initial);

@@ -33,6 +33,45 @@ function lookupSourceForEvent(timelineIr, eventId) {
   return event && event.source ? event.source : undefined;
 }
 
+function lookupSourceForExternalArrival(timelineIr, eventId) {
+  const events = Array.isArray(timelineIr?.events) ? timelineIr.events : [];
+  const arrival = events.find((event) => event?.id === eventId);
+  if (arrival?.source?.file !== "<simulation>" || isRemovedEvent(arrival) ||
+      (arrival.kind !== "trigger_receive" && arrival.kind !== "feedback_receive")) {
+    return undefined;
+  }
+  const byEventId = timelineIr.source_map?.by_event_id ?? {};
+  const projectRoot = timelineIr.project?.root || timelineIr.project_root;
+  const sources = new Map();
+  for (const event of events) {
+    const meta = event?.meta;
+    if (!event || event.sequencer_id !== arrival.sequencer_id || isRemovedEvent(event) ||
+        meta?.branch_comparison_branch_id !== arrival.meta?.branch_comparison_branch_id ||
+        meta?.branch_comparison_path !== arrival.meta?.branch_comparison_path ||
+        meta?.pending || meta?.conditional_skipped || !Array.isArray(meta?.input_event_ids) ||
+        !meta.input_event_ids.includes(arrival.id)) {
+      continue;
+    }
+    const isConsumer = arrival.kind === "trigger_receive" ? event.kind === "wait_trigger"
+      : event.kind === "q1_issue" && (meta.op === "fb_pop_data" || meta.op === "fb_pull_data");
+    if (!isConsumer) {
+      continue;
+    }
+    for (const source of normalizeSources(byEventId[event.id] ?? event.source)) {
+      if (typeof source.file !== "string" || !source.file || /^<.*>$/.test(source.file) ||
+          !Number.isInteger(source.line) || source.line < 1) {
+        continue;
+      }
+      const file = normalizePathText(projectRoot ? path.resolve(projectRoot, source.file) : source.file);
+      sources.set(`${file}:${source.line}:${source.column || 1}`, source);
+      if (sources.size > 1) {
+        return undefined;
+      }
+    }
+  }
+  return sources.values().next().value;
+}
+
 function sourceMatchesLine(source, sourceFile, line) {
   if (!source || !source.file) {
     return false;
@@ -163,6 +202,7 @@ function hasDirectory(filePath) {
 }
 
 export {
+  lookupSourceForExternalArrival,
   lookupSourceForEvent,
   lookupEventIdsForSourceLine,
   lookupEventIdsForSourceRange,

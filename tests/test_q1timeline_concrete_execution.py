@@ -72,16 +72,14 @@ def test_register_target_and_label_value_work_without_expanded_instructions() ->
 
 
 @pytest.mark.parametrize("source", [
-    "jmp 3\nloop R0,@end\nmove 7,R1\nend: stop",
-    "move @end,R0\nnop\njmp @end\nloop R1,@end\nend: stop",
     "jmp R0\njlt R1,1,@end\nend: stop",
     "add R0,@end,R1\njge R1,1,@end\nend: stop",
 ])
-def test_expanded_instruction_addresses_block_before_creating_false_values(source: str) -> None:
+def test_expanded_programs_still_block_on_unknown_register_reads(source: str) -> None:
     state = execute(source)
     assert state.metadata["execution"]["status"] == "blocked"
     assert state.metadata["execution"]["steps"] == 0
-    assert "Compiled instruction-address mapping is unsupported" in state.metadata["execution"]["reason"]
+    assert "Operand R0 is unresolved" in state.metadata["execution"]["reason"]
     assert state.register_history == []
 
 
@@ -121,7 +119,7 @@ def test_unknown_inputs_and_unimplemented_semantics_block_before_execution(sourc
 
 
 @pytest.mark.parametrize("source", [
-    "move 1,R64\nstop", "add R0\nstop", "bogus 1\nstop", "illegal\nstop",
+    "move 1,R64\nstop", "add R0\nstop", "bogus 1\nstop",
     "jmp @missing\nstop", "jmp 99\nstop", "wait -1\nstop", "move 4294967296,R0\nstop",
 ])
 def test_strict_invalid_programs_error_without_executing_instruction(source: str) -> None:
@@ -129,6 +127,15 @@ def test_strict_invalid_programs_error_without_executing_instruction(source: str
     assert state.metadata["execution"]["status"] == "error"
     assert state.metadata["execution"]["steps"] == 0
     assert issues(state) == []
+
+
+def test_strict_mode_executes_the_explicit_illegal_fault() -> None:
+    state = execute("illegal\nstop", strict_q1asm=True)
+    execution = state.metadata["execution"]
+    assert execution["status"] == "error"
+    assert execution["steps"] == 1
+    assert execution["fault"]["q1_time_ns"] == 4
+    assert [issue.meta["op"] for issue in issues(state)] == ["illegal"]
 
 
 def test_unresolved_placeholder_in_strict_mode_remains_blocked() -> None:
@@ -261,10 +268,11 @@ def test_marker_bits_are_unsigned_and_phase_stays_unsigned() -> None:
     assert marker.meta["register_reads"]["R0"]["value"] == 0xFFFFFFFF
 
 
-def test_analysis_mode_preserves_existing_latched_register_interpretation() -> None:
+def test_analysis_mode_decodes_latched_frequency_and_preserves_register_word() -> None:
     state = interpret_program(parse_q1asm("move -4,R0\nnop\nset_freq R0\nupd_param 4\nstop"), sequencer_id="seq0")
     update = next(event for event in state.events if event.kind == "upd_param")
-    assert update.meta["applied_state"]["frequency"] == 4294967292
+    assert update.meta["applied_state"]["frequency"] == -4
+    assert state.registers["R0"] == Concrete(4294967292)
 
 
 def test_default_analysis_keeps_a_compact_loop_and_proves_its_affine_following_value() -> None:

@@ -114,6 +114,22 @@ describe("Q1 branch controls", () => {
     assert.equal(runtime.supported(issue.meta, {}), false);
   });
 
+  it("offers comparison for unresolved status branches with a supported target", () => {
+    const issue = event("status", {op: "jz", condition: "jz status flags", branch_comparison_supported: true});
+    const marker = event("marker", {condition: "jz status flags"}, "branch_region");
+    const runtime = load([issue, marker]);
+    for (const selected of [issue, marker]) {
+      const result = load([issue, marker]).render(selected);
+      assert.deepEqual(result.actions.map((action: any) => action.label),
+        ["Jump · @pulse", "Continue · L3", "Compare both", "Collapse", "Zoom around branch"]);
+      result.actions[2].click();
+      assert.deepEqual(result.messages, [{type: "setBranchAssumption", branchId: "branch", path: "both", eventId: selected.id}]);
+    }
+    const target = runtime.target(issue, "taken");
+    assert.equal(runtime.supported({...issue.meta, branch_comparison_supported: false}, target), false);
+    assert.equal(runtime.supported({...issue.meta, branch_decision: "concrete"}, target), false);
+  });
+
   it("sends only the branch choice and event identity without opening the source", () => {
     const issue = event("selected", { assumed_branch_path: "fallthrough", assumed_branch_taken: false });
     const result = load([issue]).render(issue);

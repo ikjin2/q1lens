@@ -175,9 +175,10 @@ def run_watch_once(project_file: str | Path, out_dir: str | Path) -> WatchRunRes
         config = load_project_config(project_path)
         states = _analyze_config(config)
         analyze_project_hardware_readiness(states, config.sequencers)
+        alignment_mode = config.alignment_for_execution(config.analysis.execution_mode)
         align_timelines(
             states,
-            mode=config.alignment_mode,
+            mode=alignment_mode,
             anchor_kinds=config.alignment_anchor_kinds,
         )
         diagnostics = [*config.diagnostics, *(diagnostic for state in states for diagnostic in state.diagnostics)]
@@ -185,12 +186,13 @@ def run_watch_once(project_file: str | Path, out_dir: str | Path) -> WatchRunRes
             states,
             project={
                 "root": str(config.root),
-                "alignment_mode": config.alignment_mode,
+                "alignment_mode": alignment_mode,
                 "alignment_anchor_kinds": list(config.alignment_anchor_kinds),
                 "display_file": str(config.display_file) if config.display_file else None,
                 "display": config.display,
             },
             diagnostics=diagnostics,
+            feedback_routes=config.simulation.get("routes", ()),
         )
         for entry, sequencer in zip(ir["sequencers"], config.sequencers):
             if sequencer.module:
@@ -273,6 +275,8 @@ def _analyze_config(config: ProjectConfig) -> list[AnalysisState]:
             simulation=config.simulation,
             sequences={seq.id: load_sequence_data(seq.sequence_json)
                        for seq in config.sequencers if seq.sequence_json},
+            hardware_parameters={seq.id: seq.hardware_parameters for seq in config.sequencers},
+            sequencer_metadata=config.sequencer_metadata(),
         )
     states = []
     for sequencer in config.sequencers:
@@ -289,6 +293,9 @@ def _analyze_config(config: ProjectConfig) -> list[AnalysisState]:
             execution_mode=config.analysis.execution_mode,
             max_steps=config.analysis.max_steps,
         )
+        state.metadata["hardware_parameters"] = dict(sequencer.hardware_parameters)
+        if sequence_names is not None:
+            state.metadata["weight_lengths"] = sequence_names.weight_lengths
         states.append(state)
     analyze_underflows(states)
     return states

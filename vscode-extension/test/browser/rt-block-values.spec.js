@@ -1,5 +1,6 @@
 const path = require("node:path");
-const { test, expect } = require("./helpers");
+const { execFileSync } = require("node:child_process");
+const { test, expect, analysisDetails } = require("./helpers");
 
 const assets = path.resolve(__dirname, "../../src");
 const value = (number) => ({kind: "concrete", value: number, display: String(number)});
@@ -25,9 +26,9 @@ function fixture() {
   ]};
 }
 
-async function mount(page, ir = fixture(), mode = "normal") {
+async function mount(page, ir = fixture(), mode = "normal", html) {
   await page.goto("about:blank");
-  await page.setContent(`<!doctype html><html><head><style>
+  await page.setContent(html || `<!doctype html><html><head><style>
     :root{--vscode-foreground:#d4d4d4;--vscode-descriptionForeground:#aaa;--vscode-editor-background:#1e1e1e;
     --vscode-editor-foreground:#d4d4d4;--vscode-editorWidget-background:#252526;--vscode-sideBar-background:#252526;
     --vscode-charts-green:#89d185;--vscode-charts-blue:#75beff;--vscode-charts-yellow:#cca700;
@@ -39,6 +40,7 @@ async function mount(page, ir = fixture(), mode = "normal") {
     let saved = {expandedQ1IssueSequencers: ["seq"]};
     window.acquireVsCodeApi = () => ({postMessage: (message) => window.messages.push(message),
       getState: () => saved, setState: (state) => {saved = state;}});
+    document.getElementById("timeline-ir")?.remove();
     const data = document.createElement("script");
     data.id = "timeline-ir"; data.type = "application/json"; data.textContent = JSON.stringify(ir); document.body.append(data);
     const state = document.createElement("meta"); state.id = "q1timeline-webview-state";
@@ -52,6 +54,72 @@ async function mount(page, ir = fixture(), mode = "normal") {
     await page.addScriptTag({path: path.join(assets, file)});
   }
 }
+
+function diagnosticEvidenceFixture() {
+  const repo = path.resolve(__dirname, "../../..");
+  return JSON.parse(execFileSync(process.env.Q1LENS_BROWSER_PYTHON || "python", ["-c", [
+    "import json", "from q1timeline.analysis.api import analyze_documents", "from q1timeline.render.html import render_html",
+    "programs={'a.q1asm':'acquire 0,0,4\\nstop','b.q1asm':'acquire 0,0,4\\nstop','rx.q1asm':'wait 400\\nstop'}",
+    "simulation={'startup_delay_ns':100,'trigger_networks':{'rack':{'grid_epoch_ns':100}},'trigger_routes':[{'source':seq,'target':'rx','address':3,'network':'rack'} for seq in ('a','b')],'inputs':{'acquisitions':[{'sequencer':seq,'acquisition_index':0,'bin_index':0,'thresholded':1} for seq in ('a','b')]}}",
+    "ir=analyze_documents(programs,execution_mode='simulation',alignment_mode='first_rt_dequeue',simulation=simulation)",
+    "by_id={event['id']:event for event in ir['events']}",
+    "conflict=next(d for d in ir['diagnostics'] if d['category']=='trigger_network_conflict')",
+    "request,result=(next(event_id for event_id in conflict['related_events'] if by_id[event_id]['kind']==kind) for kind in ('trigger_network_request','acquisition_result'))",
+    "issue=next(event['id'] for event in ir['events'] if event['kind']=='q1_issue' and event['sequencer_id']=='a')",
+    "unrendered=next(event['id'] for event in ir['events'] if event['kind']=='rt_queue_enqueue')",
+    "ir['diagnostics'].extend({'severity':'warning','category':category,'message':category,'related_events':ids} for category,ids in [('hidden_q1',[issue,result]),('single_q1',[issue]),('missing_first',[unrendered,result])])",
+    "print(json.dumps({'ir':ir,'html':render_html(ir,default_mode='normal'),'request':request,'result':result,'issue':issue,'ordered':conflict['related_events']}))",
+  ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
+}
+
+test("diagnostic link follows the first visible evidence in the VS Code timeline", async ({page}) => {
+  const {ir, html, request, result, issue, ordered} = diagnosticEvidenceFixture();
+  const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
+    /type=["']application\/json["']/i.test(attributes) ? tag : "");
+  await mount(page, ir, "normal", shell);
+  await analysisDetails(page);
+  const link = (category) => page.locator(`[data-diagnostic-category="${category}"]`).getByRole("link", {name: "Show event"}).first();
+  const conflict = link("trigger_network_conflict");
+  await expect(conflict).toHaveAttribute("data-related-event-id", request);
+  expect(JSON.parse(await conflict.getAttribute("data-related-event-ids"))).toEqual(ordered);
+  const selected = () => page.evaluate(() => window.messages.filter((message) => message.type === "eventClick").map((message) => message.eventId));
+  await conflict.click();
+  await expect(page.locator(`.timeline-block[data-event-id="${result}"]`)).toHaveAttribute("aria-selected", "true");
+  await page.getByRole("button", {name: "Debug view"}).click();
+  await conflict.click();
+  await expect(page.locator(`.timeline-block[data-event-id="${request}"]`)).toHaveAttribute("aria-selected", "true");
+  await link("missing_first").click();
+  await page.getByRole("button", {name: "Normal view"}).click();
+  const legacy = link("single_q1");
+  await legacy.evaluate((node) => node.removeAttribute("data-related-event-ids"));
+  await legacy.click();
+  expect(await selected()).toEqual([result, request, result, issue]);
+  await expect(page.locator("#event-inspector-fields")).toContainText("a.q1asm:1");
+});
+
+test("standalone diagnostic link chooses evidence from the active SVG", async ({page}) => {
+  const {html, request, result, issue} = diagnosticEvidenceFixture();
+  await page.setContent(html);
+  await analysisDetails(page);
+  await page.evaluate(() => {
+    window.selectedEvidence = [];
+    window.addEventListener("q1timeline:eventClick", (event) => window.selectedEvidence.push(event.detail.eventId));
+  });
+  const link = (category) => page.locator(`[data-diagnostic-category="${category}"]`).getByRole("link", {name: "Show event"}).first();
+  const visible = (id) => page.locator(`#timeline-root > svg [data-event-id="${id}"]`);
+  await expect(visible(request)).toHaveCount(0);
+  await link("trigger_network_conflict").click();
+  await expect(visible(result)).toHaveClass(/is-selected/);
+  await link("hidden_q1").click();
+  await expect(page.locator(`#timeline-root > svg .is-selected[data-event-id="${result}"]`)).toBeVisible();
+  await page.locator("#mode-debug").click();
+  await link("trigger_network_conflict").click();
+  await expect(visible(request)).toHaveClass(/is-selected/);
+  await link("hidden_q1").click();
+  await expect(page.locator(`#timeline-root > svg .is-selected[data-event-id="${issue}"]`)).toBeVisible();
+  await link("missing_first").click();
+  expect(await page.evaluate(() => window.selectedEvidence)).toEqual([result, result, request, issue, result]);
+});
 
 test("RT blocks expand captured values and highlight only known changes", async ({page}) => {
   const ir = fixture();

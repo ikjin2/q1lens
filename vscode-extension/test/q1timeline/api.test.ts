@@ -3,7 +3,9 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createQ1TimelineControllerState, q1timelineProjectOutputDir } from "../../src/q1timeline/register";
-import { lookupEventIdsForSourceLine, lookupEventIdsForSourceRange, lookupSourceForEvent } from "../../src/q1timeline/sourceMapLookup";
+import {
+  lookupEventIdsForSourceLine, lookupEventIdsForSourceRange, lookupSourceForEvent, lookupSourceForExternalArrival,
+} from "../../src/q1timeline/sourceMapLookup";
 import {
   collectProjectRelatedPaths,
   isProjectRelatedPath,
@@ -159,6 +161,30 @@ describe("q1timeline internal API", () => {
     );
   });
 
+  it("requires one source location among arrival consumers on the same sequencer and comparison path", () => {
+    const branch = { branch_comparison_branch_id: "branch-a", branch_comparison_path: "taken" };
+    const arrival = { id: "arrival", kind: "trigger_receive", sequencer_id: "seq0",
+      source: { file: "<simulation>", line: 1 }, meta: branch };
+    const source = { file: "seq0.q1asm", line: 2 };
+    const consumer = { id: "consumer", kind: "wait_trigger", sequencer_id: "seq0", source,
+      meta: { ...branch, input_event_ids: [arrival.id] } };
+    const unrelated = [
+      { ...consumer, id: "peer", sequencer_id: "seq1" },
+      { ...consumer, id: "other-branch", meta: { ...consumer.meta, branch_comparison_branch_id: "branch-b" } },
+      { ...consumer, id: "other-path", meta: { ...consumer.meta, branch_comparison_path: "fallthrough" } },
+      { ...consumer, id: "removed", meta: { ...consumer.meta, diff_status: "removed" } },
+      { ...consumer, id: "skipped", meta: { ...consumer.meta, conditional_skipped: true } },
+      { ...consumer, id: "pending", meta: { ...consumer.meta, pending: true } },
+    ].map((event) => ({ ...event, source: { ...source, line: 3 } }));
+    const timelineIr = { events: [arrival, ...unrelated] };
+    assert.equal(lookupSourceForExternalArrival(timelineIr, arrival.id), undefined);
+    timelineIr.events.push(consumer, { ...consumer, id: "repeat" });
+    assert.deepEqual(lookupSourceForExternalArrival(timelineIr, arrival.id), source);
+    timelineIr.events.push({ ...consumer, id: "ambiguous", source: { ...source, line: 4 } });
+    assert.equal(lookupSourceForExternalArrival(timelineIr, arrival.id), undefined);
+    assert.deepEqual(lookupSourceForEvent(timelineIr, arrival.id), arrival.source);
+  });
+
   it("omits diff-removed events from active source-line lookup", () => {
     const timelineIr: any = {
       source_map: {
@@ -283,7 +309,17 @@ describe("q1timeline internal API", () => {
     assert.equal(diagnostic?.range.startColumn, 0);
   });
 
-  it("ignores malformed related diagnostic entries", () => {
+  it("keeps synthetic arrival diagnostics out of editor source mapping", () => {
+    const diagnostic = mapAnalyzerDiagnostic({
+      severity: "error",
+      category: "feedback_queue_overflow",
+      source: { file: "<simulation>", line: 1 },
+      related_events: ["seq:e5"],
+    }, () => assert.fail("Synthetic arrivals have no editor path"));
+    assert.equal(diagnostic, undefined);
+  });
+
+  it("ignores malformed and synthetic related diagnostic entries", () => {
     const diagnostic = mapAnalyzerDiagnostic(
       {
         severity: "warning",
@@ -293,6 +329,7 @@ describe("q1timeline internal API", () => {
         related: [
           null,
           {},
+          { source: { file: "<simulation>", line: 1 }, message: "simulated arrival" },
           { source: { file: "schedule.py", line: 12 }, message: "source pulse" },
         ],
       },

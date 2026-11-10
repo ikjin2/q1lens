@@ -8,6 +8,9 @@ from q1timeline.analysis.values import Concrete, Value, add_values, multiply_val
 from q1timeline.diagnostics import Diagnostic
 
 
+SIMULATION_ALIGNMENT_MODE = "first_rt_dequeue"
+
+
 @dataclass(frozen=True)
 class AlignmentResult:
     mode: str
@@ -20,10 +23,13 @@ class AlignmentResult:
 def align_timelines(
     states: list[AnalysisState],
     *,
-    mode: str = "first_wait_sync",
+    mode: str | None = None,
     anchor_kinds: list[str] | tuple[str, ...] | None = None,
 ) -> AlignmentResult:
     normalized_anchor_kinds = tuple(anchor_kinds or ())
+    if states and all("simulation" in state.metadata for state in states):
+        return _align_simulation(states, mode or SIMULATION_ALIGNMENT_MODE, normalized_anchor_kinds)
+    mode = mode or "first_wait_sync"
     offsets: dict[str, Value] = {}
     anchor_events: dict[str, str | None] = {}
     diagnostics: list[Diagnostic] = []
@@ -72,6 +78,41 @@ def align_timelines(
     return result
 
 
+def _align_simulation(states: list[AnalysisState], mode: str, anchor_kinds: tuple[str, ...]) -> AlignmentResult:
+    # Compare the actual anchor edge on the shared clock. Sequencer and event
+    # IDs break ties independently of input order. Alternative paths do not
+    # set the clock origin for the recorded baseline.
+    def earliest(anchor_mode: str) -> TimelineEvent | None:
+        candidates = (event for state in states for event in _anchor_candidates(state, anchor_mode, anchor_kinds, simulation=True)
+                      if not event.meta.get("branch_comparison_path") and not _anchor_confidence_unknown(anchor_mode, event))
+        return min(candidates, key=lambda event: (_anchor_time(anchor_mode, event).value, event.sequencer_id, event.id), default=None)
+
+    anchor = earliest(mode) if _mode_requires_anchor(mode) else None
+    diagnostics = []
+    offset_mode = mode
+    if anchor is None and _mode_requires_anchor(mode) and mode != SIMULATION_ALIGNMENT_MODE:
+        offset_mode = SIMULATION_ALIGNMENT_MODE
+        anchor = earliest(offset_mode)
+        owner = min(states, key=lambda state: state.sequencer_id)
+        fallback = "the first RT dequeue" if anchor else "simulation time zero"
+        diagnostic = Diagnostic(
+            severity="warning", category="alignment_missing", source=_fallback_source(owner),
+            message=f"No concrete project-wide alignment anchor for {mode}. Using {fallback}.",
+            details={**_alignment_diagnostic_details(owner.sequencer_id, mode, anchor_kinds), "fallback": offset_mode},
+        )
+        diagnostics.append(diagnostic)
+        owner.diagnostics.append(diagnostic)
+    offset = _offset_for_mode(offset_mode, anchor)
+    for state in states:
+        _apply_alignment_metadata(state, mode, offset, anchor, anchor_kinds)
+        state.metadata["alignment"].update(clock="shared_simulation", confidence="exact", unaligned=False,
+                                           anchor_sequencer_id=anchor.sequencer_id if anchor else None)
+        if offset_mode != mode:
+            state.metadata["alignment"]["fallback"] = offset_mode
+    return AlignmentResult(mode, {state.sequencer_id: offset for state in states},
+                           {state.sequencer_id: anchor.id if anchor else None for state in states}, "exact", diagnostics)
+
+
 def diagnostics_for_state(diagnostics: list[Diagnostic], sequencer_id: str) -> list[Diagnostic]:
     return [
         diagnostic
@@ -94,38 +135,56 @@ def _find_anchor(
     mode: str,
     anchor_kinds: tuple[str, ...] = (),
 ) -> TimelineEvent | None:
+    return next(iter(_anchor_candidates(state, mode, anchor_kinds)), None)
+
+
+def _anchor_candidates(state: AnalysisState, mode: str, anchor_kinds: tuple[str, ...], *, simulation: bool = False):
     if mode == "none" or mode.startswith("manual:"):
-        return None
-    if mode in {"first_wait_sync", "after_first_wait_sync"}:
-        return _first_event(state, lambda event: event.kind == "wait_sync")
+        return ()
+    if mode == SIMULATION_ALIGNMENT_MODE:
+        return (event for event in state.events if event.kind == "rt_queue_dequeue")
+    if mode == "after_first_wait_sync":
+        return (event for event in state.events if event.kind == "wait_sync" and (
+            not simulation or ("observation_cutoff_ns" not in event.meta and not event.meta.get("interrupted_by_fault"))
+        ))
+    if mode == "first_wait_sync":
+        return (event for event in state.events if event.kind == "wait_sync" or (
+            simulation and event.kind == "sync_wait" and event.meta.get("pending") is True
+        ))
     if mode == "first_wait_trigger":
-        return _first_event(state, lambda event: event.kind == "wait_trigger")
+        return (event for event in state.events if event.kind == "wait_trigger" or (
+            simulation and event.kind == "trigger_wait" and event.meta.get("pending") is True
+        ))
     if mode == "first_anchor":
         anchor_kind_set = set(anchor_kinds)
-        return _first_event(state, lambda event: event.kind in anchor_kind_set)
+        return (event for event in state.events if event.kind in anchor_kind_set)
     if mode == "first_marker_rise":
         marker_state_anchor = _first_marker_state_rise(state)
         if marker_state_anchor is not None:
-            return marker_state_anchor
-        return _first_event(state, _is_pending_marker_rise)
+            return (marker_state_anchor,)
+        return () if simulation else (event for event in state.events if _is_pending_marker_rise(event))
     if mode == "first_play":
-        return _first_event(state, lambda event: event.kind == "play")
+        return (event for event in state.events if event.kind == "play")
     if mode == "first_acquire":
-        return _first_event(state, lambda event: event.kind == "acquire")
+        return (event for event in state.events if event.kind == "acquire")
     if mode.startswith("label:"):
         label = _label_alignment_payload(mode)
         pc = state.labels.get(label)
         if pc is None:
-            return None
+            return ()
         instruction = state.instructions_by_pc.get(pc)
         if instruction is None:
-            return None
-        return _first_event(
-            state,
-            lambda event: event.source.line == instruction.source.line
-            and event.kind != "q1_issue",
+            return ()
+        return (
+            event for event in state.events
+            if event.kind != "q1_issue"
+            and event.source.file == instruction.source.file and event.source.line == instruction.source.line
+            and (not simulation or (
+                event.lane.startswith("rt.")
+                and ("rt_execution_ns" in event.meta or event.kind in {"stop", "sync_wait", "trigger_wait"})
+            ))
         )
-    return None
+    return ()
 
 
 def _label_alignment_payload(mode: str) -> str:
@@ -186,6 +245,7 @@ def _apply_alignment_metadata(
     anchor_kinds: tuple[str, ...] = (),
 ) -> None:
     anchor_confidence_unknown = _anchor_confidence_unknown(mode, anchor)
+    nominal_anchor = bool(anchor and anchor.meta.get("rt_trigger_epoch"))
     alignment_metadata = {
         "mode": mode,
         "offset": _plain_offset(offset),
@@ -195,8 +255,14 @@ def _apply_alignment_metadata(
     }
     if anchor_kinds:
         alignment_metadata["anchor_kinds"] = list(anchor_kinds)
+    if nominal_anchor:
+        alignment_metadata["time_basis"] = "nominal"
     state.metadata["alignment"] = alignment_metadata
     for event in chain(state.events, getattr(state, "observed_loop_events", ())):
+        if nominal_anchor and (event.lane.startswith("rt.") or event.lane == "state.pending") and "fault" not in event.meta:
+            event.meta["aligned_time_nominal"] = True
+        else:
+            event.meta.pop("aligned_time_nominal", None)
         event.meta["local_t0"] = _plain_time(event.t0)
         event.meta["aligned_t0"] = _plain_time(add_values(event.t0, offset))
         if event.t1 is not None:
@@ -204,15 +270,14 @@ def _apply_alignment_metadata(
             event.meta["aligned_t1"] = _plain_time(add_values(event.t1, offset))
 
 
-def _first_event(state: AnalysisState, predicate) -> TimelineEvent | None:
-    return next((event for event in state.events if predicate(event)), None)
+def _anchor_time(mode: str, anchor: TimelineEvent) -> Value | None:
+    return anchor.t1 if mode == "after_first_wait_sync" else anchor.t0
 
 
 def _anchor_confidence_unknown(mode: str, anchor: TimelineEvent | None) -> bool:
     if not _mode_requires_anchor(mode) or anchor is None:
         return _mode_requires_anchor(mode)
-    anchor_time = anchor.t1 if mode == "after_first_wait_sync" else anchor.t0
-    return not isinstance(anchor_time, Concrete)
+    return bool(anchor.meta.get("rt_trigger_epoch")) or not isinstance(_anchor_time(mode, anchor), Concrete)
 
 
 def _plain_offset(value: Value):

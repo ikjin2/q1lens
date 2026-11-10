@@ -130,6 +130,20 @@ describe("DEF execution and sweep in VS Code", function () {
       await waitText('[data-field="trace-heading"]', "sweep case 5");
       await waitText('[data-field="result"]', "X=2, Y=10");
       assert.equal(await frame.locator('[data-result="word"][data-observed="R2"]').textContent(), "12");
+      await frame.getByRole("textbox", { name: "Formula", exact: true }).fill("R2");
+      await frame.getByLabel("Reference formula").fill("X + Y + 0.125");
+      await frame.getByLabel("Absolute tolerance").fill("0.125");
+      await frame.getByRole("button", { name: "Plot formula" }).click();
+      await waitText('[data-comparison="pass"]', "6");
+      assert.equal(await frame.locator('[data-comparison="fail"]').textContent(), "0");
+      const errorPoint = frame.locator('svg[aria-label="Two-axis DEF heatmap by Error"] [data-case="5"]');
+      assert.match(await errorPoint.getAttribute("aria-label") || "", /Error -0\.125 · Pass/);
+      await frame.getByLabel("Absolute tolerance").fill("0.1");
+      await frame.getByRole("button", { name: "Plot formula" }).click();
+      await waitText('[data-comparison="fail"]', "6");
+      assert.equal(await errorPoint.getAttribute("data-verdict"), "fail");
+      await errorPoint.click();
+      await waitText('[data-field="trace-heading"]', "sweep case 5");
 
       await frame.getByLabel("Sweep axis 2").selectOption("");
       await r1.uncheck();
@@ -149,6 +163,14 @@ describe("DEF execution and sweep in VS Code", function () {
       assert.equal(await frame.locator('[data-time-statistics]').count(), 0);
       assert.equal(await frame.locator('[data-field="sweep-results"] svg, button[data-case]').count(), 0);
 
+      const sampleCount = frame.getByRole("spinbutton", { name: "Sample count" });
+      const random = frame.getByRole("button", { name: "Random sample" });
+      await sampleCount.fill("32");
+      await random.click();
+      await waitText('[data-cases-reported]', "32 / 32 samples reported");
+      await waitText(`${r2Stats} [data-stat="count"]`, "32");
+      assert.equal(await frame.locator('[data-time-statistics], button[data-case]').count(), 0);
+
       await frame.getByLabel("Axis 1 max").fill("999999");
       await waitText('[data-field="plan"]', "1000000 combinations");
       await frame.getByRole("button", { name: "Start sweep" }).click();
@@ -157,6 +179,39 @@ describe("DEF execution and sweep in VS Code", function () {
       await waitText('[data-status="cancelled"]', "Cancelled");
       assert.ok(Number(await frame.locator(`${r2Stats} [data-stat="count"]`).textContent()) > 0);
       await output.selectOption("cases");
+      await frame.getByLabel("Axis 1 max").fill("4096");
+      await waitText('[data-field="plan"]', /4097 combinations.*Maximum 4,096/);
+      assert.equal(await frame.getByRole("button", { name: "Start sweep" }).isDisabled(), true);
+      await time.check();
+      await sampleCount.fill("6");
+      await random.click();
+      await waitText('[data-cases-reported]', "6 / 6 samples reported");
+      await waitText('[data-comparison="fail"]', "6");
+      const sampledCase = frame.getByRole("button", { name: "Case 1", exact: true });
+      const sampledDefs = await sampledCase.locator("xpath=../..").locator("td").first().textContent();
+      const sampledX = Number(sampledDefs?.match(/^X=(\d+), Y=10$/)?.[1]);
+      assert.ok(sampledX >= 0 && sampledX <= 4096);
+      const sampledPoint = frame.locator('svg[aria-label="DEF input versus Formula"] [data-case="1"]');
+      assert.match(await sampledPoint.getAttribute("aria-label") || "", new RegExp(`X=${sampledX}, Y=10.*Formula ${sampledX + 10}`));
+      assert.match(await frame.locator('svg[aria-label="DEF input versus Error"] [data-case="1"]').getAttribute("aria-label") || "", /Error -0\.125 · Fail/);
+      await sampledPoint.click();
+      await waitText('[data-field="trace-heading"]', "sweep case 1");
+      await waitText('[data-field="result"]', `X=${sampledX}, Y=10`);
+      assert.equal(await frame.locator('[data-result="word"][data-observed="R2"]').textContent(), String(sampledX + 10));
+      assert.equal(await frame.locator('[data-result="time"]').textContent(), "40 ns");
+
+      await sampleCount.fill("25000");
+      await frame.getByRole("button", { name: "Estimate time" }).click();
+      await waitText('[data-field="estimate"]', /Estimated time: about .+ \(measured on \d+ samples\)/);
+      await waitText('[data-cases-reported]', "6 / 6 samples reported");
+      await random.click();
+      await waitText('[data-cases-reported]', /[1-9]\d* \/ 25000 samples reported/);
+      await frame.getByRole("button", { name: "Stop sampling" }).click();
+      await waitText('[data-status="cancelled"]', "Cancelled");
+      const partial = Number(await frame.locator(`${r2Stats} [data-stat="count"]`).textContent());
+      assert.ok(partial > 0 && partial < 25000);
+      assert.equal(await frame.locator('[data-time-statistics] [data-stat="count"]').textContent(), String(partial));
+      assert.equal(await frame.locator('[data-comparison="fail"]').textContent(), String(partial));
       await frame.getByLabel("Axis 1 max").fill("4095");
       await waitText('[data-field="plan"]', "4096 combinations");
       await frame.getByRole("button", { name: "Start sweep" }).click();
@@ -168,7 +223,7 @@ describe("DEF execution and sweep in VS Code", function () {
       assert.equal(await vscode.workspace.applyEdit(edit), true);
       await waitText('[data-field="progress"]', /Stale/);
       await waitText('[data-field="message"]', "Save the project and Q1ASM sources");
-      await waitText('[data-field="trace-heading"]', "sweep case 5");
+      await waitText('[data-field="trace-heading"]', "sweep case 1");
       assert.equal(await frame.locator('button[data-case="1"]').isDisabled(), true);
       assert.equal(await doc.save(), true);
 

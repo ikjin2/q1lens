@@ -371,6 +371,43 @@ describe("hardware state cursor model", () => {
     assert.equal(result.eventId, "result");
   });
 
+  it("keeps each latest digital acquisition outcome and only timestamps available data as ready", () => {
+    const ir = fixture();
+    ir.simulation = { seq0: { queue_capacity: 32 } };
+    const result = (id: string, time: number, meta: any) => event(id, "acquisition_result", time, time, 3,
+      { acquisition_index: 0, bin_index: 0, kind: "acquire_timetags", ...meta });
+    ir.events.push(result("level", 100, { kind: "acquire_digital", status: "supplied", level: 0 }),
+      result("unavailable", 104, { kind: "acquire_digital", status: "unavailable", reason: "No digital input" }),
+      result("incomplete", 105, { status: "incomplete", count: 1, reason: "Gate stayed open" }),
+      result("discarded", 106, { status: "discarded", count: 0, timetag_reason: "Missing edge" }),
+      result("invalid", 107, { status: "invalid", count: 1, timetag_reason: "Missing reference" }),
+      result("invalid-count", 108, { status: "supplied", count_valid: false, valid: false, classification_reason: "Invalid count" }),
+      result("count", 109, { status: "modeled", count: 0, valid: false, timetag_ticks: null }),
+      result("delta", 110, { status: "supplied", count_valid: false, valid: true, timetag_ticks: -129 }));
+    const before = JSON.stringify(ir);
+    const index = hardware.createIndex(ir);
+    const outcomeAt = (time: number) => hardware.snapshot(index, "seq0", time - 20, "aligned").bins.records[0].result;
+
+    assert.equal(outcomeAt(103).readyTime, 80);
+    assert.equal(outcomeAt(103).digital.level, 0);
+    for (const [time, id, status] of [[104, "unavailable", "unavailable"], [105, "incomplete", "incomplete"],
+      [106, "discarded", "discarded"], [107, "invalid", "invalid"], [108, "invalid-count", "invalid"]] as const) {
+      const outcome = outcomeAt(time);
+      assert.equal(outcome.eventId, id);
+      assert.equal(outcome.status, status);
+      assert.equal(outcome.outcomeTime, time - 20);
+      assert.equal(Object.hasOwn(outcome, "readyTime"), false);
+    }
+    assert.equal(outcomeAt(104).reason, "No digital input");
+    assert.equal(outcomeAt(109).readyTime, 89);
+    assert.equal(outcomeAt(109).digital.edgeCount, 0);
+    assert.equal(outcomeAt(109).digital.timetagTicks, undefined);
+    assert.equal(outcomeAt(110).readyTime, 90);
+    assert.equal(outcomeAt(110).digital.edgeCount, undefined);
+    assert.equal(outcomeAt(110).digital.timetagTicks, -129);
+    assert.equal(JSON.stringify(ir), before);
+  });
+
   it("aligns indexed physical samples with the cursor without holding values beyond trace bounds", () => {
     const ir = fixture();
     const trace = { stage: "adc", path: "i", t0: 100, dt_ns: 2, samples: [0.1, 0.2, 0.3], source: { kind: "supplied_trace", label: "input waveform" } };
@@ -595,6 +632,120 @@ describe("hardware state cursor model", () => {
     assert.ok(state.warnings.some((message: string) => message.includes("Collapsed loop")));
   });
 
+  it("keeps compact loop uncertainty scoped to the latest applicable fields", () => {
+    const ir = fixture();
+    const loopA = event("loop-a", "loop_block", 116, 120, 10, { count: 3, loop_q1_issue_event_id: "q-loop-a",
+      source_end: source(10), uncertain_registers: ["R0"], uncertain_latched_fields: ["frequency"] });
+    ir.events.push(
+      event("marker", "latched_state_pending", 118, 118, 9, { field: "marker", value: 7, q1_issue_event_id: "q-marker" }),
+      event("q-marker", "q1_issue", 16, 20, 9, { op: "set_mrk" }),
+      event("q-loop-a", "q1_issue", 24, 44, 10, { op: "loop" }), loopA,
+      event("q-loop-b", "q1_issue", 48, 72, 11, { op: "loop" }),
+      event("loop-b", "loop_block", 124, 128, 11, { count: 3, loop_q1_issue_event_id: "q-loop-b",
+        source_end: source(11), uncertain_registers: ["R1"], uncertain_latched_fields: ["marker"] }),
+      event("updated", "upd_param", 160, 164, 12, { rt_packet_id: "p6", applied_state: { frequency: 200 } }),
+    );
+    ir.register_history.push(write("R5", 12, 77, 4), write("R0", 76, 0, 4));
+    const index = hardware.createIndex(ir);
+    for (const basis of ["local", "aligned"]) {
+      const time = (local: number) => local + (basis === "aligned" ? -20 : 0);
+      const at = (local: number) => hardware.snapshot(index, "seq0", time(local), basis);
+      const parameter = (local: number, field: string) => at(local).parameters.find((item: any) => item.field === field);
+      assert.equal(at(43).registers[0].value.value, 1);
+      assert.equal(at(44).registers[0].known, false);
+      assert.equal(at(73).registers[0].known, false);
+      assert.equal(at(76).registers[0].value.value, 0);
+      assert.equal(hardware.registerAt(index, "seq0", "r0", time(73), basis), null);
+      assert.equal(at(73).registers[5].value.value, 77);
+      assert.equal(hardware.registerAt(index, "seq0", "r5", time(73), basis).value.value, 77);
+      assert.equal(parameter(45, "marker").pending.value, 7);
+      assert.equal(parameter(72, "marker").pending.known, false);
+      assert.equal(parameter(119, "frequency").applied.value, 120);
+      assert.equal(parameter(129, "frequency").applied.known, false);
+      assert.equal(parameter(160, "frequency").applied.value, 200);
+      assert.equal(at(129).rt.status, "unknown");
+      assert.equal(at(129).bins.partial, true);
+    }
+
+    delete loopA.meta.uncertain_registers;
+    delete loopA.meta.uncertain_latched_fields;
+    const legacy = hardware.snapshot(hardware.createIndex(ir), "seq0", 45);
+    assert.equal(legacy.registers[5].known, false);
+    assert.equal(legacy.parameters.find((item: any) => item.field === "marker").pending.known, false);
+  });
+
+  it("keeps RT and bin state exact only for a proven Q1-only compact loop", () => {
+    const ir = fixture();
+    const body = event("body", "q1_issue", 0, 4, 3, { op: "nop", emits_rt_packet: false });
+    const jump = event("jump", "q1_issue", 4, 20, 4, { op: "jmp", emits_rt_packet: false });
+    const loop = event("loop", "loop_block", 0, 0, 3, { count: "forever", period: concrete(0), period_invariant: true,
+      first_iteration_event_ids: [body.id], loop_q1_issue_event_id: jump.id, uncertain_registers: ["R0"] });
+    ir.events = [body, jump, loop];
+    ir.register_history = [write("R0", 8, 3, 1)];
+    const at = (time: number) => hardware.snapshot(hardware.createIndex(ir), "seq0", time);
+    assert.equal(at(19).q1.status, "active");
+    assert.equal(at(19).rt.status, "not-started");
+    assert.equal(at(20).q1.status, "unknown");
+    assert.equal(at(20).registers[0].known, false);
+    assert.equal(at(20).bins.partial, false);
+    assert.ok(at(20).warnings.some((warning: string) => warning.includes("Q1 state")));
+
+    ir.events.unshift(event("earlier", "acquire", -4, 0, 2, { rt_packet_id: "p0", acquisition_index: 0, bin_index: 0 }));
+    assert.equal(at(19).rt.event.id, "earlier");
+    assert.equal(at(19).bins.records[0].count, 1);
+    assert.equal(at(19).bins.partial, false);
+
+    delete body.meta.emits_rt_packet;
+    assert.equal(at(19).rt.status, "unknown");
+    assert.equal(at(19).bins.partial, true);
+    body.meta.emits_rt_packet = true;
+    body.meta.rt_packet_id = "p1";
+    assert.equal(at(19).rt.status, "unknown");
+    assert.equal(at(19).bins.partial, true);
+
+    body.meta.emits_rt_packet = false;
+    delete body.meta.rt_packet_id;
+    ir.events.push(event("separate-risk", "unknown_region", 12, null, 5));
+    assert.equal(at(19).rt.status, "unknown");
+    assert.equal(at(19).bins.partial, true);
+  });
+
+  it("uses a separate Q1 boundary for each compact loop visit and ignores previews", () => {
+    const ir = fixture();
+    const loops = [event("first-loop", "loop_block", 0, 4, 4, { count: 2, loop_q1_issue_event_id: "first-edge",
+      source_end: source(5), first_iteration_event_ids: ["first-body"] }),
+    event("second-loop", "loop_block", 8, 12, 4, { count: 2, loop_q1_issue_event_id: "second-edge",
+      source_end: source(5), first_iteration_event_ids: ["second-body"] })];
+    ir.events = [
+      event("first-body", "q1_issue", 12, 16, 4, { op: "wait" }),
+      event("first-edge", "q1_issue", 16, 40, 5, { op: "loop" }),
+      loops[0],
+      event("preview-edge", "q1_issue", 40, 48, 5, { op: "loop", preview_source_event_id: "first-edge" }),
+      event("first-next", "q1_issue", 48, 60, 6, { op: "sub" }),
+      event("second-body", "q1_issue", 84, 88, 4, { op: "wait" }),
+      event("second-edge", "q1_issue", 88, 112, 5, { op: "loop" }),
+      loops[1],
+      event("second-next", "q1_issue", 120, 132, 6, { op: "sub" }),
+    ];
+    for (const legacy of [false, true]) {
+      if (legacy) for (const loop of loops) delete loop.meta.loop_q1_issue_event_id;
+      const index = hardware.createIndex(ir);
+      for (const basis of ["local", "aligned"]) {
+        const status = (local: number) => hardware.summarize(index, "seq0", local + (basis === "aligned" ? -20 : 0), basis).q1.status;
+        for (const [before, start, last, resume] of [[39, 40, 47, 48], [111, 112, 119, 120]]) {
+          assert.equal(status(before), "active");
+          assert.equal(status(start), "unknown");
+          assert.equal(status(last), "unknown");
+          assert.equal(status(resume), "active");
+        }
+      }
+    }
+    // The older unambiguous source lookup remains available without summary membership.
+    ir.events = ir.events.filter((item: any) => !item.id.startsWith("second-"));
+    delete loops[0].meta.first_iteration_event_ids;
+    assert.equal(hardware.summarize(hardware.createIndex(ir), "seq0", 40).q1.status, "unknown");
+  });
+
   it("preserves symbolic register values and never treats symbolic times as concrete", () => {
     const ir = fixture();
     ir.register_history.push(write("R1", 16, { kind: "runtime_dependent", display: "runtime_dependent(feedback)" }, 4));
@@ -734,6 +885,73 @@ describe("hardware state cursor model", () => {
     assert.equal(state.bins.partial, true);
   });
 
+  it("anchors unresolved branch Q1 risk to the recorded issue, independently of RT", () => {
+    const ir = fixture();
+    const region = event("unresolved", "branch_region", 8, null, 7, { q1_issue_event_id: "second-jz" });
+    ir.events = [
+      event("wait", "wait", 4, 8, 3, { rt_packet_id: "p0" }),
+      event("first-jz", "q1_issue", 36, 52, 7, { op: "jz" }),
+      event("body", "q1_issue", 52, 56, 3, { op: "wait" }),
+      event("second-jz", "q1_issue", 80, 96, 7, { op: "jz" }),
+      event("preview-jz", "q1_issue", 100, 116, 7, { op: "jz", preview_source_event_id: "second-jz" }),
+      region,
+    ];
+    ir.register_history = [write("R5", 12, 77, 1)];
+    const index = hardware.createIndex(ir);
+    for (const basis of ["local", "aligned"]) {
+      const at = (local: number) => hardware.snapshot(index, "seq0", local + (basis === "aligned" ? -20 : 0), basis);
+      assert.equal(at(52).q1.event.id, "body");
+      assert.equal(at(52).registers[5].value.value, 77);
+      assert.equal(at(95).q1.status, "active");
+      assert.equal(at(96).q1.status, "unknown");
+      assert.equal(at(7).rt.status, "active");
+      assert.equal(at(8).rt.status, "unknown");
+    }
+
+    region.t0 = { kind: "symbolic", expr: "DELAY", display: "DELAY" };
+    const symbolic = hardware.createIndex(ir);
+    assert.equal(hardware.summarize(symbolic, "seq0", 96).q1.status, "unknown");
+    assert.equal(hardware.summarize(symbolic, "seq0", 96).rt.status, "last-command");
+
+    region.t0 = concrete(8);
+    delete region.meta.q1_issue_event_id;
+    const ambiguous = hardware.createIndex(ir);
+    assert.equal(hardware.summarize(ambiguous, "seq0", 52).q1.status, "active");
+    assert.equal(hardware.summarize(ambiguous, "seq0", 96).q1.status, "last-command");
+    assert.equal(hardware.summarize(ambiguous, "seq0", 8).rt.status, "unknown");
+    ir.events = ir.events.filter((item: any) => item.id !== "first-jz");
+    assert.equal(hardware.summarize(hardware.createIndex(ir), "seq0", 96).q1.status, "unknown");
+  });
+
+  it("uses an explicit Q1 proof cutoff without invalidating recorded register values", () => {
+    const ir = fixture();
+    const cutoff = event("cutoff", "unknown_region", 0, null, 7, { q1_issue_event_id: "outer", q1_proof_cutoff: true });
+    ir.events = [event("outer", "q1_issue", 52, 76, 7, { op: "loop" }), cutoff];
+    ir.register_history = [write("R0", 8, 2, 1), write("R0", 76, 1, 7, { event_id: "outer" })];
+    const index = hardware.createIndex(ir);
+    for (const basis of ["local", "aligned"]) {
+      const time = (local: number) => local + (basis === "aligned" ? -20 : 0);
+      const at = (local: number) => hardware.snapshot(index, "seq0", time(local), basis);
+      assert.equal(at(75).q1.event.id, "outer");
+      assert.equal(at(75).q1.status, "active");
+      assert.equal(at(76).q1.status, "unknown");
+      assert.equal(at(-1).rt.status, "not-started");
+      assert.equal(at(0).rt.status, "unknown");
+      assert.equal(at(76).registers[0].value.value, 1);
+      assert.equal(hardware.registerAt(index, "seq0", "R0", time(76), basis).eventId, "outer");
+      assert.equal(hardware.registerHistory(index, "seq0", "R0", time(76), basis).entries[1].value.value, 1);
+    }
+
+    cutoff.t0 = { kind: "symbolic", expr: "DELAY", display: "DELAY" };
+    assert.equal(hardware.summarize(hardware.createIndex(ir), "seq0", 76).q1.status, "unknown");
+
+    cutoff.t0 = concrete(0);
+    delete cutoff.meta.q1_proof_cutoff;
+    const unmarked = hardware.summarize(hardware.createIndex(ir), "seq0", 76);
+    assert.equal(unmarked.q1.status, "last-command");
+    assert.equal(unmarked.rt.status, "unknown");
+  });
+
   it("summarizes the same Q1 and RT state as detail for local, aligned and uncertain execution", () => {
     const straight = fixture();
     const loop = fixture();
@@ -769,6 +987,171 @@ describe("hardware state cursor model", () => {
     Object.defineProperty(ir, "events", { get: unavailable });
     Object.defineProperty(ir, "register_history", { get: unavailable });
     assert.deepEqual(hardware.summarize(index, "seq0", 100), expected);
+  });
+
+  it("ends pending cores at the recorded observation edge while retaining committed history", () => {
+    const ir = fixture();
+    const terminal = { local_time_ns: 120, category: "feedback_queue_overflow", display_reason: "LINQ feedback queue overflow." };
+    ir.execution = { seq0: { mode: "simulation", status: "error", reason: "Feedback queue overflow at 120 ns.", terminal } };
+    ir.simulation = { seq0: { queue_capacity: 1, end_time_ns: 200 } };
+    ir.alignment.seq0.offset = -100;
+    ir.events = [event("stop", "q1_issue", 8, 12, 2, { op: "stop" }),
+      event("prior", "wait", 100, 104, 3, { rt_packet_id: "p0" }),
+      event("pending", "trigger_wait", 104, 120, 4, { pending: true })];
+    const snapshot = (time: number, basis = "aligned") => hardware.snapshot(hardware.createIndex(ir), "seq0", time, basis);
+    assert.equal(snapshot(19).rt.status, "waiting");
+    for (const time of [20, 75]) {
+      const state = snapshot(time);
+      assert.equal(state.rt.status, "observation-ended");
+      assert.equal(state.rt.event.id, "prior");
+      assert.equal(state.q1.status, "stopped");
+      assert.equal(state.registers[0].value.value, 1);
+      assert.equal(state.simulation.endTime, 100);
+      assert.equal(state.execution.reason, "Feedback queue overflow at 120 ns.");
+      assert.deepEqual(state.terminal, { ...terminal, time: 20 });
+    }
+    assert.equal(snapshot(119, "local").rt.status, "waiting");
+    assert.equal(snapshot(120, "local").terminal.time, 120);
+    assert.deepEqual(hardware.summarize(hardware.createIndex(ir), "seq0", 75, "aligned").rt, snapshot(75).rt);
+
+    ir.alignment.seq0 = { offset: "unknown", confidence: "unknown" };
+    assert.equal(snapshot(75).terminal.time, undefined);
+    assert.notEqual(snapshot(75).rt.status, "observation-ended");
+    assert.equal(snapshot(120, "local").rt.status, "observation-ended");
+    delete ir.execution.seq0.terminal;
+    assert.equal(snapshot(200, "local").rt.status, "waiting");
+    assert.equal(snapshot(200, "local").terminal, undefined);
+  });
+
+  it("distinguishes a clipped stop and an unresolved stall from completed Q1 state", () => {
+    const ir = fixture();
+    ir.execution = { seq0: { mode: "simulation", status: "step_limit", terminal: {
+      local_time_ns: 12, category: "simulation_time_limit", display_reason: "Reached simulation time limit.",
+    } } };
+    ir.simulation = { seq0: { end_time_ns: 12 } };
+    ir.events = [event("stop", "q1_issue", 8, 12, 2, { op: "stop", planned_q1_end_ns: 16, observation_cutoff_ns: 12 })];
+    let index = hardware.createIndex(ir);
+    assert.equal(hardware.snapshot(index, "seq0", 11).q1.status, "active");
+    assert.equal(hardware.snapshot(index, "seq0", 12).q1.status, "observation-ended");
+    assert.equal(hardware.snapshot(index, "seq0", 12).q1.event.id, "stop");
+    delete ir.events[0].meta.planned_q1_end_ns;
+    assert.equal(hardware.snapshot(hardware.createIndex(ir), "seq0", 12).q1.status, "stopped");
+
+    ir.events = [event("stall", "q1_stall", 0, 12, 1, { pending: true, reason: "feedback_input" })];
+    index = hardware.createIndex(ir);
+    assert.equal(hardware.snapshot(index, "seq0", 11).q1.status, "stalled");
+    assert.equal(hardware.snapshot(index, "seq0", 12).q1.status, "observation-ended");
+    assert.equal(hardware.snapshot(index, "seq0", 12).simulation.stall, null);
+    ir.events = [];
+    ir.register_history = [];
+    index = hardware.createIndex(ir);
+    assert.deepEqual(hardware.stepTimes(index, "seq0"), [12]);
+    assert.equal(hardware.snapshot(index, "seq0", 12).q1.event, null);
+    ir.execution.seq0.mode = "concrete";
+    assert.equal(hardware.snapshot(hardware.createIndex(ir), "seq0", 12).terminal, undefined);
+  });
+
+  it("carries accepted QTM bin snapshots past discards without leaking future or alternative results", () => {
+    const ir = fixture();
+    const result = (id: string, time: number, bin: number, meta: any) => event(id, "acquisition_result", time, time, 3,
+      { kind: "acquire_timetags", acquisition_index: 0, bin_index: bin, ...meta });
+    const first = { avg_cnt: 1, count: 1, count_sum: 1, timetag_ticks: 9, timetag_ticks_sum: 9, valid: true };
+    const recordedZero = { avg_cnt: 2, count: 2, count_sum: 4, timetag_ticks: 4.5, timetag_ticks_sum: 9, valid: false };
+    const unknown = { avg_cnt: 1, count: null, count_sum: null, timetag_ticks: null, timetag_ticks_sum: null, valid: false, count_valid: false };
+    ir.events.push(result("first", 103, 0, { status: "modeled", count: 1, timetag_ticks: 9, bin_aggregate: first }),
+      result("zero", 107, 0, { status: "supplied", count: 3, timetag_ticks: 0, valid: false, bin_aggregate: recordedZero }),
+      result("discard", 110, 0, { status: "discarded" }), result("unknown", 111, 1, { status: "supplied", bin_aggregate: unknown }),
+      result("alternative", 109, 0, { status: "modeled", branch_comparison_path: "taken", bin_aggregate: { ...first, avg_cnt: 100 } }));
+    const index = hardware.createIndex(ir);
+    const records = (time: number, basis = "local") => hardware.snapshot(index, "seq0", time, basis).bins.records;
+    assert.equal(records(102)[0].aggregate, undefined);
+    assert.deepEqual(records(103)[0].aggregate, first);
+    assert.deepEqual(records(87, "aligned")[0].aggregate, recordedZero);
+    assert.equal(records(107)[0].result.digital.edgeCount, 3);
+    assert.equal(records(107)[0].result.digital.timetagTicks, undefined);
+    assert.deepEqual(records(110)[0].aggregate, recordedZero);
+    assert.equal(records(110)[0].result.status, "discarded");
+    assert.deepEqual(records(111)[1].aggregate, unknown);
+    assert.deepEqual(records(111)[0].history.map((item: any) => item.eventId), ["a1", "a2"]);
+  });
+
+  it("keeps the accepted I/Q aggregate when a later scenario or unavailable outcome arrives", () => {
+    const ir = fixture();
+    ir.simulation = { seq0: { queue_capacity: 32 } };
+    const identity = { acquisition_index: 0, bin_index: 0 };
+    const aggregate = { kind: "iq", count: 1, mean_i: 2, mean_q: -1, thresholded_count: 0, units: "normalized full scale * ns" };
+    ir.events.push(
+      event("modeled", "acquisition_result", 106, 106, 3, { ...identity, i: 2, q: -1, bin_aggregate: aggregate }),
+      event("scenario", "acquisition_result", 110, 110, 4, { ...identity, i: 17, q: -9, source: { kind: "scenario" } }),
+      event("unavailable", "acquisition_unavailable", 114, 114, 5, { ...identity, reason: "No input" }),
+    );
+    const index = hardware.createIndex(ir);
+    const at = (time: number) => hardware.snapshot(index, "seq0", time, "aligned");
+    assert.equal(at(85).bins.records[0].aggregate, undefined);
+    for (const [time, id] of [[86, "modeled"], [90, "scenario"], [94, "unavailable"]] as const) {
+      const bin = at(time).bins.records[0];
+      assert.deepEqual(bin.aggregate, aggregate);
+      assert.equal(bin.result.eventId, id);
+    }
+    const snapshot = at(94);
+    assert.deepEqual(snapshot.bins.records[0].result, { ...identity, eventId: "unavailable", outcomeTime: 94, reason: "No input", status: "unavailable" });
+    assert.equal(snapshot.simulation.communications.entries.at(-1).event.id, "unavailable");
+  });
+
+  it("keeps observed acquisition windows independent of digital samples and RT packet ends", () => {
+    const ir = fixture();
+    ir.simulation = { seq0: { queue_capacity: 32 } };
+    const timing = { digital_gate_timing: "effective" };
+    const identity = { acquisition_index: 0, bin_index: 0 };
+    ir.events = [
+      event("analog", "acquire", 100, 104, 1, { ...identity, op: "acquire", rt_packet_id: "p0",
+        acquisition_window: { end_ns: 120, status: "completed" } }),
+      event("gate", "acquire", 104, 108, 2, { ...identity, ...timing, op: "acquire_timetags",
+        rt_packet_id: "p1", operand_snapshot: [0, 0, 1], digital_gate_window: {
+          start_ticks: 104 * 128 + 1, end_ticks: 116 * 128 + 3, status: "closed",
+        } }),
+      event("sample-command", "acquire", 108, 112, 3, { ...identity, op: "acquire_digital", rt_packet_id: "p2" }),
+      event("sample", "acquisition_result", 108, 108, 3, { ...identity, kind: "acquire_digital", level: 1, status: "modeled" }),
+      event("close", "acquire", 116, 120, 4, { ...identity, ...timing, op: "acquire_timetags", rt_packet_id: "p3", operand_snapshot: [0, 0, 0] }),
+      event("legacy", "acquire", 124, 128, 5, { ...identity, op: "acquire_ttl", rt_packet_id: "p4", operand_snapshot: [0, 0, 1] }),
+    ];
+    const index = hardware.createIndex(ir);
+    const at = (time: number) => hardware.snapshot(index, "seq0", time, "aligned");
+    assert.equal(at(84).acquisition.event.id, "analog");
+    const opening = at(84 + 1 / 128);
+    assert.equal(opening.acquisition.event.id, "gate");
+    assert.equal(opening.acquisition.status, "active");
+    assert.deepEqual(opening.acquisition.gate, { start: 84 + 1 / 128, end: 96 + 3 / 128, status: "closed" });
+    assert.equal(at(89).acquisition.event.id, "gate");
+    assert.equal(at(89).rt.event.id, "sample-command");
+    assert.equal(at(96 + 2 / 128).acquisition.event.id, "gate");
+    assert.equal(at(96 + 3 / 128).acquisition.event.id, "analog");
+    assert.equal(at(96 + 3 / 128).rt.event.id, "close");
+    assert.equal(at(101).acquisition.status, "last-command");
+    assert.equal(at(105).acquisition.event.id, "legacy");
+    assert.equal(at(105).acquisition.status, "active");
+    assert.equal(at(105).acquisition.gate, undefined);
+    assert.ok(hardware.stepTimes(index, "seq0", "aligned").includes(96 + 3 / 128));
+  });
+
+  it("separates explicit digital bin kinds and keeps analog and untyped identities", () => {
+    const ir = fixture();
+    const target = (id: string, op: string, time: number, meta = {}) => event(id, "acquire", time, time + 4, 3,
+      { acquisition_index: 0, bin_index: 0, op, rt_packet_id: id, ...meta });
+    const result = (id: string, kind: string, time: number, values: object) => event(id, "acquisition_result", time, time, 3,
+      { acquisition_index: 0, bin_index: 0, kind, status: "modeled", ...values });
+    ir.events = [target("analog", "acquire", 100), target("weighted", "acquire_weighed", 104),
+      target("tag", "acquire_timetags", 108), target("level", "acquire_digital", 112),
+      target("legacy-ttl", "acquire_ttl", 116), result("analog-result", "acquire", 104, { i: 1, q: 2 }),
+      result("tag-result", "acquire_timetags", 112, { count: 1, timetag_ticks: 20 }),
+      result("level-result", "acquire_digital", 112, { level: 0 }), result("ttl-result", "acquire_ttl", 120, { count: 3 })];
+    const bins = hardware.snapshot(hardware.createIndex(ir), "seq0", 120).bins.records;
+    assert.deepEqual(bins.map((bin: any) => [bin.key, bin.count, bin.result.eventId]), [
+      ["0:0", 2, "analog-result"], ["0:0:acquire_timetags", 1, "tag-result"],
+      ["0:0:acquire_digital", 1, "level-result"], ["0:0:acquire_ttl", 1, "ttl-result"],
+    ]);
+    assert.deepEqual(bins[0].history.map((entry: any) => entry.eventId), ["analog", "weighted"]);
+    assert.equal(bins[3].gate, undefined);
   });
 
   it("does not rescan events during cursor movement and bounds bin history output", () => {

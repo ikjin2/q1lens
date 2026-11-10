@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,7 @@ class SequenceNames:
     waveforms: dict[int, str] = field(default_factory=dict)
     acquisitions: dict[int, str] = field(default_factory=dict)
     diagnostics: list[Diagnostic] = field(default_factory=list)
+    weight_lengths: dict[int, int] = field(default_factory=dict)
 
 
 def load_sequence_data(path: str | Path) -> dict[str, Any]:
@@ -157,7 +159,32 @@ def load_sequence_names(path: str | Path) -> SequenceNames:
         waveforms=waveforms,
         acquisitions=acquisitions,
         diagnostics=diagnostics,
+        weight_lengths=sequence_weight_lengths(loaded),
     )
+
+
+def sequence_weight_lengths(sequence: Any) -> dict[int, int]:
+    """Return lengths of valid, unambiguously indexed uploaded weights."""
+    entries = sequence.get("weights") if isinstance(sequence, Mapping) else None
+    if not isinstance(entries, Mapping):
+        return {}
+    seen = set()
+    lengths = {}
+    for entry in entries.values():
+        if not isinstance(entry, Mapping):
+            continue
+        index = entry.get("index")
+        if type(index) is not int or not 0 <= index <= 63:
+            continue
+        if index in seen:
+            lengths.pop(index, None)
+            continue
+        seen.add(index)
+        data = entry.get("data")
+        if (isinstance(data, list) and 0 < len(data) <= 16_384
+                and all(type(sample) in (int, float) and -1 <= sample <= 1 for sample in data)):
+            lengths[index] = len(data)
+    return lengths
 
 
 def _index_name_map(

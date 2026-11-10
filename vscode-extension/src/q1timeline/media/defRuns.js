@@ -9,6 +9,9 @@
   const format = (number) => Number.isInteger(number) ? String(number) : String(Number(number.toPrecision(12)));
   const assignments = (defs) => Object.entries(defs).map(([name, value]) => `${name}=${value}`).join(", ");
   const diagnostics = (row) => [row.reason, ...row.diagnostics.map((item) => `${item.severity}: ${item.message}`)].filter(Boolean).join(" · ");
+  const metricNames = new Map([["time", "Q1 time"], ["formula", "Formula"], ["reference", "Reference"], ["error", "Error"]]);
+  const formulaMetrics = ["formula", "reference", "error"];
+  const verdictNames = { pass: "Pass", fail: "Fail", unavailable: "Unavailable", compared: "Compared" };
 
   const formulaOperators = {
     "+": [1, (a, b) => a + b], "-": [1, (a, b) => a - b],
@@ -117,6 +120,31 @@
     };
   }
 
+  function parseTolerance(text) {
+    const literal = text.trim();
+    if (!literal) return null;
+    const value = Number(literal);
+    if (!/^\+?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(literal) || !Number.isFinite(value)) {
+      throw new Error("Enter a finite, non-negative absolute tolerance.");
+    }
+    return value;
+  }
+
+  function compareValues(actual, reference, tolerance) {
+    const error = actual == null || reference == null ? NaN : actual - reference;
+    if (!Number.isFinite(error)) return { formula: actual, reference, error: null, verdict: "unavailable" };
+    const verdict = tolerance === null ? "compared" : Math.abs(error) <= tolerance ? "pass" : "fail";
+    return { formula: actual, reference, error, verdict };
+  }
+
+  function estimatedDuration(ms) {
+    const seconds = Math.ceil(ms / 1000);
+    if (seconds < 60) return `${seconds} s`;
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes} min ${seconds % 60} s`;
+    return `${Math.floor(minutes / 60)} h ${minutes % 60} min`;
+  }
+
   function plotValue(row, mode, metric) {
     if (metric === "time") {
       return row.engine_completed && ["completed", "undetermined"].includes(row.status) && Number.isFinite(row.q1_ns) ? row.q1_ns : null;
@@ -160,50 +188,84 @@
     return { count: values.length, min, max, mean, deviation, bins };
   }
 
-  function plot(sweep, stats, mode, metric, formulaValues) {
+  function sampledInputs(sweep) {
+    const axes = sweep.plan.axes;
+    const projections = axes.map((axis) => {
+      const min = BigInt(axis.min), span = BigInt(axis.last) - min;
+      const scale = Number(span);
+      return (value) => {
+        if (!span) return 0.5;
+        const offset = BigInt(value) - min;
+        return Number.isFinite(scale) ? Number(offset) / scale : Number(offset * 1_000_000n / span) / 1_000_000;
+      };
+    });
+    const inputs = new Map();
+    for (const row of sweep.rows) {
+      const values = axes.map((axis) => row.defs[axis.name]);
+      const key = values.join(",");
+      const sample = inputs.get(key);
+      if (sample) sample.repeats += 1;
+      else inputs.set(key, { row, repeats: 1, position: values.map((value, i) => projections[i](value)) });
+    }
+    return [...inputs.values()];
+  }
+
+  function plot(sweep, stats, mode, metric, derived, samples) {
     const [xAxis, yAxis] = sweep.plan.axes;
     const columns = Number(xAxis.count), rows = yAxis ? Number(yAxis.count) : 1;
-    const left = yAxis ? 8 : formulaValues ? 126 : 96, top = 20;
-    const width = yAxis ? Math.max(430, columns * 8) : 340, height = yAxis ? Math.max(180, rows * 8) : 180;
+    const width = yAxis ? samples ? 430 : Math.max(430, columns * 8) : 340;
+    const height = yAxis && !samples ? Math.max(180, rows * 8) : 180;
+    const cells = yAxis && (!samples || (columns <= width / 4 && rows <= height / 4));
+    const left = yAxis ? 8 : derived ? 126 : 96, top = 20;
     const end = left + width, bottom = top + height;
     const xLabel = `${xAxis.name}: ${xAxis.min} → ${xAxis.last}`;
     const time = metric === "time";
-    const quantity = time ? "Q1 time" : formulaValues ? "Formula" : metric;
-    const valueLabel = time ? "Q1 time (ns)" : formulaValues ? "Formula value" : `${metric} (${mode})`;
+    const quantity = metricNames.get(metric) ?? metric;
+    const valueLabel = time ? "Q1 time (ns)" : derived ? quantity : `${metric} (${mode})`;
     const yLabel = yAxis ? `${yAxis.name}: ${yAxis.min} → ${yAxis.last}` : valueLabel;
-    const chartLabel = yAxis ? `Two-axis DEF heatmap by ${quantity}` : `DEF input versus ${quantity}`;
+    const chartLabel = yAxis ? `Two-axis DEF ${cells ? "heatmap" : "scatter plot"} by ${quantity}` : `DEF input versus ${quantity}`;
     const spread = stats && stats.max !== stats.min;
     const scale = (value) => stats ? fraction(value, stats.min, stats.max) : 0.5;
     const marks = [], missing = new Set();
-    if (yAxis) marks.push(`<rect class="def-plot-unrun" x="${left}" y="${top}" width="${width}" height="${height}"/>`);
-    for (const row of sweep.rows) {
-      const i = row.id - 1, x = Math.floor(i / rows), y = i % rows;
-      const value = formulaValues ? formulaValues.get(row.id) : plotValue(row, mode, metric);
+    let hasFailures = false;
+    if (cells) marks.push(`<rect class="def-plot-unrun" x="${left}" y="${top}" width="${width}" height="${height}"/>`);
+    const points = samples ?? sweep.rows.map((row) => ({ row, repeats: 1 }));
+    for (const [index, { row, repeats, position }] of points.entries()) {
+      const i = row.id - 1;
+      const x = position ? position[0] : columns === 1 ? 0.5 : Math.floor(i / rows) / (columns - 1);
+      const y = position ? position[1] : rows === 1 ? 0.5 : (i % rows) / (rows - 1);
+      const result = derived?.get(row.id);
+      const value = derived ? result?.[metric] : plotValue(row, mode, metric);
+      const verdict = result?.verdict;
+      hasFailures ||= verdict === "fail";
       const missingStatus = value == null ? (row.status === "completed" ? "undetermined" : row.status) : "";
       if (missingStatus) missing.add(missingStatus);
-      const title = `Case ${row.id} · ${assignments(row.defs)} · ${statusName(row.status)}${value == null ? "" : ` · ${quantity} ${format(value)}${time ? " ns" : ""}`}`;
-      const attributes = `data-case="${row.id}" class="def-plot-point ${esc(missingStatus)}" role="button" tabindex="${i === 0 ? "0" : "-1"}" aria-label="${esc(title)}"`;
+      const title = `Case ${row.id} · ${assignments(row.defs)}${repeats > 1 ? ` · ${repeats} samples` : ""} · ${statusName(row.status)}${value == null ? "" : ` · ${quantity} ${format(value)}${time ? " ns" : ""}`}${verdict ? ` · ${verdictNames[verdict]}` : ""}`;
+      const attributes = `data-case="${row.id}" class="def-plot-point ${esc(missingStatus)}"${verdict ? ` data-verdict="${verdict}"` : ""} role="button" tabindex="${index === 0 ? "0" : "-1"}" aria-label="${esc(title)}"`;
       const label = `<title>${esc(title)}</title>`;
-      if (yAxis) {
+      const color = yAxis && value != null ? ` style="fill:hsl(209 80% ${18 + 60 * scale(value)}%)"` : "";
+      if (cells) {
         const w = width / columns, h = height / rows;
-        const color = value == null ? "" : ` style="fill:hsl(209 80% ${18 + 60 * scale(value)}%)"`;
-        marks.push(`<rect ${attributes}${color} x="${left + x * w}" y="${bottom - (y + 1) * h}" width="${w}" height="${h}">${label}</rect>`);
+        marks.push(`<rect ${attributes}${color} x="${left + Math.round(x * (columns - 1)) * w}" y="${bottom - (Math.round(y * (rows - 1)) + 1) * h}" width="${w}" height="${h}">${label}</rect>`);
       } else {
-        const cx = left + 5 + (columns === 1 ? 0.5 : x / (columns - 1)) * (width - 10);
-        const cy = value == null ? bottom + 14 : bottom - 6 - scale(value) * (height - 12);
-        marks.push(`<circle ${attributes} cx="${cx}" cy="${cy}" r="4">${label}</circle>`);
+        const cx = left + 5 + x * (width - 10);
+        const cy = yAxis ? bottom - 6 - y * (height - 12) : value == null ? bottom + 14 : bottom - 6 - scale(value) * (height - 12);
+        marks.push(`<circle ${attributes}${color} cx="${cx}" cy="${cy}" r="4">${label}</circle>`);
       }
     }
-    if (!yAxis && sweep.rows.length < columns) {
+    if (!samples && !yAxis && sweep.rows.length < columns) {
       const x = left + (sweep.rows.length / columns) * width;
       marks.unshift(`<rect class="def-plot-unrun" x="${x}" y="${top}" width="${end - x}" height="${height}"/>`);
     }
     const tick = (value, y) => `<text x="${left - 6}" y="${y}" text-anchor="end">${format(value)}</text>`;
     const yTicks = !yAxis && stats ? (spread ? tick(stats.max, top + 8) + tick(stats.min, bottom) : tick(stats.min, top + height / 2 + 4)) : "";
     const colorRange = stats && (spread ? `${format(stats.min)} to ${format(stats.max)}` : format(stats.min));
-    const minWidth = Math.max(230, yAxis ? left + columns * 8 : 0);
-    const keys = [...missing].map((status) => `<span><i class="def-key ${esc(status)}"></i>${esc((time || formulaValues) && status === "undetermined" ? `${quantity} unavailable` : statusName(status))}</span>`);
-    if (sweep.rows.length < columns * rows) keys.push('<span><i class="def-key def-plot-unrun"></i>Unexecuted</span>');
+    const minWidth = Math.max(230, yAxis && !samples ? left + columns * 8 : 0);
+    const keys = [...missing].map((status) => `<span><i class="def-key ${esc(status)}"></i>${esc((time || derived) && status === "undetermined" ? `${quantity} unavailable` : statusName(status))}</span>`);
+    if (hasFailures) keys.push('<span><i class="def-key def-outside-tolerance"></i>Outside tolerance</span>');
+    if (points.length < columns * rows && (!samples || cells)) {
+      keys.push(`<span><i class="def-key def-plot-unrun"></i>${samples ? "Unsampled inputs" : "Unexecuted"}</span>`);
+    }
     if (yAxis && stats) keys.unshift(`<span><i class="def-plot-scale${spread ? "" : " is-constant"}"></i>${esc(valueLabel)} ${colorRange}</span>`);
     return `<div class="def-plot-scroll"><svg viewBox="0 0 ${end + 12} ${bottom + 35}" style="min-width:${minWidth}px" aria-label="${chartLabel}">
       <text x="${left}" y="14">${esc(yLabel)}</text>${yTicks}
@@ -248,22 +310,29 @@
           <p data-field="plan" role="status" class="def-muted"></p>
           <p data-field="observation-required" class="def-muted" hidden>Select at least one register or Q1 time.</p>
           <div class="def-toolbar"><label>Results <select data-field="sweep-output"><option value="cases">Plots and cases</option><option value="statistics">Statistics only</option></select></label>
-          <button data-action="sweep">Start sweep</button><button data-action="cancel" hidden>Stop sweep</button></div>
+          <button data-action="sweep">Start sweep</button></div>
+          <div class="def-toolbar"><label>Sample count <input type="number" data-field="sample-count" value="1000" min="1" step="1" aria-describedby="q1lens-sweep-sample-help"></label>
+          <button data-action="estimate">Estimate time</button><button data-action="sample" aria-describedby="q1lens-sweep-sample-help">Random sample</button>
+          <span data-field="setup-actions"><button data-action="cancel" hidden>Stop sweep</button></span></div>
+          <p id="q1lens-sweep-sample-help" class="def-muted" data-field="sample-help" aria-live="polite"></p>
+          <p data-field="estimate" role="status"></p>
         </section>
       </div>
       <p data-field="message" role="status"></p>
       <section class="def-card" data-field="sweep" aria-labelledby="def-results-heading" hidden>
-        <h3 id="def-results-heading">Sweep results</h3>
+        <div class="def-heading"><h3 id="def-results-heading" data-field="sweep-heading">Sweep results</h3><span data-field="progress-actions"></span></div>
         <div data-field="progress" role="status"></div><progress data-field="bar" aria-label="Sweep progress"></progress>
         <div data-field="register-summary"></div>
         <div data-field="plot-controls" class="def-heading" hidden><h4>Plots</h4><label>Plot metric <select data-field="metric"></select></label></div>
         <form data-field="formula-form" class="def-formula" hidden>
-          <label for="q1lens-sweep-formula">Formula</label>
-          <input id="q1lens-sweep-formula" type="text" data-field="formula" maxlength="512" spellcheck="false" placeholder="atan2(R1, R0)" aria-describedby="q1lens-sweep-formula-help">
+          <label>Formula <input type="text" data-field="formula" maxlength="512" spellcheck="false" placeholder="R2" aria-describedby="q1lens-sweep-formula-help"></label>
+          <label>Reference formula <input type="text" data-field="reference-formula" maxlength="512" spellcheck="false" placeholder="Optional"></label>
+          <label>Absolute tolerance <input type="text" data-field="tolerance" maxlength="64" spellcheck="false" placeholder="Optional"></label>
           <button type="submit">Plot formula</button>
-          <p id="q1lens-sweep-formula-help" class="def-muted">Use observed final registers or DEF input names. Trigonometric functions use radians.</p>
+          <p id="q1lens-sweep-formula-help" class="def-muted">Use observed final registers or DEF inputs. Trigonometric functions use radians. With a tolerance, a case passes when |error| ≤ tolerance.</p>
           <p data-field="formula-status" role="status"></p>
         </form>
+        <div data-field="comparison" hidden></div>
         <div data-field="sweep-results" class="def-plots"></div><div data-field="table"></div>
       </section>
       <section class="def-card" data-field="trace" hidden>
@@ -284,7 +353,7 @@
     const seqField = field("seq"), timeField = field("observe-time"), modeField = field("mode"), metricField = field("metric");
     const registerFields = [...panel.querySelectorAll("input[data-register]")];
     const observedRegisters = () => registerFields.filter((input) => input.checked).map((input) => input.dataset.register);
-    const outputField = field("sweep-output");
+    const outputField = field("sweep-output"), sampleField = field("sample-count");
     let edits = saved.edits || {}, selected = saved.sequencer, plan, planError, planTimer, token = 0, page = 0;
     let traceId, index, instructions = [], used = new Set(), pendingAt = [], position = saved.position || 0;
     let showAllRegisters = false;
@@ -295,8 +364,14 @@
     modeField.value = saved.mode || "signed";
     let selectedMetric = saved.metric;
     let activeFormula = typeof saved.formula === "string" ? saved.formula : "";
+    let activeReference = typeof saved.referenceFormula === "string" ? saved.referenceFormula : "";
+    let activeTolerance = Number.isFinite(saved.tolerance) ? saved.tolerance : null;
+    let derived = null;
     const formulaField = field("formula"), formulaStatus = field("formula-status");
+    const referenceField = field("reference-formula"), toleranceField = field("tolerance");
     formulaField.value = activeFormula;
+    referenceField.value = activeReference;
+    toleranceField.value = activeTolerance ?? "";
     outputField.value = saved.sweepOutput === "statistics" ? "statistics" : "cases";
     panel.hidden = !saved.open;
     toggle.setAttribute("aria-expanded", String(!panel.hidden));
@@ -305,10 +380,14 @@
     const currentEdits = () => edits[editKey()] || {};
     const save = () => persist({ open: !panel.hidden, sequencer: selected,
       ...(hasRegisterChoice ? { registers: observedRegisters() } : {}), observeTime: timeField.checked,
-      mode: modeField.value, metric: selectedMetric, formula: activeFormula, sweepOutput: outputField.value, edits, traceId, position });
+      mode: modeField.value, metric: selectedMetric, formula: activeFormula, referenceFormula: activeReference,
+      tolerance: activeTolerance, sweepOutput: outputField.value, edits, traceId, position });
     const statisticsOnly = () => outputField.value === "statistics";
     const target = () => ({ revision: state.info.revision, sequencer: selected, uri: sequencer().uri });
     const inputNodes = () => [...field("defs").querySelectorAll("input[data-def]")];
+    const runInputs = () => ({ ...target(), registers: observedRegisters(), observe_time: timeField.checked,
+      overrides: Object.fromEntries(inputNodes().map((input) => [input.dataset.def, input.value])) });
+    const sweepInputs = () => ({ ...runInputs(), axes: readAxes(), statistics_only: statisticsOnly() });
 
     function renderControls() {
       const available = Boolean(sequencer()) && !unsaved && !state.busy;
@@ -320,10 +399,28 @@
       button("run").disabled = !available;
       button("reset").disabled = !sequencer()?.defs.length;
       button("info").disabled = Boolean(unsaved || state.busy);
-      button("cancel").hidden = state.busy !== "sweep";
-      button("cancel").disabled = state.message?.startsWith("Stopping") || false;
-      outputField.disabled = state.busy === "sweep";
+      const stop = button("cancel");
+      const sweeping = state.busy === "sweep", estimating = state.busy === "estimate";
+      const stopSlot = field(sweeping && state.sweep?.status === "running" ? "progress-actions" : "setup-actions");
+      if (stop.parentElement !== stopSlot) stopSlot.append(stop);
+      stop.hidden = !sweeping && !estimating;
+      stop.textContent = estimating ? "Stop estimate" : state.sampling ? "Stop sampling" : "Stop sweep";
+      stop.disabled = state.message?.startsWith("Stopping") || false;
+      outputField.disabled = sweeping || estimating;
       button("sweep").disabled = !available || !plan?.allowed || !hasObservations;
+      const sampleLimit = plan?.sample_limit ?? plan?.limit ?? (statisticsOnly() ? 1_000_000 : 25_000);
+      sampleField.max = sampleLimit;
+      sampleField.disabled = sweeping || estimating;
+      const validSampleCount = Number.isSafeInteger(sampleField.valueAsNumber) && sampleField.validity.valid;
+      button("sample").disabled = !available || !plan || !validSampleCount || !hasObservations;
+      button("estimate").disabled = button("sample").disabled;
+      field("sample-help").textContent = validSampleCount ? "Draws from the selected ranges. The same combination can appear more than once." :
+        `Enter a whole sample count from 1 to ${sampleLimit.toLocaleString("en-US")}.`;
+      const estimate = state.estimate;
+      const matchingEstimate = plan && estimate && sequencer() && !unsaved &&
+        JSON.stringify(estimate.inputs) === JSON.stringify(sweepInputs());
+      field("estimate").textContent = estimating ? "Measuring sample time…" : matchingEstimate && validSampleCount ?
+        `Estimated time: about ${estimatedDuration(estimate.setupMs + estimate.sampleMs * sampleField.valueAsNumber)} (measured on ${estimate.count} samples).` : "";
       const error = planError || (plan && !plan.allowed ? `Maximum ${(plan.limit ?? 4096).toLocaleString("en-US")} combinations.` : "");
       field("plan").textContent = [plan && `${plan.axes.map((axis) => `${axis.name}: ${axis.count}`).join(" × ")} · ${plan.total} combinations`, error].filter(Boolean).join(" · ");
       field("message").textContent = unsaved ? "Save the project and Q1ASM sources before calculating execution." :
@@ -400,11 +497,18 @@
       requestPlan();
     }
 
+    function issueTiming({ event, time, end }) {
+      const range = `${time}–${end} ns`;
+      const { observation_cutoff_ns: cutoff, planned_q1_end_ns: planned } = event.meta || {};
+      return cutoff === end && time <= cutoff && Number.isFinite(planned) && cutoff < planned
+        ? `${range} observed · planned end ${planned} ns` : range;
+    }
+
     function renderStep(scroll = false) {
       const step = instructions[position];
       field("steps").hidden = !step;
       if (!step) return;
-      const { event, time, end, writes } = step;
+      const { event, time, writes } = step;
       const blocks = field("blocks");
       blocks.querySelector('[aria-pressed="true"]')?.setAttribute("aria-pressed", "false");
       const selectedBlock = blocks.children[position];
@@ -413,7 +517,7 @@
       button("prev").disabled = position === 0;
       button("next").disabled = position + 1 === instructions.length;
       button("instruction-source").disabled = Boolean(state.trace.stale);
-      field("position").textContent = `${position + 1} / ${instructions.length} · ${time}–${end} ns · line ${event.source?.line ?? "—"}`;
+      field("position").textContent = `${position + 1} / ${instructions.length} · ${issueTiming(step)} · line ${event.source?.line ?? "—"}`;
       const display = (value) => {
         const number = model.numericValue(value);
         return number === undefined ? model.displayValue(value) : String(interpret(number >>> 0, modeField.value));
@@ -421,7 +525,12 @@
       const meta = event.meta || {};
       const values = (entries) => entries.length ? entries.map(([name, value]) => `<span><code>${esc(name)}</code> ${esc(display(value))}</span>`).join(" ") : "—";
       const written = [...writes, ...(pendingAt[position]?.issued || [])];
-      const writeList = (items) => items.length ? items.map((item) => `<span><code>${esc(item.register)}</code> ${esc(display(item.value))} · ${item.time == null ? "availability outside trace" : `readable at ${item.time} ns`}</span>`).join(" ") : "—";
+      const writeList = (items) => items.length ? items.map((item) => {
+        const availability = item.pending
+          ? (Number.isFinite(item.time) ? `pending · planned ready at ${item.time} ns` : "pending · availability unknown")
+          : (item.time == null ? "availability outside trace" : `readable at ${item.time} ns`);
+        return `<span><code>${esc(item.register)}</code> ${esc(display(item.value))} · ${esc(availability)}</span>`;
+      }).join(" ") : "—";
       const readable = [...used].sort((a, b) => Number(a.slice(1)) - Number(b.slice(1))).map((register) =>
         [register, meta.register_snapshot?.[register] ?? model.registerAt(index, event.sequencer_id, register, time)?.value]);
       field("instruction").innerHTML = `<div><strong>Instruction</strong><p><code>${esc(event.source?.raw || meta.op)}</code></p></div>
@@ -456,9 +565,9 @@
         position = Math.max(0, Math.min(instructions.length - 1, position));
         used = new Set(trace.registers);
         const finalWrites = new Map();
-        for (const write of trace.pending) {
+        for (const write of trace.pending ?? []) {
           const list = finalWrites.get(write.event_id) || [];
-          list.push({ ...write, time: write.ready_ns });
+          list.push({ ...write, time: Number.isFinite(write.ready_ns) ? write.ready_ns : undefined, pending: true });
           finalWrites.set(write.event_id, list);
         }
         let pending = [];
@@ -469,9 +578,10 @@
           for (const register of [...Object.keys(event.meta.register_reads || {}), ...writes.map((item) => item.register), ...issued.map((item) => item.register)]) used.add(register);
           return { before, issued };
         });
-        field("blocks").innerHTML = instructions.map(({ event, time, end }, i) => {
+        field("blocks").innerHTML = instructions.map((step, i) => {
+          const { event } = step;
           const op = root.q1asmInstructionColors.eventCommandToken(event);
-          return `<button data-step="${i}" aria-pressed="false" style="--def-command:${root.q1asmInstructionColors.commandAccentColor(op)}" title="${esc(`#${i + 1} · ${event.source?.raw || op} · ${time}–${end} ns`)}">${esc(op)}</button>`;
+          return `<button data-step="${i}" aria-pressed="false" style="--def-command:${root.q1asmInstructionColors.commandAccentColor(op)}" title="${esc(`#${i + 1} · ${event.source?.raw || op} · ${issueTiming(step)}`)}">${esc(op)}</button>`;
         }).join("");
       }
       renderStep();
@@ -483,6 +593,8 @@
       const sweep = state.sweep;
       field("sweep").hidden = !sweep;
       if (!sweep) return;
+      const random = sweep.plan.sampling === "random";
+      field("sweep-heading").textContent = random ? "Random sample results" : "Sweep results";
       const count = (status) => sweep.statisticsOnly ? sweep.summary?.statuses[status] ?? 0 : sweep.rows.filter((row) => row.status === status).length;
       const ended = sweep.summary?.count ?? sweep.rows.length, planned = Number(sweep.plan.total), remaining = planned - ended;
       field("bar").max = planned;
@@ -499,7 +611,7 @@
       field("progress").innerHTML = `<div class="def-toolbar">
         <strong class="def-status" data-status="${esc(sweep.status)}">${esc(statusName(sweep.status))}</strong>
         <span>${esc([sweep.sequencer, ...observed, ...(sweep.observeTime ? ["Q1 time"] : [])].join(" · "))}</span>
-        <span data-cases-reported><strong>${ended} / ${planned}</strong> cases reported</span>
+        <span data-cases-reported><strong>${ended} / ${planned}</strong> ${random ? "samples" : "cases"} reported</span>
         </div>${counts.length ? `<ul class="def-counts">${counts.map(([label, n]) => `<li>${label} <strong>${n}</strong></li>`).join("")}</ul>` : ""}
         ${sweep.incompleteBatch ? '<p class="def-muted">Last batch interrupted.</p>' : ""}`;
     }
@@ -511,20 +623,51 @@
       page = Math.min(page, pages - 1);
       const disabled = sweep.status === "stale" || state.busy;
       const mode = modeField.value;
+      const comparing = Boolean(activeReference && derived);
       field("table").innerHTML = `<div class="def-heading"><h4>Cases</h4><div class="def-toolbar">
         <button data-page="-1" ${page ? "" : "disabled"}>Previous results</button><span>Page ${page + 1} of ${pages}</span>
         <button data-page="1" ${page + 1 < pages ? "" : "disabled"}>Next results</button></div></div>
         <div class="def-table-scroll def-case-table" tabindex="0" role="region" aria-label="Sweep case table"><table aria-label="Sweep cases"><thead><tr><th scope="col">Case</th><th scope="col">Effective DEFs</th><th scope="col">Status</th>
+        ${comparing ? '<th scope="col">Actual</th><th scope="col">Reference</th><th scope="col">Error</th><th scope="col">Verdict</th>' : ""}
         ${sweep.registers.map((name) => `<th scope="col">${esc(name)} · ${mode} / raw</th>`).join("")}
         ${sweep.observeTime ? '<th scope="col">Q1 time</th>' : ""}<th scope="col">Diagnostics</th></tr></thead><tbody>
         ${sweep.rows.slice(page * 50, (page + 1) * 50).map((row) => `<tr><th scope="row"><button data-case="${row.id}" ${disabled ? "disabled" : ""}>Case ${row.id}</button></th>
         <td><code>${esc(assignments(row.defs))}</code></td><td>${esc(statusName(row.status))}</td>
+        ${comparing ? comparisonCells(derived.get(row.id)) : ""}
         ${sweep.registers.map((name) => {
           const word = row.words[name];
           return `<td class="def-observed-value">${word == null ? "—" : `${interpret(word, mode)} <code class="def-muted">${hex(word)}</code>`}</td>`;
         }).join("")}
         ${sweep.observeTime ? `<td class="def-observed-value">${row.q1_ns == null ? "—" : `${row.q1_ns} ns`}</td>` : ""}
         <td>${esc(diagnostics(row)) || "—"}</td></tr>`).join("")}</tbody></table></div>`;
+    }
+
+    function comparisonCells(result) {
+      const { formula, reference, error, verdict } = result;
+      return [formula, reference, error].map((value) => `<td class="def-observed-value">${value == null ? "—" : format(value)}</td>`).join("") +
+        `<td data-verdict="${verdict}">${verdictNames[verdict]}</td>`;
+    }
+
+    function renderComparison() {
+      const summary = field("comparison");
+      summary.hidden = !activeReference || !derived;
+      if (summary.hidden) return;
+      const counts = { pass: 0, fail: 0, compared: 0, unavailable: 0 };
+      let max = null;
+      for (const { verdict, error } of derived.values()) {
+        counts[verdict] += 1;
+        if (error !== null) max = Math.max(max ?? 0, Math.abs(error));
+      }
+      summary.innerHTML = `<h4>Reference comparison</h4>
+        <p class="def-muted"><code>${esc(activeFormula)}</code> versus <code>${esc(activeReference)}</code></p>
+        <ul class="def-counts">
+          ${activeTolerance === null ? `<li>Compared <strong data-comparison="compared">${counts.compared}</strong></li>` : `
+            <li>Pass <strong data-comparison="pass">${counts.pass}</strong></li>
+            <li>Fail <strong data-comparison="fail">${counts.fail}</strong></li>
+            <li>Absolute tolerance <strong data-comparison="tolerance">${format(activeTolerance)}</strong></li>`}
+          <li>Unavailable <strong data-comparison="unavailable">${counts.unavailable}</strong></li>
+          <li>Max |error| <strong data-comparison="max-error">${max === null ? "—" : format(max)}</strong></li>
+        </ul>`;
     }
 
     function metricSummary(observations, mode) {
@@ -541,6 +684,8 @@
       renderProgress();
       const sweep = state.sweep, output = field("sweep-results");
       const summary = field("register-summary");
+      derived = null;
+      field("comparison").hidden = true;
       field("plot-controls").hidden = !sweep || sweep.status === "running" || sweep.statisticsOnly;
       field("formula-form").hidden = field("plot-controls").hidden;
       if (!sweep || sweep.status === "running") { summary.innerHTML = ""; output.innerHTML = ""; renderTable(); return; }
@@ -553,36 +698,52 @@
       summary.innerHTML = `<p class="def-muted">${sweep.statisticsOnly ? "Statistics only · " : ""}${esc(sweep.mode)} · ${sweep.maxSteps} instruction limit${fixed ? ` · Fixed DEFs ${esc(fixed)}` : ""}</p>
         ${metricSummary(observations, mode)}`;
       if (sweep.statisticsOnly) { output.innerHTML = ""; renderTable(); return; }
-      const plotMetrics = activeFormula ? [...metrics, "formula"] : metrics;
-      metricField.innerHTML = plotMetrics.map((metric) => `<option value="${esc(metric)}">${metric === "time" ? "Q1 time" : metric === "formula" ? "Formula" : esc(metric)}</option>`).join("");
+      formulaStatus.textContent = "";
+      if (activeFormula) {
+        try {
+          const evaluate = compileFormula(activeFormula, sweep);
+          const evaluateReference = activeReference ? compileFormula(activeReference, sweep) : null;
+          derived = new Map(sweep.rows.map((row) => {
+            const actual = evaluate(row, mode);
+            return [row.id, evaluateReference ? compareValues(actual, evaluateReference(row, mode), activeTolerance) : { formula: actual }];
+          }));
+          if (!evaluateReference) {
+            const count = [...derived.values()].filter((result) => result.formula !== null).length;
+            if (count < sweep.rows.length) formulaStatus.textContent = `${count} of ${sweep.rows.length} cases produced a finite formula value.`;
+          }
+        } catch (error) {
+          formulaStatus.textContent = error.message;
+        }
+      }
+      const plotMetrics = derived ? [...metrics, ...(activeReference ? formulaMetrics : ["formula"])] : metrics;
+      metricField.innerHTML = plotMetrics.map((metric) => `<option value="${esc(metric)}">${esc(metricNames.get(metric) ?? metric)}</option>`).join("");
       const metric = plotMetrics.includes(selectedMetric) ? selectedMetric : plotMetrics[0];
       metricField.value = metric;
+      renderComparison();
       renderPlots(sweep, observations.get(metric));
       renderTable();
     }
 
     function renderPlots(sweep, plotStats) {
       const metric = metricField.value, time = metric === "time";
-      const formula = metric === "formula";
-      const quantity = time ? "Q1 time" : formula ? "Formula" : metric;
-      let formulaValues;
-      formulaStatus.textContent = "";
-      if (formula) {
-        try {
-          const evaluate = compileFormula(activeFormula, sweep);
-          formulaValues = new Map(sweep.rows.map((row) => [row.id, evaluate(row, modeField.value)]));
-          plotStats = summarize([...formulaValues.values()], true);
-          const count = plotStats?.count ?? 0;
-          if (count < sweep.rows.length) formulaStatus.textContent = `${count} of ${sweep.rows.length} cases produced a finite formula value.`;
-        } catch (error) {
-          formulaStatus.textContent = error.message;
-          field("sweep-results").innerHTML = "";
-          return;
-        }
-      }
+      const computed = formulaMetrics.includes(metric) ? derived : null;
+      const quantity = metricNames.get(metric) ?? metric;
+      const summarizeFormula = (name) => summarize([...computed.values()].map((result) => result[name]), true);
+      if (computed) plotStats = summarizeFormula(metric);
+      const paired = Boolean(computed && activeReference && metric !== "reference");
+      const samples = sweep.plan.sampling === "random" ? sampledInputs(sweep) : null;
+      const charts = (paired ? ["formula", "error"] : [metric]).map((name) => {
+        const caption = name === "formula" ? `Actual value <code>${esc(activeFormula)}</code>` :
+          name === "reference" ? `Reference <code>${esc(activeReference)}</code>` :
+            name === "error" ? "Error (actual − reference)" : `Inputs and ${quantity}`;
+        const stats = name === metric ? plotStats : summarizeFormula(name);
+        return `<figure class="def-chart"><figcaption>${caption}</figcaption>${plot(sweep, stats, modeField.value, name, computed, samples)}</figure>`;
+      });
       const maxFrequency = plotStats ? Math.max(...plotStats.bins.map((bin) => bin.count)) : 0;
       const histogram = plotStats ? `<ul class="def-histogram">${plotStats.bins.map((bin) => `<li><span>${bin.min === bin.max ? format(bin.min) : `${format(bin.min)} to ${format(bin.max)}`}${time ? " ns" : ""}</span> <meter max="${maxFrequency}" value="${bin.count}" aria-label="${quantity} frequency"></meter> ${bin.count}</li>`).join("")}</ul>` : "";
-      field("sweep-results").innerHTML = `<figure class="def-chart"><figcaption>${formula ? `Formula <code>${esc(activeFormula)}</code>` : `Inputs and ${quantity}`}</figcaption>${plot(sweep, plotStats, modeField.value, metric, formulaValues)}</figure>
+      const output = field("sweep-results");
+      output.classList.toggle("def-paired-plots", paired);
+      output.innerHTML = `${charts.join("")}
         <section class="def-chart"><h4>${quantity} frequency</h4>${histogram || '<p class="def-muted">No values</p>'}</section>`;
     }
 
@@ -590,14 +751,21 @@
       event.preventDefault();
       const sweep = state.sweep;
       if (!sweep || sweep.statisticsOnly || sweep.status === "running") return;
+      const formula = formulaField.value.trim(), reference = referenceField.value.trim();
+      let tolerance;
       try {
-        compileFormula(formulaField.value, sweep);
+        compileFormula(formula, sweep);
+        if (reference) compileFormula(reference, sweep);
+        tolerance = parseTolerance(toleranceField.value);
+        if (tolerance !== null && !reference) throw new Error("Enter a reference formula to apply an absolute tolerance.");
       } catch (error) {
         formulaStatus.textContent = error.message;
         return;
       }
-      activeFormula = formulaField.value.trim();
-      selectedMetric = "formula";
+      activeFormula = formula;
+      activeReference = reference;
+      activeTolerance = tolerance;
+      selectedMetric = reference ? "error" : "formula";
       renderSweep();
       save();
     });
@@ -626,8 +794,9 @@
         const values = { ...currentEdits(), [def]: event.target.value };
         if (values[def] === declaration) delete values[def];
         edits = { ...edits, [editKey()]: values };
-        updateEdited(); save();
+        updateEdited(); renderControls(); save();
       } else if (event.target.closest("[data-axis]")) requestPlan();
+      else if (event.target === sampleField) renderControls();
     });
     panel.addEventListener("change", (event) => {
       if (event.target === seqField) { selected = seqField.value; showAllRegisters = false; renderInputs(); }
@@ -635,7 +804,7 @@
       if (event.target === modeField) { renderTrace(); renderSweep(); }
       if (event.target === metricField) {
         selectedMetric = metricField.value;
-        const stats = selectedMetric === "formula" ? null : statistics(state.sweep.rows, modeField.value, selectedMetric);
+        const stats = formulaMetrics.includes(selectedMetric) ? null : statistics(state.sweep.rows, modeField.value, selectedMetric);
         renderPlots(state.sweep, stats);
       }
       if (event.target.matches("input[data-register]")) { hasRegisterChoice = true; renderControls(); }
@@ -661,10 +830,9 @@
         renderRegisterChoices();
         renderControls();
       }
-      if (["run", "sweep"].includes(action) && sequencer()) {
-        send(action, { ...target(), registers: observedRegisters(), observe_time: timeField.checked,
-          overrides: Object.fromEntries(inputNodes().map((input) => [input.dataset.def, input.value])),
-          ...(action === "sweep" ? { axes: readAxes(), statistics_only: statisticsOnly() } : {}) });
+      if (["run", "sweep", "sample", "estimate"].includes(action) && sequencer()) {
+        send(action === "sample" ? "sweep" : action, { ...(action === "run" ? runInputs() : sweepInputs()),
+          ...(action === "sample" ? { sample_count: sampleField.valueAsNumber } : {}) });
       }
       if (action === "reset" || reset !== undefined) {
         const inputs = inputNodes();
@@ -721,7 +889,7 @@
     if (!panel.hidden) setTimeout(loadInfo, 0);
   }
 
-  const api = { mount, statistics, interpret, compileFormula, summarize };
+  const api = { mount, statistics, interpret, compileFormula, summarize, parseTolerance, compareValues };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   if (root) root.q1lensDefRuns = api;
 })(typeof window !== "undefined" ? window : undefined);

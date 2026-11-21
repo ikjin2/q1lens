@@ -1,10 +1,17 @@
-"""32-bit Q1 classical ALU results and status flags for concrete inputs."""
+"""32-bit Q1 classical ALU semantics on Python integers or Z3 bit-vectors."""
 
 from __future__ import annotations
 
 import operator
+from typing import TYPE_CHECKING, Union
 
 from q1timeline.q1asm.ast import Instr
+
+if TYPE_CHECKING:
+    from z3 import BitVecRef, BoolRef
+
+Word = Union[int, "BitVecRef"]
+Flag = Union[bool, "BoolRef"]
 
 
 _MASK = 0xFFFFFFFF
@@ -43,37 +50,49 @@ def operand_ranges(op: str) -> list[tuple[int, str, int, int]]:
     return [(0, role, low, high), (1, role, low, high)]
 
 
-def _flags(word: int, carry: bool, overflow: bool) -> dict[str, bool]:
+def _unsigned_lt(left: Word, right: Word) -> Flag:
+    if isinstance(left, int) and isinstance(right, int):
+        return left < right
+    from z3 import ULT
+    return ULT(left, right)
+
+
+def _flags(word: Word, carry: Flag, overflow: Flag) -> dict[str, Flag]:
     word &= _MASK
-    return {"zf": word == 0, "nf": bool(word & _SIGN), "cf": carry, "of": overflow}
+    if not isinstance(word, int):
+        from z3 import BoolVal
+        carry = BoolVal(carry) if isinstance(carry, bool) else carry
+        overflow = BoolVal(overflow) if isinstance(overflow, bool) else overflow
+    return {"zf": word == 0, "nf": (word & _SIGN) != 0, "cf": carry, "of": overflow}
 
 
-def logic_flags(word: int) -> dict[str, bool]:
+def logic_flags(word: Word) -> dict[str, Flag]:
     return _flags(word, False, False)
 
 
-def add_flags(left: int, right: int) -> dict[str, bool]:
+def add_flags(left: Word, right: Word) -> dict[str, Flag]:
     left &= _MASK
     right &= _MASK
-    total = left + right
-    return _flags(total, total > _MASK, bool(~(left ^ right) & (left ^ total) & _SIGN))
+    total = (left + right) & _MASK
+    return _flags(total, _unsigned_lt(total, left), (~(left ^ right) & (left ^ total) & _SIGN) != 0)
 
 
-def sub_flags(left: int, right: int) -> dict[str, bool]:
+def sub_flags(left: Word, right: Word) -> dict[str, Flag]:
     left &= _MASK
     right &= _MASK
     difference = left - right
-    return _flags(difference, left < right, bool((left ^ right) & (left ^ difference) & _SIGN))
+    return _flags(difference, _unsigned_lt(left, right), ((left ^ right) & (left ^ difference) & _SIGN) != 0)
 
 
-def shift_flags(op: str, left: int, shift: int, result: int) -> dict[str, bool]:
+def shift_flags(op: str, left: Word, shift: Word, result: Word) -> dict[str, Flag]:
     shift &= _MASK
-    if not 0 < shift <= 32:
-        return logic_flags(result)
+    active = (shift != 0) & _unsigned_lt(shift, 33)
     if op in {"asl", "lsl"}:
-        carry = bool(left & (1 << (32 - shift)))
-        return _flags(result, carry, carry != bool(result & _SIGN))
-    return _flags(result, bool(left & (1 << (shift - 1))), False)
+        carry_bit = (left & (1 << ((32 - shift) & 31))) != 0
+        overflow = carry_bit != ((result & _SIGN) != 0)
+        return _flags(result, active & carry_bit, active & overflow)
+    carry_bit = (left & (1 << ((shift - 1) & 31))) != 0
+    return _flags(result, active & carry_bit, False)
 
 
 def _signed(word: int, width: int) -> int:
@@ -81,28 +100,44 @@ def _signed(word: int, width: int) -> int:
     return (word ^ sign) - sign
 
 
-def _multiply(op: str, left: int, right: int) -> tuple[tuple[int, ...], dict[str, bool]]:
+def _multiply_operand(word: Word, width: int, signed: bool) -> Word:
+    if isinstance(word, int):
+        word &= (1 << width) - 1
+        return _signed(word, width) if signed else word
+    from z3 import Extract, SignExt, ZeroExt
+    return (SignExt if signed else ZeroExt)(64 - width, Extract(width - 1, 0, word))
+
+
+def _multiply(op: str, left: Word, right: Word) -> tuple[tuple[Word, ...], dict[str, Flag]]:
     width = 16 if op.endswith("16") else 32
-    mask = (1 << width) - 1
-    left &= mask
-    right &= mask
     signed = op.startswith("muls")
-    if signed:
-        left, right = _signed(left, width), _signed(right, width)
-    product = left * right
-    low, high = product & _MASK, (product >> 32) & _MASK
+    product = _multiply_operand(left, width, signed) * _multiply_operand(right, width, signed)
+    if isinstance(product, int):
+        low, high = product & _MASK, (product >> 32) & _MASK
+    else:
+        from z3 import Extract
+        low, high = Extract(31, 0, product), Extract(63, 32, product)
     if op in {"mulu32", "muls32"}:
         # Concrete's reference convention compares the full product with the
         # 32-bit input range. Hardware parity for these flags is unverified.
-        overflow = not (-_SIGN <= product < _SIGN if signed else 0 <= product <= _MASK)
-        flags = {"zf": product == 0, "nf": bool(high & _SIGN), "cf": overflow, "of": overflow}
+        overflow = product != _multiply_operand(low, 32, signed)
+        flags = {"zf": product == 0, "nf": (high & _SIGN) != 0, "cf": overflow, "of": overflow}
         return (low, high), flags
     word = high if op.endswith("h") else low
     return (word,), logic_flags(word)
 
 
-def evaluate(instruction: Instr, inputs: tuple[int, ...]) -> tuple[tuple[int, ...], dict[str, bool]]:
-    """Evaluate validated operands in source order, returning destination words and flags."""
+def _register_is_second(instruction: Instr) -> bool:
+    return instruction.args[0].kind != "reg" and instruction.args[1].kind == "reg"
+
+
+def shift_count(instruction: Instr, inputs: tuple[Word, ...]) -> Word:
+    """The immediate is the shift count even when it precedes the register."""
+    return inputs[0] if _register_is_second(instruction) else inputs[1]
+
+
+def evaluate(instruction: Instr, inputs: tuple[Word, ...]) -> tuple[tuple[Word, ...], dict[str, Flag]]:
+    """Evaluate operands in source order. Symbolic callers must guard shift counts in 0..32."""
     op = instruction.op
     if op == "not":
         word = ~inputs[0] & _MASK
@@ -111,7 +146,7 @@ def evaluate(instruction: Instr, inputs: tuple[int, ...]) -> tuple[tuple[int, ..
     # For these instructions the register is the left operand of an
     # immediate/register form, including when the immediate is written first.
     if ((op in _SHIFTS or op in {"sub", "cmp"})
-            and instruction.args[0].kind != "reg" and instruction.args[1].kind == "reg"):
+            and _register_is_second(instruction)):
         left, right = right, left
     if op == "add":
         return ((left + right) & _MASK,), add_flags(left, right)
@@ -122,15 +157,19 @@ def evaluate(instruction: Instr, inputs: tuple[int, ...]) -> tuple[tuple[int, ..
         word = _BITWISE[op](left, right) & _MASK
         return (() if op == "test" else (word,)), logic_flags(word)
     if op in _SHIFTS:
-        if not 0 <= right <= 32:
+        if isinstance(right, int) and not 0 <= right <= 32:
             raise ValueError(f"Invalid shift count {right}")
         left &= _MASK
         if op in {"asl", "lsl"}:
             word = (left << right) & _MASK
         elif op == "asr":
-            word = (_signed(left, 32) >> right) & _MASK
-        else:
+            signed_left = _signed(left, 32) if isinstance(left, int) else left
+            word = (signed_left >> right) & _MASK
+        elif isinstance(left, int) and isinstance(right, int):
             word = left >> right
+        else:
+            from z3 import LShR
+            word = LShR(left, right)
         return (word,), shift_flags(op, left, right, word)
     if op in _MULTIPLY:
         return _multiply(op, left, right)

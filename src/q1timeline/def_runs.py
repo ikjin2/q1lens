@@ -7,7 +7,7 @@ import itertools
 import json
 import sys
 from collections import Counter
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from decimal import Decimal
 from math import sqrt
 from pathlib import Path
@@ -25,7 +25,7 @@ from q1timeline.analysis.values import Concrete, value_to_json
 from q1timeline.cli import _load_json_override, _parse_param_overrides
 from q1timeline.ir.serialize import _diagnostic_to_dict, timeline_ir_from_states
 from q1timeline.project import ConfigLoadError, load_project_config
-from q1timeline.q1asm.ast import Arg, Program
+from q1timeline.q1asm.ast import Arg, Program, numeric_defs, with_def_values
 from q1timeline.q1asm.parser import parse_integer_literal, parse_q1asm
 from q1timeline.sequence import load_sequence_data, load_sequence_names
 from q1timeline.simulation.runtime import simulate_programs
@@ -35,13 +35,6 @@ MAX_CASES = 4096
 MAX_RANDOM_CASES = 25_000
 MAX_STATISTICS_CASES = 1_000_000
 REGISTERS = frozenset(f"R{i}" for i in range(64))
-
-
-def numeric_defs(program: Program) -> dict[str, Arg]:
-    duplicates = {item.details.get("name") for item in program.diagnostics
-                  if item.message.startswith("Duplicate .DEF name:")}
-    return {name: arg for name, arg in program.defs.items()
-            if arg.kind == "imm" and name in program.def_sources and name not in duplicates}
 
 
 def _referenced_registers(program: Program, params: dict) -> list[str]:
@@ -149,12 +142,6 @@ class _SweepStatistics:
         return result
 
 
-def _with_def_values(program: Program, values: dict[str, int]) -> Program:
-    changes = {name: Arg("imm", value, str(value)) for name, value in values.items()
-               if value != program.defs[name].value}
-    return replace(program, defs={**program.defs, **changes}) if changes else program
-
-
 class RunSnapshot:
     def __init__(self, args):
         project = Path(args.project).resolve()
@@ -250,14 +237,14 @@ class RunSnapshot:
                 raise ValueError(f"Fix the source before sweeping. {item.message}")
 
     def prepare_statistics(self, target: str, values: dict[str, int], axes: set[str]) -> dict[str, PreparedDefProgram]:
-        programs = {**self.programs, target: _with_def_values(self.programs[target], values)}
+        programs = {**self.programs, target: with_def_values(self.programs[target], values)}
         return {name: prepare_def_program(program, params=self.params, strict_q1asm=self.strict,
                                           varying=axes if name == target else set())
                 for name, program in programs.items()}
 
     def run(self, target: str, selection: str | _Observation, values: dict[str, int], *, detail: bool = False, case_id: int = 1,
             prepared: dict[str, PreparedDefProgram] | None = None) -> dict:
-        programs = {**self.programs, target: _with_def_values(self.programs[target], values)}
+        programs = {**self.programs, target: with_def_values(self.programs[target], values)}
         config = self.config
         if self.mode == "simulation":
             states = simulate_programs(programs, params=self.params, max_steps=self.max_steps,

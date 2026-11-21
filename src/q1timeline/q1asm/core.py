@@ -78,9 +78,9 @@ def possible_flags(flags: dict[str, bool] | None) -> frozenset[FlagCase]:
 
 
 def branch_on_flags(
-    op: str, flags: dict[str, bool] | None, cases: frozenset[FlagCase] | None = None,
-) -> bool | None:
-    """Resolve a status jump when all possible flag combinations agree."""
+    op: str, flags: dict[str, core_alu.Flag] | None, cases: frozenset[FlagCase] | None = None,
+) -> core_alu.Flag | None:
+    """Evaluate a status jump, enumerating completions only for partial concrete flags."""
     if cases is not None or (flags is not None and len(flags) < len(FLAG_NAMES)):
         possibilities = cases if cases is not None else possible_flags(flags)
         decisions = {branch_on_flags(op, dict(zip(FLAG_NAMES, values))) for values in possibilities}
@@ -88,11 +88,13 @@ def branch_on_flags(
     if flags is None:
         return None
     zf, nf, cf, of = (flags[name] for name in FLAG_NAMES)
+    # XOR with True negates Python bools and Z3 predicates alike.
+    nz, nc = zf ^ True, cf ^ True
     return {
-        "jz": zf, "jnz": not zf, "jo": of, "jno": not of, "js": nf, "jns": not nf,
-        "jg": not zf and nf == of, "jl": nf != of, "jle": zf or nf != of,
+        "jz": zf, "jnz": nz, "jo": of, "jno": of ^ True, "js": nf, "jns": nf ^ True,
+        "jg": nz & (nf == of), "jl": nf != of, "jle": zf | (nf != of),
         # Qblox's Core actions text for jge appears to repeat jg.
-        "jge": nf == of, "ja": not cf and not zf, "jae": not cf, "jb": cf, "jbe": cf or zf,
+        "jge": nf == of, "ja": nc & nz, "jae": nc, "jb": cf, "jbe": cf | zf,
     }.get(op)
 
 
@@ -109,8 +111,8 @@ def destination_indexes(op: str) -> tuple[int, ...]:
 
 
 def branch_effect(
-    instruction: Instr, inputs: tuple[int, ...], flags: dict[str, bool] | None,
-) -> tuple[bool | None, tuple[int, ...], dict[str, bool] | None]:
+    instruction: Instr, inputs: tuple[core_alu.Word, ...], flags: dict[str, core_alu.Flag] | None,
+) -> tuple[core_alu.Flag | None, tuple[core_alu.Word, ...], dict[str, core_alu.Flag] | None]:
     """Return the branch decision, loop counter write and resulting flags."""
     if instruction.op == "loop":
         bits = core_alu.sub_flags(inputs[0], 1)

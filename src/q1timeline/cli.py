@@ -45,6 +45,12 @@ VSCODE_JSON_SCHEMA_VERSION = "0.2.0"
 VALID_BRANCH_ASSUMPTION_PATHS = {"collapsed", "taken", "fallthrough", "both"}
 
 
+def _prove_command(args: argparse.Namespace) -> int:
+    from q1timeline.prove import run
+
+    return run(args)
+
+
 def _render_command(args: argparse.Namespace) -> int:
     if not args.ir or not args.out:
         print("q1timeline render: provide --ir and --out", file=sys.stderr)
@@ -781,6 +787,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
+
+    prove = subparsers.add_parser("prove", help="prove a final-state property or find an input reaching a branch path")
+    prove.add_argument("source", type=Path, help="single Q1ASM file")
+    prove.add_argument("--range", required=True, dest="def_range", metavar="NAME=MIN..MAX",
+                       help="inclusive range of one numeric .DEF")
+    queries = prove.add_mutually_exclusive_group(required=True)
+    queries.add_argument("--assert", dest="assertion", metavar="EXPR", help="compare R0..R63, stop_code, q1_time or rt_time")
+    queries.add_argument("--reach", metavar="LABEL_OR_PC", help="reach an instruction at a label or compiled PC")
+    queries.add_argument("--path", metavar="BRANCH=OUTCOME,...", help="reach ordered taken/fallthrough branch outcomes")
+    queries.add_argument("--underflow-at", type=int, metavar="STARTUP_NS", help="reach an RT queue underflow at fixed startup")
+    prove.add_argument("--max-steps", type=int, default=10000, help="maximum Q1 issues per path (default 10000)")
+    prove.add_argument("--max-paths", type=int, default=256, help="maximum number of paths to explore (default 256)")
+    prove.add_argument("--replay-ir", type=Path, help="write the verified witness timeline")
+    prove.set_defaults(handler=_prove_command)
 
     analyze = subparsers.add_parser(
         "analyze",

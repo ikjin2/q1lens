@@ -1,0 +1,7 @@
+.DEF N 1
+wait 1184
+move $N,R0
+nop
+delay: loop R0,@delay
+wait 4
+stop

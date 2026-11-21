@@ -22,6 +22,9 @@ uses the shared RT packet transition. Analysis also uses that transition for
 resolved local packets. It keeps symbolic values and timing uncertainty when
 the inputs are still open.
 
+A [symbolic query](def-register-sweep.md#prove-a-property-or-find-a-reachable-path)
+can find a DEF input that reaches a branch and replay that input in Concrete.
+
 Q1 issue times use q1simulator 1.4.1, ISA 2, for the operand forms it executes.
 For example, `add R0,1,R2` takes 12 ns and `add R0,R1,R2` takes 16 ns.
 A flag branch takes 16 ns on a jump and 4 ns on fallthrough. Three-operand

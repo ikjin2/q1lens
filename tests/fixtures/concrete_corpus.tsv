@@ -30,7 +30,9 @@ examples/cursor-frequency-demo/q1timeline.yml#blue_peak	8	unsupported	8/wait_tri
 examples/cursor-frequency-demo/q1timeline.yml#orange_drive	19	unsupported	19/wait_trigger	926957de058aca1949bd6e14ae1b0cef01623cf40b7942c054037240fecc523f	prepared	blocked/19/19/-/120/236
 examples/cursor-frequency-demo/q1timeline.yml#red_cursor	9	unsupported	9/wait_trigger	c77774bc98656dafe1346022b25899bf9473abf008f3f67714a312421aef5458	prepared	blocked/9/9/-/52/204
 examples/cursor-frequency-demo/q1timeline.yml#red_tracker	1	unsupported	1/fb_acq_iq_id	25f2f060a7a222852cd1f8b8cdf3094863b91db1025001f957e9292e71982589	prepared	blocked/18/18/-/88/216
+examples/def-register-sweep/branches.q1asm	8	completed	-/0	97ae7aae52a9eb120a32a5de88b3601ab66fdfe97bc396aa38189bb9a3f21df5	prepared	-
 examples/def-register-sweep/q1timeline.yml#sum	8	completed	-/0	90b28816565ee2e385fbb424bd7b3fcb08e9b20074b69773226341d0e1c0e619	prepared	-
+examples/def-register-sweep/queue.q1asm	6	completed	-/0	f4ac0699b5ad5c6f61cac48f1f594fd7c8013ff100b7b1dd9feed002ab5a9d96	prepared	-
 examples/golden-section/q1timeline.yml#golden_section	5	unsupported	5/fb_acq_iq_id	562d67a0d623235858b7adda8c4492c4494035c18bdc460f661f360c893a7459	prepared	blocked/81/60/-/716/1002032
 examples/initial-buffer-demo/q1timeline.yml#assumed	10000	step_limit	4	46d356cd2ccc9f876a992cfbc25c0c48f2fee97312c47e1523001d1097c68468	prepared	-
 examples/initial-buffer-demo/q1timeline.yml#exhausted	10000	step_limit	4	95c165d2a815235b6a712a372d399b10a4be3239d1a5d266c73ce68018d610d1	prepared	-

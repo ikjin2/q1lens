@@ -203,3 +203,44 @@ def test_partial_add_checks_informative_facts(monkeypatch):
     assert write.unsigned_bounds is not None and write.unsigned_bounds != (0, MASK)
     assert write.known_bits is not None and write.known_bits[1] & 1
     assert state.alu_flags is not None and state.alu_flags["cf"] is False
+
+
+@pytest.mark.parametrize(("op", "immediate_first"), [
+    *((op, False) for op in sorted(core_alu.ALU_OPS)),
+    *((op, True) for op in sorted(SHIFTS | {"cmp", "sub"})),
+])
+def test_symbolic_alu_words_and_flags_match_concrete_issues(op, immediate_first):
+    z3 = pytest.importorskip("z3")
+    unary = op == "not"
+    operands = ("R0",) if unary else ("1", "R0") if immediate_first else ("R0", "R1")
+    item = instruction(op, *operands)
+    variables = tuple(z3.BitVec(f"arg{i}", 32) for i in range(len(operands)))
+    words, flags = core_alu.evaluate(item, variables)
+    assert all(word.size() == 32 for word in words)
+    assert all(z3.is_bool(flag) for flag in flags.values())
+
+    rng = Random(f"q1-smt-alu/{op}")
+    edges = [0, 1, 0x7FFF, 0x8000, 0x7FFFFFFF, 0x80000000, MASK]
+    data = edges + list(generated_word_domain(rng).words)
+    counts = [0, 1, 31, 32, *generated_shift_counts(rng).words]
+    cases = product(data) if unary else product(data, counts if op in SHIFTS else data)
+    for values in cases:
+        if immediate_first:
+            values = values[::-1]
+        expected = core.issue(item, values)
+        bindings = [(var, z3.BitVecVal(value, 32)) for var, value in zip(variables, values)]
+        for word, concrete in zip(words, expected.words, strict=True):
+            assert z3.simplify(z3.substitute(word, *bindings)).as_long() == concrete, values
+        for name, concrete in expected.flags.as_dict().items():
+            assert z3.is_true(z3.simplify(z3.substitute(flags[name], *bindings))) == concrete, (values, name)
+
+
+def test_symbolic_status_branches_match_concrete_for_every_flag_combination():
+    z3 = pytest.importorskip("z3")
+    flags = {name: z3.Bool(name) for name in core.FLAG_NAMES}
+    for op in core.STATUS_BRANCH_OPS | {"jge"}:
+        decision = core.branch_on_flags(op, flags)
+        for values in product((False, True), repeat=len(flags)):
+            concrete = dict(zip(flags, values))
+            bindings = [(flag, z3.BoolVal(concrete[name])) for name, flag in flags.items()]
+            assert z3.is_true(z3.simplify(z3.substitute(decision, *bindings))) == core.branch_on_flags(op, concrete)

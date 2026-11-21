@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Literal
 
 from q1timeline.diagnostics import Diagnostic
@@ -41,3 +41,17 @@ class Program:
     instructions: list[Instr] = field(default_factory=list)
     diagnostics: list[Diagnostic] = field(default_factory=list)
     def_sources: dict[str, SourceLocation] = field(default_factory=dict)
+
+
+def numeric_defs(program: Program) -> dict[str, Arg]:
+    """Return the unambiguous numeric DEFs that a run can override."""
+    duplicates = {item.details.get("name") for item in program.diagnostics
+                  if item.message.startswith("Duplicate .DEF name:")}
+    return {name: arg for name, arg in program.defs.items()
+            if arg.kind == "imm" and name in program.def_sources and name not in duplicates}
+
+
+def with_def_values(program: Program, values: dict[str, int]) -> Program:
+    changes = {name: Arg("imm", value, str(value)) for name, value in values.items()
+               if value != program.defs[name].value}
+    return replace(program, defs={**program.defs, **changes}) if changes else program

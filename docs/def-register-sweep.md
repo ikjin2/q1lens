@@ -22,3 +22,46 @@ Each register has its own valid sample count. A completed case with no error dia
 In **Statistics only**, the worker binds fixed instruction metadata once and skips instruction snapshots and register history. It retains RT timing and acquisition data used by runtime checks. The worker sends cumulative counts, minima, maxima, means, and population standard deviations. Individual plots, rows, and case traces are available in **Plots and cases**. A completed case with an undetermined register can still contribute a Q1 time sample.
 
 DEF inputs apply to the selected sequencer instance and leave source files and project parameters intact. Save source edits before running. The extension marks existing results stale when it detects changes to project inputs. Explicit VS Code execution settings take precedence over the project mode. An analysis preview uses concrete execution for this action, and simulation uses the project's configured scenario.
+
+## Prove a property or find a reachable path
+
+The `q1timeline prove` command uses Z3 to explore one sequencer over an inclusive range of one numeric DEF. Other DEFs keep their source values. Arithmetic and status flags follow the Q1 core, including 32-bit wraparound, wide multiplication and register write delays. Conditional jumps split execution on their actual flag or register predicates. Loops consume the instruction budget each time they execute.
+
+Install the optional Z3 dependency from the repository root, then check the sum example with its declared `Y=10`.
+
+```shell
+python -m pip install -e ".[smt]"
+q1lens q1timeline prove examples/def-register-sweep/sum.q1asm --range X=0..1013 --assert "R2 < 1024"
+q1lens q1timeline prove examples/def-register-sweep/sum.q1asm --range X=0..1014 --assert "R2 < 1024" --replay-ir output/smt-def-sweep/x1014.json
+q1lens q1timeline render --ir output/smt-def-sweep/x1014.json --out output/smt-def-sweep/x1014.html --mode debug
+```
+
+The first query returns `proved` (exit 0). The second returns `counterexample` (exit 1) after Concrete replays `X=1014` and reads `R2=1024`. The optional `--replay-ir` saves that execution for the timeline renderer. Other final assertions can compare signed `stop_code`, unsigned `R0` through `R63`, or the analytical clocks `q1_time` and `rt_time` in ns. Assertions accept `==`, `!=`, `<`, `<=`, `>` and `>=`.
+
+The [branch example](../examples/def-register-sweep/branches.q1asm) tests the same value twice. The first command below finds `X=1014` and confirms that Concrete reaches `limit` and executes `stop 1`. The second asks whether the same input can take both jumps. Taking the first requires `R2 < 1024`, while taking the second requires `R2 >= 1024`, so the path is unreachable.
+
+```shell
+q1lens q1timeline prove examples/def-register-sweep/branches.q1asm --range X=0..1014 --reach limit --replay-ir output/branch.json
+q1lens q1timeline prove examples/def-register-sweep/branches.q1asm --range X=0..1014 --path "check=taken,below=taken"
+```
+
+`--reach` and `--path` accept source labels or compiled Q1 instruction addresses. Path decisions occur in the specified order and can have intervening instructions and branches. Repeating a decision asks for separate occurrences. Concrete replays through the instruction or last decision that establishes the witness, so a reachable prefix can be confirmed even when execution would continue looping. A confirmed witness returns `reachable` (exit 0). Exhausting all feasible paths without a witness returns `unreachable` (exit 1).
+
+`--max-steps` bounds Q1 issues per path (default 10,000). `--max-paths` bounds the number of explored paths (default 256). An unfinished path, solver timeout, unsupported operation such as a LINQ receive, or unreadable register can leave the answer `unknown` (exit 2). A verified witness on any explored path suffices for an existential query or a counterexample.
+
+### Check a fixed-start RT queue
+
+In the [queue example](../examples/def-register-sweep/queue.q1asm), the first wait occupies the RT core for 1,184 ns. The Q1 core counts down `N` before it can enqueue the next wait. With RT starting at 4 ns, the next dequeue is due at 1,188 ns. The 32-slot queue model accounts for full-queue stalls, enqueue/dequeue ties, and the 4 ns dequeue spacing of a zero-dwell command.
+
+```shell
+q1lens q1timeline prove examples/def-register-sweep/queue.q1asm --range N=1..37 --underflow-at 4
+q1lens q1timeline prove examples/def-register-sweep/queue.q1asm --range N=1..38 --underflow-at 4 --replay-ir output/underflow.json
+```
+
+For `N=37`, the next packet arrives exactly at the dequeue deadline. Extending the range to 38 produces the witness `N=38`. Concrete replays its Q1 instruction path and Simulation independently confirms the underflow at 1,188 ns. For this query the exported timeline is the fixed-start Simulation trace. The queue result is specific to the supplied startup delay and the modeled local instructions. Scenarios involving external triggers, LINQ traffic or acquisition hardware need their own Simulation inputs.
+
+### Cross-check Analysis summaries
+
+With the `dev` and `smt` extras installed, run `python -m pytest -q tests/test_q1timeline_analysis_smt_oracle.py`. The tests take time and register bounds reported by Analysis and ask Z3 whether any permitted input violates them. Analysis summarizes the loop or merges the branches. The verifier follows the individual instructions on each feasible path.
+
+The cases cover loop durations that vary by iteration, zero-duration RT packets, and the Q1 clock at the 32-entry FIFO boundary. The branch tests cover equal clocks across both paths and a join with equal RT time but different Q1 completion times. For the symbolic-input cases, Z3 ranges over all 32-bit input words.

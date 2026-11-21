@@ -15,7 +15,7 @@ import yaml
 from q1timeline import __version__
 from q1timeline.analysis.alignment import SIMULATION_ALIGNMENT_MODE, align_timelines
 from q1timeline.analysis.hardware_readiness import analyze_project_hardware_readiness
-from q1timeline.analysis.interpreter import LOOP_PREVIEW_MAX_VISIBLE_ITERATIONS, interpret_program
+from q1timeline.analysis.playback_loops import LOOP_PREVIEW_MAX_VISIBLE_ITERATIONS
 from q1timeline.analysis.underflow import analyze_underflows
 from q1timeline.diagnostics import (
     DIAGNOSTICS_SCHEMA_VERSION,
@@ -652,6 +652,8 @@ def _analyze_command(args: argparse.Namespace) -> int:
             else:
                 print(f"q1timeline analyze: {exc}", file=sys.stderr)
             return 2
+        from q1timeline.analysis.interpreter import interpret_program
+
         state = interpret_program(
             program,
             sequencer_id=sequencer.id,

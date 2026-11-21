@@ -5,7 +5,7 @@ for (const profile of ["01-feedback-missing", "06-feedback-too-late"]) {
     await open(page, `fault-${profile}`, "QCM0", "seq");
     await at(page, 1199);
     await tab(page, "Simulation");
-    await expect(value(page, "simulation-queue")).toContainText("Q1 stalled: feedback input (4–1200 ns)");
+    await expect(value(page, "simulation-queue")).toContainText("Q1 stalled: feedback input (8–1200 ns)");
     await expect(value(page, "q1-event")).toContainText("stalled");
     await expect(value(page, "communications")).not.toContainText("feedback receive");
     await expect(value(page, "communications")).not.toContainText("value 7");
@@ -30,7 +30,7 @@ test("delayed feedback becomes readable only after arrival and register latency"
   await open(page, "fault-02-feedback-delayed", "QCM0", "seq");
   await at(page, 399);
   await tab(page, "Simulation");
-  await expect(value(page, "simulation-queue")).toContainText("Q1 stalled: feedback input (4–400 ns)");
+  await expect(value(page, "simulation-queue")).toContainText("Q1 stalled: feedback input (8–400 ns)");
   await expect(value(page, "communications")).not.toContainText("value 7");
   await at(page, 400);
   await expect(value(page, "simulation-queue")).not.toContainText("Q1 stalled");
@@ -38,9 +38,9 @@ test("delayed feedback becomes readable only after arrival and register latency"
   await expect(value(page, "communications")).toContainText("id 5 · value 7");
   await tab(page, "Registers");
   await page.getByRole("checkbox", { name: "All 64" }).check();
-  await at(page, 407);
+  await at(page, 403);
   await expect(register(page, "R0")).toHaveText("?");
-  await at(page, 408);
+  await at(page, 404);
   await expect(register(page, "R0")).toHaveText("7");
   await page.locator('[data-register="R0"]').click();
   await page.getByRole("button", { name: "Open source", exact: true }).click();
@@ -55,7 +55,7 @@ test("delayed feedback becomes readable only after arrival and register latency"
 test("duplicate feedback preserves FIFO occurrences even when two payloads are equal", async ({ page }) => {
   await open(page, "fault-03-feedback-duplicate", "QCM0", "seq");
   const inputEvents = [];
-  for (const [name, ready, expected, inputIndex, line] of [["R0", 408, "7", 0, 2], ["R1", 416, "7", 1, 4], ["R2", 424, "9", 2, 6]]) {
+  for (const [name, ready, expected, inputIndex, line] of [["R0", 404, "7", 0, 2], ["R1", 412, "7", 1, 4], ["R2", 420, "9", 2, 6]]) {
     await tab(page, "Registers");
     await page.getByRole("checkbox", { name: "All 64" }).check();
     await at(page, ready - 1);

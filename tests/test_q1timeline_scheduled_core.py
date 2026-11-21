@@ -4,9 +4,57 @@ from q1timeline.analysis.api import analyze_text
 from q1timeline.analysis.interpreter import interpret_program
 from q1timeline.analysis.values import Concrete
 from q1timeline.playback import PlaybackSession
-from q1timeline.q1asm import compiled_addresses, core
+from q1timeline.q1asm import compiled_addresses, core, core_rt
 from q1timeline.q1asm.parser import parse_q1asm
 from q1timeline.simulation.runtime import simulate_programs
+
+
+def test_analysis_dequeues_resolved_packets_and_preserves_unknown_trigger(monkeypatch):
+    calls = []
+    execute = core_rt.execute_packet
+
+    def observe(op, operands, selected, latches, devices, **kwargs):
+        calls.append((op, selected.skipped, selected.dwell_ns))
+        return execute(op, operands, selected, latches, devices, **kwargs)
+
+    monkeypatch.setattr(core_rt, "execute_packet", observe)
+    source = ("set_mrk 5\nreset_ph\nset_cond 1,0,0,0\nupd_param 32\nset_cond 0,0,0,4\nupd_param 8\n"
+              "set_cond 1,1,0,4\nupd_param 4\nstop")
+    state = interpret_program(parse_q1asm(source), sequencer_id="s")
+    assert calls == [("upd_param", True, 0), ("upd_param", False, 8)]
+    skipped, update, unknown = state.rt_packets
+    assert skipped.meta["captured_state"] == {"marker": 5, "phase_reset": True}
+    event = next(e for e in state.events if e.kind == "upd_param")
+    assert event.meta["applied_state"] == {"marker": 5}
+    assert (update.rt_t0, unknown.rt_t0, unknown.duration) == (Concrete(4), Concrete(12), Concrete(4))
+    assert unknown.meta["conditional_execution_unknown"]
+
+
+def test_play_executes_packed_device_aliases_and_keeps_one_shots_until_dequeue():
+    source = ("set_mrk 5\nset_time_ref\nreset_netzero\nset_cond 1,0,0,4\nfb_cmd 0x10,123,8\n"
+              "set_cond 0,0,0,4\nwait 8\nset_time_ref\nfb_cmd 0x11,217,12\nfb_cmd 0x100,9,8\nstop")
+    session = PlaybackSession({"s": ("s.q1asm", source)})
+    assert session.run(budget_ms=1000)["status"] == "completed"
+    state = session.runners[0].state
+    concrete = interpret_program(parse_q1asm(source), sequencer_id="s", execution_mode="concrete")
+    assert [(p.rt_t0, p.duration, p.meta.get("device_operands"), p.meta.get("applied_state")) for p in state.rt_packets] == [
+        (p.rt_t0, p.duration, p.meta.get("device_operands"), p.meta.get("applied_state")) for p in concrete.rt_packets]
+    skip, _, update, send = state.rt_packets
+    assert skip.meta["captured_state"] == {"marker": 5, "netzero_reset": True, "time_ref": True}
+    assert update.meta["applied_state"] == {"marker": 5, "time_ref": True}
+    assert dict(state.playback_devices.thresholds) == {1: 217}
+    assert state.playback_devices.time_ref_ns == 12
+    assert send.meta["normalized_op"] == "fb_com_data" and send.meta["device_operands"] == [0, 9, 8]
+
+
+@pytest.mark.parametrize("command,status", [("fb_cmd 3,1,4", "blocked"), ("fb_cmd 0x42,0x80,4", "error")])
+def test_play_validates_raw_linq_only_on_the_executed_arm(command, status):
+    session = PlaybackSession({"s": ("s.q1asm", f"set_cond 1,0,0,8\n{command}\nset_cond 0,0,0,4\n{command}\nstop")})
+    assert session.run(budget_ms=1000)["status"] == status
+    state = session.runners[0].state
+    skip, = state.rt_packets
+    assert skip.meta["conditional_skipped"]
+    assert state.metadata["execution"]["source"]["line"] == 4
 
 
 @pytest.mark.parametrize(("source", "expected"), [

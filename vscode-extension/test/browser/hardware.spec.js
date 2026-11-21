@@ -295,7 +295,7 @@ test("digital register readiness, occurrence navigation, queue, latched values a
   expect(source.file.replaceAll("\\", "/")).toMatch(/\/counter\.q1asm$/);
   const occurrence = await page.evaluate(() => window.selectedEventId);
   await page.getByRole("button", { name: "Next change ›", exact: true }).click();
-  await expect(page.getByRole("spinbutton")).toHaveValue("80");
+  await expect(page.getByRole("spinbutton")).toHaveValue("92");
   await expect(register(page, "R1")).toHaveText("2");
   expect(await page.evaluate(() => window.selectedEventId)).not.toBe(occurrence);
   await page.getByRole("button", { name: "‹ Previous change", exact: true }).click();
@@ -308,13 +308,13 @@ test("digital register readiness, occurrence navigation, queue, latched values a
   await page.getByRole("combobox", { name: "Register number format" }).selectOption("decimal");
   await at(page, 100);
   await tab(page, "Simulation");
-  await expect(value(page, "simulation-queue")).toContainText("2 / 2 packets · Q1 stalled: queue full (84–200 ns)");
-  await at(page, 250);
+  await expect(value(page, "simulation-queue")).toContainText("2 / 2 packets · Q1 stalled: queue full (100–200 ns)");
+  await at(page, 262);
   await tab(page, "Parameters");
   const gain = value(page, "parameters").locator("tr").filter({ has: page.getByRole("rowheader", { name: "awg_gain", exact: true }) });
   await expect(gain.locator("td").nth(0).getByRole("button")).toHaveText("3, 3");
   await expect(gain.locator("td").nth(1).getByRole("button")).toHaveText("1, 1");
-  await at(page, 252);
+  await at(page, 284);
   await expect(value(page, "instruction-detail")).toContainText("ZF=1 NF=0 CF=0 OF=0");
   await at(page, 404);
   await expect(gain.locator("td").nth(1).getByRole("button")).toHaveText("3, 3");
@@ -338,14 +338,14 @@ test("communication input provenance, cross-sequencer navigation and trigger bou
   await open(page, "02-communication", "QRM0", "receiver");
   await at(page, 227);
   await tab(page, "Simulation");
-  await expect(value(page, "simulation-queue")).toContainText("Q1 stalled: feedback input (8–228 ns)");
+  await expect(value(page, "simulation-queue")).toContainText("Q1 stalled: feedback input (12–228 ns)");
   await at(page, 228);
   await expect(value(page, "communications")).toContainText("228 ns · feedback receive");
   await expect(value(page, "communications")).toContainText("id 16 · value 7");
   await tab(page, "Registers");
-  await at(page, 235);
+  await at(page, 231);
   await expect(register(page, "R0")).toHaveText("?");
-  await at(page, 236);
+  await at(page, 232);
   await expect(register(page, "R0")).toHaveText("7");
   await page.locator('[data-register="R0"]').click();
   await page.getByRole("button", { name: "Show received input that supplied this value", exact: true }).click();
@@ -356,7 +356,7 @@ test("communication input provenance, cross-sequencer navigation and trigger bou
   await expect(page.getByRole("spinbutton")).toHaveValue("204");
   await page.getByRole("combobox", { name: "Hardware module" }).selectOption("QRM0");
   await page.getByRole("button", { name: "Inspect sequencer receiver", exact: true }).click();
-  await at(page, 252);
+  await at(page, 248);
   await tab(page, "Registers");
   await expect(register(page, "R1")).toHaveText("8");
   await at(page, 1099);
@@ -399,11 +399,11 @@ test("physical stage values, finite SVG and acquisition visibility while rewindi
   await page.getByRole("combobox", { name: "Hardware module" }).selectOption("QCM0");
   await page.getByRole("button", { name: "Inspect sequencer controller", exact: true }).click();
   await tab(page, "Registers");
-  await at(page, 299);
+  await at(page, 295);
   await expect(register(page, "R0")).toHaveText("?");
-  await at(page, 300);
+  await at(page, 296);
   await expect(register(page, "R0")).toHaveText("3");
-  await at(page, 316);
+  await at(page, 312);
   await expect(register(page, "R1")).toHaveText("1");
 });
 
@@ -464,7 +464,7 @@ test("underflow remains a visible error with the partial queue trace", async ({ 
   await expect(value(page, "execution")).toContainText("error");
   await expect(value(page, "execution")).toContainText("24 ns");
   await tab(page, "Simulation");
-  await expect(value(page, "communications")).toContainText("4 ns · q1 stall");
+  await expect(value(page, "communications")).toContainText("8 ns · q1 stall");
   await expect(value(page, "simulation-queue")).toContainText("RT queue 0 / 32 packets");
 });
 
@@ -743,7 +743,7 @@ test("Hardware shows live Play waits on the core that is armed", async ({page}) 
     {fixture: fixtures.trigger, core: "rt", arm: 8, local: 12, kind: "wait_trigger", filename: "trigger.q1asm",
       label: "waiting · Waiting for external trigger", receivedAt: 20, receivedLabel: "active · wait_trigger"},
     {fixture: fixtures.linq, core: "q1", arm: 0, local: 4, kind: "feedback_pop", filename: "linq.q1asm",
-      label: "stalled · Waiting for LINQ feedback", receivedAt: 15, receivedLabel: "active · fb_pull_data"},
+      label: "stalled · Waiting for LINQ feedback", receivedAt: 11, receivedLabel: "active · fb_pull_data"},
   ]) {
     expect(fixture.waiting.execution.seq.status).toBe("waiting");
     expect(fixture.waiting.execution.seq.terminal).toBeUndefined();
@@ -791,12 +791,12 @@ test("Hardware scopes compact loop uncertainty by field and by visit", async ({p
   ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
   const view = {level: "detail", basis: "local"};
   const frequency = value(page, "parameters").locator("tr").filter({has: page.getByRole("rowheader", {name: "frequency", exact: true})});
-  await mountHardwareTrace(page, fixtures.steady, {...view, sequencerId: "steady", time: 43});
+  await mountHardwareTrace(page, fixtures.steady, {...view, sequencerId: "steady", time: 51});
   await expect(register(page, "R0")).toHaveText("3");
-  await at(page, 44);
+  await at(page, 52);
   await expect(register(page, "R0")).toContainText("unknown");
   await expect(register(page, "R5")).toHaveText("77");
-  await at(page, 80);
+  await at(page, 112);
   await expect(register(page, "R0")).toHaveText("0");
   await at(page, 104);
   await tab(page, "Parameters");
@@ -805,18 +805,18 @@ test("Hardware scopes compact loop uncertainty by field and by visit", async ({p
   await expect(page.getByRole("spinbutton")).toHaveValue("100");
   await expect(frequency.getByRole("button", {name: "4000000", exact: true})).toBeVisible();
 
-  await mountHardwareTrace(page, fixtures.varying, {...view, sequencerId: "varying", time: 104});
+  await mountHardwareTrace(page, fixtures.varying, {...view, sequencerId: "varying", time: 124});
   await tab(page, "Parameters");
   await expect(frequency.getByRole("button", {name: "unknown", exact: true})).toBeVisible();
   await at(page, 304);
   await expect(frequency.getByRole("button", {name: "2000000", exact: true})).toBeVisible();
 
   expect(fixtures.visits.events.filter((event) => event.kind === "q1_issue" && event.meta.preview_source_event_id).length).toBeGreaterThan(0);
-  await mountHardwareTrace(page, fixtures.visits, {...view, sequencerId: "visits", time: 39});
+  await mountHardwareTrace(page, fixtures.visits, {...view, sequencerId: "visits", time: 47});
   for (const offset of [0, -4]) {
     if (offset) await page.evaluate(() => window.hardwarePreview.setTimeBasis("aligned"));
-    for (const [time, label] of [[39, "active · loop"], [40, "unknown"], [47, "unknown"], [48, "active · sub"],
-      [111, "active · loop"], [112, "unknown"], [119, "unknown"], [120, "active · sub"]]) {
+    for (const [time, label] of [[47, "active · loop"], [48, "unknown"], [71, "unknown"], [72, "active · sub"],
+      [143, "active · loop"], [144, "unknown"], [167, "unknown"], [168, "active · sub"]]) {
       await at(page, time + offset);
       await expect(value(page, "q1-event")).toContainText(label);
     }
@@ -836,7 +836,7 @@ test("Hardware shows unresolved branches at the recorded Q1 issue end", async ({
 
   for (const [sequencerId, ir] of Object.entries(fixtures)) {
     const repeat = sequencerId === "repeat";
-    const issueEnd = repeat ? 96 : 32;
+    const issueEnd = repeat ? 88 : 32;
     const issues = ir.events.filter((event) => event.kind === "q1_issue" && event.meta.op === "jz");
     const unresolved = ir.events.find((event) => event.kind === "branch_region" && event.t1 === null);
     expect(issues).toHaveLength(repeat ? 2 : 1);
@@ -852,7 +852,7 @@ test("Hardware shows unresolved branches at the recorded Q1 issue end", async ({
     for (const offset of [0, -4]) {
       if (offset) await page.evaluate(() => window.hardwarePreview.setTimeBasis("aligned"));
       if (repeat) {
-        await at(page, 52 + offset);
+        await at(page, 48 + offset);
         await expect(value(page, "q1-event")).toContainText("active · wait");
       }
       await at(page, issueEnd - 1 + offset);
@@ -876,7 +876,7 @@ test("Hardware separates Q1 proof cutoffs from RT-only uncertainty", async ({pag
     "    for seq, (program, steps) in programs.items()}))",
   ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
 
-  for (const [sequencerId, issueEnd, rtBoundary, op] of [["nested", 76, 0, "loop"], ["limit", 104, 12, "jz"], ["partial", 44, 8, "wait"]]) {
+  for (const [sequencerId, issueEnd, rtBoundary, op] of [["nested", 108, 0, "loop"], ["limit", 104, 12, "jz"], ["partial", 44, 8, "wait"]]) {
     const ir = fixtures[sequencerId];
     const cutoff = ir.events.find((event) => event.kind === "unknown_region");
     expect(cutoff.meta.q1_proof_cutoff).toBe(true);

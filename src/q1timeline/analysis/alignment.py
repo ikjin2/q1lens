@@ -3,9 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from itertools import chain
 
-from q1timeline.analysis.interpreter import AnalysisState, Confidence, TimelineEvent
 from q1timeline.analysis.values import Concrete, Value, add_values, multiply_value
 from q1timeline.diagnostics import Diagnostic
+from q1timeline.execution.state import AnalysisState, Confidence, TimelineEvent
 
 
 SIMULATION_ALIGNMENT_MODE = "first_rt_dequeue"

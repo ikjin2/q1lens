@@ -1,11 +1,15 @@
-"""Concrete Q1 latch writes and analytical, single-sequencer RT packet effects."""
+"""Q1 latch writes and RT packet effects shared by the two concrete schedulers."""
 from __future__ import annotations
 
 from collections.abc import Collection
 from dataclasses import dataclass, replace
 
 from q1timeline.q1asm.ast import Instr
-from q1timeline.q1asm.core_devices import CoreBlocked, DEVICE_SETTERS
+from q1timeline.q1asm.core_devices import (
+    CoreBlocked, DEVICE_RT_OPS, DEVICE_SETTERS, DeviceState, check_device_issue, decode_device_command, device_limitation,
+)
+from q1timeline.q1asm.instruction_table import get_instruction_spec
+from q1timeline.q1asm.linq_commands import raw_linq_operation
 
 
 LATCH_FIELDS = {
@@ -75,6 +79,73 @@ class Latches:
             active["phase"] = LatchWrite("phase", 0)
         active.update((value.field, value) for value in applied if value.field not in ONE_SHOTS)
         return Latches(active=tuple(active.values())), applied
+
+
+def packet_applies_latches(op: str, first_operand: int | None = None) -> bool:
+    return get_instruction_spec(op).applies_latched_state or (
+        op == "fb_cmd" and raw_linq_operation(first_operand) == "upd_thres"
+    )
+
+
+def rt_dequeue_spacing_ns(duration: int) -> int:
+    """A zero-duration packet occupies one 4 ns RT dequeue slot."""
+    return duration or 4
+
+
+@dataclass(frozen=True)
+class SelectedPacket:
+    skipped: bool
+    dwell_ns: int
+    wait: str | None
+
+    def next_dequeue(self, resumed_ns: int | float) -> int | float:
+        return resumed_ns + rt_dequeue_spacing_ns(self.dwell_ns)
+
+
+def select_packet(
+    op: str, duration: int, condition: tuple[int, int | None, int | None, int], taken: bool | None,
+) -> SelectedPacket | None:
+    """Resolve the dequeue action; the scheduler supplies any receiver decision."""
+    if condition[0]:
+        if taken is None:
+            return None
+        if not taken:
+            return SelectedPacket(True, condition[3], None)
+    return SelectedPacket(False, duration, op if op in {"wait_trigger", "wait_sync"} else None)
+
+
+@dataclass(frozen=True)
+class PacketEffects:
+    op: str | None
+    operands: tuple[int, ...]
+    commits_latches: bool
+    latches: Latches
+    applied: tuple[LatchWrite, ...]
+    devices: DeviceState
+    limitation: str | None
+
+
+def execute_packet(
+    op: str, operands: tuple[int, ...], selected: SelectedPacket, latches: Latches,
+    devices: DeviceState, *, time_ns: int | float,
+) -> PacketEffects:
+    """Apply one RT dequeue, including skipped one-shots, without advancing either clock."""
+    applied = ()
+    captures = packet_applies_latches(op, operands[0] if operands else None)
+    if captures:
+        latches, applied = latches.commit(skipped=selected.skipped)
+    if selected.skipped:
+        return PacketEffects(None, (), False, latches, applied, devices, None)
+    if op in DEVICE_RT_OPS:
+        op, operands = decode_device_command(op, operands)
+        check_device_issue(op, operands)
+        limitation = device_limitation(op, operands)
+        if limitation:
+            return PacketEffects(op, operands, captures, latches, applied, devices, limitation)
+        devices = devices.apply(op, operands)
+    if any(write.field == "time_ref" for write in applied):
+        devices = replace(devices, time_ref_ns=time_ns)
+    return PacketEffects(op, operands, captures, latches, applied, devices, None)
 
 
 def decode_register(op: str, word: int) -> int:

@@ -10,9 +10,9 @@ import yaml
 
 from q1timeline.analysis.alignment import align_timelines
 from q1timeline.analysis.hardware_readiness import analyze_project_hardware_readiness
-from q1timeline.analysis.interpreter import AnalysisState, interpret_program
 from q1timeline.analysis.underflow import analyze_underflows
 from q1timeline.diagnostics import Diagnostic, has_fatal_diagnostics
+from q1timeline.execution.state import AnalysisState
 from q1timeline.ir.serialize import diagnostics_to_json, timeline_ir_from_states, write_timeline_ir
 from q1timeline.project import ConfigLoadError, ProjectConfig, load_project_config
 from q1timeline.q1asm.parser import parse_q1asm_file
@@ -278,6 +278,8 @@ def _analyze_config(config: ProjectConfig) -> list[AnalysisState]:
             hardware_parameters={seq.id: seq.hardware_parameters for seq in config.sequencers},
             sequencer_metadata=config.sequencer_metadata(),
         )
+    from q1timeline.analysis.interpreter import interpret_program
+
     states = []
     for sequencer in config.sequencers:
         sequence_names = load_sequence_names(sequencer.sequence_json) if sequencer.sequence_json else None

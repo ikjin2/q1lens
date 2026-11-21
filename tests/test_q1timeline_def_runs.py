@@ -227,7 +227,7 @@ def test_loop_repeats_source_line_as_separate_occurrences(tmp_path):
 
 @pytest.mark.parametrize("mode", ["concrete", "simulation"])
 def test_statistics_preparation_reuses_lints_and_matches_case_execution(tmp_path, monkeypatch, mode):
-    from q1timeline.analysis import interpreter
+    from q1timeline.execution import validation
 
     project = program(tmp_path, ".DEF X 4\n.DEF Y 1\nmove $Y,R2\nwait $X\nnop\nstop\n")
     run = snapshot(project, execution_mode=mode)
@@ -236,13 +236,13 @@ def test_statistics_preparation_reuses_lints_and_matches_case_execution(tmp_path
     prepared = run.prepare_statistics("sum", cases[0], {"X"})
     assert [instruction.op for instruction in prepared["sum"].revalidate] == ["wait"]
     calls = []
-    lint = interpreter.analyze_program_lints
+    lint = validation.analyze_program_lints
 
     def tracked_lint(*args, **kwargs):
         calls.append(1)
         return lint(*args, **kwargs)
 
-    monkeypatch.setattr(interpreter, "analyze_program_lints", tracked_lint)
+    monkeypatch.setattr(validation, "analyze_program_lints", tracked_lint)
     for values, original in zip(cases, expected):
         actual = run.run("sum", "R2", values, prepared=prepared)
         assert actual == {key: original[key] for key in ("status", "engine_completed", "word", "q1_ns")}
@@ -253,6 +253,8 @@ def test_statistics_preparation_reuses_lints_and_matches_case_execution(tmp_path
 @pytest.mark.parametrize("mode", ["concrete", "simulation"])
 def test_statistics_runs_branches_and_wraps_words_without_building_trace(tmp_path, monkeypatch, mode):
     from q1timeline.analysis import interpreter
+    from q1timeline.execution import registers
+    from q1timeline.execution.state import RegisterWrite, TimelineEvent
 
     project = program(tmp_path, ".DEF X 1\nmove $X,R2\nmove 3,R0\n"
                       "again: add R2,1,R2\nnop\nloop R0,@again\nstop\n")
@@ -265,9 +267,10 @@ def test_statistics_runs_branches_and_wraps_words_without_building_trace(tmp_pat
     def unexpected_trace(*args, **kwargs):
         pytest.fail("Statistics generated a trace entry for a Q1-only program")
 
-    monkeypatch.setattr(interpreter, "TimelineEvent", unexpected_trace)
-    monkeypatch.setattr(interpreter, "RegisterWrite", unexpected_trace)
+    monkeypatch.setattr(TimelineEvent, "__init__", unexpected_trace)
+    monkeypatch.setattr(RegisterWrite, "__init__", unexpected_trace)
     monkeypatch.setattr(interpreter, "_register_issue_metadata", unexpected_trace)
+    monkeypatch.setattr(registers, "register_issue_metadata", unexpected_trace)
     for values, case in zip(cases, expected):
         actual = run.run("sum", "R2", values, prepared=prepared)
         assert actual == {key: case[key] for key in ("status", "engine_completed", "word", "q1_ns")}

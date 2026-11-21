@@ -4,11 +4,23 @@ Select `analysis.execution_mode: simulation` in `q1timeline.yml`, or pass
 `--execution-mode simulation` to `q1lens q1timeline analyze`. In VS Code,
 `q1lens.q1timeline.executionMode: project` follows the YAML.
 
-Concrete runs a pure single-sequencer step for each issued instruction. Simulation
-and Play share resolved Q1 results, compiled branch addresses, register visibility
-rules and latch capture. Simulation schedules physical queues and devices. Play
-uses analytical clocks and can follow a user-selected branch. Concrete can consume
-[scheduled receiver inputs](external-inputs.md).
+Concrete and Simulation share Q1 operand validation, issue effects, register
+writes, branch decisions and issue records through the `q1timeline.execution`
+package. Simulation can execute a program and serialize its timeline independently
+of the Analysis interpreter. At RT dequeue the two engines use the same
+packet transition to select the dwell, apply latched settings and consume
+one-shot setters. Both use the same LINQ command decoder, FIFO selection rule
+and device register updates.
+
+Concrete advances a pure single-sequencer step on analytical clocks and can
+consume [scheduled receiver inputs](external-inputs.md). Simulation schedules
+the transitions on its event clock, including queue stalls, register-ready
+events, trigger arrivals, cross-sequencer barriers and physical device responses.
+Play can follow a user-selected branch or wait for the user to supply a trigger
+or LINQ input. Once its packet inputs, condition and latch values are known, it
+uses the shared RT packet transition. Analysis also uses that transition for
+resolved local packets. It keeps symbolic values and timing uncertainty when
+the inputs are still open.
 
 Q1 issue times use q1simulator 1.4.1, ISA 2, for the operand forms it executes.
 For example, `add R0,1,R2` takes 12 ns and `add R0,R1,R2` takes 16 ns.

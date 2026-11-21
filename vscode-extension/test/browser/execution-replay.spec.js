@@ -45,7 +45,7 @@ test("execution replay is opt-in inside sequencer detail and fits a narrow view"
 test("stepping follows loop occurrences and register readiness without draining RT time", async ({ page }) => {
   await open(page, "concrete-replay", "QCM0", "counter");
   await page.getByRole("button", { name: "Execution replay", exact: true }).click();
-  const ends = [4, 8, 12, 16, 28, 32, 36, 60, 72, 76, 80, 104, 116, 120, 124, 128, 132, 136, 140];
+  const ends = [4, 8, 12, 16, 28, 32, 36, 68, 80, 84, 88, 120, 132, 136, 140, 160, 164, 168, 172];
   const lines = [2, 3, 4, 5, 6, 7, 8, 9, 6, 7, 8, 9, 6, 7, 8, 9, 10, 11, 12];
   for (let index = 0; index < ends.length; index++) {
     await step(page).click();
@@ -206,7 +206,7 @@ test("the open cursor project replays its recorded prefix and shows its input wa
   await page.clock.runFor(13000);
   await expect(value(page, "replay-progress")).toHaveText("128 / 128 instructions");
   await expect(replayRegister(page, "R0")).not.toHaveText("?");
-  await expect(value(page, "replay-status")).toContainText(/Recorded trace ended.*No scheduled input can resume trigger_wait\..*Observation end 964 ns/);
+  await expect(value(page, "replay-status")).toContainText(/Recorded trace ended.*No scheduled input can resume trigger_wait\..*Observation end 1000 ns/);
   const evidence = await page.evaluate(() => {
     const ir = window.demoIr;
     const pending = ir.events.filter((event) => event.sequencer_id === "blue_peak" && event.meta.pending);
@@ -216,7 +216,7 @@ test("the open cursor project replays its recorded prefix and shows its input wa
     return {wait: [wait.t0.value, wait.t1.value, wait.source.line], stall: [stall.t0.value, stall.t1.value, stall.source.line],
       diagnosticLine: diagnostic.source.line};
   });
-  expect(evidence).toEqual({wait: [932, 964, 47], stall: [952, 964, 93], diagnosticLine: 47});
+  expect(evidence).toEqual({wait: [968, 1000, 47], stall: [988, 1000, 93], diagnosticLine: 47});
   await page.screenshot({ path: test.info().outputPath("current-project-replay.png"), fullPage: true });
 });
 

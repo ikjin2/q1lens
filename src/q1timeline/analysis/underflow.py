@@ -3,15 +3,15 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Any, Literal
 
-from q1timeline.analysis.interpreter import (
-    AnalysisState, RtPacket, TimelineEvent, _physical_read_register, _register_write_operands, _rt_dequeue_spacing_ns,
-)
 from q1timeline.analysis.queue_timing import (
     ASSUMED_INITIAL_BUFFER_NS, POSSIBLE_INITIAL_BUFFER_NS, replay_queues, synchronization_participants,
 )
 from q1timeline.analysis.values import Concrete, Unknown, subtract_values
 from q1timeline.diagnostics import Diagnostic
 from q1timeline.diagnostic_catalog import underflow_label
+from q1timeline.execution.operands import physical_read_register, register_write_operands
+from q1timeline.execution.state import AnalysisState, RtPacket, TimelineEvent
+from q1timeline.q1asm.core_rt import rt_dequeue_spacing_ns
 from q1timeline.q1asm.instruction_table import get_instruction_spec, rt_duration_arg_for_instruction
 
 
@@ -309,7 +309,7 @@ def _queue_packets(state: AnalysisState):
                         "set_awg_gain", "set_awg_offs", "set_freq", "reset_ph", "set_ph", "set_ph_delta"}
         written_registers = {meta.get("counter_reg")}
         for instruction in instructions:
-            written_registers.update(_register_write_operands(instruction, state))
+            written_registers.update(register_write_operands(instruction, state))
         repeatable = True
         affine_packets = meta.get("rt_packet_affine", {})
         affine_period = meta.get("period_affine", {})
@@ -324,13 +324,13 @@ def _queue_packets(state: AnalysisState):
                              and len(evaluated_packets[packet.id]) == len(periods)
                              and all(type(value) is int and 0 <= value <= 65535 for value in evaluated_packets[packet.id])
                              for packet in loop_packets)
-                     and all(sum(_rt_dequeue_spacing_ns(evaluated_packets[packet.id][index]) for packet in loop_packets) == value
+                     and all(sum(rt_dequeue_spacing_ns(evaluated_packets[packet.id][index]) for packet in loop_packets) == value
                              for index, value in enumerate(periods)))
         for instruction in instructions:
             spec = get_instruction_spec(instruction.op)
             # ALU fetch cost depends on the encoded operands, which stay fixed across iterations.
             if spec.category == "classical":
-                if meta.get("counter_reg") not in _register_write_operands(instruction, state):
+                if meta.get("counter_reg") not in register_write_operands(instruction, state):
                     continue
             elif instruction.op in constant_ops:
                 duration_index = rt_duration_arg_for_instruction(spec, instruction)
@@ -341,7 +341,7 @@ def _queue_packets(state: AnalysisState):
                     break
                 arg = instruction.args[duration_index]
                 if (instruction.pc in meta.get("invariant_duration_pcs", [])
-                        or _physical_read_register(arg, state) not in written_registers):
+                        or physical_read_register(arg, state) not in written_registers):
                     continue
             repeatable = False
             break
@@ -377,13 +377,13 @@ def _queue_packets(state: AnalysisState):
                     index = min(iteration, len(periods) - 1)
                     duration = Concrete(evaluated_packets[packet.id][index])
                     rt_t0 = Concrete(loop.t0.value + evaluated_elapsed + evaluated_prefix)
-                    evaluated_prefix += _rt_dequeue_spacing_ns(duration.value)
+                    evaluated_prefix += rt_dequeue_spacing_ns(duration.value)
                 else:
                     rt_t0 = Concrete(packet.rt_t0.value + offset)
                 packet_meta = dict(packet.meta)
                 if duration == Concrete(0):
                     packet_meta.update(queue_duration_ns=0,
-                                       next_dequeue_not_before_ns=rt_t0.value + _rt_dequeue_spacing_ns(0))
+                                       next_dequeue_not_before_ns=rt_t0.value + rt_dequeue_spacing_ns(0))
                 else:
                     packet_meta.pop("queue_duration_ns", None)
                     packet_meta.pop("next_dequeue_not_before_ns", None)
@@ -407,7 +407,7 @@ def _queue_packets(state: AnalysisState):
             return known, "unknown_rt_timing", packet
         if known:
             previous = known[-1]
-            gap = _rt_dequeue_spacing_ns(0) if previous.duration == Concrete(0) else 0
+            gap = rt_dequeue_spacing_ns(0) if previous.duration == Concrete(0) else 0
             if packet.rt_t0.value != previous.rt_t1.value + gap:
                 return known, "unrepresented_rt_commands", packet
         known.append(packet)
@@ -632,8 +632,6 @@ def _preview_underflow_status(
 
 
 def _event_like(state: AnalysisState, *, lane: str, kind: str, t0: Concrete | Unknown, source, label: str, meta: dict):
-    from q1timeline.analysis.interpreter import TimelineEvent
-
     return TimelineEvent(
         id=f"{state.sequencer_id}:e{len(state.events)}",
         sequencer_id=state.sequencer_id,

@@ -7,9 +7,9 @@ from dataclasses import dataclass, field
 import heapq
 from itertools import count
 
-from q1timeline.analysis.interpreter import RtPacket
 from q1timeline.analysis.trigger_counters import ScheduledTriggerCounters, TriggerSchedule
 from q1timeline.analysis.values import Concrete
+from q1timeline.execution.state import RtPacket
 
 
 ASSUMED_INITIAL_BUFFER_NS = 1_000_000

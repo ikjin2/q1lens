@@ -3,9 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from q1timeline.analysis.interpreter import AnalysisState, TimelineEvent
 from q1timeline.analysis.values import Concrete
 from q1timeline.diagnostics import Diagnostic
+from q1timeline.execution.state import AnalysisState, TimelineEvent
 from q1timeline.q1asm.instruction_table import get_instruction_spec
 
 

@@ -5,8 +5,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from q1timeline.analysis.acquisition_buffer import READOUT_OPS, analyze_acquisition_buffer
-from q1timeline.analysis.interpreter import AnalysisState, TimelineEvent
 from q1timeline.diagnostics import Diagnostic
+from q1timeline.execution.state import AnalysisState, TimelineEvent
 from q1timeline.q1asm.ast import SourceLocation
 
 if TYPE_CHECKING:

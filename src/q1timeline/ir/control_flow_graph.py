@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from q1timeline.analysis.interpreter import AnalysisState
+from q1timeline.execution.state import AnalysisState
 from q1timeline.q1asm.ast import Arg, Instr, SourceLocation
 from q1timeline.q1asm.instruction_table import STATUS_BRANCH_OPS
 

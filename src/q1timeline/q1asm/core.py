@@ -16,8 +16,9 @@ from q1timeline.q1asm.ast import Arg, Instr, Program
 from q1timeline.q1asm.compiled_addresses import compile_addresses, next_compiled_pc
 from q1timeline.q1asm.core_devices import (
     CoreBlocked, DEVICE_RANGES, DEVICE_RT_OPS, DEVICE_SETTERS, DeviceState, ExternalInputs, FeedbackOverflow,
-    check_device_issue, normalize_command,
+    check_device_issue,
 )
+from q1timeline.q1asm.core_rt import rt_dequeue_spacing_ns
 from q1timeline.q1asm.instruction_table import STATUS_BRANCH_OPS, branch_duration, get_instruction_spec
 from q1timeline.q1asm.linq_commands import PACKED_LINQ_OPERATIONS, raw_linq_operation
 from q1timeline.q1asm.parser import parameter_integer
@@ -107,6 +108,21 @@ def destination_indexes(op: str) -> tuple[int, ...]:
     return ()
 
 
+def branch_effect(
+    instruction: Instr, inputs: tuple[int, ...], flags: dict[str, bool] | None,
+) -> tuple[bool | None, tuple[int, ...], dict[str, bool] | None]:
+    """Return the branch decision, loop counter write and resulting flags."""
+    if instruction.op == "loop":
+        bits = core_alu.sub_flags(inputs[0], 1)
+        return bits["zf"] ^ True, ((inputs[0] - 1) & _WORD_MASK,), bits
+    if instruction.op == "jmp":
+        return True, (), None
+    if len(instruction.args) == 3:
+        bits = core_alu.sub_flags(inputs[0], inputs[1])
+        return (bits["cf"] if instruction.op == "jlt" else bits["cf"] ^ True), (), bits
+    return branch_on_flags(instruction.op, flags), (), None
+
+
 def issue(
     instruction: Instr, operands: tuple[int | None, ...] | int, flags: dict[str, bool] | None = None,
 ) -> Issue:
@@ -124,22 +140,11 @@ def issue(
     if op in core_alu.ALU_OPS:
         words, bits = core_alu.evaluate(instruction, values)
         return Issue(cost, words=words, flags=Flags(**bits))
-    if op == "loop":
-        word = (values[0] - 1) & _WORD_MASK
-        bits = Flags(**core_alu.sub_flags(values[0], 1))
-        return Issue(branch_duration(cost, not bits.zf), words=(word,), flags=bits, taken=not bits.zf)
     if op in BRANCH_OPS:
-        bits = None
-        if op == "jmp":
-            taken = True
-        elif len(instruction.args) == 3:
-            bits = Flags(**core_alu.sub_flags(values[0], values[1]))
-            taken = bits.cf if op == "jlt" else not bits.cf
-        else:
-            taken = branch_on_flags(op, flags)
-            if taken is None:
-                raise ValueError(f"{op} requires known status flags")
-        return Issue(branch_duration(cost, taken), flags=bits, taken=taken)
+        taken, words, bits = branch_effect(instruction, values, flags)
+        if taken is None:
+            raise ValueError(f"{op} requires known status flags")
+        return Issue(branch_duration(cost, taken), words=words, flags=Flags(**bits) if bits else None, taken=taken)
     if op in core_rt.RT_OPS:
         return Issue(cost, wait_duration=core_rt.rt_duration(instruction, values))
     if op in DEVICE_RT_OPS:
@@ -170,11 +175,6 @@ def issue(
     if op == "nop":
         return Issue(cost)
     raise ValueError(f"Unsupported core instruction {op}")
-
-
-def rt_dequeue_spacing_ns(duration: int) -> int:
-    """A zero-duration packet occupies one 4 ns RT dequeue slot."""
-    return duration if duration else 4
 
 
 def reference_sync_adjustment(wait_after: int, selected_dwell: int) -> int:
@@ -400,37 +400,25 @@ def step(
     packet = None
     if result.wait_duration is not None:
         values = cast(tuple[int, ...], inputs)
-        device_op, device_args = item.op, values
-        duration = result.wait_duration
-        enabled, mask, operator, otherwise = state.condition
+        enabled, mask, operator, _ = state.condition
         # Count arrivals at this RT edge before changing the counting-enable latch.
         if external is not None or devices.latch_enabled or enabled:
             devices = devices.advance_counters(external or ExternalInputs(), rt_ns)
-        skipped = bool(enabled) and not devices.condition_taken(cast(int, mask), cast(int, operator),
-                                                                external or ExternalInputs())
+        taken = devices.condition_taken(cast(int, mask), cast(int, operator), external or ExternalInputs()) if enabled else True
+        selected = core_rt.select_packet(item.op, result.wait_duration, state.condition, taken)
+        assert selected is not None  # condition_taken raises CoreBlocked on missing receiver inputs.
         start = rt_ns
-        applied = ()
-        if skipped:
-            duration = otherwise
-            applies = (get_instruction_spec(item.op).applies_latched_state or
-                       item.op == "fb_cmd" and raw_linq_operation(values[0]) == "upd_thres")
-            if applies:
-                latches, applied = latches.commit(skipped=True)
-        else:
-            if item.op in DEVICE_RT_OPS:
-                device_op, device_args = normalize_command(item.op, values)
-                devices = devices.apply(device_op, device_args)
-            if device_op == "wait_trigger":
-                devices, start = devices.await_trigger(external or ExternalInputs(), values[0], rt_ns)
-            if get_instruction_spec(device_op).applies_latched_state:
-                latches, applied = latches.commit()
-                if any(update.field == "time_ref" for update in applied):
-                    devices = replace(devices, time_ref_ns=rt_ns)
-        packet = RtPacket(state.q1_ns, q1_end, rt_ns, start + duration, item.op, values, applied,
-                          skipped, None if skipped else device_op, () if skipped else device_args)
+        if selected.wait == "wait_trigger":
+            devices, start = devices.await_trigger(external or ExternalInputs(), values[0], rt_ns)
+        effects = core_rt.execute_packet(item.op, values, selected, latches, devices, time_ns=rt_ns)
+        if effects.limitation:
+            raise CoreBlocked(effects.limitation)
+        devices, latches = effects.devices, effects.latches
+        packet = RtPacket(state.q1_ns, q1_end, rt_ns, start + selected.dwell_ns, item.op, values,
+                          effects.applied, selected.skipped, effects.op, effects.operands)
         if item.op == "wait_sync":
-            reference_sync_ns += reference_sync_adjustment(result.wait_duration, duration)
-        rt_ns = start + rt_dequeue_spacing_ns(duration)
+            reference_sync_ns += reference_sync_adjustment(result.wait_duration, selected.dwell_ns)
+        rt_ns = selected.next_dequeue(start)
     next_state = replace(state,
         pc=next_pc, registers=tuple(registers), pending_writes=pending,
         flags=result.flags or state.flags, q1_ns=q1_end, rt_ns=rt_ns, stop_code=result.stop_code,

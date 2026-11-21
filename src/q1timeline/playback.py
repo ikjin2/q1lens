@@ -15,21 +15,31 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-from q1timeline.analysis import interpreter as core
+from q1timeline.analysis import interpreter
 from q1timeline.analysis.alignment import align_timelines
 from q1timeline.analysis.playback_loops import ExecutedStep
 from q1timeline.analysis.playback_timing import annotate_playback_queue_timing
 from q1timeline.analysis.queue_timing import DISABLED_SYNC_REASON
 from q1timeline.analysis.trigger_counters import ScheduledTriggerCounters, TriggerSchedule, selected_addresses
-from q1timeline.analysis.values import Concrete, Unknown, add_values, resolve_arg_value, value_to_json
+from q1timeline.analysis.values import (
+    Concrete, Unknown, add_values, resolve_arg_value, resolve_def_values, subtract_values, symbol_table_from_params,
+    value_to_json,
+)
 from q1timeline.diagnostics import Diagnostic
+from q1timeline.execution import issue as q1_issue, operands as operand_binding, registers as register_writes
+from q1timeline.execution import trace as timeline, validation as q1_validation
+from q1timeline.execution.state import AnalysisState, CLASSICAL_REGISTER_MASK, LOCAL_EXECUTION_OPS, PendingRegisterWrite
 from q1timeline.ir.serialize import timeline_ir_from_states
 from q1timeline.external_inputs import resolve_feedback_sources, resolve_trigger_sources, validate_external_inputs
 from q1timeline.feedback_fifo import DEFAULT_FEEDBACK_QUEUE_CAPACITY, feedback_pop_limitation, feedback_q1_completion, take_feedback
 from q1timeline.project import ConfigLoadError, load_project_config, load_single_file_config
 from q1timeline.q1asm.ast import Instr, SourceLocation
-from q1timeline.q1asm.compiled_addresses import next_source_position
-from q1timeline.q1asm.instruction_table import get_instruction_spec, rt_duration_arg_for_instruction
+from q1timeline.q1asm.compiled_addresses import compile_addresses, next_source_position
+from q1timeline.q1asm.core import branch_on_flags
+from q1timeline.q1asm.core_alu import register_write_delay_slots, sub_flags
+from q1timeline.q1asm.core_devices import DeviceState
+from q1timeline.q1asm.instruction_table import branch_duration, get_instruction_spec, rt_duration_arg_for_instruction
+from q1timeline.q1asm.linq_commands import MOCK_LIMITATION, raw_linq_operation
 from q1timeline.q1asm.parser import parse_q1asm
 from q1timeline.sequence import load_sequence_names
 
@@ -55,7 +65,7 @@ class _ScheduledFeedback:
 
 @dataclass
 class _Runner:
-    state: core.AnalysisState
+    state: AnalysisState
     symbols: dict
     trigger_counters: ScheduledTriggerCounters
     scheduled_feedback: _ScheduledFeedback | None = None
@@ -66,7 +76,7 @@ class _Runner:
     waiting: dict | None = None
 
 
-def _record_q1_terminal(state: core.AnalysisState, reason: str, category: str = "playback_boundary") -> None:
+def _record_q1_terminal(state: AnalysisState, reason: str, category: str = "playback_boundary") -> None:
     execution = state.metadata["execution"]
     if isinstance(state.q1_time_ns, Concrete) and "terminal" not in execution:
         execution["terminal"] = {"local_time_ns": state.q1_time_ns.value, "category": category,
@@ -143,22 +153,22 @@ class PlaybackSession:
         self.feedback_sources = resolve_feedback_sources(self.external_inputs)
         feedback_by_target = {source["target"]: source["arrivals"] for source in self.feedback_sources}
         for seq, program in self.programs.items():
-            state = core.AnalysisState(
+            state = AnalysisState(
                 sequencer_id=seq, labels=program.labels,
                 instructions_by_pc={item.pc: item for item in program.instructions},
-                register_aliases=core._register_aliases(program.defs), execution_mode="concrete",
+                register_aliases=operand_binding.register_aliases(program.defs), execution_mode="concrete", playback_devices=DeviceState(),
             )
             state.diagnostics.extend(program.diagnostics)
-            symbols = core.symbol_table_from_params(self.params)
+            symbols = symbol_table_from_params(self.params)
             defs = {name: arg for name, arg in program.defs.items() if arg.kind != "reg"}
-            state.compiled_addresses = core.compile_addresses(state.instructions_by_pc, state.labels)
-            resolved = core.resolve_def_values(defs, symbols, state.diagnostics, labels=core._address_labels(state))
-            state.symbol_origins = core._symbol_origins(self.params, symbols, defs, resolved)
+            state.compiled_addresses = compile_addresses(state.instructions_by_pc, state.labels)
+            resolved = resolve_def_values(defs, symbols, state.diagnostics, labels=operand_binding.address_labels(state))
+            state.symbol_origins = operand_binding.symbol_origins(self.params, symbols, defs, resolved)
             symbols.update(resolved)
-            core._diagnose_program(state, symbols, program)
+            q1_validation.diagnose_program(state, symbols, program)
             state.metadata["execution"] = {
                 "mode": "playback", "status": "paused", "steps": 0,
-                "timing_model": "analytical", "address_model": core._address_model(state),
+                "timing_model": "analytical", "address_model": operand_binding.address_model(state),
                 "assumptions": ["One executed path with assumed feedback receipts and a 32-entry RT FIFO.",
                                 "External trigger times are assumed receiver arrivals on the unaligned analytical RT clock; hardware transport latency is not modeled."],
             }
@@ -181,7 +191,7 @@ class PlaybackSession:
                 execution = state.metadata["execution"]
                 execution.update(status="error", reason=error.message)
                 if error.source is not None:
-                    execution["source"] = core._source_to_json(error.source)
+                    execution["source"] = timeline.source_to_json(error.source)
 
     def run(self, *, budget_ms: int = 100, max_steps: int = 1000) -> dict:
         if type(budget_ms) is not int or not 1 <= budget_ms <= 5000:
@@ -281,12 +291,12 @@ class PlaybackSession:
         self.status, self.reason = ("error" if error else "blocked"), reason
         state = runner.state
         execution = state.metadata["execution"]
-        execution.update(status=self.status, reason=reason, pc=instruction.pc, source=core._source_to_json(instruction.source))
+        execution.update(status=self.status, reason=reason, pc=instruction.pc, source=timeline.source_to_json(instruction.source))
         if state.compiled_addresses is not None:
-            execution["compiled_pc"] = core._compiled_pc(state, instruction.pc)
+            execution["compiled_pc"] = q1_validation.compiled_pc(state, instruction.pc)
         _record_q1_terminal(state, reason)
         if emit_boundary:
-            core._emit_event(
+            timeline.emit_event(
                 state, lane="rt.unknown", kind="unknown_region", t0=state.rt_time_ns,
                 t1=None, duration=Unknown(reason), label=reason, confidence="unknown", source=instruction.source,
                 meta={"reason": "playback_boundary", "playback": True},
@@ -296,7 +306,7 @@ class PlaybackSession:
     def _step(self, runner: _Runner) -> bool:
         state = runner.state
         history_start = len(state.register_history)
-        instruction = core._execution_instruction(state)
+        instruction = operand_binding.execution_instruction(state)
         if instruction is None:
             if state.pc == len(state.instructions_by_pc) and any(
                 item.details.get("source_line_skipped") for item in state.diagnostics
@@ -311,7 +321,7 @@ class PlaybackSession:
             overflow = runner.scheduled_feedback.advance(state.q1_time_ns.value)
             if overflow is not None:
                 return self._feedback_overflow(runner, instruction, overflow)
-        core._apply_ready_register_writes(state)
+        register_writes.apply_ready_register_writes(state)
         spec = get_instruction_spec(instruction.op)
         validation = spec.validate(instruction)
         invalid = [item for item in validation if item.severity == "error"]
@@ -322,13 +332,13 @@ class PlaybackSession:
                 or (spec.timing_effect_status == "analysis_incomplete" and not spec.emits_rt_packet
                     and instruction.op != "set_cond")):
             return self._block(runner, instruction, f"{instruction.op} requires unavailable execution or external timing semantics.")
-        scope = core._scope(runner.symbols, state)
-        duration_error = core._invalid_rt_duration(instruction, spec, scope)
+        scope = operand_binding.operand_scope(runner.symbols, state)
+        duration_error = q1_validation.invalid_rt_duration(instruction, spec, scope)
         if instruction.op == "set_cond" or duration_error is not None:
-            _, invalid, diagnostic_start = core._validate_instruction(state, instruction, runner.symbols)
-            if not core._concrete_instruction_ready(
+            _, invalid, diagnostic_start = q1_validation.validate_instruction(state, instruction, runner.symbols)
+            if not q1_validation.concrete_instruction_ready(
                 state, instruction, runner.symbols, spec, invalid, diagnostic_start,
-                supported_ops=core._LOCAL_EXECUTION_OPS | {instruction.op}, allow_symbolic_operands=True,
+                supported_ops=LOCAL_EXECUTION_OPS | {instruction.op}, allow_symbolic_operands=True,
                 rt_duration_error=duration_error,
             ):
                 execution = state.metadata["execution"]
@@ -363,10 +373,10 @@ class PlaybackSession:
                               "uncertain_addresses": sorted(runner.trigger_counters.uncertain_addresses().intersection(addresses)),
                               "input_event_ids": [event_id for group in counted_ids for event_id in group]}
             if decision is not False:
-                raw_linq_op = (core.raw_linq_operation(core._arg_int(instruction.args[0], scope))
+                raw_linq_op = (raw_linq_operation(operand_binding.arg_int(instruction.args[0], scope))
                                if instruction.op == "fb_cmd" else None)
                 if "fb_acq_tb_mock" in {instruction.op, raw_linq_op}:
-                    return self._block(runner, instruction, core.MOCK_LIMITATION)
+                    return self._block(runner, instruction, MOCK_LIMITATION)
                 if spec.timing_effect_status == "analysis_incomplete":
                     return self._block(runner, instruction, f"{instruction.op} requires unavailable execution or external timing semantics.")
             if decision is not False and instruction.op == "set_latch_en":
@@ -385,12 +395,12 @@ class PlaybackSession:
             if not isinstance(resolve_arg_value(instruction.args[duration_index], scope), Concrete):
                 return self._block(runner, instruction, f"{instruction.op} duration is unknown.")
         event_start = len(state.events)
-        continuation = core._has_jump_continuation(state, instruction)
+        continuation = interpreter._has_jump_continuation(state, instruction)
         if spec.category != "branch":
             state.next_pc, state.next_interior_pc = next_source_position(
                 state.compiled_addresses, instruction, state.interior_pc, len(state.instructions_by_pc),
             )
-        state.current_resolved_args = core._resolved_args_for_instruction(instruction, scope, state)
+        state.current_resolved_args = operand_binding.resolved_args_for_instruction(instruction, scope, state)
         diagnostic_start = len(state.diagnostics)
         flags_before = dict(state.alu_flags) if state.alu_flags is not None else None
         try:
@@ -411,7 +421,7 @@ class PlaybackSession:
                     return False
             else:
                 names = self.sequence_names.get(state.sequencer_id)
-                core._execute_instruction(state, instruction, runner.symbols,
+                interpreter._execute_instruction(state, instruction, runner.symbols,
                                           names.waveforms if names else {}, names.acquisitions if names else {},
                                           allow_symbolic_operands=True, rt_condition_decision=decision,
                                           share_resolved_issue=True)
@@ -468,17 +478,17 @@ class PlaybackSession:
         # Unknown values may propagate; invalid instructions never become executed steps.
         if not fault and any(item.severity == "error" for item in state.diagnostics[diagnostic_start:]):
             return self._block(runner, instruction, "Instruction validation failed.", error=True)
-        runner.trace.append(core._executed_step(state, instruction, event_start, rt_start,
+        runner.trace.append(interpreter._executed_step(state, instruction, event_start, rt_start,
                                                 branch_taken, branch_target, continuation))
         state.executed_pcs.add(instruction.pc)
         state.q1_issue_index += 1
         state.metadata["execution"]["steps"] = state.q1_issue_index
         self.steps += 1
-        core._advance_execution(state)
+        q1_issue.advance_execution(state)
         if stop_overflow is not None:
             return self._feedback_overflow(runner, instruction, stop_overflow)
         if state.stopped:
-            core._apply_ready_register_writes(state)
+            register_writes.apply_ready_register_writes(state)
             if fault:
                 _record_q1_terminal(state, execution["reason"], "illegal_instruction")
             else:
@@ -497,14 +507,14 @@ class PlaybackSession:
 
     def _receive_trigger(self, runner: _Runner, instruction: Instr, *, rt_condition_decision: bool | None = None) -> bool:
         state = runner.state
-        spec, invalid, diagnostic_start = core._validate_instruction(state, instruction, runner.symbols)
-        if not core._concrete_instruction_ready(
+        spec, invalid, diagnostic_start = q1_validation.validate_instruction(state, instruction, runner.symbols)
+        if not q1_validation.concrete_instruction_ready(
             state, instruction, runner.symbols, spec, invalid, diagnostic_start,
-            supported_ops=core._LOCAL_EXECUTION_OPS | {"wait_trigger"}, allow_symbolic_operands=True,
+            supported_ops=LOCAL_EXECUTION_OPS | {"wait_trigger"}, allow_symbolic_operands=True,
         ):
             execution = state.metadata["execution"]
             return self._block(runner, instruction, execution["reason"], error=execution["status"] == "error")
-        address, duration = [resolve_arg_value(arg, core._scope(runner.symbols, state)) for arg in instruction.args]
+        address, duration = [resolve_arg_value(arg, operand_binding.operand_scope(runner.symbols, state)) for arg in instruction.args]
         if not all(isinstance(value, Concrete) for value in (address, duration, state.rt_time_ns)):
             return self._block(runner, instruction, "wait_trigger address, duration or RT start is unknown.")
         if not 0 <= address.value <= 15:
@@ -528,7 +538,7 @@ class PlaybackSession:
             assumption["source_id"] = matching[0]["id"] if len(matching) == 1 else None
             runner.waiting = assumption
             state.metadata["execution"].update(status="waiting", reason=assumption["reason"], pc=instruction.pc)
-            core._emit_event(state, lane="rt.sync", kind="wait_trigger", t0=state.rt_time_ns,
+            timeline.emit_event(state, lane="rt.sync", kind="wait_trigger", t0=state.rt_time_ns,
                              t1=None, duration=Unknown(assumption["reason"]), label="Waiting for external trigger",
                              confidence="unknown", source=instruction.source,
                              meta={"playback": True, "trigger_assumption": assumption})
@@ -537,7 +547,7 @@ class PlaybackSession:
         assumption.update(source_id=source_id, event_id=event_id, arrival_ns=arrival,
                           resume_ns=arrival + duration.value, status="received")
         event_start = len(state.events)
-        core._execute_instruction(state, instruction, runner.symbols, {}, {}, allow_symbolic_operands=True,
+        interpreter._execute_instruction(state, instruction, runner.symbols, {}, {}, allow_symbolic_operands=True,
                                   rt_condition_decision=rt_condition_decision)
         if state.metadata["execution"].get("status") in {"error", "blocked"}:
             execution = state.metadata["execution"]
@@ -552,7 +562,7 @@ class PlaybackSession:
             event.meta["trigger_assumption"] = assumption
             if event.kind == "wait_trigger":
                 edge = Concrete(arrival)
-                receive = core._emit_event(
+                receive = timeline.emit_event(
                     state, lane="rt.trigger", kind="trigger_receive", t0=edge, t1=edge,
                     duration=Concrete(0), label="trigger receive", confidence="assumed",
                     source=SourceLocation("<simulation>", 1, 1, ""),
@@ -562,7 +572,7 @@ class PlaybackSession:
                 assumption["arrival_event_id"] = receive.id
                 event.meta["input_event_ids"] = [receive.id]
                 state.events[index] = replace(event, t1=end, duration=elapsed, confidence="assumed")
-        core._advance_after_zero_duration(state, packet, event_start)
+        interpreter._advance_after_zero_duration(state, packet, event_start)
         runner.trigger_assumptions.append(event_id)
         self.triggers.append({**assumption, "sequencer_id": state.sequencer_id})
         return True
@@ -571,7 +581,7 @@ class PlaybackSession:
         state = runner.state
         event_start = len(state.events)
         pending_start = len(state.pending_register_writes)
-        core._execute_instruction(state, instruction, runner.symbols, {}, {}, allow_symbolic_operands=True)
+        interpreter._execute_instruction(state, instruction, runner.symbols, {}, {}, allow_symbolic_operands=True)
         if state.metadata["execution"].get("status") in {"error", "blocked"}:
             return
         feedback_id = f"{state.sequencer_id}:feedback:{state.q1_issue_index}"
@@ -585,19 +595,19 @@ class PlaybackSession:
         available_at = add_values(issue.t0, delay)
         value = (Concrete(assumption["value"] & 0xFFFFFFFF) if assumption["value"] is not None
                  else Unknown(f"Assumed feedback receipt {feedback_id} has no supplied value"))
-        destination = core._register_name(instruction.args[1], state)
-        channel = core._feedback_channel(instruction.args[0], core._scope(runner.symbols, state))
+        destination = operand_binding.resolve_register_name(instruction.args[1], state)
+        channel = interpreter._feedback_channel(instruction.args[0], operand_binding.operand_scope(runner.symbols, state))
         expression = f"assumed {instruction.op} channel {channel}"
-        provenance = core._register_provenance(
+        provenance = register_writes.make_register_provenance(
             state, destination, expression=expression, value=value,
-            steps=[{**core._provenance_step(instruction, expression, value),
+            steps=[{**register_writes.provenance_step(instruction, expression, value),
                     "playback_feedback_id": feedback_id, "feedback_assumption": assumption}],
         )
         for index in range(pending_start, len(state.pending_register_writes)):
             pending = state.pending_register_writes[index]
             state.pending_register_writes[index] = replace(
                 pending, value=value,
-                provenance=core._concrete_write_provenance(state, instruction, provenance, issue.id),
+                provenance=register_writes.concrete_write_provenance(state, instruction, provenance, issue.id),
                 meta={**pending.meta, "playback_feedback_id": feedback_id, "feedback_assumption": assumption},
             )
         for index in range(event_start, len(state.events)):
@@ -613,7 +623,7 @@ class PlaybackSession:
         runner.feedback_assumptions.append(feedback_id)
         self.feedback.append({
             "feedback_id": feedback_id, "event_id": issue.id, "sequencer_id": state.sequencer_id,
-            "op": instruction.op, "source": core._source_to_json(instruction.source),
+            "op": instruction.op, "source": timeline.source_to_json(instruction.source),
             "channel": channel, "register": destination, "step": self.steps,
             "value": assumption["value"], "delay_ns": assumption["delay_ns"],
             "assumption_source": assumption["source"], "assumed": True,
@@ -634,7 +644,7 @@ class PlaybackSession:
                 })
                 state.q1_time_ns = edge
             break
-        marker = core._emit_event(
+        marker = timeline.emit_event(
             state, lane="rt.feedback", kind="feedback_rejected", t0=edge, t1=edge, duration=Concrete(0),
             label="Rejected LINQ arrival", confidence="assumed", source=instruction.source,
             meta={"id": entry["id"], "input_event_id": entry["event_id"], "capacity": self.feedback_queue_capacity,
@@ -655,9 +665,9 @@ class PlaybackSession:
     def _receive_scheduled_feedback(self, runner: _Runner, instruction: Instr, fifo: _ScheduledFeedback) -> bool:
         state = runner.state
         requested_id = None
-        destinations = {"data": core._register_name(instruction.args[1], state)}
+        destinations = {"data": operand_binding.resolve_register_name(instruction.args[1], state)}
         if instruction.op == "fb_pop_data":
-            requested = resolve_arg_value(instruction.args[0], core._scope(runner.symbols, state))
+            requested = resolve_arg_value(instruction.args[0], operand_binding.operand_scope(runner.symbols, state))
             if not isinstance(requested, Concrete):
                 return self._block(runner, instruction, "fb_pop_data requires a known LINQ ID for scheduled receipts.")
             requested_id = requested.value
@@ -667,7 +677,7 @@ class PlaybackSession:
                                                     message=limitation, source=instruction.source))
                 return self._block(runner, instruction, limitation)
         else:
-            destinations["id"] = core._register_name(instruction.args[0], state)
+            destinations["id"] = operand_binding.resolve_register_name(instruction.args[0], state)
         armed = state.q1_time_ns.value
         receipt, discarded = take_feedback(fifo.pending, requested_id)
         while receipt is None and fifo.arrivals:
@@ -685,17 +695,17 @@ class PlaybackSession:
             input_details.update(status="waiting", reason=reason)
             runner.waiting = input_details
             state.metadata["execution"].update(status="waiting", reason=reason, pc=instruction.pc, feedback_input=input_details)
-            event = core._emit_event(state, lane="rt.feedback", kind="feedback_pop", t0=state.q1_time_ns, t1=None,
+            event = timeline.emit_event(state, lane="rt.feedback", kind="feedback_pop", t0=state.q1_time_ns, t1=None,
                                      duration=Unknown(reason), label="Waiting for LINQ feedback", confidence="unknown",
                                      source=instruction.source, meta={"playback": True, "feedback_input": input_details})
             self.feedback.append({**input_details, "feedback_id": feedback_id, "event_id": event.id,
                                   "sequencer_id": state.sequencer_id, "op": instruction.op, "step": self.steps,
-                                  "assumption_source": "scenario", "source": core._source_to_json(instruction.source)})
+                                  "assumption_source": "scenario", "source": timeline.source_to_json(instruction.source)})
             return False
 
         event_start = len(state.events)
         pending_start = len(state.pending_register_writes)
-        core._execute_instruction(state, instruction, runner.symbols, {}, {}, allow_symbolic_operands=True)
+        interpreter._execute_instruction(state, instruction, runner.symbols, {}, {}, allow_symbolic_operands=True)
         if state.metadata["execution"].get("status") in {"error", "blocked"}:
             execution = state.metadata["execution"]
             return self._block(runner, instruction, execution["reason"], error=execution["status"] == "error")
@@ -710,11 +720,11 @@ class PlaybackSession:
             pending = state.pending_register_writes[index]
             result = Concrete(receipt["id"] if role == "id" else value)
             expression = f"scheduled LINQ {role} from ID {receipt['id']}"
-            provenance = core._register_provenance(state, pending.register, expression=expression, value=result,
-                steps=[{**core._provenance_step(instruction, expression, result), "input_event_id": receipt["event_id"]}])
+            provenance = register_writes.make_register_provenance(state, pending.register, expression=expression, value=result,
+                steps=[{**register_writes.provenance_step(instruction, expression, result), "input_event_id": receipt["event_id"]}])
             provenance["input_event_id"] = receipt["event_id"]
             state.pending_register_writes[index] = replace(
-                pending, value=result, provenance=core._concrete_write_provenance(state, instruction, provenance, issue.id),
+                pending, value=result, provenance=register_writes.concrete_write_provenance(state, instruction, provenance, issue.id),
                 meta={**pending.meta, "feedback_input": input_details, "input_event_id": receipt["event_id"]},
             )
         for index in range(event_start, len(state.events)):
@@ -733,89 +743,89 @@ class PlaybackSession:
         self.feedback.append({**input_details, "feedback_id": feedback_id, "event_id": issue.id,
                               "sequencer_id": state.sequencer_id, "op": instruction.op, "step": self.steps,
                               "assumption_source": "scenario", "assumed": True, "delay_ns": available - armed,
-                              "source": core._source_to_json(instruction.source)})
+                              "source": timeline.source_to_json(instruction.source)})
         return True
 
     def _branch(self, runner: _Runner, instruction: Instr) -> bool:
         state = runner.state
-        _, invalid, diagnostic_start = core._validate_instruction(state, instruction, runner.symbols)
+        _, invalid, diagnostic_start = q1_validation.validate_instruction(state, instruction, runner.symbols)
         failures = [item for item in state.diagnostics[diagnostic_start:] if item.severity == "error" or item.category == "register_not_ready"]
         if invalid or failures:
             return self._block(runner, instruction, failures[0].message if failures else "Invalid branch operands.", error=True)
-        scope = core._scope(runner.symbols, state)
+        scope = operand_binding.operand_scope(runner.symbols, state)
         target_index = 1 if instruction.op == "loop" else 2 if len(instruction.args) == 3 else 0
         target_arg = instruction.args[target_index]
         target_value = resolve_arg_value(target_arg, scope)
-        target = core._execution_target(state, target_value)
+        target = operand_binding.resolve_execution_target(state, target_value)
         conditional = instruction.op != "jmp"
-        effects = core._resolved_core_issue(state, instruction, scope)
+        effects = q1_issue.resolved_core_issue(state, instruction, scope)
         value = None
         if effects is not None:
             natural = effects.taken
         elif instruction.op == "loop":
             previous = resolve_arg_value(instruction.args[0], scope)
-            value = core._wrap_concrete_classical_register_value(core.subtract_values(previous, Concrete(1)))
+            value = interpreter._wrap_concrete_classical_register_value(subtract_values(previous, Concrete(1)))
             natural = value.value != 0 if isinstance(value, Concrete) else None
         elif len(instruction.args) == 3:
             left, right = (resolve_arg_value(arg, scope) for arg in instruction.args[:2])
             natural = None
             if isinstance(left, Concrete) and isinstance(right, Concrete):
-                a, b = left.value & core._CLASSICAL_REGISTER_MASK, right.value & core._CLASSICAL_REGISTER_MASK
+                a, b = left.value & CLASSICAL_REGISTER_MASK, right.value & CLASSICAL_REGISTER_MASK
                 natural = a < b if instruction.op == "jlt" else a >= b
         else:
-            natural = core._status_branch_decision(instruction.op, state.alu_flags) if conditional else True
+            natural = branch_on_flags(instruction.op, state.alu_flags) if conditional else True
         branch_id = f"{state.sequencer_id}:playback:{state.q1_issue_index}"
         choice = self.choices.get(branch_id) if conditional else None
         assumed = choice is not None or natural is None
         taken = choice == "taken" if choice is not None else natural if natural is not None else False
         if taken and target is None:
-            return self._block(runner, instruction, core._invalid_branch_target_reason(state, target_value))
+            return self._block(runner, instruction, q1_validation.invalid_branch_target_reason(state, target_value))
         origin = "user" if choice is not None else "default" if natural is None else "calculated"
         duration = (effects.q1_duration if effects is not None and choice is None else
-                    core.branch_duration(core._branch_taken_duration(instruction, state, runner.symbols), taken))
+                    branch_duration(q1_issue.branch_taken_duration(instruction, state, runner.symbols), taken))
         t0 = state.q1_time_ns
         t1 = add_values(t0, Concrete(duration))
         state.q1_time_ns = t1
-        issue = core._emit_q1_issue(
+        issue = q1_issue.emit_q1_issue(
             state, instruction, t0, t1, None,
-            register_metadata=core._register_issue_metadata(state, instruction, scope),
+            register_metadata=register_writes.register_issue_metadata(state, instruction, scope),
         )
         if effects is not None and target is not None:
             # The chosen arm sets the clock; its natural condition still sets the flags and counter.
-            core._execute_concrete_branch(state, instruction, issue, runner.symbols, defer_register_write=True,
+            q1_issue.execute_concrete_branch(state, instruction, issue, runner.symbols, defer_register_write=True,
                                           branch_issue=replace(effects, q1_duration=duration), projected=True)
         elif instruction.op == "loop":
-            register = core._register_name(instruction.args[0], state)
+            register = operand_binding.resolve_register_name(instruction.args[0], state)
             if effects is not None:
                 value = Concrete(effects.words[0])
                 flags = effects.flags.as_dict()
             else:
-                flags = core._sub_flags(previous.value, 1) if isinstance(previous, Concrete) else None
-            core._set_alu_flags(state, instruction, flags)
-            provenance = core._register_provenance(
+                flags = sub_flags(previous.value, 1) if isinstance(previous, Concrete) else None
+            register_writes.set_alu_flags(state, instruction, flags)
+            provenance = register_writes.make_register_provenance(
                 state, register, expression=f"{register} - 1", value=value,
-                steps=[core._provenance_step(instruction, f"{register} - 1", value)],
+                steps=[register_writes.provenance_step(instruction, f"{register} - 1", value)],
             )
-            state.pending_register_writes.append(core.PendingRegisterWrite(
-                register, value, core._concrete_write_provenance(state, instruction, provenance, issue.id),
-                instruction.source, state.q1_issue_index + 1 + core.register_write_delay_slots(instruction.op),
+            state.pending_register_writes.append(PendingRegisterWrite(
+                register, value, register_writes.concrete_write_provenance(state, instruction, provenance, issue.id),
+                instruction.source, state.q1_issue_index + 1 + register_write_delay_slots(instruction.op),
                 issue.id, {"op": "loop"},
             ))
         elif len(instruction.args) == 3:
             if effects is not None:
                 flags = effects.flags.as_dict()
             else:
-                flags = core._sub_flags(left.value, right.value) if isinstance(left, Concrete) and isinstance(right, Concrete) else None
-            core._set_alu_flags(state, instruction, flags)
+                flags = sub_flags(left.value, right.value) if isinstance(left, Concrete) and isinstance(right, Concrete) else None
+            register_writes.set_alu_flags(state, instruction, flags)
         state.next_pc, state.next_interior_pc = next_source_position(
             state.compiled_addresses, instruction, state.interior_pc, len(state.instructions_by_pc),
             taken=taken, target=target_value.value if isinstance(target_value, Concrete) else None,
         )
-        source_branch_id = core._branch_id(state, instruction, str(target_arg.value) if target_arg.kind == "label" else None, target_arg.raw)
+        source_branch_id = interpreter._branch_id(state, instruction, str(target_arg.value) if target_arg.kind == "label" else None, target_arg.raw)
         decision = "default" if origin == "default" else "assumed" if assumed else "concrete"
         metadata = {
             "playback_branch_id": branch_id, "branch_id": source_branch_id, "branch_taken": taken,
-            "branch_decision": decision, **core._branch_target_metadata(target, state),
+            "branch_decision": decision, **operand_binding.branch_target_metadata(target, state),
             "target_label": str(target_arg.value) if target_arg.kind == "label" else None,
         }
         if assumed:
@@ -827,8 +837,8 @@ class PlaybackSession:
         if conditional:
             self.branches.append({
                 "branch_id": branch_id, "source_branch_id": source_branch_id, "event_id": issue.id,
-                "sequencer_id": state.sequencer_id, "op": instruction.op, "source": core._source_to_json(instruction.source),
-                "target_label": metadata["target_label"], **core._branch_target_metadata(target, state),
+                "sequencer_id": state.sequencer_id, "op": instruction.op, "source": timeline.source_to_json(instruction.source),
+                "target_label": metadata["target_label"], **operand_binding.branch_target_metadata(target, state),
                 "calculated_taken": natural, "path": "taken" if taken else "fallthrough",
                 "assumed": assumed, "assumption_source": origin, "step": self.steps,
             })
@@ -839,7 +849,7 @@ class PlaybackSession:
         loops = []
         for runner in self.runners:
             state = runner.state
-            summaries = core._observed_loop_events(state, runner.trace, mode="playback")
+            summaries = interpreter._observed_loop_events(state, runner.trace, mode="playback")
             events = [*state.events, *summaries]
             loops.extend({"sequencer_id": state.sequencer_id, **event.meta} for event in summaries)
             metadata = dict(state.metadata)

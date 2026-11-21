@@ -40,6 +40,47 @@ for ir in (analyze_text(source), analyze_documents({{'sample.q1asm': source}}, a
     assert result.returncode == 0, result.stderr
 
 
+def test_simulation_can_execute_and_serialize_without_the_analysis_interpreter() -> None:
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    program = """\
+import sys
+sys.path.insert(0, sys.argv[1])
+sys.modules["q1timeline.analysis.interpreter"] = None
+from q1timeline.analysis import analyze_text
+ir = analyze_text("move 9,R0\\nnop\\nwait 4\\nstop", file="seq.q1asm",
+                  execution_mode="simulation", simulation={"startup_delay_ns": 64})
+assert ir["execution"]["seq"]["status"] == "completed", ir["diagnostics"]
+assert ir["register_history"][0]["value"]["value"] == 9
+assert any(event["kind"] == "wait" for event in ir["events"])
+"""
+    result = subprocess.run([sys.executable, "-c", program, str(source_root)], capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stderr
+
+
+def test_simulation_cli_and_watch_run_without_the_analysis_interpreter(tmp_path: Path) -> None:
+    (tmp_path / "seq.q1asm").write_text("move 9,R0\nnop\nwait 4\nstop", encoding="utf-8")
+    (tmp_path / "q1timeline.yml").write_text(
+        "sequencers:\n  - id: seq\n    file: seq.q1asm\nanalysis:\n  execution_mode: simulation\n"
+        "simulation:\n  startup_delay_ns: 64\n", encoding="utf-8",
+    )
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    program = """\
+import sys
+sys.path.insert(0, sys.argv[1])
+sys.modules["q1timeline.analysis.interpreter"] = None
+from q1lens.cli import main
+assert main(["q1timeline", "analyze", "--project", "q1timeline.yml", "--out", "ir.json", "--no-render"]) == 0
+assert main(["q1timeline", "watch", "--project", "q1timeline.yml", "--once", "--out-dir", "watch"]) == 0
+"""
+    run = subprocess.run([sys.executable, "-c", program, str(source_root)], cwd=tmp_path,
+                         capture_output=True, text=True, timeout=15)
+    assert run.returncode == 0, run.stdout + run.stderr
+    for path in (tmp_path / "ir.json", tmp_path / "watch" / "timeline_ir.json"):
+        ir = json.loads(path.read_text(encoding="utf-8"))
+        assert ir["execution"]["seq"]["status"] == "completed"
+        assert ir["register_history"][0]["value"]["value"] == 9
+
+
 def test_concrete_api_serializes_executed_iterations_and_register_evidence() -> None:
     ir = json.loads(timeline_ir_to_json(analyze_text(
         LOOP_PROGRAM, file="counter.q1asm", execution_mode="concrete",

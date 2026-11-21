@@ -13,11 +13,11 @@ from q1timeline.analysis.acquisition_windows import (
     CONFIGURED_INTEGRATION_SOURCES, acquisition_windows, qrm_scope_key,
     resolve_qrm_scope_settings, scope_acquisition_windows,
 )
-from q1timeline.analysis.interpreter import AnalysisState, TimelineEvent
 from q1timeline.analysis.hardware_readiness import hardware_readiness_summary
 from q1timeline.analysis.queue_timing import synchronization_participants
 from q1timeline.analysis.values import value_to_json
 from q1timeline.diagnostics import Diagnostic
+from q1timeline.execution.state import AnalysisState, TimelineEvent
 from q1timeline.ir.control_flow_graph import control_flow_graph_from_states
 from q1timeline.q1asm.ast import SourceLocation
 from q1timeline.q1asm.linq_commands import LINQ_CONFIGURATION_STREAMS

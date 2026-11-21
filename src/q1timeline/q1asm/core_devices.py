@@ -1,9 +1,10 @@
 """Single-receiver inputs and device commands at concrete instruction boundaries."""
 from __future__ import annotations
 
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
 
-from q1timeline.feedback_fifo import DEFAULT_FEEDBACK_QUEUE_CAPACITY, feedback_pop_limitation
+from q1timeline.feedback_fifo import DEFAULT_FEEDBACK_QUEUE_CAPACITY, feedback_match_index, feedback_pop_limitation
 from q1timeline.q1asm.linq_commands import (
     LINQ_CONFIGURATION_STREAMS, MOCK_LIMITATION, PACKED_LINQ_OPERATIONS, UnsupportedLinqCommand,
     decode_linq_command, linq_configuration_limitation,
@@ -60,6 +61,15 @@ class ExternalInputs:
             if time_ns <= until_ns:
                 raise FeedbackOverflow(time_ns, identifier, self.feedback_queue_capacity)
 
+    def feedback_ids_from(self, cursor: int, now_ns: int) -> Iterator[int]:
+        for index in range(cursor, len(self.feedback_arrivals)):
+            arrival, channel, _ = self.feedback_arrivals[index]
+            if arrival > now_ns:
+                # A waiting pop discarded nonmatches before this new arrival batch.
+                self.check_fifo(index, arrival)
+                now_ns = arrival
+            yield channel
+
 
 @dataclass(frozen=True)
 class DeviceState:
@@ -72,7 +82,7 @@ class DeviceState:
     feedback_cursor: int = 0
     thresholds: tuple[tuple[int, int], ...] = ()
     linq_config: tuple[tuple[str, tuple[int, ...]], ...] = ()
-    time_ref_ns: int | None = None
+    time_ref_ns: int | float | None = None
 
     def advance_counters(self, inputs: ExternalInputs, time_ns: int) -> DeviceState:
         arrivals = inputs.trigger_arrivals
@@ -113,18 +123,13 @@ class DeviceState:
             limitation = feedback_pop_limitation(identifier)
             if limitation:
                 raise CoreBlocked(limitation)
-        cursor = self.feedback_cursor
-        observed = now_ns
-        for index in range(cursor, len(inputs.feedback_arrivals)):
-            arrival, channel, word = inputs.feedback_arrivals[index]
-            if arrival > observed:
-                # A waiting selective pop discards nonmatches before the next arrival batch.
-                cursor, observed = index, arrival
-                inputs.check_fifo(cursor, observed)
-            if identifier is None or channel == identifier:
-                words = (channel, word) if identifier is None else (word,)
-                return replace(self, feedback_cursor=index + 1), arrival, words
-        raise CoreBlocked("LINQ receive requires a matching feedback FIFO entry")
+        offset = feedback_match_index(inputs.feedback_ids_from(self.feedback_cursor, now_ns), identifier)
+        if offset is None:
+            raise CoreBlocked("LINQ receive requires a matching feedback FIFO entry")
+        index = self.feedback_cursor + offset
+        arrival, channel, word = inputs.feedback_arrivals[index]
+        words = (channel, word) if identifier is None else (word,)
+        return replace(self, feedback_cursor=index + 1), arrival, words
 
     def apply(self, op: str, args: tuple[int, ...]) -> DeviceState:
         if op == "set_latch_en":
@@ -169,32 +174,43 @@ DEVICE_RT_OPS = frozenset(DEVICE_RANGES) | {"latch_rst"}
 DEVICE_SETTERS = {"reset_netzero": "netzero_reset", "set_time_ref": "time_ref"}
 
 
-def _check_args(op: str, args: tuple[int, ...]) -> None:
-    for index, role, low, high in DEVICE_RANGES.get(op, ()):
-        if not low <= args[index] <= high:
-            raise ValueError(f"{op} {role} {args[index]} outside {low}..{high}")
+def invalid_operand(
+    args: Sequence[int], ranges: Iterable[tuple[int, str, int, int]],
+) -> tuple[str, int, int, int] | None:
+    for index, role, low, high in ranges:
+        if index < len(args) and not low <= args[index] <= high:
+            return role, args[index], low, high
+    return None
 
 
 def check_device_issue(op: str, args: tuple[int, ...]) -> None:
     # Packed alias fields are decoded at RT only when the packet executes.
     if op not in PACKED_LINQ_OPERATIONS or len(args) != 2:
-        _check_args(op, args)
+        violation = invalid_operand(args, DEVICE_RANGES.get(op, ()))
+        if violation:
+            role, value, low, high = violation
+            raise ValueError(f"{op} {role} {value} outside {low}..{high}")
 
 
-def normalize_command(op: str, args: tuple[int, ...]) -> tuple[str, tuple[int, ...]]:
-    if op == "fb_cmd" or op in PACKED_LINQ_OPERATIONS and len(args) == 2:
+def is_linq_alias(op: str, operand_count: int) -> bool:
+    return op == "fb_cmd" or op in PACKED_LINQ_OPERATIONS and operand_count == 2
+
+
+def decode_device_command(op: str, args: tuple[int, ...]) -> tuple[str, tuple[int, ...]]:
+    if is_linq_alias(op, len(args)):
         try:
             op, decoded = decode_linq_command(op, list(args))
         except UnsupportedLinqCommand as exc:
             raise CoreBlocked(str(exc)) from exc
         args = tuple(decoded)
-        _check_args(op, args)
-    if op == "play_pulse":
-        raise CoreBlocked("Execution behavior for play_pulse is unverified")
-    if op == "fb_acq_tb_mock":
-        raise CoreBlocked(MOCK_LIMITATION)
-    if op in LINQ_CONFIGURATION_STREAMS:
-        limitation = linq_configuration_limitation(op, list(args))
-        if limitation:
-            raise CoreBlocked(limitation)
     return op, args
+
+
+def device_limitation(op: str, args: tuple[int, ...]) -> str | None:
+    if op == "play_pulse":
+        return "Execution behavior for play_pulse is unverified"
+    if op == "fb_acq_tb_mock":
+        return MOCK_LIMITATION
+    if op in LINQ_CONFIGURATION_STREAMS:
+        return linq_configuration_limitation(op, list(args))
+    return None

@@ -6,6 +6,9 @@ from dataclasses import dataclass
 from q1timeline.analysis.values import Value
 
 
+LOOP_PREVIEW_MAX_VISIBLE_ITERATIONS = 10
+
+
 @dataclass(frozen=True)
 class ExecutedStep:
     pc: int

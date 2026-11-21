@@ -1,4 +1,5 @@
 from q1timeline.analysis import interpreter
+from q1timeline.execution import issue
 from q1timeline.q1asm.parser import parse_q1asm
 
 
@@ -8,7 +9,7 @@ def test_analysis_uses_core_decisions_flags_and_counter_for_resolved_branches(mo
 
     monkeypatch.setattr(interpreter, "_comparison_flags", unexpected)
     monkeypatch.setattr(interpreter, "_status_branch_decision", unexpected)
-    monkeypatch.setattr(interpreter, "_concrete_branch_test", unexpected)
+    monkeypatch.setattr(issue, "concrete_branch_test", unexpected)
     program = parse_q1asm(
         "move -1,R0\nnop\njlt R0,1,@end\njge R0,1,@status\nstop 7\n"
         "status: jb @end\njns @end\nmove 2,R1\nnop\nloop R1,@end\nstop 6\nend: stop R1"

@@ -8,8 +8,8 @@ from typing import Any
 
 from q1timeline.analysis.alignment import SIMULATION_ALIGNMENT_MODE, align_timelines
 from q1timeline.analysis.hardware_readiness import analyze_hardware_readiness
-from q1timeline.analysis.interpreter import AnalysisState, interpret_program
 from q1timeline.analysis.underflow import analyze_underflows
+from q1timeline.execution.state import AnalysisState
 from q1timeline.external_inputs import concrete_receiver_inputs, validate_external_inputs
 from q1timeline.project import is_valid_alignment_mode, is_valid_branch_policy, validate_params_json_mapping
 from q1timeline.q1asm.parser import parse_q1asm
@@ -160,6 +160,8 @@ def _analyze_program_text(
             sequences={sequencer_id: sequence} if sequence is not None else None,
             branch_assumptions=branch_assumptions,
         )[0]
+    from q1timeline.analysis.interpreter import interpret_program
+
     state = interpret_program(
         parse_q1asm(text, file=file),
         sequencer_id=sequencer_id,

@@ -4,8 +4,8 @@ from bisect import bisect_left
 from collections.abc import Callable, Iterable
 from typing import Any
 
-from q1timeline.analysis.interpreter import AnalysisState, TimelineEvent
 from q1timeline.analysis.values import Concrete
+from q1timeline.execution.state import AnalysisState, TimelineEvent
 
 
 READOUT_OPS = {"acquire", "acquire_weighed", "acquire_weighted"}

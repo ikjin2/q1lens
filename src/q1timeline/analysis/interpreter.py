@@ -2,49 +2,95 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from copy import deepcopy
-from dataclasses import dataclass, field, replace
-from itertools import count, product
+from dataclasses import dataclass, replace
+from itertools import product
 import json
 from typing import Any, Literal
 
-from q1timeline.analysis.playback_loops import ExecutedStep, observed_loops
+from q1timeline.analysis.playback_loops import ExecutedStep, LOOP_PREVIEW_MAX_VISIBLE_ITERATIONS, observed_loops
 from q1timeline.analysis.values import (
-    _symbol_lookup_names,
-    Concrete,
-    RuntimeDependent,
-    Symbolic,
-    SymbolTable,
-    Unknown,
-    Value,
-    add_values,
-    compare_values,
-    multiply_value,
-    resolve_arg_value,
-    resolve_def_values,
-    resolve_duration_arg,
-    subtract_values,
-    symbol_table_from_params,
-    value_to_json,
+    Concrete, RuntimeDependent, Symbolic, SymbolTable, Unknown, Value, add_values, compare_values,
+    multiply_value, resolve_arg_value, resolve_def_values, resolve_duration_arg, subtract_values,
+    symbol_table_from_params, value_to_json,
 )
 from q1timeline.diagnostics import Diagnostic
+from q1timeline.execution.state import (
+    AnalysisState, AnalysisVisitEntry as _AnalysisVisitEntry, BoundInstruction as _BoundInstruction,
+    CLASSICAL_REGISTER_MASK as _CLASSICAL_REGISTER_MASK, Confidence as Confidence, ILLEGAL_INSTRUCTION_FLAG,
+    LOCAL_EXECUTION_OPS as _LOCAL_EXECUTION_OPS, NETZERO_PULSE_OPS as _NETZERO_PULSE_OPS,
+    NetZeroWindow as _NetZeroWindow, PendingRegisterWrite as PendingRegisterWrite, PreparedDefProgram,
+    RT_DURATION_MAX as _RT_DURATION_MAX, RegisterWrite as RegisterWrite, RtPacket, TimelineEvent,
+)
+from q1timeline.execution.trace import (
+    append_packet as _append_packet, clear_nco_one_shots as _clear_nco_one_shots,
+    confidence_for_timing as _confidence_for_timing, confidence_for_value as _confidence_for_value,
+    consume_applied_state as _consume_applied_state, diagnose_netzero_gap as _diagnose_netzero_gap,
+    emit_event as _emit_event, emit_marker_state_event as _emit_marker_state_event,
+    plain_value as _plain_value, source_to_json as _source_to_json, trace_q1_issue as _trace_q1_issue,
+)
+from q1timeline.execution.operands import (
+    REGISTER_MAX_INDEX as _REGISTER_MAX_INDEX, address_labels as _address_labels,
+    address_model as _address_model, arg_int as _arg_int,
+    arg_symbol_lookup_names as _arg_symbol_lookup_names, bounds_known_bits as _bounds_known_bits,
+    branch_target_metadata as _branch_target_metadata,
+    build_immutable_value_origins as _build_immutable_value_origins,
+    docs_ordered_binary_args as _docs_ordered_binary_args, execution_instruction as _execution_instruction,
+    instruction_for_q1_timing as _instruction_for_q1_timing, is_valid_register_arg as _is_valid_register_arg,
+    normalise_branch_assumptions as _normalise_branch_assumptions, operand_known_bits as _operand_known_bits,
+    operand_scope as _scope, physical_read_register as _physical_read_register,
+    refine_bounds_with_bits as _refine_bounds_with_bits, register_aliases as _register_aliases,
+    register_read_operands as _register_read_operands, register_write_operands as _register_write_operands,
+    resolve_execution_target as _execution_target, resolve_register_name as _register_name,
+    resolved_args_for_instruction as _resolved_args_for_instruction,
+    set_cond_is_disabled as _set_cond_is_disabled,
+    signed_32_bit_register_value as _signed_32_bit_register_value, symbol_origins as _symbol_origins,
+    unsigned_operand_bounds as _unsigned_operand_bounds,
+)
+from q1timeline.execution.registers import (
+    apply_ready_register_writes as _apply_ready_register_writes,
+    arg_register_provenance as _arg_register_provenance, binary_provenance as _binary_provenance,
+    copied_provenance_steps as _copied_provenance_steps,
+    flush_pending_register_writes as _flush_pending_register_writes,
+    fresh_value_origin as _fresh_value_origin, invalidate_register_history as _invalidate_register_history,
+    make_register_provenance as _register_provenance, move_provenance as _move_provenance,
+    operand_value_origin as _operand_value_origin, origin_peer_facts as _origin_peer_facts,
+    pending_register_write as _pending_register_write, project_classical_words as _project_classical_words,
+    provenance_step as _provenance_step, record_register_write as _record_register_write,
+    register_issue_metadata as _register_issue_metadata, retire_register_write as _retire_register_write,
+    schedule_register_write as _schedule_register_write, set_alu_flags as _set_alu_flags,
+    unary_provenance as _unary_provenance,
+)
+from q1timeline.execution.validation import (
+    branch_target_arg as _branch_target_arg, compiled_pc as _compiled_pc,
+    concrete_branch_destination_ready as _concrete_branch_destination_ready,
+    diagnose_program as _diagnose_program,
+    diagnose_strict_q1asm_placeholder_defs as _diagnose_strict_q1asm_placeholder_defs,
+    diagnose_unresolved_index_operand as _diagnose_unresolved_index_operand,
+    emit_undefined_label as _emit_undefined_label, end_concrete_execution as _end_concrete_execution,
+    invalid_branch_target_reason as _invalid_branch_target_reason,
+    is_packed_feedback_register_form as _is_packed_feedback_register_form,
+    official_operand_ranges as _official_operand_ranges,
+    unsupported_register_operand as _unsupported_register_operand, valid_rt_duration as _valid_rt_duration,
+)
+from q1timeline.execution.issue import (
+    admit_q1_issue as _admit_q1_issue, advance_execution as _advance_execution,
+    begin_execution_step as _begin_execution_step, branch_taken_duration as _branch_taken_duration,
+    concrete_bound_instruction as _concrete_bound_instruction, emit_q1_issue as _emit_q1_issue,
+    execute_concrete_branch as _execute_concrete_branch, finish_q1_issue as _finish_q1_issue,
+    project_q1_issue as _project_q1_issue, record_illegal_instruction as _record_illegal_instruction,
+    record_stop_code as _record_stop_code, resolved_core_issue as _resolved_core_issue,
+    set_execution_target as _set_execution_target,
+)
 from q1timeline.feedback_fifo import feedback_pop_limitation
 from q1timeline.q1asm import core, core_rt
 from q1timeline.q1asm.ast import Arg, Instr, Program, SourceLocation
-from q1timeline.q1asm.compiled_addresses import CompiledAddresses, CompiledTarget, compile_addresses, source_position
+from q1timeline.q1asm.compiled_addresses import CompiledTarget, compile_addresses, source_position
 from q1timeline.q1asm.core import (
-    FLAG_NAMES as _ALU_FLAG_NAMES,
-    FlagCase as _AluFlagCase,
-    branch_on_flags as _status_branch_decision,
-    possible_flags as _possible_alu_flags,
-    rt_dequeue_spacing_ns as _rt_dequeue_spacing_ns,
+    FLAG_NAMES as _ALU_FLAG_NAMES, branch_on_flags as _status_branch_decision,
+    possible_flags as _possible_alu_flags, rt_dequeue_spacing_ns as _rt_dequeue_spacing_ns,
 )
 from q1timeline.q1asm.core_alu import (
-    add_flags as _add_flags,
-    logic_flags as _logic_flags,
-    operand_ranges as _alu_operand_ranges,
-    register_write_delay_slots,
-    shift_flags as _shift_flags,
-    sub_flags as _sub_flags,
+    add_flags as _add_flags, logic_flags as _logic_flags, shift_flags as _shift_flags, sub_flags as _sub_flags,
 )
 from q1timeline.q1asm.instruction_table import (
     STATUS_BRANCH_OPS,
@@ -59,81 +105,20 @@ from q1timeline.q1asm.linq_commands import (
 )
 
 
-Confidence = Literal["exact", "symbolic", "assumed", "unknown", "runtime_dependent"]
-BranchAssumptionPath = Literal["collapsed", "taken", "fallthrough", "both"]
-
-VALID_BRANCH_ASSUMPTION_PATHS = {"collapsed", "taken", "fallthrough", "both"}
-LOOP_PREVIEW_MAX_VISIBLE_ITERATIONS = 10
-
 FEEDBACK_ANNOTATIONS = {
     "fb_pop_data": ("feedback_pop", "feedback pop"),
     "fb_pull_data": ("feedback_pop", "feedback pull"),
 }
 
-_CLASSICAL_REGISTER_MASK = 0xFFFFFFFF
-_REGISTER_MAX_INDEX = 63
-_RT_DURATION_MAX = 65535
-_RT_DURATION_MIN = 4
 _AWG_PAIR_SETTERS = {"set_awg_gain", "set_awg_offs"}
 _ANALYSIS_LATCH_RANGE_OPS = _AWG_PAIR_SETTERS | {"set_ph", "set_ph_delta"}
 _NESTED_INVARIANT_SETTERS = {"set_freq", "set_mrk"} | _AWG_PAIR_SETTERS
-_NETZERO_PULSE_OPS = {"play", "play_netzero"}
 _ACQUISITION_FEEDBACK_TYPES = {
     "fb_acq_tb_id": "thresholded_bits", "fb_acq_iq_id": "iq_values",
     "fb_llp_tags_id": "low_latency_time_tags", "fb_tdc_tags_id": "high_resolution_time_tags",
     "fb_llp_ttls_id": "ttl_counts", "fb_tdc_tdelta_id": "time_delta",
 }
-_VALUE_ORIGIN_SERIALS = count(1)
 _WRAPPING_CLASSICAL_OPS = {"add", "sub", "and", "or", "xor", "asl", "asr", "lsl", "lsr"}
-ILLEGAL_INSTRUCTION_FLAG = core.ILLEGAL_INSTRUCTION_FLAG
-# Analysis probes and Play admit external operations through their own handlers.
-_LOCAL_EXECUTION_OPS = core.LOCAL_OPS - {"set_cond"}
-
-
-@dataclass(frozen=True)
-class TimelineEvent:
-    id: str
-    sequencer_id: str
-    lane: str
-    kind: str
-    t0: Value
-    t1: Value | None
-    duration: Value
-    label: str
-    confidence: Confidence
-    source: SourceLocation
-    meta: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class RtPacket:
-    id: str
-    sequencer_id: str
-    source: SourceLocation
-    op: str
-    duration: Value
-    q1_issue_t0: Value
-    q1_issue_t1: Value
-    rt_t0: Value | None
-    rt_t1: Value | None
-    confidence: Confidence
-    meta: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class _NetZeroWindow:
-    source: SourceLocation
-    event_id: str
-    start_ns: int
-    maxt_ns: int
-    maxt_register: str | None
-
-
-@dataclass(frozen=True)
-class _AnalysisVisitEntry:
-    event_start: int
-    packet_start: int
-    diagnostic_start: int
 
 
 @dataclass(frozen=True)
@@ -149,146 +134,6 @@ class _LoopEvidence:
 class _NestedLoopProof:
     children: dict[int, TimelineEvent]
     count_slopes: dict[int, int]
-
-
-@dataclass(frozen=True)
-class RegisterWrite:
-    sequencer_id: str
-    register: str
-    time: Value
-    value: Value
-    source: SourceLocation
-    event_id: str | None
-    confidence: Confidence
-    meta: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class PendingRegisterWrite:
-    register: str
-    value: Value
-    provenance: dict[str, Any]
-    source: SourceLocation
-    available_issue_index: int
-    event_id: str
-    meta: dict[str, Any] = field(default_factory=dict)
-    unsigned_bounds: tuple[int, int] | None = None
-    known_bits: tuple[int, int] | None = None
-    value_origin: tuple[str, bool] | None = field(default=None, compare=False)
-
-
-@dataclass
-class LatchedState:
-    marker: Value | None = None
-    awg_gain: tuple[Value, Value] | None = None
-    awg_offset: tuple[Value, Value] | None = None
-    frequency: Value | None = None
-    phase: Value | None = None
-    phase_delta: Value | None = None
-    digital: tuple[Value, Value, Value] | None = None
-    scope_enable: Value | None = None
-    netzero_reset: bool = False
-    time_ref: bool = False
-    pending_since: dict[str, SourceLocation] = field(default_factory=dict)
-    pending_event_ids: dict[str, str] = field(default_factory=dict)
-
-
-@dataclass
-class AnalysisState:
-    sequencer_id: str
-    labels: dict[str, int] = field(default_factory=dict)
-    instructions_by_pc: dict[int, Instr] = field(default_factory=dict)
-    register_aliases: dict[str, str] = field(default_factory=dict)
-    pc: int = 0
-    registers: SymbolTable = field(default_factory=dict)
-    register_bounds: dict[str, tuple[int, int]] = field(default_factory=dict)
-    latched_state: LatchedState = field(default_factory=LatchedState)
-    conditional_enable: Value = field(default_factory=lambda: Concrete(0))
-    conditional_mask: Value = field(default_factory=lambda: Concrete(0))
-    conditional_operator: Value = field(default_factory=lambda: Concrete(0))
-    conditional_enable_bounds: tuple[int, int] | None = None
-    conditional_operator_bounds: tuple[int, int] | None = None
-    conditional_enable_known_bits: tuple[int, int] | None = None
-    conditional_operator_known_bits: tuple[int, int] | None = None
-    conditional_else_duration: Value = field(default_factory=lambda: Concrete(0))
-    conditional_time_unknown: bool = False
-    q1_time_ns: Value = field(default_factory=lambda: Concrete(0))
-    rt_fifo_starts: tuple[Value, ...] = ()
-    reference_sync_ns: Value = field(default_factory=lambda: Concrete(0))
-    q1_fifo_stall_ns: int = 0
-    rt_time_ns: Value = field(default_factory=lambda: Concrete(0))
-    rt_trigger_epoch: int = 0
-    netzero_window: _NetZeroWindow | None = None
-    loop_stack: list[Any] = field(default_factory=list)
-    rt_packets: list[RtPacket] = field(default_factory=list)
-    events: list[TimelineEvent] = field(default_factory=list)
-    diagnostics: list[Diagnostic] = field(default_factory=list)
-    metadata: dict[str, Any] = field(default_factory=dict)
-    symbol_origins: dict[str, Any] = field(default_factory=dict)
-    register_provenance: dict[str, dict[str, Any]] = field(default_factory=dict)
-    pending_register_writes: list[PendingRegisterWrite] = field(default_factory=list)
-    register_history: list[RegisterWrite] = field(default_factory=list)
-    current_resolved_args: list[dict[str, Any]] = field(default_factory=list)
-    feedback_acq_channels: dict[str, str] = field(default_factory=dict)
-    alu_flags: dict[str, bool] | None = None
-    alu_flags_source: SourceLocation | None = None
-    alu_flag_cases: frozenset[_AluFlagCase] | None = None
-    alu_flags_read_hazard: bool = False
-    loop_counter: int = 0
-    q1_issue_index: int = 0
-    next_pc: int | None = None
-    stopped: bool = False
-    executed_pcs: set[int] = field(default_factory=set)
-    analysis_back_edge_limit: int | None = None
-    analysis_back_edge_issue: TimelineEvent | None = None
-    analysis_replayed_steps: int = 0
-    analysis_replayed_pcs: set[int] = field(default_factory=set)
-    analysis_visit_entries: dict[int, _AnalysisVisitEntry] = field(default_factory=dict)
-    branch_policy: str = "collapse_unresolved"
-    branch_assumptions: dict[str, BranchAssumptionPath] = field(default_factory=dict)
-    branch_explore_depth: int = 0
-    loop_preview_counts: dict[str, int] = field(default_factory=dict)
-    strict_q1asm: bool = False
-    execution_mode: Literal["analysis", "concrete"] = "analysis"
-    compiled_addresses: CompiledAddresses | None = None
-    interior_pc: int | None = None
-    next_interior_pc: int | None = None
-    static_diagnostics: list[Diagnostic] = field(default_factory=list)
-    register_known_bits: dict[str, tuple[int, int]] = field(default_factory=dict)
-    register_value_origins: dict[str, tuple[str, bool]] = field(default_factory=dict, compare=False)
-    value_origin_serial: int = field(default=0, compare=False)
-    immutable_value_origins: dict[str, tuple[str, bool]] = field(default_factory=dict, compare=False)
-    pending_phase_reset: bool | None = False
-    nco_phase_uncertain: bool = False
-    queue_alternatives: dict[str, AnalysisState] = field(default_factory=dict, compare=False, repr=False)
-    queue_alternative_probe: bool = field(default=False, compare=False, repr=False)
-    record_trace: bool = True
-    bound_instructions: dict[int, _BoundInstruction] = field(default_factory=dict, repr=False)
-    event_serial: int = 0
-    observed_loop_events: list[TimelineEvent] = field(default_factory=list)
-
-
-@dataclass(frozen=True)
-class _BoundInstruction:
-    spec: InstructionSpec
-    raw_diagnostics: tuple[Diagnostic, ...]
-    duration_ns: int | None
-    simple_operands: bool
-    reads: tuple[tuple[int, str], ...]
-
-
-@dataclass(frozen=True)
-class PreparedDefProgram:
-    """Reusable source data for a sweep that changes only named integer DEFs."""
-
-    instructions_by_pc: dict[int, Instr]
-    register_aliases: dict[str, str]
-    param_symbols: SymbolTable
-    revalidate: tuple[Instr, ...] | None
-    lints: tuple[Diagnostic, ...]
-    bindings: dict[int, _BoundInstruction]
-    needs_queue_analysis: bool
-    compiled_addresses: CompiledAddresses | None = None
 
 
 def prepare_def_program(
@@ -409,90 +254,12 @@ def _prepare_program(
     return state, symbols
 
 
-def _end_concrete_execution(
-    state: AnalysisState, status: str, reason: str, instruction: Instr | None = None, *, category: str | None = None,
-) -> None:
-    pc = instruction.pc if instruction is not None else state.pc
-    location = {"pc": pc}
-    if state.compiled_addresses is not None:
-        location["compiled_pc"] = _compiled_pc(state, pc)
-    state.metadata["execution"].update(status=status, reason=reason, **location)
-    state.stopped = True
-    source = instruction.source if instruction is not None else None
-    if source is not None:
-        state.metadata["execution"]["source"] = _source_to_json(source)
-    state.diagnostics.append(Diagnostic(
-        severity="error" if status == "error" else "warning",
-        category=category or ("analysis_incomplete" if status != "error" else "invalid_argument_value"),
-        message=f"{state.metadata['execution']['mode'].capitalize()} execution {status}: {reason}",
-        source=source,
-        details={"execution_status": status, **location},
-    ))
-
-
 @dataclass
 class _ConcreteMachine:
     code: tuple[Instr, ...]
     state: core.CoreState
     external: core.ExternalInputs | None
     retired_writes: tuple[core.RegisterWrite, ...] = ()
-
-
-def _concrete_bound_instruction(instruction: Instr, state: AnalysisState, scope: SymbolTable) -> Instr:
-    """Bind aliases and parameters at the issue boundary, preserving physical register operands."""
-    bound = _instruction_for_q1_timing(instruction, state, {}, scope=scope)
-    if any(arg.kind == "label" for arg in bound.args):
-        bound = replace(bound, args=[
-            Arg("imm", _arg_int(arg, scope), arg.raw) if arg.kind == "label" else arg for arg in bound.args
-        ])
-    if bound.op in core.BRANCH_OPS and instruction.args[-1].raw.startswith("$"):
-        alias = instruction.args[-1].raw[1:]
-        source = state.symbol_origins.get("defs", {}).get(alias, {}).get("raw", "")
-        if source.startswith("@"):
-            bound = replace(bound, args=[*bound.args[:-1], replace(bound.args[-1], raw=source)])
-    return bound
-
-
-def _resolved_core_issue(
-    state: AnalysisState, instruction: Instr, scope: SymbolTable, *, analysis: bool = False,
-) -> core.Issue | None:
-    """Return the local effect when the operands needed for this issue are resolved."""
-    if instruction.op not in core.LOCAL_OPS:
-        return None
-    destinations = core.destination_indexes(instruction.op)
-    if analysis:
-        # A visible word can be stale while its replacement is in the write pipeline.
-        if state.pending_register_writes and any(
-            _pending_register_write(state, register) is not None
-            for _, register in _register_read_operands(instruction, state)
-        ):
-            return None
-        if instruction.op == "loop":
-            # The counter is read and written. A project parameter with the same
-            # name does not initialize it, and its decrement cannot feed the target.
-            counter = _register_name(instruction.args[0], state)
-            if not isinstance(state.registers.get(counter), Concrete) or counter == _register_name(instruction.args[1], state):
-                return None
-        # A symbolic destination or overlapping halves of a product has no exact write.
-        registers = {_register_name(instruction.args[i], state) for i in destinations}
-        if None in registers or len(registers) != len(destinations):
-            return None
-    words = tuple(_arg_int(arg, scope) for i, arg in enumerate(instruction.args) if i not in destinations)
-    if any(word is None for index, word in enumerate(words)
-           if analysis or instruction.op != "set_cond" or words[0] != 0 or index not in (1, 2)):
-        return None
-    if (instruction.op in STATUS_BRANCH_OPS or instruction.op == "jge" and len(instruction.args) == 1
-            ) and core.branch_on_flags(instruction.op, state.alu_flags) is None:
-        return None
-    bound = _concrete_bound_instruction(instruction, state, scope)
-    try:
-        return core.issue(bound, words, state.alu_flags)
-    except ValueError:
-        # Analysis can describe unsupported concrete values (e.g. a shift by 33)
-        # with an unknown result or a diagnostic at the instruction that uses them.
-        if analysis:
-            return None
-        raise
 
 
 def _run_concrete_program(
@@ -559,11 +326,7 @@ def _run_concrete_program(
             branch_taken, branch_target = False, None
             for event in state.events[event_start:]:
                 if event.kind == "q1_issue":
-                    event.meta.update(
-                        source_pc=instruction.pc, execution_index=execution["steps"],
-                        flags_before=flags_before,
-                        flags_after=dict(state.alu_flags) if state.alu_flags is not None else None,
-                    )
+                    _trace_q1_issue(state, instruction, event, flags_before)
                     branch_taken = bool(event.meta.get("branch_taken"))
                     branch_target = event.meta.get("compiled_target_pc", event.meta.get("target_pc"))
             if execution["status"] == "completed" or "fault" in execution:
@@ -573,16 +336,13 @@ def _run_concrete_program(
             _execute_instruction(state, instruction, symbols, waveform_names, acquisition_names, machine=machine)
         if execution["status"] != "completed" and "fault" not in execution:
             break
-        state.executed_pcs.add(state.pc)
-        state.q1_issue_index += 1
-        execution["steps"] += 1
+        _finish_q1_issue(state, fault="fault" in execution)
         for write in machine.retired_writes:
-            provenance = state.pending_register_writes.pop(0)
-            assert provenance.register == f"R{write.index}"
-            _apply_register_write(state, replace(provenance, value=Concrete(write.value)))
+            pending = state.pending_register_writes[0]
+            assert pending.register == f"R{write.index}" and pending.available_issue_index == state.q1_issue_index
+            _retire_register_write(state, pending, value=Concrete(write.value))
         if "fault" in execution:
             break
-        _advance_execution(state)
     state.observed_loop_events = _observed_loop_events(state, trace, mode="concrete")
 
 
@@ -663,68 +423,6 @@ def _observed_loop_events(
     return summaries
 
 
-def _concrete_instruction_ready(
-    state: AnalysisState, instruction: Instr, symbols: SymbolTable,
-    spec: InstructionSpec, has_invalid_arguments: bool, diagnostic_start: int,
-    *, supported_ops: set[str] | None = None, allow_symbolic_operands: bool = False,
-    rt_duration_error: Diagnostic | None = None, scope: SymbolTable | None = None,
-) -> bool:
-    diagnostics = state.diagnostics[diagnostic_start:]
-    errors = [item for item in diagnostics if (item.severity == "error" and item.category != "unresolved_symbol") or item.category == "register_not_ready"]
-    if errors:
-        reason = errors[0].message
-        _end_concrete_execution(state, "error", reason, instruction)
-        return False
-    if rt_duration_error is not None:
-        _end_concrete_execution(state, "error", rt_duration_error.message, instruction)
-        state.diagnostics[-1].details.update(rt_duration_error.details)
-        return False
-    if (instruction.op not in (_LOCAL_EXECUTION_OPS if supported_ops is None else supported_ops)
-            and not _set_cond_is_disabled(state, instruction, symbols)):
-        status = "error" if spec.category == "unknown" else "blocked"
-        _end_concrete_execution(state, status, f"{instruction.op} has no supported concrete execution semantics.", instruction)
-        return False
-    if scope is None:
-        scope = _scope(symbols, state)
-    condition_disabled = _set_cond_is_disabled(state, instruction, symbols)
-    if instruction.op in {"mulu32", "muls32"} and not has_invalid_arguments:
-        if _register_name(instruction.args[2], state) == _register_name(instruction.args[3], state):
-            _end_concrete_execution(state, "blocked", "Full-product multiply destinations resolve to the same register; write priority is unverified.", instruction)
-            return False
-    destinations = _register_destination_argument_indexes(instruction.op)
-    for index, arg in enumerate(instruction.args):
-        if index in destinations or (condition_disabled and index in {1, 2}):
-            continue
-        value = resolve_arg_value(arg, scope)
-        if not isinstance(value, Concrete):
-            if allow_symbolic_operands and arg.kind != "label":
-                continue
-            status = "error" if arg.kind == "label" else "blocked"
-            _end_concrete_execution(state, status, f"Operand {arg.raw} is unresolved: {value}.", instruction)
-            return False
-    if has_invalid_arguments:
-        _end_concrete_execution(state, "error", "Invalid instruction operands.", instruction)
-        return False
-    if spec.category == "latched":
-        unsupported = _unsupported_register_operand(state, instruction, scope, condition_disabled=condition_disabled)
-        if unsupported is not None:
-            _end_concrete_execution(state, "blocked", unsupported.message, instruction)
-            return False
-    if instruction.op in STATUS_BRANCH_OPS or (instruction.op == "jge" and len(instruction.args) == 1):
-        if _status_branch_decision(instruction.op, state.alu_flags) is None:
-            _end_concrete_execution(state, "blocked", "Branch status flags are unknown.", instruction)
-            return False
-    if instruction.op in {"asl", "asr", "lsl", "lsr"}:
-        _, shift_arg = _docs_ordered_binary_args(instruction, state)
-        shift = resolve_arg_value(shift_arg, scope)
-        if allow_symbolic_operands and not isinstance(shift, Concrete):
-            return True
-        if not 0 <= shift.value <= 32:
-            _end_concrete_execution(state, "blocked", "Shift count is outside the supported range 0..32.", instruction)
-            return False
-    return True
-
-
 def _run_program_loop(
     state: AnalysisState,
     symbols: SymbolTable,
@@ -780,268 +478,6 @@ def _run_program_loop(
         _advance_execution(state)
 
 
-def _symbol_origins(
-    params: dict[str, Any],
-    param_symbols: SymbolTable,
-    defs: dict[str, Arg],
-    resolved_defs: SymbolTable,
-) -> dict[str, Any]:
-    param_origins = {
-        name: {
-            "kind": "param",
-            "name": name,
-            "raw_value": raw_value,
-            "value": value_to_json(param_symbols[name]),
-        }
-        for name, raw_value in params.items()
-        if name in param_symbols
-    }
-    def_origins = {
-        name: {
-            "kind": "def",
-            "name": name,
-            "raw": arg.raw,
-            "value": value_to_json(resolved_defs[name]),
-            "references": _arg_symbol_lookup_names(arg),
-        }
-        for name, arg in defs.items()
-        if name in resolved_defs
-    }
-    return {"params": param_origins, "defs": def_origins}
-
-
-def _resolved_args_for_instruction(
-    instruction: Instr,
-    scope: SymbolTable,
-    state: AnalysisState,
-) -> list[dict[str, Any]]:
-    resolved_args: list[dict[str, Any]] = []
-    has_resolution_chain = False
-    for index, arg in enumerate(instruction.args):
-        value = resolve_arg_value(arg, scope)
-        entry: dict[str, Any] = {
-            "index": index,
-            "raw": arg.raw,
-            "kind": arg.kind,
-            "value": value_to_json(value),
-        }
-        chain = _resolution_chain_for_arg(arg, state.symbol_origins)
-        if chain:
-            entry["chain"] = chain
-            has_resolution_chain = True
-        resolved_args.append(entry)
-    return resolved_args if has_resolution_chain else []
-
-
-def _resolution_chain_for_arg(arg: Arg, symbol_origins: dict[str, Any]) -> list[dict[str, Any]]:
-    params = symbol_origins.get("params", {})
-    defs = symbol_origins.get("defs", {})
-    for lookup_name in _arg_symbol_lookup_names(arg):
-        if lookup_name in defs:
-            origin = dict(defs[lookup_name])
-            references = list(origin.pop("references", []))
-            chain = [origin]
-            chain.extend(params[name] for name in references if name in params)
-            return chain
-        if lookup_name in params:
-            return [params[lookup_name]]
-    return []
-
-
-def _arg_symbol_lookup_names(arg: Arg) -> list[str]:
-    if arg.kind not in {"symbol", "placeholder"}:
-        return []
-    name = str(arg.value)
-    if name.startswith("$") and len(name) > 1:
-        return [name[1:], name]
-    return [name]
-
-
-def _diagnose_program(
-    state: AnalysisState, symbols: SymbolTable, program: Program, *, recover_source: bool = True,
-    prepared: PreparedDefProgram | None = None,
-) -> None:
-    # Reuse operand rules without inventing runtime register values or readiness.
-    probe = AnalysisState(
-        sequencer_id=state.sequencer_id,
-        labels=state.labels,
-        instructions_by_pc=state.instructions_by_pc,
-        register_aliases=state.register_aliases,
-        symbol_origins=state.symbol_origins,
-        strict_q1asm=state.strict_q1asm,
-        execution_mode="concrete",
-        compiled_addresses=state.compiled_addresses,
-    )
-    if prepared is not None and prepared.revalidate is not None:
-        for instruction in prepared.revalidate:
-            _validate_instruction(probe, instruction, symbols, prepared.bindings[instruction.pc], source_check=True)
-        if not any(item.severity == "error" for item in probe.diagnostics):
-            state.diagnostics.extend(prepared.lints)
-            return
-        # Preserve ordinary diagnostics and source recovery for invalid inputs.
-    # Removing an inline label can invalidate another branch to that label.
-    while True:
-        probe.labels = state.labels
-        probe.instructions_by_pc = state.instructions_by_pc
-        probe.compiled_addresses = state.compiled_addresses
-        probe.diagnostics = []
-        for instruction in state.instructions_by_pc.values():
-            _validate_instruction(probe, instruction, symbols)
-        errors = [item for item in probe.diagnostics
-                  if item.severity == "error" and item not in state.static_diagnostics]
-        state.static_diagnostics.extend(errors)
-        state.diagnostics.extend(errors)
-        if not recover_source or state.strict_q1asm or not _exclude_invalid_source_lines(state):
-            break
-        defs = {name: arg for name, arg in program.defs.items() if arg.kind != "reg"}
-        state.compiled_addresses = compile_addresses(state.instructions_by_pc, state.labels)
-        resolved = resolve_def_values(defs, symbols, labels=_address_labels(state))
-        symbols.update(resolved)
-        for name, value in resolved.items():
-            state.symbol_origins["defs"][name]["value"] = value_to_json(value)
-        state.immutable_value_origins = _build_immutable_value_origins(symbols, defs, state)
-    if not state.strict_q1asm:
-        scope = _scope(symbols, probe)
-        for instruction in state.instructions_by_pc.values():
-            for arg in instruction.args:
-                if (arg.kind == "symbol" and not str(arg.value).startswith("$")
-                        and not _is_bare_defined_symbol(arg, probe)):
-                    diagnostics = []
-                    resolve_arg_value(arg, scope, diagnostics, required=True, source=instruction.source)
-                    state.static_diagnostics.extend(diagnostics)
-                    state.diagnostics.extend(diagnostics)
-    recovered_program = replace(program, labels=state.labels, instructions=list(state.instructions_by_pc.values()))
-    state.diagnostics.extend(analyze_program_lints(recovered_program, known_parameters=symbols))
-
-
-def _exclude_invalid_source_lines(state: AnalysisState) -> bool:
-    categories = {"syntax_error", "unknown_instruction", "invalid_argument_count",
-                  "invalid_argument_type", "invalid_argument_value", "undefined_label"}
-    sources = {
-        (item.source.file, item.source.line)
-        for item in state.diagnostics
-        if item.severity == "error" and item.source is not None
-        and (item.category in categories or (item.category == "unresolved_symbol"
-             and str(item.details.get("operand", "")).startswith("$")))
-    }
-    if not sources:
-        return False
-    state.diagnostics = [
-        replace(item, details={**item.details, "source_line_skipped": True})
-        if item.source is not None and (item.source.file, item.source.line) in sources else item
-        for item in state.diagnostics
-    ]
-    instructions = {}
-    pc_map = {}
-    removed_labels = set()
-    for pc, instruction in state.instructions_by_pc.items():
-        pc_map[pc] = len(instructions)
-        if (instruction.source.file, instruction.source.line) in sources:
-            if state.labels.get(instruction.label) == pc:
-                removed_labels.add(instruction.label)
-        else:
-            instructions[len(instructions)] = replace(instruction, pc=len(instructions))
-    pc_map[len(state.instructions_by_pc)] = len(instructions)
-    if len(instructions) == len(state.instructions_by_pc):
-        return False
-    state.instructions_by_pc = instructions
-    state.labels = {label: pc_map[pc] for label, pc in state.labels.items() if label not in removed_labels}
-    state.bound_instructions = {}
-    return True
-
-
-def _validate_instruction(
-    state: AnalysisState,
-    instruction: Instr,
-    symbols: SymbolTable,
-    binding: _BoundInstruction | None = None,
-    *,
-    source_check: bool = False,
-) -> tuple[InstructionSpec, bool, int]:
-    spec = binding.spec if binding is not None else get_instruction_spec(instruction.op)
-    diagnostic_start = len(state.diagnostics)
-    if binding is not None and binding.simple_operands and not source_check:
-        # Source validation checked the literal operands for this case. Pending
-        # register writes still depend on the instruction's execution occurrence.
-        _diagnose_register_read_hazards(state, instruction, binding.reads)
-        return spec, False, diagnostic_start
-    validation_diagnostics = binding.raw_diagnostics if binding is not None else spec.validate(instruction)
-    state.diagnostics.extend(validation_diagnostics)
-    has_raw_invalid_arguments = any(
-        diagnostic.category in {"invalid_argument_count", "invalid_argument_type"}
-        for diagnostic in validation_diagnostics
-    )
-    has_invalid_register_operands = _diagnose_invalid_register_operands(state, instruction)
-    has_invalid_bare_def_operands = _diagnose_bare_def_symbol_operands(state, instruction)
-    has_unresolved_dollar_symbols = _diagnose_unresolved_dollar_symbol_operands(state, instruction)
-    has_unresolved_strict_symbols = _diagnose_strict_q1asm_unresolved_operands(state, instruction, symbols)
-    has_undefined_labels = _diagnose_undefined_label_operands(state, instruction, symbols, spec)
-    if not has_raw_invalid_arguments:
-        _diagnose_resolved_argument_types(state, instruction, spec, symbols)
-    _diagnose_unresolved_register_operands(state, instruction, spec)
-    _diagnose_register_read_hazards(state, instruction, binding.reads if binding is not None else None)
-    has_invalid_arguments = any(
-        diagnostic.category in {"invalid_argument_count", "invalid_argument_type"}
-        for diagnostic in state.diagnostics[diagnostic_start:]
-    ) or has_invalid_register_operands or has_invalid_bare_def_operands or has_unresolved_dollar_symbols or has_unresolved_strict_symbols
-    if has_undefined_labels and (state.execution_mode != "analysis" or spec.category != "branch"):
-        has_invalid_arguments = True
-    has_invalid_arguments = _diagnose_negative_rt_duration_operand(
-        state,
-        instruction,
-        spec,
-        symbols,
-    ) or has_invalid_arguments
-    has_invalid_arguments = _diagnose_official_rt_duration_range(
-        state,
-        instruction,
-        spec,
-        symbols,
-    ) or has_invalid_arguments
-    has_invalid_arguments = _diagnose_invalid_rt_index_operands(
-        state,
-        instruction,
-        symbols,
-    ) or has_invalid_arguments
-    has_invalid_arguments = _diagnose_official_operand_ranges(
-        state,
-        instruction,
-        symbols,
-    ) or has_invalid_arguments
-
-    if state.static_diagnostics:
-        state.diagnostics[diagnostic_start:] = [
-            item for item in state.diagnostics[diagnostic_start:]
-            if item not in state.static_diagnostics
-        ]
-    return spec, has_invalid_arguments, diagnostic_start
-
-
-def _diagnose_undefined_label_operands(
-    state: AnalysisState, instruction: Instr, symbols: SymbolTable, spec: InstructionSpec,
-) -> bool:
-    missing_labels: set[str] = set()
-    target_index = None
-    if spec.category == "branch":
-        target_index = 1 if instruction.op == "loop" else 2 if len(instruction.args) == 3 else 0
-    for index, arg in enumerate(instruction.args):
-        if _register_name(arg, state) is not None:
-            continue
-        resolved = _branch_target_arg(arg, state, symbols)
-        if resolved.kind == "label" and str(resolved.value) not in state.labels:
-            missing_labels.add(str(resolved.value))
-        elif (resolved.kind == "label" and index == target_index
-              and state.labels[str(resolved.value)] not in state.instructions_by_pc):
-            state.diagnostics.append(Diagnostic(
-                severity="error", category="invalid_argument_value",
-                message=f"Branch label @{resolved.value} does not point to an instruction.",
-                source=instruction.source, details={"op": instruction.op, "label": str(resolved.value)},
-            ))
-    for label in sorted(missing_labels):
-        _emit_undefined_label(state, instruction, label)
-    return bool(missing_labels)
-
-
 def _execute_instruction(
     state: AnalysisState,
     instruction: Instr,
@@ -1054,23 +490,21 @@ def _execute_instruction(
     allow_symbolic_operands: bool = False,
     rt_condition_decision: bool | None = None,
 ) -> None:
-    binding = state.bound_instructions.get(instruction.pc) if state.interior_pc is None else None
-    spec, has_invalid_arguments, diagnostic_start = _validate_instruction(state, instruction, symbols, binding)
-    needs_scope = state.execution_mode == "concrete" or state.record_trace or spec.emits_rt_packet or instruction.op in core.LOCAL_OPS
-    scope = _scope(symbols, state) if needs_scope else {}
+    admission = _admit_q1_issue(
+        state, instruction, symbols, supported_ops=(core.SOURCE_OPS if machine is not None else
+            (_LOCAL_EXECUTION_OPS | {instruction.op}) if allow_symbolic_operands else None),
+        allow_symbolic_operands=allow_symbolic_operands,
+    )
+    if admission is None:
+        return
+    spec, scope, binding = admission.spec, admission.scope, admission.binding
+    has_invalid_arguments, diagnostic_start = admission.invalid_arguments, admission.diagnostic_start
     register_metadata = _register_issue_metadata(state, instruction, scope) if state.record_trace else None
-    duration_error = None if has_invalid_arguments else _invalid_rt_duration(instruction, spec, scope)
+    duration_error = admission.duration_error
 
     transition = None
     core_issue = None
     if state.execution_mode == "concrete":
-        if not _concrete_instruction_ready(
-            state, instruction, symbols, spec, has_invalid_arguments, diagnostic_start,
-            supported_ops=(core.SOURCE_OPS if machine is not None else
-                           (_LOCAL_EXECUTION_OPS | {instruction.op}) if allow_symbolic_operands else None),
-            allow_symbolic_operands=allow_symbolic_operands, rt_duration_error=duration_error, scope=scope,
-        ):
-            return
         if machine is not None:
             bound = _concrete_bound_instruction(instruction, state, scope)
             try:
@@ -1114,10 +548,11 @@ def _execute_instruction(
         core_issue = _resolved_core_issue(state, instruction, scope, analysis=True)
 
     q1_t0 = state.q1_time_ns
-    raw_linq_op = raw_linq_operation(_arg_int(instruction.args[0], scope)) if (
+    linq_id = _arg_int(instruction.args[0], scope) if (
         instruction.op == "fb_cmd" and len(instruction.args) == 3
     ) else None
-    applies_latched_state = spec.applies_latched_state or raw_linq_op == "upd_thres"
+    raw_linq_op = raw_linq_operation(linq_id) if linq_id is not None else None
+    applies_latched_state = core_rt.packet_applies_latches(instruction.op, linq_id)
     duration_ns = binding.duration_ns if binding is not None else None
     # Analysis revises conditional timing after it validates the destination and chooses a path.
     analysis_conditional = state.execution_mode == "analysis" and spec.category == "branch" and instruction.op != "jmp"
@@ -1184,10 +619,9 @@ def _execute_instruction(
         return
 
     if spec.category == "classical":
-        if instruction.op != "nop":
-            _execute_classical(state, instruction, symbols, core_issue=core_issue)
-        if state.record_trace:
-            _emit_q1_issue(state, instruction, q1_t0, q1_t1, rt_packet_id, register_metadata=register_metadata)
+        if core_issue is None and instruction.op != "nop":
+            _execute_classical(state, instruction, symbols)
+        _project_q1_issue(state, instruction, symbols, spec, core_issue, q1_t0, rt_packet_id, register_metadata)
         return
 
     if spec.category == "latched":
@@ -1198,14 +632,7 @@ def _execute_instruction(
                 _end_analysis_at_issue(state, issue, "unsupported_latched_register_value", unsupported.message,
                                        details=unsupported.details)
                 return
-        pending_event = _execute_latched(state, instruction, symbols,
-                                         latch_write=core_issue.latch_write if core_issue else None,
-                                         condition=core_issue.condition if core_issue else None)
-        q1_issue_event = _emit_q1_issue(state, instruction, q1_t0, q1_t1, rt_packet_id, register_metadata=register_metadata)
-        if pending_event is not None:
-            pending_event.meta["q1_issue_event_id"] = q1_issue_event.id
-            if instruction.op == "set_cond":
-                q1_issue_event.meta["conditional_enabled"] = pending_event.meta["conditional_enabled"]
+        _project_q1_issue(state, instruction, symbols, spec, core_issue, q1_t0, rt_packet_id, register_metadata)
         return
 
     if spec.category == "feedback":
@@ -1221,15 +648,10 @@ def _execute_instruction(
                 return
         if transition is None:
             _execute_feedback_register_write(state, instruction, symbols)
+            q1_issue_event = _emit_q1_issue(state, instruction, q1_t0, q1_t1, rt_packet_id, register_metadata=register_metadata)
         else:
-            for index, word in zip(core.destination_indexes(instruction.op), transition.issue.words, strict=True):
-                register = _register_name(instruction.args[index], state)
-                value = Concrete(word)
-                expression = f"{instruction.op} FIFO {'id' if instruction.op == 'fb_pull_data' and index == 0 else 'payload'}"
-                provenance = _register_provenance(state, register, expression=expression, value=value,
-                                                  steps=[_provenance_step(instruction, expression, value)])
-                _schedule_register_write(state, instruction, register, value, provenance)
-        q1_issue_event = _emit_q1_issue(state, instruction, q1_t0, q1_t1, rt_packet_id, register_metadata=register_metadata)
+            q1_issue_event = _project_q1_issue(state, instruction, symbols, spec, core_issue, q1_t0, rt_packet_id,
+                                               register_metadata, feedback_words=transition.issue.words)
         receipt = (machine.external.feedback_arrivals[transition.state.devices.feedback_cursor - 1]
                    if transition is not None else None)
         _emit_feedback_annotation(state, instruction, q1_issue_event, symbols, receipt=receipt)
@@ -1274,10 +696,8 @@ def _execute_instruction(
         return
 
     if spec.category == "branch" and state.execution_mode == "concrete":
-        issue = _emit_q1_issue(state, instruction, q1_t0, q1_t1, None,
-                               register_metadata=register_metadata) if state.record_trace else None
-        _execute_concrete_branch(state, instruction, issue, symbols, q1_t0=q1_t0, branch_issue=core_issue,
-                                 projected=transition is not None)
+        _project_q1_issue(state, instruction, symbols, spec, core_issue, q1_t0, None, register_metadata,
+                          projected_pc=transition is not None)
         return
     if spec.emits_rt_packet:
         rt_packet_id = f"{state.sequencer_id}:p{len(state.rt_packets)}"
@@ -1332,7 +752,7 @@ def _execute_instruction(
             rt_packet_id,
             q1_issue_event,
             rt_condition_decision=rt_condition_decision,
-            raw_linq_op=raw_linq_op,
+            raw_linq_op=raw_linq_op, applies_latched_state=applies_latched_state,
             wait_duration=core_issue.wait_duration if core_issue is not None else None,
             core_packet=transition.packet if transition is not None else None,
         )
@@ -1426,11 +846,6 @@ def _diagnose_analysis_incomplete_timing_effect(
     )
 
 
-def _set_cond_is_disabled(state: AnalysisState, instruction: Instr, symbols: SymbolTable) -> bool:
-    return (instruction.op == "set_cond" and bool(instruction.args)
-            and resolve_arg_value(instruction.args[0], _scope(symbols, state)) == Concrete(0))
-
-
 def _conditional_control_values(
     value: Value, bounds: tuple[int, int] | None, maximum: int, known_bits: tuple[int, int] | None = None,
 ) -> tuple[int, ...] | None:
@@ -1467,184 +882,6 @@ def _equal_conditional_durations(state: AnalysisState, nominal: Value | None) ->
             and isinstance(nominal, Concrete) and _valid_rt_duration(nominal.value) and nominal == state.conditional_else_duration)
 
 
-def _diagnose_unresolved_register_operands(
-    state: AnalysisState,
-    instruction: Instr,
-    spec: InstructionSpec,
-) -> None:
-    for index in _register_only_argument_indexes(spec, len(instruction.args)):
-        arg = instruction.args[index]
-        if arg.kind not in {"symbol", "placeholder"}:
-            continue
-        if _is_bare_defined_symbol(arg, state):
-            continue
-        if _register_name(arg, state) is not None:
-            continue
-        state.diagnostics.append(
-            Diagnostic(
-                severity="error",
-                category="invalid_argument_type",
-                message=(
-                    f"{instruction.op} argument {index + 1} must be a register or defined "
-                    f"register alias, got {arg.raw}."
-                ),
-                source=instruction.source,
-                details={
-                    "op": instruction.op,
-                    "argument_index": index,
-                    "operand": arg.raw,
-                    "expected": "register",
-                },
-            )
-        )
-
-
-def _diagnose_invalid_register_operands(state: AnalysisState, instruction: Instr) -> bool:
-    emitted = False
-    for index, arg in enumerate(instruction.args):
-        if arg.kind != "reg" or _is_valid_register_arg(arg):
-            continue
-        state.diagnostics.append(
-            Diagnostic(
-                severity="error",
-                category="invalid_argument_type",
-                message=f"{instruction.op} argument {index + 1} must use an uppercase register R0..R63, got {arg.raw}.",
-                source=instruction.source,
-                details={
-                    "op": instruction.op,
-                    "argument_index": index,
-                    "operand": arg.raw,
-                    "expected": "R0..R63",
-                },
-            )
-        )
-        emitted = True
-    return emitted
-
-
-def _diagnose_bare_def_symbol_operands(state: AnalysisState, instruction: Instr) -> bool:
-    emitted = False
-    for index, arg in enumerate(instruction.args):
-        if not _is_bare_defined_symbol(arg, state):
-            continue
-        state.diagnostics.append(
-            Diagnostic(
-                severity="error",
-                category="invalid_argument_type",
-                message=f"{instruction.op} argument {index + 1} must reference .DEF symbols with $NAME syntax, got {arg.raw}.",
-                source=instruction.source,
-                details={
-                    "op": instruction.op,
-                    "argument_index": index,
-                    "operand": arg.raw,
-                    "expected": "$NAME",
-                },
-            )
-        )
-        emitted = True
-    return emitted
-
-
-def _diagnose_unresolved_dollar_symbol_operands(state: AnalysisState, instruction: Instr) -> bool:
-    emitted = False
-    defined_symbols = (
-        set(state.symbol_origins.get("defs", {}))
-        | set(state.symbol_origins.get("params", {}))
-        | set(state.register_aliases)
-    )
-    for index, arg in enumerate(instruction.args):
-        if arg.kind != "symbol":
-            continue
-        raw_name = str(arg.value)
-        if not raw_name.startswith("$") or len(raw_name) <= 1:
-            continue
-        name = raw_name[1:]
-        if name in defined_symbols or raw_name in defined_symbols:
-            continue
-        state.diagnostics.append(
-            Diagnostic(
-                severity="error",
-                category="unresolved_symbol",
-                message=f"Unresolved .DEF symbol: {name}.",
-                source=instruction.source,
-                details={
-                    "op": instruction.op,
-                    "argument_index": index,
-                    "operand": raw_name,
-                    "symbol": name,
-                },
-            )
-        )
-        emitted = True
-    return emitted
-
-
-def _diagnose_strict_q1asm_unresolved_operands(
-    state: AnalysisState,
-    instruction: Instr,
-    symbols: SymbolTable,
-) -> bool:
-    if not state.strict_q1asm:
-        return False
-    emitted = False
-    scope = _scope(symbols, state)
-    for index, arg in enumerate(instruction.args):
-        if arg.kind not in {"symbol", "placeholder"}:
-            continue
-        if arg.kind == "symbol" and str(arg.value).startswith("$"):
-            continue
-        if _register_name(arg, state) is not None:
-            continue
-        value = resolve_arg_value(arg, scope)
-        if not isinstance(value, Symbolic):
-            continue
-        state.diagnostics.append(
-            Diagnostic(
-                severity="error",
-                category="unresolved_symbol",
-                message=f"Unresolved Q1ASM operand in strict mode: {arg.raw}.",
-                source=instruction.source,
-                details={
-                    "op": instruction.op,
-                    "argument_index": index,
-                    "operand": arg.raw,
-                    "symbol": str(arg.value),
-                    "strict_q1asm": True,
-                },
-            )
-        )
-        emitted = True
-    return emitted
-
-
-def _diagnose_strict_q1asm_placeholder_defs(state: AnalysisState, defs: dict[str, Arg]) -> None:
-    for name, arg in defs.items():
-        if arg.kind != "placeholder":
-            continue
-        state.diagnostics.append(
-            Diagnostic(
-                severity="error",
-                category="unresolved_symbol",
-                message=f"Unresolved .DEF placeholder in strict mode: {arg.raw}.",
-                details={
-                    "symbol": name,
-                    "operand": arg.raw,
-                    "strict_q1asm": True,
-                },
-            )
-        )
-
-
-def _is_bare_defined_symbol(arg: Arg, state: AnalysisState) -> bool:
-    if arg.kind != "symbol":
-        return False
-    name = str(arg.value)
-    if name.startswith("$"):
-        return False
-    defined_symbols = set(state.symbol_origins.get("defs", {})) | set(state.register_aliases)
-    return name in defined_symbols
-
-
 def _diagnose_official_label_operand_roles(state: AnalysisState, instruction: Instr) -> bool:
     emitted = False
     for argument_index, operand_role in _label_disallowed_operand_roles(instruction.op):
@@ -1670,140 +907,6 @@ def _diagnose_official_label_operand_roles(state: AnalysisState, instruction: In
         )
         emitted = True
     return emitted
-
-
-def _is_valid_register_arg(arg: Arg) -> bool:
-    if arg.kind != "reg" or not isinstance(arg.value, str):
-        return False
-    raw = arg.raw
-    if not raw.startswith("R"):
-        return False
-    index = _register_index_from_raw(raw)
-    return index is not None and 0 <= index <= _REGISTER_MAX_INDEX
-
-
-def _register_index_from_raw(raw: str) -> int | None:
-    text = raw[1:]
-    if not text:
-        return None
-    try:
-        if text.lower().startswith("0x"):
-            return int(text, 16)
-        if text.isdigit():
-            if len(text) > 1 and text.startswith("0"):
-                return int(text, 8)
-            return int(text, 10)
-    except ValueError:
-        return None
-    return None
-
-
-def _diagnose_resolved_argument_types(
-    state: AnalysisState,
-    instruction: Instr,
-    spec: InstructionSpec,
-    symbols: SymbolTable,
-) -> None:
-    if not instruction.args:
-        return
-    candidates = [signature for signature in spec.signatures if len(signature.args) == len(instruction.args)]
-    if not candidates:
-        return
-
-    resolved_instruction = _instruction_for_q1_timing(instruction, state, symbols)
-    if resolved_instruction.args == instruction.args:
-        return
-    actual_types = [_resolved_arg_type(arg) for arg in resolved_instruction.args]
-    if any(arg_type is None for arg_type in actual_types):
-        return
-    if any(_resolved_signature_matches(signature, actual_types) for signature in candidates):
-        return
-
-    state.diagnostics.append(
-        Diagnostic(
-            severity="error",
-            category="invalid_argument_type",
-            message=(
-                f"{instruction.op} resolved arguments do not match any supported signature: "
-                f"{_resolved_signature_list_display(candidates)}."
-            ),
-            source=instruction.source,
-            details={
-                "op": instruction.op,
-                "expected_signatures": [_resolved_signature_display(signature) for signature in candidates],
-                "actual": [arg.raw for arg in instruction.args],
-                "actual_resolved_types": actual_types,
-            },
-        )
-    )
-
-
-def _resolved_arg_type(arg: Arg) -> str | None:
-    if arg.kind == "imm":
-        return "I"
-    if arg.kind == "reg":
-        return "R"
-    if arg.kind == "label":
-        return "L"
-    return None
-
-
-def _resolved_signature_matches(signature, actual_types: list[str | None]) -> bool:
-    return all(
-        arg_type in accepted or (arg_type == "L" and "I" in accepted)
-        for accepted, arg_type in zip(signature.args, actual_types, strict=True)
-    )
-
-
-def _resolved_signature_list_display(signatures) -> str:
-    return "; ".join(_resolved_signature_display(signature) for signature in signatures)
-
-
-def _resolved_signature_display(signature) -> str:
-    if not signature.args:
-        return "()"
-    return "(" + ", ".join("/".join(sorted(arg_types)) for arg_types in signature.args) + ")"
-
-
-def _diagnose_register_read_hazards(
-    state: AnalysisState, instruction: Instr, reads: tuple[tuple[int, str], ...] | None = None,
-) -> None:
-    if instruction.op == "loop" and len(instruction.args) == 2:
-        counter = _register_name(instruction.args[0], state)
-        if counter is not None and counter == _register_name(instruction.args[1], state):
-            # loop lowers to sub followed immediately by a register-target jnz.
-            state.diagnostics.append(Diagnostic(
-                severity="warning", category="register_not_ready", source=instruction.source,
-                message=(f"loop reads {counter} as its branch target before the counter decrement is available. "
-                         "Use a separate target register or expand the loop with a gap between sub and jnz."),
-                details={"op": "loop", "argument_index": 1, "register": counter,
-                         "writer": _source_to_json(instruction.source), "internal_loop_target_read": True},
-            ))
-    if not state.pending_register_writes:
-        return
-    for argument_index, register in reads if reads is not None else _register_read_operands(instruction, state):
-        pending = _pending_register_write(state, register)
-        if pending is None:
-            continue
-        state.diagnostics.append(
-            Diagnostic(
-                severity="warning",
-                category="register_not_ready",
-                message=(
-                    f"{instruction.op} reads {register} before the previous write is available; "
-                    "insert an instruction gap such as nop."
-                ),
-                source=instruction.source,
-                details={
-                    "op": instruction.op,
-                    "argument_index": argument_index,
-                    "register": register,
-                    "writer": _source_to_json(pending.source),
-                    "available_issue_index": pending.available_issue_index,
-                    "current_issue_index": state.q1_issue_index,
-                },
-            )
-        )
 
 
 def _diagnose_static_register_read_hazards(state: AnalysisState) -> None:
@@ -1866,526 +969,6 @@ def _has_register_not_ready_diagnostic(
     return False
 
 
-def _physical_read_register(arg: Arg, state: AnalysisState) -> str | None:
-    register = _register_name(arg, state)
-    if register is not None or arg.kind not in {"symbol", "placeholder"}:
-        return register
-    name = str(arg.value)
-    if name.startswith("$"):
-        alias = state.register_aliases.get(name[1:])
-        if alias is not None:
-            return alias
-        declared = set(state.symbol_origins.get("params", {})) | set(state.symbol_origins.get("defs", {}))
-        if name in declared or name[1:] in declared:
-            return None
-        name = name[1:]
-    index = _register_index_from_raw(name) if name.startswith("R") else None
-    if index is not None and 0 <= index <= _REGISTER_MAX_INDEX and name == f"R{index}":
-        return name
-    if not _is_valid_register_arg(Arg("reg", name, name)):
-        return state.register_aliases.get(name)
-    return None
-
-
-def _register_read_operands(instruction: Instr, state: AnalysisState) -> list[tuple[int, str]]:
-    destination_indexes = _register_destination_argument_indexes(instruction.op)
-    reads: list[tuple[int, str]] = []
-    for index, arg in enumerate(instruction.args):
-        if index in destination_indexes:
-            continue
-        register = _physical_read_register(arg, state)
-        if register is not None:
-            reads.append((index, register))
-    return reads
-
-
-def _register_issue_metadata(state: AnalysisState, instruction: Instr, scope: SymbolTable) -> dict[str, Any]:
-    reads = {
-        register: value_to_json(resolve_arg_value(Arg("reg", register, register), scope))
-        for _, register in _register_read_operands(instruction, state)
-    }
-    # Keep values that the preceding RT command did not itself read, so first
-    # displaying a register does not falsely imply that its value just changed.
-    snapshot = {register: value_to_json(value) for register, value in state.registers.items()}
-    snapshot.update(reads)
-    bounds = {register: list(_unsigned_operand_bounds(Arg("reg", register, register), scope.get(register, Unknown(register)), state))
-              for register in reads}
-    return {"register_reads": reads, "register_snapshot": snapshot, "register_read_bounds": bounds}
-
-
-def _register_write_operands(instruction: Instr, state: AnalysisState) -> set[str]:
-    writes: set[str] = set()
-    for index in _register_destination_argument_indexes(instruction.op):
-        if index >= len(instruction.args):
-            continue
-        register = _register_name(instruction.args[index], state)
-        if register is not None:
-            writes.add(register)
-    return writes
-
-
-def _register_destination_argument_indexes(op: str) -> set[int]:
-    if op == "fb_pop_data":
-        return {1}
-    if op == "fb_pull_data":
-        return {0, 1}
-    return set(core.destination_indexes(op))
-
-
-def _pending_register_write(state: AnalysisState, register: str) -> PendingRegisterWrite | None:
-    pending_writes = [
-        pending
-        for pending in state.pending_register_writes
-        if pending.register == register and pending.available_issue_index > state.q1_issue_index
-    ]
-    if not pending_writes:
-        return None
-    return min(pending_writes, key=lambda item: item.available_issue_index)
-
-
-def _register_only_argument_indexes(spec: InstructionSpec, actual_count: int) -> set[int]:
-    candidates = [signature for signature in spec.signatures if len(signature.args) == actual_count]
-    return {
-        index
-        for index in range(actual_count)
-        if candidates and all(signature.args[index] == frozenset({"R"}) for signature in candidates)
-    }
-
-
-def _register_aliases(defs: dict[str, Arg]) -> dict[str, str]:
-    return {name: str(arg.value).upper() for name, arg in defs.items() if arg.kind == "reg"}
-
-
-def _apply_ready_register_writes(state: AnalysisState) -> None:
-    if not state.pending_register_writes:
-        return
-    remaining: list[PendingRegisterWrite] = []
-    for pending in state.pending_register_writes:
-        if pending.available_issue_index <= state.q1_issue_index:
-            _apply_register_write(state, pending)
-        else:
-            remaining.append(pending)
-    state.pending_register_writes = remaining
-
-
-def _flush_pending_register_writes(
-    state: AnalysisState,
-    *,
-    completed_issue_index: int | None = None,
-) -> None:
-    if not state.pending_register_writes:
-        return
-    for pending in sorted(state.pending_register_writes, key=lambda item: item.available_issue_index):
-        completed = state.q1_issue_index if completed_issue_index is None else completed_issue_index
-        time = state.q1_time_ns if pending.available_issue_index <= completed else Unknown(
-            "register write availability follows an instruction outside the analyzed trace"
-        )
-        _apply_register_write(state, pending, time=time)
-    state.pending_register_writes = []
-
-
-def _fresh_value_origin(state: AnalysisState) -> tuple[str, bool]:
-    state.value_origin_serial = next(_VALUE_ORIGIN_SERIALS)
-    return f"write:{state.value_origin_serial}", False
-
-
-def _apply_register_write(state: AnalysisState, pending: PendingRegisterWrite, *, time: Value | None = None) -> None:
-    if state.record_trace:
-        meta = pending.meta
-        if state.execution_mode == "concrete":
-            meta = {
-                **meta,
-                "previous_value": value_to_json(state.registers.get(pending.register, Unknown(pending.register))),
-                "provenance": pending.provenance,
-            }
-    state.registers[pending.register] = pending.value
-    if pending.unsigned_bounds is None:
-        state.register_bounds.pop(pending.register, None)
-    else:
-        state.register_bounds[pending.register] = pending.unsigned_bounds
-    if pending.known_bits is None:
-        state.register_known_bits.pop(pending.register, None)
-    else:
-        state.register_known_bits[pending.register] = pending.known_bits
-    state.register_value_origins[pending.register] = pending.value_origin if pending.value_origin is not None else _fresh_value_origin(state)
-    if state.record_trace:
-        state.register_provenance[pending.register] = pending.provenance
-        _record_register_write(
-            state, pending.register, pending.value, source=pending.source,
-            event_id=pending.event_id, time=time, meta=meta,
-        )
-
-
-def _record_register_write(
-    state: AnalysisState,
-    register: str,
-    value: Value,
-    *,
-    source: SourceLocation,
-    event_id: str | None,
-    time: Value | None = None,
-    meta: dict[str, Any] | None = None,
-) -> None:
-    write_time = state.q1_time_ns if time is None else time
-    write_meta = dict(meta or {})
-    write_meta.setdefault("branch_assumptions", _register_branch_assumptions(state))
-    confidence = _confidence_for_value((value, write_time))
-    if confidence == "exact" and write_meta.get("branch_assumptions"):
-        confidence = "assumed"
-    state.register_history.append(
-        RegisterWrite(state.sequencer_id, register, write_time, value, source, event_id, confidence, write_meta)
-    )
-
-
-def _register_branch_assumptions(state: AnalysisState) -> list[dict[str, str]]:
-    return [
-        {"branch_id": entry["branch_id"], "assumed_branch_path": entry["assumed_branch_path"]}
-        for entry in state.metadata.get("branches", {}).get("assumptions", [])
-    ]
-
-
-def _invalidate_register_history(
-    state: AnalysisState,
-    registers: set[str],
-    *,
-    source: SourceLocation,
-    event_id: str,
-    reason: str,
-    meta: dict[str, Any] | None = None,
-) -> None:
-    for register in sorted(registers):
-        state.register_bounds.pop(register, None)
-        state.register_known_bits.pop(register, None)
-        state.register_value_origins[register] = _fresh_value_origin(state)
-        _record_register_write(
-            state,
-            register,
-            Unknown(reason),
-            source=source,
-            event_id=event_id,
-            meta={**(meta or {}), "invalidated": True, "reason": reason},
-        )
-
-
-def _schedule_register_write(
-    state: AnalysisState,
-    instruction: Instr,
-    register: str,
-    value: Value,
-    provenance: dict[str, Any],
-    *,
-    unsigned_bounds: tuple[int, int] | None = None,
-    known_bits: tuple[int, int] | None = None,
-    value_origin: tuple[str, bool] | None = None,
-) -> None:
-    # Display expressions are separate from the versioned numeric proof facts.
-    if not isinstance(value, Concrete):
-        unsigned_bounds, known_bits = _origin_peer_facts(state, value_origin, unsigned_bounds, known_bits)
-        if unsigned_bounds is not None and unsigned_bounds[0] == unsigned_bounds[1]:
-            value = Concrete(unsigned_bounds[0])
-            provenance = {**provenance, "value": value_to_json(value)}
-    if isinstance(value, (Symbolic, RuntimeDependent, Unknown)) and len(str(value)) > 1024:
-        reference = f"{register} after {instruction.op} (line {instruction.source.line})"
-        if isinstance(value, Symbolic):
-            value = Symbolic(reference, value.unresolved_symbols)
-        elif isinstance(value, RuntimeDependent):
-            value = RuntimeDependent(reference)
-        else:
-            value = Unknown(reference)
-        provenance = {**provenance, "value": value_to_json(value)}
-    event_id = f"{state.sequencer_id}:e{len(state.events)}" if state.record_trace else ""
-    if state.execution_mode == "concrete" and state.record_trace:
-        provenance = _concrete_write_provenance(state, instruction, provenance, event_id)
-    state.pending_register_writes.append(
-        PendingRegisterWrite(
-            register=register,
-            value=value,
-            provenance=provenance,
-            source=instruction.source,
-            available_issue_index=state.q1_issue_index + 1 + register_write_delay_slots(instruction.op),
-            event_id=event_id,
-            meta={
-                "op": instruction.op,
-                "branch_assumptions": _register_branch_assumptions(state),
-            } if state.record_trace else {},
-            unsigned_bounds=unsigned_bounds if not isinstance(value, Concrete) else None,
-            known_bits=known_bits if not isinstance(value, Concrete) and known_bits != (0, 0) else None,
-            value_origin=value_origin if value_origin is not None else _fresh_value_origin(state),
-        )
-    )
-
-
-def _concrete_write_provenance(
-    state: AnalysisState, instruction: Instr, provenance: dict[str, Any], event_id: str,
-) -> dict[str, Any]:
-    return {
-        **provenance,
-        "event_id": event_id,
-        "execution_index": state.q1_issue_index,
-        "inputs": {
-            register: {
-                "value": value_to_json(state.registers.get(register, Unknown(register))),
-                "event_id": state.register_provenance.get(register, {}).get("event_id"),
-            }
-            for _, register in _register_read_operands(instruction, state)
-        },
-    }
-
-
-def _diagnose_negative_rt_duration_operand(
-    state: AnalysisState,
-    instruction: Instr,
-    spec: InstructionSpec,
-    symbols: SymbolTable,
-) -> bool:
-    duration_arg_index = rt_duration_arg_for_instruction(spec, instruction)
-    if duration_arg_index is None or duration_arg_index >= len(instruction.args):
-        return False
-    duration_arg = instruction.args[duration_arg_index]
-    duration = resolve_arg_value(duration_arg, _scope(symbols, state))
-    if not isinstance(duration, Concrete) or duration.value >= 0:
-        return False
-    state.diagnostics.append(
-        Diagnostic(
-            severity="error",
-            category="invalid_argument_value",
-            message=f"{instruction.op} duration must be non-negative, got {duration.value}.",
-            source=instruction.source,
-            details={
-                "op": instruction.op,
-                "argument_index": duration_arg_index,
-                "operand": duration_arg.raw,
-                "constraint": "non_negative",
-                "value": duration.value,
-            },
-        )
-    )
-    return True
-
-
-def _diagnose_official_rt_duration_range(
-    state: AnalysisState,
-    instruction: Instr,
-    spec: InstructionSpec,
-    symbols: SymbolTable,
-) -> bool:
-    duration_arg_index = rt_duration_arg_for_instruction(spec, instruction)
-    if duration_arg_index is None or duration_arg_index >= len(instruction.args):
-        return False
-    duration_arg = instruction.args[duration_arg_index]
-    if _register_name(duration_arg, state) is not None:
-        return False
-    duration = resolve_arg_value(duration_arg, _scope(symbols, state))
-    if not isinstance(duration, Concrete) or duration.value <= _RT_DURATION_MAX:
-        return False
-    state.diagnostics.append(
-        Diagnostic(
-            severity="error",
-            category="invalid_argument_value",
-            message=f"{instruction.op} duration must be in range 0..{_RT_DURATION_MAX}, got {duration.value}.",
-            source=instruction.source,
-            details={
-                "op": instruction.op,
-                "argument_index": duration_arg_index,
-                "operand": duration_arg.raw,
-                "operand_role": "duration",
-                "constraint": "range",
-                "min": 0,
-                "max": _RT_DURATION_MAX,
-                "value": duration.value,
-            },
-        )
-    )
-    return True
-
-
-def _valid_rt_duration(duration: int) -> bool:
-    return duration == 0 or _RT_DURATION_MIN <= duration <= _RT_DURATION_MAX
-
-
-def _invalid_rt_duration(instruction: Instr, spec: InstructionSpec, scope: SymbolTable) -> Diagnostic | None:
-    is_else = instruction.op == "set_cond"
-    index = 3 if is_else else rt_duration_arg_for_instruction(spec, instruction)
-    if index is None or index >= len(instruction.args) or instruction.op == "fb_acq_tb_mock":
-        return None
-    arg = instruction.args[index]
-    value = resolve_arg_value(arg, scope)
-    if not isinstance(value, Concrete) or _valid_rt_duration(value.value):
-        return None
-    if instruction.op == "fb_cmd" and raw_linq_operation(_arg_int(instruction.args[0], scope)) == "fb_acq_tb_mock":
-        return None
-    role = "else_duration" if is_else else "duration"
-    return Diagnostic(
-        severity="error", category="invalid_argument_value", source=instruction.source,
-        message=(f"{instruction.op} {role.replace('_', ' ')} {value.value} ns is invalid. "
-                 f"RT duration must be zero or {_RT_DURATION_MIN}..{_RT_DURATION_MAX} ns."),
-        details={"reason": "invalid_rt_duration", "op": instruction.op, "argument_index": index, "operand": arg.raw,
-                 "operand_role": role, "value": value.value, "min_nonzero": _RT_DURATION_MIN, "max": _RT_DURATION_MAX},
-    )
-
-
-def _diagnose_invalid_rt_index_operands(
-    state: AnalysisState,
-    instruction: Instr,
-    symbols: SymbolTable,
-) -> bool:
-    emitted = False
-    for argument_index, operand_role in _non_negative_operand_roles(instruction.op):
-        if argument_index >= len(instruction.args):
-            continue
-        arg = instruction.args[argument_index]
-        value = resolve_arg_value(arg, _scope(symbols, state))
-        if isinstance(value, Concrete):
-            if _has_official_operand_range(instruction.op, argument_index, operand_role):
-                continue
-            if value.value >= 0:
-                continue
-            state.diagnostics.append(
-                Diagnostic(
-                    severity="error",
-                    category="invalid_argument_value",
-                    message=f"{instruction.op} {operand_role.replace('_', ' ')} must be non-negative, got {value.value}.",
-                    source=instruction.source,
-                    details={
-                        "op": instruction.op,
-                        "argument_index": argument_index,
-                        "operand": arg.raw,
-                        "operand_role": operand_role,
-                        "constraint": "non_negative",
-                        "value": value.value,
-                    },
-                )
-            )
-            emitted = True
-            continue
-        if operand_role == "feedback_source" and _register_name(arg, state) is not None:
-            continue
-        if _should_reject_unresolved_rt_index_operand(instruction.op, operand_role) and _diagnose_unresolved_index_operand(
-            state,
-            instruction,
-            arg,
-            argument_index,
-            operand_role,
-        ):
-            emitted = True
-    return emitted
-
-
-def _has_official_operand_range(op: str, argument_index: int, operand_role: str) -> bool:
-    return any(
-        index == argument_index and role == operand_role
-        for index, role, _lower, _upper in _official_operand_ranges(op)
-    )
-
-
-def _diagnose_official_operand_ranges(
-    state: AnalysisState,
-    instruction: Instr,
-    symbols: SymbolTable,
-) -> bool:
-    if _is_packed_feedback_register_form(instruction, state):
-        return False
-    emitted = False
-    scope = _scope(symbols, state)
-    for argument_index, operand_role, lower, upper in _official_operand_ranges(instruction.op, len(instruction.args)):
-        if argument_index >= len(instruction.args):
-            continue
-        arg = instruction.args[argument_index]
-        value: Value
-        if operand_role == "branch_target":
-            target_arg = _branch_target_arg(arg, state, symbols)
-            if target_arg.kind != "imm":
-                continue
-            value = Concrete(int(target_arg.value))
-        elif _register_name(arg, state) is not None:
-            continue
-        else:
-            value = resolve_arg_value(arg, scope)
-        if not isinstance(value, Concrete):
-            continue
-        if lower <= value.value <= upper:
-            continue
-        state.diagnostics.append(
-            Diagnostic(
-                severity="error",
-                category="invalid_argument_value",
-                message=(
-                    f"{instruction.op} {operand_role.replace('_', ' ')} must be in range "
-                    f"{lower}..{upper}, got {value.value}."
-                ),
-                source=instruction.source,
-                details={
-                    "op": instruction.op,
-                    "argument_index": argument_index,
-                    "operand": arg.raw,
-                    "operand_role": operand_role,
-                    "constraint": "range",
-                    "min": lower,
-                    "max": upper,
-                    "value": value.value,
-                },
-            )
-        )
-        emitted = True
-    return emitted
-
-
-def _is_packed_feedback_register_form(instruction: Instr, state: AnalysisState) -> bool:
-    return (
-        instruction.op in {"fb_com_cfg", "fb_acq_tb_cfg", "fb_com_extra", "fb_acq_tb_extra", "fb_acq_tb_mock"}
-        and len(instruction.args) == 2
-        and _register_name(instruction.args[0], state) is not None
-    )
-
-
-def _official_operand_ranges(op: str, argument_count: int = 1) -> list[tuple[int, str, int, int]]:
-    signed_32 = (-2147483648, 2147483647)
-    classical_imm = (-2147483648, 0xFFFFFFFF)
-    if op in core.DEVICE_RANGES:
-        return list(core.DEVICE_RANGES[op])
-    if op in core_rt.OPERAND_RANGES:
-        return list(core_rt.OPERAND_RANGES[op])
-    if op == "stop":
-        return [(0, "stop_status", *signed_32)]
-    if op == "sw_req":
-        return [(0, "software_request", *signed_32)]
-    if op == "fb_pop_data":
-        return [(0, "feedback_pop_tag", 0, 65535)]
-    if op == "jmp" or (op == "jge" and argument_count == 1):
-        return [(0, "branch_target", 0, 16383)]
-    if op in {"jge", "jlt"}:
-        return [
-            (1, "branch_compare_immediate", *classical_imm),
-            (2, "branch_target", 0, 16383),
-        ]
-    if op in STATUS_BRANCH_OPS:
-        return [(0, "branch_target", 0, 16383)]
-    if op == "loop":
-        return [(1, "branch_target", 0, 16383)]
-    return _alu_operand_ranges(op)
-
-
-def _non_negative_operand_roles(op: str) -> list[tuple[int, str]]:
-    roles = list(_rt_index_operand_roles(op))
-    if op == "set_cond":
-        roles.append((3, "else_duration"))
-    elif op == "wait_trigger":
-        roles.append((0, "trigger_index"))
-    elif op == "set_latch_en":
-        roles.append((0, "enable_flag"))
-    elif op == "upd_thres":
-        roles.append((0, "threshold_index"))
-    elif op == "fb_acq_iq_shift":
-        roles.append((0, "shift_count"))
-    elif op in {"fb_com_cfg", "fb_acq_tb_cfg"}:
-        roles.extend([(0, "write_combine_flag"), (1, "bit_position"), (2, "payload_length")])
-    elif op in {"fb_com_extra", "fb_acq_tb_extra"}:
-        roles.extend([(0, "enable_flag"), (1, "extra_payload_bytes")])
-    elif op == "fb_acq_tb_mock":
-        roles.extend([(0, "enable_flag"), (1, "valid_bit"), (2, "mock_data")])
-    return roles
-
-
 def _label_disallowed_operand_roles(op: str) -> list[tuple[int, str]]:
     if op in {"acquire_ttl", "acquire_timetags"}:
         return [(2, "input_index")]
@@ -2406,282 +989,6 @@ def _label_disallowed_operand_roles(op: str) -> list[tuple[int, str]]:
     if op == "fb_acq_tb_valid":
         return [(0, "feedback_acquisition_channel")]
     return []
-
-
-def _rt_index_operand_roles(op: str) -> list[tuple[int, str]]:
-    if op == "play":
-        return [(0, "waveform_index"), (1, "waveform_index")]
-    if op == "acquire":
-        return [(0, "acquisition_index"), (1, "bin_index")]
-    if op in {"acquire_weighed", "acquire_weighted"}:
-        return [
-            (0, "acquisition_index"),
-            (1, "bin_index"),
-            (2, "weight_index"),
-            (3, "weight_index"),
-        ]
-    if op == "acquire_ttl":
-        return [(0, "acquisition_index"), (1, "bin_index"), (2, "input_index")]
-    if op == "acquire_timetags":
-        return [
-            (0, "acquisition_index"),
-            (1, "bin_index"),
-            (2, "input_index"),
-            (3, "tag_index"),
-        ]
-    if op == "acquire_digital":
-        return [(0, "acquisition_index"), (1, "bin_index")]
-    if op in {"fb_com_data", "fb_cmd"}:
-        return [(0, "feedback_channel"), (1, "feedback_source")]
-    if op in {"fb_acq_iq_id", "fb_acq_tb_id", "fb_acq_tb_valid"}:
-        return [(0, "feedback_acquisition_channel")]
-    if op in {"fb_llp_tags_id", "fb_llp_ttls_id", "fb_tdc_tags_id", "fb_tdc_tdelta_id"}:
-        return [(0, "feedback_channel")]
-    return []
-
-
-def _should_reject_unresolved_rt_index_operand(op: str, operand_role: str) -> bool:
-    concrete_required_roles = {
-        "bit_position",
-        "enable_flag",
-        "extra_payload_bytes",
-        "mock_data",
-        "payload_length",
-        "sample_count",
-        "shift_count",
-        "threshold_index",
-        "trigger_index",
-        "valid_bit",
-        "write_combine_flag",
-    }
-    return (
-        op.startswith("acquire")
-        or operand_role.startswith("feedback_")
-        or operand_role in concrete_required_roles
-    )
-
-
-def _instruction_for_q1_timing(
-    instruction: Instr, state: AnalysisState, symbols: SymbolTable, *, scope: SymbolTable | None = None,
-) -> Instr:
-    if not any(arg.kind in {"symbol", "placeholder"} for arg in instruction.args):
-        return instruction
-    if scope is None:
-        scope = _scope(symbols, state)
-    args: list[Arg] = []
-    changed = False
-    for arg in instruction.args:
-        timing_arg = _arg_for_q1_timing(arg, state, scope)
-        args.append(timing_arg)
-        changed = changed or timing_arg != arg
-    if not changed:
-        return instruction
-    return Instr(
-        pc=instruction.pc,
-        label=instruction.label,
-        op=instruction.op,
-        args=args,
-        source=instruction.source,
-    )
-
-
-def _branch_taken_duration(instruction: Instr, state: AnalysisState, symbols: SymbolTable) -> int:
-    bound = _instruction_for_q1_timing(instruction, state, symbols)
-    return get_instruction_spec(instruction.op).q1_time_model(bound)
-
-
-def _arg_for_q1_timing(arg: Arg, state: AnalysisState, scope: SymbolTable) -> Arg:
-    if arg.kind not in {"symbol", "placeholder"}:
-        return arg
-    register = _register_name(arg, state)
-    if register is not None:
-        return Arg(kind="reg", value=register, raw=arg.raw)
-    value = resolve_arg_value(arg, scope)
-    if isinstance(value, Concrete):
-        return Arg(kind="imm", value=value.value, raw=arg.raw)
-    return arg
-
-
-def _resolved_branch_target_arg(arg: Arg, value: Value) -> Arg | None:
-    if isinstance(value, Concrete):
-        return Arg(kind="imm", value=value.value, raw=arg.raw)
-    if isinstance(value, Symbolic) and value.expr.startswith("@") and len(value.expr) > 1:
-        return Arg(kind="label", value=value.expr[1:], raw=arg.raw)
-    return None
-
-
-def _branch_target_arg(arg: Arg, state: AnalysisState, symbols: SymbolTable) -> Arg:
-    if arg.kind in {"label", "imm"}:
-        return arg
-    if arg.kind == "symbol" and str(arg.value).startswith("$"):
-        origin = state.symbol_origins.get("defs", {}).get(str(arg.value)[1:], {})
-        raw = origin.get("raw", "")
-        if raw.startswith("@"):
-            return Arg(kind="label", value=raw[1:], raw=arg.raw)
-    scope = _scope(symbols, state)
-    if arg.kind == "reg":
-        return _resolved_branch_target_arg(arg, resolve_arg_value(arg, scope)) or arg
-    register = _register_name(arg, state)
-    if register is not None:
-        register_arg = Arg(kind="reg", value=register, raw=arg.raw)
-        return _resolved_branch_target_arg(register_arg, resolve_arg_value(register_arg, scope)) or register_arg
-    value = resolve_arg_value(arg, scope)
-    return _resolved_branch_target_arg(arg, value) or arg
-
-
-def _address_model(state: AnalysisState) -> str:
-    return "compiled_q1asm" if state.compiled_addresses is not None else "source_instruction_index"
-
-
-def _address_labels(state: AnalysisState) -> dict[str, int]:
-    return state.compiled_addresses.labels if state.compiled_addresses is not None else state.labels
-
-
-def _compiled_pc(state: AnalysisState, pc: int) -> int | None:
-    if pc == state.pc and state.interior_pc is not None:
-        return state.interior_pc
-    return state.compiled_addresses.entries.get(pc) if state.compiled_addresses is not None else pc
-
-
-def _execution_instruction(state: AnalysisState) -> Instr | None:
-    if state.interior_pc is not None and state.compiled_addresses is not None:
-        return state.compiled_addresses.targets[state.interior_pc].interior
-    return state.instructions_by_pc.get(state.pc)
-
-
-def _begin_execution_step(state: AnalysisState) -> None:
-    state.next_pc = state.pc + 1
-    state.next_interior_pc = None
-
-
-def _advance_execution(state: AnalysisState) -> None:
-    state.pc = state.next_pc
-    state.interior_pc = state.next_interior_pc
-
-
-def _execution_target(state: AnalysisState, value: Value) -> CompiledTarget | None:
-    if not isinstance(value, Concrete) or type(value.value) is not int:
-        return None
-    if state.compiled_addresses is not None:
-        return state.compiled_addresses.targets.get(value.value)
-    return CompiledTarget(value.value, value.value) if value.value in state.instructions_by_pc else None
-
-
-def _invalid_branch_target_reason(state: AnalysisState, value: Value) -> str:
-    if not isinstance(value, Concrete):
-        return "Branch destination is unknown."
-    address_space = "Compiled branch target" if state.compiled_addresses is not None else "Branch target"
-    return f"{address_space} PC {value.value} has no instruction."
-
-
-def _set_execution_target(state: AnalysisState, target: CompiledTarget) -> None:
-    state.next_pc = target.source_pc
-    state.next_interior_pc = target.address if target.interior is not None else None
-
-
-def _branch_target_metadata(target: CompiledTarget | None, state: AnalysisState) -> dict[str, Any]:
-    result = {"target_pc": target.source_pc if target is not None else None}
-    if target is not None and state.compiled_addresses is not None:
-        result["compiled_target_pc"] = target.address
-        if target.interior is not None:
-            result["target_interior_op"] = target.interior.op
-    return result
-
-
-def _concrete_branch_test(
-    state: AnalysisState, instruction: Instr, scope: SymbolTable,
-) -> tuple[bool | None, dict[str, bool] | None]:
-    if instruction.op == "loop":
-        previous = state.registers[_register_name(instruction.args[0], state)].value
-        flags = _sub_flags(previous, 1)
-        return not flags["zf"], flags
-    if len(instruction.args) == 3:
-        left = resolve_arg_value(instruction.args[0], scope).value & _CLASSICAL_REGISTER_MASK
-        right = resolve_arg_value(instruction.args[1], scope).value & _CLASSICAL_REGISTER_MASK
-        return (left >= right if instruction.op == "jge" else left < right), _sub_flags(left, right)
-    return (True if instruction.op == "jmp" else _status_branch_decision(instruction.op, state.alu_flags)), None
-
-
-def _concrete_branch_destination_ready(
-    state: AnalysisState, instruction: Instr, scope: SymbolTable, taken: bool | None = None,
-) -> bool:
-    if taken is None:
-        taken, _ = _concrete_branch_test(state, instruction, scope)
-    if not taken:
-        return True
-    target_index = 1 if instruction.op == "loop" else 2 if len(instruction.args) == 3 else 0
-    value = resolve_arg_value(instruction.args[target_index], scope)
-    if _execution_target(state, value) is not None:
-        return True
-    _end_concrete_execution(state, "error", _invalid_branch_target_reason(state, value), instruction)
-    return False
-
-
-def _execute_concrete_branch(
-    state: AnalysisState, instruction: Instr, q1_issue_event: TimelineEvent | None, symbols: SymbolTable,
-    *, q1_t0: Value | None = None, defer_register_write: bool = False, forced_decision: bool | None = None,
-    branch_issue: core.Issue | None = None, projected: bool = False,
-) -> None:
-    if forced_decision is not None and (type(forced_decision) is not bool or instruction.op == "jmp"):
-        raise ValueError("A forced branch decision must be a boolean for a conditional branch")
-    scope = _scope(symbols, state)
-    target_index = 1 if instruction.op == "loop" else 2 if len(instruction.args) == 3 else 0
-    target = _execution_target(state, resolve_arg_value(instruction.args[target_index], scope))
-    if branch_issue is not None:
-        decision = branch_issue.taken
-        flags = branch_issue.flags.as_dict() if branch_issue.flags is not None else None
-    else:
-        decision, flags = _concrete_branch_test(state, instruction, scope)
-    if flags is not None:
-        _set_alu_flags(state, instruction, flags)
-    counter_write = None
-    if instruction.op == "loop":
-        register = _register_name(instruction.args[0], state)
-        if branch_issue is None:
-            value = Concrete((state.registers[register].value - 1) & _CLASSICAL_REGISTER_MASK)
-        else:
-            value = Concrete(branch_issue.words[0])
-        event_id = q1_issue_event.id if q1_issue_event is not None else ""
-        provenance = {}
-        if state.record_trace:
-            provenance = _register_provenance(
-                state, register, expression=f"{register} - 1", value=value,
-                steps=[_provenance_step(instruction, f"{register} - 1", value)],
-            )
-            provenance = _concrete_write_provenance(state, instruction, provenance, event_id)
-        counter_write = PendingRegisterWrite(
-            register, value, provenance,
-            instruction.source, state.q1_issue_index + 1 + register_write_delay_slots(instruction.op), event_id, {"op": "loop"},
-        )
-    if forced_decision is not None:
-        if q1_issue_event is not None:
-            q1_issue_event.meta.update(natural_branch_taken=decision, branch_overridden=True,
-                                      assumption_source="user", assumed_branch_path="taken" if forced_decision else "fallthrough")
-        decision = forced_decision
-    if branch_issue is not None:
-        duration = branch_issue.q1_duration
-    else:
-        duration = branch_duration(_branch_taken_duration(instruction, state, symbols), decision)
-    if q1_issue_event is not None:
-        q1_t0 = q1_issue_event.t0
-    assert q1_t0 is not None
-    q1_t1 = state.q1_time_ns if projected else add_values(q1_t0, Concrete(duration))
-    if q1_issue_event is not None:
-        state.events[-1] = replace(q1_issue_event, t1=q1_t1, duration=Concrete(duration),
-                                  confidence="assumed" if forced_decision is not None else q1_issue_event.confidence)
-        q1_issue_event.meta.update(branch_decision="assumed" if forced_decision is not None else "concrete",
-                                   branch_taken=decision, **_branch_target_metadata(target, state))
-    state.q1_time_ns = q1_t1
-    if counter_write is not None:
-        if defer_register_write:
-            state.pending_register_writes.append(counter_write)
-        else:
-            _apply_register_write(state, counter_write)
-    if decision and not projected:
-        assert target is not None
-        _set_execution_target(state, target)
-    elif forced_decision is not None and not projected:
-        _begin_execution_step(state)
 
 
 def _can_follow_compiled_interior(
@@ -4283,7 +2590,7 @@ def _prove_timing_only_branch_join(
                 if next_pc is None or next_pc <= pc:
                     break
             elif (item.op == "nop" or spec.category == "classical"
-                  and (_register_destination_argument_indexes(item.op) or item.op in {"cmp", "test"})
+                  and (core.destination_indexes(item.op) or item.op in {"cmp", "test"})
                   or spec.category == "latched" and item.op in {
                       "set_mrk", "set_awg_gain", "set_awg_offs", "set_freq", "reset_ph", "set_ph",
                       "set_ph_delta", "set_digital", "set_scope_en", "set_cond",
@@ -4953,25 +3260,6 @@ def _branch_id(state: AnalysisState, instruction: Instr, target_label: str | Non
     return f"{state.sequencer_id}:branch:{instruction.source.file}:{instruction.source.line}:{instruction.op}:{target}"
 
 
-def _normalise_branch_assumptions(
-    branch_assumptions: Mapping[str, str] | None,
-) -> dict[str, BranchAssumptionPath]:
-    if branch_assumptions is None:
-        return {}
-    if not isinstance(branch_assumptions, Mapping):
-        raise ValueError(
-            f"Invalid branch assumptions: expected a mapping/object, got {type(branch_assumptions).__name__}"
-        )
-    normalised: dict[str, BranchAssumptionPath] = {}
-    for branch_id, path in branch_assumptions.items():
-        if not isinstance(branch_id, str) or not branch_id.strip():
-            raise ValueError("branch assumption ids must be non-empty strings")
-        if path not in VALID_BRANCH_ASSUMPTION_PATHS:
-            raise ValueError(f"Invalid branch assumption for {branch_id}: {path}")
-        normalised[branch_id] = path  # type: ignore[assignment]
-    return normalised
-
-
 def _normalise_loop_preview_counts(loop_preview_counts: Mapping[str, int] | None) -> dict[str, int]:
     if loop_preview_counts is None:
         return {}
@@ -5021,18 +3309,6 @@ def _record_branch_assumption(
     assumptions.append(record)
 
 
-def _emit_undefined_label(state: AnalysisState, instruction: Instr, target_label: str) -> None:
-    diagnostic = Diagnostic(
-        severity="error",
-        category="undefined_label",
-        message=f"Undefined label: @{target_label}",
-        source=instruction.source,
-        details={"label": target_label, "op": instruction.op},
-    )
-    if diagnostic not in state.static_diagnostics:
-        state.diagnostics.append(diagnostic)
-
-
 def _affine_loop_timing(
     state: AnalysisState, body: list[Instr], evidence: _LoopEvidence, count: int,
     counter_reg: str | None, symbols: SymbolTable, *, children: Mapping[int, TimelineEvent] | None = None,
@@ -5074,7 +3350,7 @@ def _affine_loop_timing(
             writes.add(child_counters[item.pc])
             continue
         writes.update(_register_write_operands(item, state))
-        destinations = _register_destination_argument_indexes(item.op)
+        destinations = core.destination_indexes(item.op)
         reads.update(register for _, register in _register_read_operands(item, state))
         event = issues[item.source]
         for index, arg in enumerate(item.args):
@@ -5229,7 +3505,7 @@ def _bounded_loop_total(
     """Prove an elapsed sum without claiming individual unknown packet times."""
     if count < 2 or state.conditional_enable != Concrete(0) or any(
         item.op not in {"nop", "wait", "cmp", "test"}
-        and not (get_instruction_spec(item.op).category == "classical" and _register_destination_argument_indexes(item.op))
+        and not (get_instruction_spec(item.op).category == "classical" and core.destination_indexes(item.op))
         for item in body
     ):
         return None
@@ -5409,7 +3685,7 @@ def _bounded_loop_total(
 def _supported_loop_evaluation_instruction(item: Instr) -> bool:
     category = get_instruction_spec(item.op).category
     return (item.op in {"nop", "wait", "cmp", "test"}
-            or category == "classical" and bool(_register_destination_argument_indexes(item.op))
+            or category == "classical" and bool(core.destination_indexes(item.op))
             or category == "branch" and item.op != "loop")
 
 
@@ -6461,24 +4737,6 @@ def _collapse_invalid_loop_count(
     state.stopped = True
 
 
-def _docs_ordered_binary_args(instruction: Instr, state: AnalysisState) -> tuple[Arg, Arg]:
-    left_arg = instruction.args[0]
-    right_arg = instruction.args[1]
-    if instruction.op in {"cmp", "sub", "asl", "asr", "lsl", "lsr"} and _register_name(right_arg, state) is not None:
-        if _register_name(left_arg, state) is None:
-            return right_arg, left_arg
-    return left_arg, right_arg
-
-
-def _set_alu_flags(state: AnalysisState, instruction: Instr, flags: dict[str, bool] | None) -> None:
-    state.alu_flags = flags
-    state.alu_flag_cases = None
-    state.alu_flags_source = instruction.source if flags is not None else None
-    state.alu_flags_read_hazard = state.analysis_back_edge_limit is not None and bool(state.pending_register_writes) and any(
-        _pending_register_write(state, register) is not None for _, register in _register_read_operands(instruction, state)
-    )
-
-
 def _result_bounds_flags(bounds: tuple[int, int] | None) -> dict[str, bool]:
     flags = {}
     if bounds is not None:
@@ -6488,17 +4746,6 @@ def _result_bounds_flags(bounds: tuple[int, int] | None) -> dict[str, bool]:
         if high < 0x80000000 or low >= 0x80000000:
             flags["nf"] = low >= 0x80000000
     return flags
-
-
-def _bounds_known_bits(bounds: tuple[int, int]) -> tuple[int, int]:
-    low, high = bounds
-    prefix = _CLASSICAL_REGISTER_MASK ^ ((1 << (low ^ high).bit_length()) - 1)
-    return low & prefix, ~high & prefix & _CLASSICAL_REGISTER_MASK
-
-
-def _refine_bounds_with_bits(bounds: tuple[int, int] | None, known_bits: tuple[int, int]) -> tuple[int, int]:
-    low, high = known_bits[0], _CLASSICAL_REGISTER_MASK ^ known_bits[1]
-    return (low, high) if bounds is None else (max(bounds[0], low), min(bounds[1], high))
 
 
 def _shift_count_facts(
@@ -6625,41 +4872,6 @@ def _binary_alu_flags(op: str, left: Value, right: Value, result: Value) -> dict
     return _logic_flags(result.value)
 
 
-def _build_immutable_value_origins(symbols: SymbolTable, defs: dict[str, Arg], state: AnalysisState) -> dict[str, tuple[str, bool]]:
-    origins = {name: (f"binding:param:{name}", False) for name in symbols}
-    for name, arg in defs.items():
-        origin = None
-        if arg.kind == "imm":
-            origin = f"constant:{int(arg.value) & _CLASSICAL_REGISTER_MASK}", False
-        elif arg.kind in {"symbol", "placeholder"} and _physical_read_register(arg, state) is None:
-            origin = next((origins[key] for key in _symbol_lookup_names(str(arg.value)) if key in origins), None)
-            if origin is None:
-                origin = f"template:{arg.value}", False
-        origins[name] = origin if origin is not None else (f"binding:def:{name}", False)
-    return origins
-
-
-def _operand_value_origin(arg: Arg, value: Value, state: AnalysisState) -> tuple[str, bool] | None:
-    if isinstance(value, Concrete):
-        return f"constant:{value.value & _CLASSICAL_REGISTER_MASK}", False
-    register = _physical_read_register(arg, state)
-    if register is not None:
-        return state.register_value_origins.get(register, (f"initial:{register}", False))
-    if arg.kind in {"symbol", "placeholder"}:
-        declared = set(state.symbol_origins.get("defs", {})) | set(state.symbol_origins.get("params", {}))
-        for name in _symbol_lookup_names(str(arg.value)):
-            if name in state.immutable_value_origins:
-                return state.immutable_value_origins[name]
-            if name.startswith("$") and name[1:] in state.immutable_value_origins:
-                return state.immutable_value_origins[name[1:]]
-            if name in declared:
-                return f"binding:{name}", False
-            if name.startswith("$") and name[1:] in declared:
-                return f"binding:{name[1:]}", False
-        return f"template:{arg.value}", False
-    return None
-
-
 def _operand_value_relation(left: Arg, left_value: Value, right: Arg, right_value: Value, state: AnalysisState) -> bool | None:
     a = _operand_value_origin(left, left_value, state)
     b = _operand_value_origin(right, right_value, state)
@@ -6739,58 +4951,6 @@ def _scaled_value_origin(origin: tuple[str, bool] | None, factor: int) -> tuple[
             if parts is not None else None)
 
 
-def _origin_peer_facts(
-    state: AnalysisState, origin: tuple[str, bool] | None,
-    bounds: tuple[int, int] | None, known_bits: tuple[int, int] | None,
-) -> tuple[tuple[int, int] | None, tuple[int, int] | None]:
-    if origin is None:
-        return bounds, known_bits
-    for register in state.register_bounds.keys() | state.register_known_bits.keys():
-        value = state.registers.get(register, Unknown(register))
-        peer = state.register_value_origins.get(register, _operand_value_origin(Arg("reg", register, register), value, state))
-        if peer is None or peer[0] != origin[0]:
-            continue
-        interval = state.register_bounds.get(register, (0, _CLASSICAL_REGISTER_MASK))
-        ones, zeros = state.register_known_bits.get(register, (0, 0))
-        if isinstance(value, Concrete):
-            word = value.value & _CLASSICAL_REGISTER_MASK
-            interval, (ones, zeros) = (word, word), (word, _CLASSICAL_REGISTER_MASK ^ word)
-        prefix_ones, prefix_zeros = _bounds_known_bits(interval)
-        ones, zeros = ones | prefix_ones, zeros | prefix_zeros
-        if peer[1] != origin[1]:
-            interval = _CLASSICAL_REGISTER_MASK - interval[1], _CLASSICAL_REGISTER_MASK - interval[0]
-            ones, zeros = zeros, ones
-        current = bounds or (0, _CLASSICAL_REGISTER_MASK)
-        bounds = max(current[0], interval[0]), min(current[1], interval[1])
-        old_ones, old_zeros = known_bits or (0, 0)
-        known_bits = old_ones | ones, old_zeros | zeros
-    if bounds is not None or known_bits not in {None, (0, 0)}:
-        bounds = _refine_bounds_with_bits(bounds, known_bits or (0, 0))
-    return bounds, known_bits
-
-
-def _unsigned_operand_bounds(arg: Arg, value: Value, state: AnalysisState) -> tuple[int, int] | None:
-    if isinstance(value, Concrete):
-        word = value.value & _CLASSICAL_REGISTER_MASK
-        return word, word
-    register = _physical_read_register(arg, state)
-    if register is None:
-        return None
-    bounds = state.register_bounds.get(register, (0, _CLASSICAL_REGISTER_MASK))
-    known_bits = state.register_known_bits.get(register)
-    return _refine_bounds_with_bits(bounds, known_bits) if known_bits is not None else bounds
-
-
-def _operand_known_bits(arg: Arg, value: Value, state: AnalysisState) -> tuple[int, int]:
-    bounds = _unsigned_operand_bounds(arg, value, state)
-    ones, zeros = _bounds_known_bits(bounds) if bounds is not None else (0, 0)
-    if not isinstance(value, Concrete):
-        register_bits = state.register_known_bits.get(_physical_read_register(arg, state), (0, 0))
-        ones |= register_bits[0]
-        zeros |= register_bits[1]
-    return ones, zeros
-
-
 def _comparison_flags(left_arg: Arg, left: Value, right_arg: Arg, right: Value, state: AnalysisState) -> dict[str, bool] | None:
     if isinstance(left, Concrete) and isinstance(right, Concrete):
         return _sub_flags(left.value, right.value)
@@ -6847,26 +5007,7 @@ def _word_interval(bounds: tuple[int, int]) -> tuple[int, int] | None:
 
 def _execute_classical(state: AnalysisState, instruction: Instr, symbols: SymbolTable, *, core_issue: core.Issue | None = None) -> None:
     if core_issue is not None:
-        if core_issue.flags is not None and instruction.op != "not":
-            _set_alu_flags(state, instruction, core_issue.flags.as_dict())
-        destinations = core.destination_indexes(instruction.op)
-        for index, word in zip(destinations, core_issue.words, strict=True):
-            destination = _register_name(instruction.args[index], state)
-            assert destination is not None
-            value = Concrete(word)
-            if instruction.op == "move":
-                provenance = _move_provenance(state, instruction, instruction.args[0], destination, value)
-            elif instruction.op == "not":
-                provenance = _unary_provenance(state, instruction, instruction.args[0], destination, value)
-            else:
-                left, right = _docs_ordered_binary_args(instruction, state)
-                provenance = _binary_provenance(state, instruction, left, right, destination, value)
-            # The core supplies the exact word. The trace above records its source operands.
-            _schedule_register_write(state, instruction, destination, value, provenance,
-                                     value_origin=(f"constant:{word}", False))
-        if instruction.op == "not" and core_issue.flags is not None:
-            # Preserve Analysis's read-hazard tracking for an in-place NOT.
-            _set_alu_flags(state, instruction, core_issue.flags.as_dict())
+        _project_classical_words(state, instruction, core_issue)
         return
 
     scope = _scope(symbols, state)
@@ -7136,9 +5277,9 @@ def _execute_classical(state: AnalysisState, instruction: Instr, symbols: Symbol
         else:
             flags = _logic_flags(value.value) if isinstance(value, Concrete) else {**_result_bounds_flags(bounds), "cf": False, "of": False}
         _set_alu_flags(state, instruction, flags)
-        destinations = [_register_name(instruction.args[index], state) for index in sorted(_register_destination_argument_indexes(instruction.op))
+        destinations = [_register_name(instruction.args[index], state) for index in sorted(core.destination_indexes(instruction.op))
                         if index < len(instruction.args)]
-        for destination_index in sorted(_register_destination_argument_indexes(instruction.op)):
+        for destination_index in sorted(core.destination_indexes(instruction.op)):
             if destination_index >= len(instruction.args):
                 continue
             destination = _register_name(instruction.args[destination_index], state)
@@ -7213,192 +5354,6 @@ def _wrap_concrete_classical_register_value(value: Value) -> Value:
     return value
 
 
-def _move_provenance(
-    state: AnalysisState,
-    instruction: Instr,
-    source_arg: Arg,
-    destination: str,
-    value: Value,
-) -> dict[str, Any]:
-    if not state.record_trace:
-        return {}
-    source_provenance = _arg_register_provenance(source_arg, state)
-    expression = _arg_provenance_expression(source_arg, state)
-    steps = _copied_provenance_steps(source_provenance)
-    steps.append(_provenance_step(instruction, expression, value))
-    return _register_provenance(
-        state,
-        destination,
-        expression=expression,
-        value=value,
-        steps=steps,
-    )
-
-
-def _unary_provenance(
-    state: AnalysisState,
-    instruction: Instr,
-    source_arg: Arg,
-    destination: str,
-    value: Value,
-) -> dict[str, Any]:
-    if not state.record_trace:
-        return {}
-    source_provenance = _arg_register_provenance(source_arg, state)
-    source_expression = _arg_provenance_expression(source_arg, state)
-    expression = f"{instruction.op} {source_expression}"
-    steps = _copied_provenance_steps(source_provenance)
-    steps.append(_provenance_step(instruction, expression, value))
-    return _register_provenance(
-        state,
-        destination,
-        expression=expression,
-        value=value,
-        steps=steps,
-    )
-
-
-def _binary_provenance(
-    state: AnalysisState,
-    instruction: Instr,
-    left_arg: Arg,
-    right_arg: Arg,
-    destination: str,
-    value: Value,
-) -> dict[str, Any]:
-    if not state.record_trace:
-        return {}
-    left_provenance = _arg_register_provenance(left_arg, state)
-    right_provenance = _arg_register_provenance(right_arg, state)
-    left_expression = _arg_provenance_expression(left_arg, state)
-    right_expression = _arg_provenance_expression(right_arg, state)
-    expression = _binary_provenance_expression(instruction.op, left_expression, right_expression)
-    steps = _copied_provenance_steps(left_provenance)
-    if right_provenance is not None:
-        steps.extend(_copied_provenance_steps(right_provenance))
-    steps.append(_provenance_step(instruction, expression, value))
-    steps = _ordered_unique_provenance_steps(steps)
-    return _register_provenance(
-        state,
-        destination,
-        expression=expression,
-        value=value,
-        steps=steps,
-    )
-
-
-def _latched_operand_value(op: str, arg: Arg, scope: SymbolTable, state: AnalysisState) -> Value:
-    value = resolve_arg_value(arg, scope)
-    register = _register_name(arg, state)
-    if register is None:
-        return value
-    # Decode only the value sent to the latch. Register traces keep the raw word.
-    # https://docs.qblox.com/en/main/products/qblox_instruments/q1/index.html#latched-instructions
-    if isinstance(value, Concrete):
-        return Concrete(core_rt.decode_register(op, value.value))
-    elif op == "set_mrk" and isinstance(value, Symbolic) and _pending_register_write(state, register) is None:
-        ones, zeros = _operand_known_bits(arg, value, state)
-        if (ones | zeros) & 0xF == 0xF:
-            return Concrete(ones & 0xF)
-    return value
-
-
-def _unsupported_register_operand(
-    state: AnalysisState, instruction: Instr, scope: SymbolTable, *, condition_disabled: bool = False,
-) -> Diagnostic | None:
-    for index, role, lower, upper in _official_operand_ranges(instruction.op, len(instruction.args)):
-        if index >= len(instruction.args) or condition_disabled and index in {1, 2}:
-            continue
-        arg = instruction.args[index]
-        register = _register_name(arg, state)
-        if register is None:
-            continue
-        value = _latched_operand_value(instruction.op, arg, scope, state)
-        if (isinstance(value, Concrete) and not lower <= value.value <= upper
-                and _pending_register_write(state, register) is None):
-            return Diagnostic(
-                severity="warning", category="analysis_incomplete", source=instruction.source,
-                message=(f"{instruction.op} register {arg.raw} decodes to {value.value}, outside the supported "
-                         f"{role} range {lower}..{upper}; truncation or wrapping is not modeled."),
-                details={"op": instruction.op, "argument_index": index, "operand": arg.raw, "register": register,
-                         "operand_role": role, "min": lower, "max": upper, "value": value.value},
-            )
-    return None
-
-
-def _execute_latched(
-    state: AnalysisState, instruction: Instr, symbols: SymbolTable, *,
-    latch_write: core_rt.LatchWrite | None = None,
-    condition: tuple[int, int | None, int | None, int] | None = None,
-) -> TimelineEvent | None:
-    scope = _scope(symbols, state)
-    field_name: str | None = None
-    value: Any = None
-
-    if latch_write is not None or instruction.op in core_rt.LATCH_OPS:
-        if latch_write is not None:
-            field_name = latch_write.field
-            raw = latch_write.value
-            if isinstance(raw, tuple):
-                value = tuple(Concrete(word) for word in raw)
-            else:
-                value = raw if isinstance(raw, bool) else Concrete(raw)
-        else:
-            field_name = core_rt.LATCH_FIELDS[instruction.op]
-            arity = len(get_instruction_spec(instruction.op).signatures[0].args)
-            if len(instruction.args) < arity:
-                return None
-            if field_name == "phase_reset":
-                value = True
-            else:
-                values = tuple(_latched_operand_value(instruction.op, arg, scope, state)
-                               for arg in instruction.args[:arity])
-                value = values[0] if arity == 1 else values
-        if field_name == "phase_reset":
-            state.pending_phase_reset = True
-        else:
-            setattr(state.latched_state, field_name, value)
-    elif instruction.op in {"set_cond", "set_time_ref"}:
-        field_name = instruction.op
-        value = [resolve_arg_value(arg, scope) for arg in instruction.args]
-        if instruction.op == "set_cond":
-            value = (tuple(Concrete(word) if word is not None else original
-                           for word, original in zip(condition, value, strict=True))
-                     if condition is not None else tuple(value))
-            state.conditional_enable = value[0]
-            state.conditional_mask = value[1]
-            state.conditional_operator = value[2]
-            state.conditional_enable_bounds = _unsigned_operand_bounds(instruction.args[0], value[0], state)
-            state.conditional_operator_bounds = _unsigned_operand_bounds(instruction.args[2], value[2], state)
-            state.conditional_enable_known_bits = _operand_known_bits(instruction.args[0], value[0], state)
-            state.conditional_operator_known_bits = _operand_known_bits(instruction.args[2], value[2], state)
-            state.conditional_else_duration = value[3]
-
-    if field_name is not None:
-        if field_name not in {"set_cond", "set_time_ref"}:
-            state.latched_state.pending_since[field_name] = instruction.source
-        event = _emit_event(
-            state,
-            lane="state.pending",
-            kind="latched_state_pending",
-            t0=state.rt_time_ns,
-            t1=state.rt_time_ns,
-            duration=Concrete(0),
-            label=instruction.op,
-            confidence=_confidence_for_value(value),
-            source=instruction.source,
-            meta={"field": field_name, "value": _plain_value(value)},
-        )
-        if field_name not in {"set_cond", "set_time_ref"}:
-            state.latched_state.pending_event_ids[field_name] = event.id
-        elif field_name == "set_cond":
-            event.meta["conditional_enabled"] = (
-                bool(state.conditional_enable.value) if isinstance(state.conditional_enable, Concrete) else None
-            )
-        return event
-    return None
-
-
 def _advance_after_zero_duration(
     state: AnalysisState, packet: RtPacket, event_start: int, *, next_rt: int | None = None,
 ) -> None:
@@ -7420,6 +5375,52 @@ def _advance_after_zero_duration(
             event.meta.update(timing)
 
 
+def _resolved_rt_packet(
+    state: AnalysisState, instruction: Instr, scope: SymbolTable, q1_t0: Value, q1_t1: Value,
+    decision: bool | None, captures: bool, wait_duration: int | None,
+) -> core.RtPacket | None:
+    """Run known analytical packets through the same dequeue transition as Concrete."""
+    # Analysis models receiver/device effects separately when inputs or timing
+    # can be uncertain. A resolved local issue has already checked register readiness.
+    if state.playback_devices is None:
+        if instruction.op not in core_rt.RT_OPS or wait_duration is None:
+            return None
+        # Local Analysis cannot establish the timing of a conditional synchronization barrier.
+        if instruction.op == "wait_sync" and state.conditional_enable != Concrete(0):
+            return None
+    if not all(isinstance(t, Concrete) for t in (q1_t0, q1_t1, state.rt_time_ns)):
+        return None
+    operands = tuple(_arg_int(arg, scope) for arg in instruction.args)
+    if None in operands:
+        return None
+    condition = tuple(v.value if isinstance(v, Concrete) else None for v in (
+        state.conditional_enable, state.conditional_mask, state.conditional_operator, state.conditional_else_duration))
+    if condition[0] is None or condition[0] and condition[3] is None:
+        return None
+    dwell = wait_duration if wait_duration is not None else operands[-1]
+    selected = core_rt.select_packet(instruction.op, dwell, condition, decision)
+    if selected is None:
+        return None
+    writes = []
+    if captures:
+        if state.pending_phase_reset is None:
+            return None
+        for name, raw in _consume_applied_state(state, consume=False).items():
+            value = tuple(raw) if isinstance(raw, list) else raw
+            if not all(isinstance(v, int) for v in (value if isinstance(value, tuple) else (value,))):
+                return None
+            writes.append(core_rt.LatchWrite(name, value))
+    start = state.rt_time_ns.value
+    effects = core_rt.execute_packet(instruction.op, operands, selected, core_rt.Latches(pending=tuple(writes)),
+                                     state.playback_devices or core.DeviceState(), time_ns=start)
+    if effects.limitation:
+        raise core.CoreBlocked(effects.limitation)
+    if state.playback_devices is not None:
+        state.playback_devices = effects.devices
+    return core.RtPacket(q1_t0.value, q1_t1.value, start, start + selected.dwell_ns, instruction.op,
+                         operands, effects.applied, selected.skipped, effects.op, effects.operands)
+
+
 def _execute_rt_instruction(
     state: AnalysisState,
     instruction: Instr,
@@ -7432,12 +5433,12 @@ def _execute_rt_instruction(
     q1_issue_event: TimelineEvent,
     *,
     rt_condition_decision: bool | None = None,
+    applies_latched_state: bool,
     raw_linq_op: str | None = None,
     wait_duration: int | None = None,
     core_packet: core.RtPacket | None = None,
 ) -> None:
     spec = get_instruction_spec(instruction.op)
-    applies_latched_state = spec.applies_latched_state or raw_linq_op == "upd_thres"
     is_linq_mock = "fb_acq_tb_mock" in {instruction.op, raw_linq_op}
     unverified_pulse = instruction.op == "play_pulse" and state.execution_mode == "analysis"
     configuration = _describe_linq_configuration(state, instruction, scope, raw_linq_op)
@@ -7446,6 +5447,23 @@ def _execute_rt_instruction(
     t1: Value | None = state.rt_time_ns
     duration_arg: Arg | None = None
     duration_arg_index = rt_duration_arg_for_instruction(spec, instruction)
+    decision = rt_condition_decision
+    if decision is None and core_packet is None and state.conditional_enable != Concrete(0):
+        decision = _conditional_decision(
+            state.conditional_enable, state.conditional_mask, state.conditional_operator,
+            enable_bounds=state.conditional_enable_bounds, operator_bounds=state.conditional_operator_bounds,
+            enable_known_bits=state.conditional_enable_known_bits, operator_known_bits=state.conditional_operator_known_bits,
+        )
+    if core_packet is None:
+        try:
+            core_packet = _resolved_rt_packet(state, instruction, scope, q1_t0, q1_t1, decision,
+                                              applies_latched_state, wait_duration)
+        except core.CoreBlocked as error:
+            _end_concrete_execution(state, "blocked", str(error), instruction)
+            return
+        except ValueError as error:
+            _end_concrete_execution(state, "error", str(error), instruction)
+            return
 
     if rt_condition_decision is not False and (
         spec.category == "sync" or (spec.timing_effect_status != "known" and instruction.op != "play_netzero")
@@ -7455,23 +5473,18 @@ def _execute_rt_instruction(
         t0, t1 = Concrete(core_packet.rt_t0), Concrete(core_packet.rt_t1)
         duration = Concrete(core_packet.rt_t1 - core_packet.rt_t0)
         if state.conditional_enable != Concrete(0):
-            rt_condition_decision = not core_packet.skipped
+            decision = not core_packet.skipped
     if state.conditional_enable != Concrete(0):
         # Execution truth and elapsed time are independent: only the selected
         # duration matters once the predicate is known. Equal durations
         # can also prove time while the execution decision remains unknown.
         candidate = None
-        if ((rt_condition_decision is not None or instruction.op == "wait_trigger"
+        if ((core_packet is not None or rt_condition_decision is not None or instruction.op == "wait_trigger"
              or spec.category == "rt" and spec.timing_effect_status == "known")
                 and duration_arg_index is not None and duration_arg_index < len(instruction.args)):
             candidate = (Concrete(wait_duration) if wait_duration is not None
                          else resolve_arg_value(instruction.args[duration_arg_index], scope))
-        decision = rt_condition_decision if rt_condition_decision is not None else _conditional_decision(
-            state.conditional_enable, state.conditional_mask, state.conditional_operator,
-            enable_bounds=state.conditional_enable_bounds, operator_bounds=state.conditional_operator_bounds,
-            enable_known_bits=state.conditional_enable_known_bits, operator_known_bits=state.conditional_operator_known_bits,
-        )
-        if decision is not None and (candidate is not None or core_packet is not None):
+        if decision is not None and candidate is not None:
             selected_duration = candidate if decision else state.conditional_else_duration
             timing_known = ((not decision or not (is_linq_mock or unverified_pulse))
                             and isinstance(selected_duration, Concrete) and _valid_rt_duration(selected_duration.value))
@@ -7626,7 +5639,7 @@ def _execute_rt_instruction(
     elif instruction.op in {"wait_sync", "wait_trigger"}:
         unresolved = instruction.op == "wait_trigger" and state.execution_mode == "analysis"
         meta = {"rt_packet_id": packet.id}
-        if core_packet is not None and instruction.op == "wait_trigger":
+        if core_packet is not None and instruction.op == "wait_trigger" and state.playback_devices is None:
             dwell = core_packet.operands[-1]
             timing = {"address": core_packet.operands[0], "armed_ns": core_packet.rt_t0,
                       "arrival_ns": core_packet.rt_t1 - dwell, "resume_ns": core_packet.rt_t1,
@@ -7704,25 +5717,6 @@ def _execute_rt_instruction(
             event.meta["applied_setter_event_ids"] = {
                 field: pending_event_ids[field] for field in applied_state if field in pending_event_ids
             }
-
-
-def _diagnose_netzero_gap(
-    state: AnalysisState, window: _NetZeroWindow, pulse: TimelineEvent, start_ns: int,
-) -> None:
-    elapsed_ns = start_ns - window.start_ns
-    if not 0 <= elapsed_ns < window.maxt_ns:
-        return
-    shortfall_ns = window.maxt_ns - elapsed_ns
-    state.diagnostics.append(Diagnostic(
-        severity="warning",
-        category="possible_netzero_overlap",
-        message=(f"The next pulse starts {shortfall_ns} ns before the maximum net-zero compensation time "
-                 "has elapsed and may overlap the compensation pulse."),
-        source=pulse.source,
-        related_events=[window.event_id, pulse.id],
-        details={"maxt_ns": window.maxt_ns, "elapsed_ns": elapsed_ns, "shortfall_ns": shortfall_ns,
-                 "compensation_source": _source_to_json(window.source)},
-    ))
 
 
 def _emit_play_events(
@@ -7827,63 +5821,6 @@ def _emit_acquire_event(
     )
 
 
-def _diagnose_unresolved_index_operand(
-    state: AnalysisState,
-    instruction: Instr,
-    arg: Arg,
-    operand_index: int,
-    operand_role: str,
-) -> bool:
-    if arg.kind not in {"symbol", "placeholder"}:
-        return False
-    symbol = _arg_symbol_lookup_names(arg)[0]
-    diagnostic = Diagnostic(
-        severity="warning",
-        category="unresolved_symbol",
-        message=f"{operand_role.replace('_', ' ')} must resolve to a concrete integer: {arg.raw}",
-        source=instruction.source,
-        details={
-            "symbol": symbol,
-            "operand": arg.raw,
-            "operand_index": operand_index,
-            "operand_role": operand_role,
-            "op": instruction.op,
-        },
-    )
-    for index, existing in enumerate(state.diagnostics):
-        if (existing.category == "unresolved_symbol" and existing.severity == "warning"
-                and existing.source == instruction.source and existing.details == {"symbol": symbol}):
-            state.diagnostics[index] = diagnostic
-            return True
-    if diagnostic not in state.diagnostics:
-        state.diagnostics.append(diagnostic)
-    return True
-
-
-def _emit_marker_state_event(
-    state: AnalysisState,
-    instruction: Instr,
-    *,
-    duration: Value,
-    t0: Value,
-    t1: Value | None,
-    packet_id: str,
-    value: Any,
-) -> None:
-    _emit_event(
-        state,
-        lane="rt.marker",
-        kind="marker_state",
-        t0=t0,
-        t1=t1,
-        duration=duration,
-        label=f"marker {value}",
-        confidence=_confidence_for_value((state.latched_state.marker, t0, t1)),
-        source=instruction.source,
-        meta={"field": "marker", "value": value, "rt_packet_id": packet_id},
-    )
-
-
 def _emit_feedback_annotation(
     state: AnalysisState,
     instruction: Instr,
@@ -7936,120 +5873,6 @@ def _emit_unknown_region(state: AnalysisState, instruction: Instr, duration: Val
         confidence="unknown",
         source=instruction.source,
     )
-
-
-def _append_packet(
-    state: AnalysisState,
-    instruction: Instr,
-    duration: Value,
-    q1_t0: Value,
-    q1_t1: Value,
-    rt_t0: Value | None,
-    rt_t1: Value | None,
-    packet_id: str | None,
-) -> RtPacket:
-    packet = RtPacket(
-        id=packet_id or f"{state.sequencer_id}:p{len(state.rt_packets)}",
-        sequencer_id=state.sequencer_id,
-        source=instruction.source,
-        op=instruction.op,
-        duration=duration,
-        q1_issue_t0=q1_t0,
-        q1_issue_t1=q1_t1,
-        rt_t0=rt_t0,
-        rt_t1=rt_t1,
-        confidence=_confidence_for_timing(duration, rt_t0, rt_t1),
-        meta={"conditional_time_unknown": True,
-              "output_state_unknown": get_instruction_spec(instruction.op).applies_latched_state}
-        if state.conditional_time_unknown else {},
-    )
-    state.rt_packets.append(packet)
-    if state.q1_fifo_stall_ns:
-        packet.meta["q1_fifo_stall_ns"] = state.q1_fifo_stall_ns
-    return packet
-
-
-def _emit_q1_issue(
-    state: AnalysisState,
-    instruction: Instr,
-    q1_t0: Value,
-    q1_t1: Value,
-    rt_packet_id: str | None,
-    *,
-    register_metadata: dict[str, Any] | None = None,
-) -> TimelineEvent:
-    meta: dict[str, Any] = {
-        "op": instruction.op,
-        "emits_rt_packet": rt_packet_id is not None,
-        "display_modes": ["debug"],
-        **(register_metadata or {}),
-    }
-    if state.compiled_addresses is not None:
-        meta["compiled_pc"] = (state.interior_pc if state.interior_pc is not None
-                               else state.compiled_addresses.entries.get(instruction.pc))
-        if state.interior_pc is not None:
-            meta["source_pc"] = instruction.pc
-            meta["macro_source_op"] = state.instructions_by_pc[instruction.pc].op
-    if rt_packet_id is not None:
-        meta["rt_packet_id"] = rt_packet_id
-    return _emit_event(
-        state,
-        lane="debug.q1_issue",
-        kind="q1_issue",
-        t0=q1_t0,
-        t1=q1_t1,
-        duration=subtract_values(q1_t1, q1_t0),
-        label=instruction.op,
-        confidence="exact",
-        source=instruction.source,
-        meta=meta,
-    )
-
-
-def _emit_event(
-    state: AnalysisState,
-    *,
-    lane: str,
-    kind: str,
-    t0: Value,
-    t1: Value | None,
-    duration: Value,
-    label: str,
-    confidence: Confidence,
-    source: SourceLocation,
-    meta: dict[str, Any] | None = None,
-) -> TimelineEvent:
-    event_meta = dict(meta or {})
-    if state.rt_trigger_epoch and (lane.startswith("rt.") or lane == "state.pending") and "fault" not in event_meta:
-        event_meta["rt_trigger_epoch"] = state.rt_trigger_epoch
-    if state.conditional_time_unknown and kind != "q1_issue":
-        event_meta["conditional_time_unknown"] = True
-    if state.current_resolved_args and "resolved_args" not in event_meta:
-        event_meta["resolved_args"] = state.current_resolved_args
-    if state.record_trace:
-        event_index = len(state.events)
-    else:
-        event_index = state.event_serial
-        state.event_serial += 1
-    event = TimelineEvent(
-        id=f"{state.sequencer_id}:e{event_index}",
-        sequencer_id=state.sequencer_id,
-        lane=lane,
-        kind=kind,
-        t0=t0,
-        t1=t1,
-        duration=duration,
-        label=label,
-        confidence=confidence,
-        source=source,
-        meta=event_meta,
-    )
-    # Statistics still need the RT alignment anchor and hardware diagnostic evidence.
-    if state.record_trace or kind in {"q1_issue", "acquire", "rt_queue_dequeue", "unknown_region", "latched_state_pending"} or (
-        "scope_enable" in (event_meta.get("applied_state") or {})
-    ):
-        state.events.append(event)
-    return event
 
 
 def _loop_preview_events(state: AnalysisState, start_line: int, end_line: int) -> list[TimelineEvent]:
@@ -8561,111 +6384,6 @@ def _counter_after(count: Value) -> Any:
     return None
 
 
-def _source_to_json(source: SourceLocation) -> dict[str, Any]:
-    return {
-        "file": source.file,
-        "line": source.line,
-        "column": source.column,
-        "raw": source.raw,
-    }
-
-
-def _record_stop_code(state: AnalysisState, instruction: Instr, scope: SymbolTable, *, code: int | None = None) -> Any:
-    if code is None:
-        value: Value = Concrete(0)
-        if instruction.args:
-            operand = instruction.args[0]
-            register = _physical_read_register(operand, state)
-            value = resolve_arg_value(operand, scope)
-            if register is not None and _pending_register_write(state, register) is not None:
-                value = Unknown(f"Stop status register {register} is not ready")
-        code = _signed_32_bit_register_value(value.value) if isinstance(value, Concrete) else _plain_value(value)
-    if "execution" in state.metadata:
-        state.metadata["execution"].update(stop_code=code, stop_source=_source_to_json(instruction.source))
-    return code
-
-
-def _record_illegal_instruction(
-    state: AnalysisState, instruction: Instr, issue: TimelineEvent | None, *, flag: str = ILLEGAL_INSTRUCTION_FLAG,
-) -> None:
-    reason = "Illegal Q1ASM instruction executed."
-    source = _source_to_json(instruction.source)
-    fault = {"flag": flag, "sequencer_status": "STOPPED",
-             "q1_time_ns": _plain_value(state.q1_time_ns), "source": source}
-    if "execution" in state.metadata:
-        execution = state.metadata["execution"]
-        execution.update(status="error", reason=reason, source=source, pc=instruction.pc, fault=fault)
-        if state.compiled_addresses is not None:
-            execution["compiled_pc"] = state.compiled_addresses.entries[instruction.pc]
-    state.stopped = True
-    assumed = state.execution_mode == "analysis" and (state.branch_explore_depth or _register_branch_assumptions(state))
-    related = []
-    if issue is not None:
-        issue.meta["fault"] = fault
-        event = _emit_event(state, lane="rt.control", kind="illegal", t0=state.q1_time_ns, t1=state.q1_time_ns,
-                            duration=Concrete(0), label="Illegal instruction", confidence="assumed" if assumed else
-                            _confidence_for_timing(Concrete(0), state.q1_time_ns, state.q1_time_ns), source=instruction.source,
-                            meta={"fault": fault, "q1_issue_event_id": issue.id})
-        related = [event.id, issue.id]
-    state.diagnostics.append(Diagnostic(severity="warning" if assumed else "error", category="illegal_instruction",
-                                        message=reason, source=instruction.source, related_events=related,
-                                        details={"op": instruction.op, "fault": fault}))
-
-
-def _consume_applied_state(state: AnalysisState, *, consume: bool = True) -> dict[str, Any]:
-    applied: dict[str, Any] = {}
-    pending = state.latched_state.pending_since
-    fields, _ = core_rt.latch_commit_fields(pending, state.pending_phase_reset is True)
-    for name in fields:
-        value = True if name == "phase_reset" else getattr(state.latched_state, name)
-        if value is not None:
-            applied[name] = _plain_value(value)
-    if consume:
-        pending.clear()
-        state.latched_state.pending_event_ids.clear()
-        _clear_nco_one_shots(state)
-    return applied
-
-
-def _clear_nco_one_shots(state: AnalysisState) -> None:
-    pending = state.latched_state.pending_since.keys() | state.latched_state.pending_event_ids.keys()
-    _, retained = core_rt.latch_commit_fields(pending, state.pending_phase_reset is True, skipped=True)
-    state.pending_phase_reset = False
-    state.latched_state.phase_delta = None
-    for field in pending.difference(retained):
-        state.latched_state.pending_since.pop(field, None)
-        state.latched_state.pending_event_ids.pop(field, None)
-
-
-def _scope(symbols: SymbolTable, state: AnalysisState) -> SymbolTable:
-    label_symbols = {f"@{label}": Concrete(pc) for label, pc in _address_labels(state).items()}
-    scope = {**symbols, **label_symbols, **state.registers}
-    for name, value in symbols.items():
-        if not name.startswith("$"):
-            scope.setdefault(f"${name}", value)
-    if state.execution_mode == "concrete":
-        for name in symbols:
-            if _is_valid_register_arg(Arg("reg", name, name)):
-                scope[name] = state.registers.get(name, Unknown(name))
-    for alias, register in state.register_aliases.items():
-        value = scope.get(register, Unknown(register))
-        scope[f"${alias}"] = value
-        if not _is_valid_register_arg(Arg("reg", alias, alias)):
-            scope[alias] = value
-    return scope
-
-
-def _register_name(arg: Arg, state: AnalysisState) -> str | None:
-    if arg.kind == "reg":
-        return str(arg.value).upper()
-    if arg.kind != "symbol":
-        return None
-    name = str(arg.value)
-    if not name.startswith("$") or len(name) <= 1:
-        return None
-    return state.register_aliases.get(name[1:])
-
-
 def _arg_register_references(arg: Arg, state: AnalysisState) -> set[str]:
     references = {_register_name(arg, state)}
     for name in _arg_symbol_lookup_names(arg):
@@ -8673,118 +6391,6 @@ def _arg_register_references(arg: Arg, state: AnalysisState) -> set[str]:
             references.add(name.upper())
         references.add(state.register_aliases.get(name.lstrip("$")))
     return references - {None}
-
-
-def _arg_register_provenance(arg: Arg, state: AnalysisState) -> dict[str, Any] | None:
-    register = _register_name(arg, state)
-    if register is None:
-        return None
-    if state.execution_mode == "concrete":
-        return {"register": register, "expression": register, "steps": []}
-    return state.register_provenance.get(register)
-
-
-def _arg_provenance_expression(arg: Arg, state: AnalysisState) -> str:
-    provenance = _arg_register_provenance(arg, state)
-    if provenance is not None:
-        expression = provenance.get("expression")
-        if isinstance(expression, str) and expression:
-            return expression
-    if arg.kind in {"symbol", "placeholder"}:
-        name = str(arg.value)
-        return name[1:] if name.startswith("$") and len(name) > 1 else name
-    return arg.raw
-
-
-def _register_provenance(
-    state: AnalysisState,
-    register: str,
-    *,
-    expression: str,
-    value: Value,
-    steps: list[dict[str, Any]],
-) -> dict[str, Any]:
-    symbol = _register_symbol_for_register(state, register)
-    return {
-        "register": register,
-        "symbol": symbol,
-        "expression": expression if len(expression) <= 1024 else register,
-        "value": value_to_json(value),
-        "steps": steps,
-    }
-
-
-def _register_symbol_for_register(state: AnalysisState, register: str) -> str:
-    aliases = sorted(alias for alias, target in state.register_aliases.items() if target == register)
-    return aliases[0] if aliases else register
-
-
-def _copied_provenance_steps(provenance: dict[str, Any] | None) -> list[dict[str, Any]]:
-    if provenance is None:
-        return []
-    steps = provenance.get("steps")
-    if not isinstance(steps, list):
-        return []
-    return [dict(step) for step in steps if isinstance(step, dict)]
-
-
-def _ordered_unique_provenance_steps(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    unique_steps: dict[tuple[str, int, int, str, str], dict[str, Any]] = {}
-    for index, step in enumerate(steps):
-        source = step.get("source") if isinstance(step.get("source"), dict) else {}
-        key = (
-            str(source.get("file", "")),
-            int(source.get("line", 0)),
-            int(source.get("column", 0)),
-            str(step.get("op", "")),
-            str(step.get("expression", "")),
-        )
-        unique_steps.setdefault(key, {**step, "_order": index})
-    ordered = sorted(
-        unique_steps.values(),
-        key=lambda step: (
-            str(step.get("source", {}).get("file", "")),
-            int(step.get("source", {}).get("line", 0)),
-            int(step.get("source", {}).get("column", 0)),
-            int(step.get("_order", 0)),
-        ),
-    )
-    return [{key: value for key, value in step.items() if key != "_order"} for step in ordered]
-
-
-def _provenance_step(instruction: Instr, expression: str, value: Value) -> dict[str, Any]:
-    return {
-        "op": instruction.op,
-        "source": _source_to_json(instruction.source),
-        "expression": expression,
-        "value": value_to_json(value),
-    }
-
-
-def _binary_provenance_expression(op: str, left: str, right: str) -> str:
-    operators = {
-        "add": "+",
-        "sub": "-",
-        "and": "&",
-        "or": "|",
-        "xor": "^",
-        "asl": "<<",
-        "asr": ">>",
-        "lsl": "<<",
-        "lsr": ">>",
-    }
-    right_expression = _parenthesized_right_expression(op, right)
-    return f"{left} {operators.get(op, op)} {right_expression}"
-
-
-def _parenthesized_right_expression(op: str, expression: str) -> str:
-    if op in {"sub", "asl", "asr", "lsl", "lsr"} and _is_composite_expression(expression):
-        return f"({expression})"
-    return expression
-
-
-def _is_composite_expression(expression: str) -> bool:
-    return any(operator in expression for operator in (" + ", " - ", " & ", " | ", " ^ ", " << ", " >> "))
 
 
 def _duration_provenance_for_arg(
@@ -8868,13 +6474,6 @@ def _shift_classical_value(op: str, left: int, shift: int) -> Value:
     if op == "asr":
         return Concrete(_signed_32_bit_register_value(left) >> shift)
     return Concrete((left & 0xFFFFFFFF) >> shift)
-
-
-def _signed_32_bit_register_value(value: int) -> int:
-    value &= _CLASSICAL_REGISTER_MASK
-    if value & 0x80000000:
-        return value - 0x100000000
-    return value
 
 
 def _describe_linq_configuration(
@@ -9034,49 +6633,3 @@ def _value_expr(value: Value) -> str:
     if isinstance(value, Unknown):
         return value.reason
     return str(value)
-
-
-def _arg_int(arg: Arg, scope: SymbolTable | None = None) -> int | None:
-    if arg.kind == "imm":
-        return int(arg.value)
-    if scope is None:
-        return None
-    value = resolve_arg_value(arg, scope)
-    if isinstance(value, Concrete):
-        return value.value
-    return None
-
-
-def _confidence_for_value(value: Any) -> Confidence:
-    if isinstance(value, tuple):
-        confidences = {_confidence_for_value(item) for item in value}
-        if "unknown" in confidences:
-            return "unknown"
-        if "runtime_dependent" in confidences:
-            return "runtime_dependent"
-        if "symbolic" in confidences:
-            return "symbolic"
-        return "exact"
-    if isinstance(value, Concrete):
-        return "exact"
-    if isinstance(value, Unknown):
-        return "unknown"
-    if value.__class__.__name__ == "RuntimeDependent":
-        return "runtime_dependent"
-    if value.__class__.__name__ == "Symbolic":
-        return "symbolic"
-    return "unknown"
-
-
-def _confidence_for_timing(duration: Value, t0: Value | None, t1: Value | None) -> Confidence:
-    return _confidence_for_value((t0, t1, duration))
-
-
-def _plain_value(value: Any) -> Any:
-    if isinstance(value, tuple):
-        return [_plain_value(item) for item in value]
-    if isinstance(value, Concrete):
-        return value.value
-    if isinstance(value, Value):
-        return value_to_json(value)
-    return value

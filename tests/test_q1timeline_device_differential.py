@@ -165,6 +165,21 @@ def test_qtm_capture_one_shots_thresholds_and_gate_operands(monkeypatch):
     assert pulse.meta["device_operands"][0] == scheduled.meta["maxt_ns"]
 
 
+def test_skipped_raw_threshold_discards_one_shots_and_keeps_marker_for_next_commit():
+    concrete, simulated = check_completed(
+        "set_mrk 5\nset_time_ref\nreset_netzero\nset_cond 1,0,0,0\n"
+        "fb_cmd 0x13,99,8\nwait_trigger 7,12\nset_cond 0,0,0,4\nfb_cmd 0x10,2,8\nstop"
+    )
+    for state in (concrete, simulated):
+        _, threshold, wait, commit = state.rt_packets
+        assert threshold.duration.value == wait.duration.value == 0
+        assert threshold.meta["conditional_skipped"] and wait.meta["conditional_skipped"]
+        assert wait.rt_t0.value == threshold.rt_t0.value + 4
+        assert commit.rt_t0.value == wait.rt_t0.value + 4
+        assert commit.meta["applied_state"] == {"marker": 5}
+        assert not commit.meta.get("netzero_reset") and "time_reference_ticks" not in commit.meta
+
+
 def test_packed_register_configurations_decode_the_same_fields():
     concrete, _ = check_completed(
         ".DEF WORD R0\nmove 0x20201,R0\nnop\nfb_acq_tb_cfg $WORD,8\n"
@@ -189,18 +204,18 @@ def test_unverified_device_operation_stops_both_engines_at_the_named_instruction
 # Source spellings, raw LINQ command IDs and payloads are fixed vectors, including
 # nonzero fields. They do not come from either runtime's shared command decoder.
 LINQ = [
-    ("fb_acq_tb_id 23,8", 0x40, 23, "tb_id"),
-    ("fb_acq_iq_id 24,8", 0x41, 24, "iq_id"),
-    ("fb_acq_tb_valid 0,8", 0x5B, 0, "tb_valid"),
-    ("fb_acq_iq_shift 7,8", 0x5C, 7, "iq_shift"),
-    ("fb_acq_tb_cfg 1,2,2,8", 0x42, 0x20201, "tb_cfg"),
-    ("fb_acq_tb_extra 0,5,8", 0x43, 5, "tb_extra"),
-    ("fb_com_cfg 0,6,3,8", 0x60, 0x60300, "com_cfg"),
-    ("fb_com_extra 0,7,8", 0x61, 7, "com_extra"),
-    ("fb_llp_tags_id 33,8", 0x20, 33, None),
-    ("fb_llp_ttls_id 34,8", 0x21, 34, None),
-    ("fb_tdc_tags_id 35,8", 0x00, 35, None),
-    ("fb_tdc_tdelta_id 36,8", 0x01, 36, None),
+    ("fb_acq_tb_id 23,8", 0x40, 23),
+    ("fb_acq_iq_id 24,8", 0x41, 24),
+    ("fb_acq_tb_valid 0,8", 0x5B, 0),
+    ("fb_acq_iq_shift 7,8", 0x5C, 7),
+    ("fb_acq_tb_cfg 1,2,2,8", 0x42, 0x20201),
+    ("fb_acq_tb_extra 0,5,8", 0x43, 5),
+    ("fb_com_cfg 0,6,3,8", 0x60, 0x60300),
+    ("fb_com_extra 0,7,8", 0x61, 7),
+    ("fb_llp_tags_id 33,8", 0x20, 33),
+    ("fb_llp_ttls_id 34,8", 0x21, 34),
+    ("fb_tdc_tags_id 35,8", 0x00, 35),
+    ("fb_tdc_tdelta_id 36,8", 0x01, 36),
 ]
 
 
@@ -214,13 +229,13 @@ def test_every_device_mnemonic_has_a_differential_scenario():
 def test_linq_settings_update_independent_device_state_at_each_packet(monkeypatch, raw):
     # The timelines expose decoded requests; observe the actual stored values as
     # well so that dropping a write in either implementation fails this test.
-    attributes = {line.split()[0]: attribute for line, _, _, attribute in LINQ}
+    operations = {line.split()[0] for line, _, _ in LINQ}
     concrete_writes, simulation_writes = [], []
     step, dispatch = core.step, runtime._Runtime.dispatch_rt
 
     def observe_step(*args, **kwargs):
         transition = step(*args, **kwargs)
-        if transition.packet and transition.packet.device_op in attributes:
+        if transition.packet and transition.packet.device_op in operations:
             op = transition.packet.device_op
             concrete_writes.append((op, dict(transition.state.devices.linq_config)[op]))
         return transition
@@ -228,17 +243,15 @@ def test_linq_settings_update_independent_device_state_at_each_packet(monkeypatc
     def observe_dispatch(self, seq, command, *args, **kwargs):
         dispatch(self, seq, command, *args, **kwargs)
         op = command.op
-        if op in attributes:
-            attr = attributes[op]
-            value = getattr(seq, attr) if attr else seq.qtm_streams[op]
-            simulation_writes.append((op, value if isinstance(value, tuple) else (value,)))
+        if op in operations:
+            simulation_writes.append((op, dict(seq.rt_devices.linq_config)[op]))
 
     monkeypatch.setattr(core, "step", observe_step)
     monkeypatch.setattr(runtime._Runtime, "dispatch_rt", observe_dispatch)
-    body = [f"fb_cmd {command},{word},8" if raw else named for named, command, word, _ in LINQ]
+    body = [f"fb_cmd {command},{word},8" if raw else named for named, command, word in LINQ]
     check_completed("\n".join([*body, "stop"]))
     expected = []
-    for named, _, _, _ in LINQ:
+    for named, _, _ in LINQ:
         op, args = named.split()
         expected.append((op, tuple(int(x) for x in args.split(",")[:-1])))
     assert concrete_writes == simulation_writes == expected
@@ -297,6 +310,22 @@ def test_selective_receive_stalls_discards_and_preserves_same_tick_fifo_order():
     discarded, = [e for e in simulated.events if e.kind == "feedback_discard"]
     first, = [e for e in simulated.events if e.kind == "feedback_receive" and e.meta["id"] == 3]
     assert discarded.meta["input_event_ids"] == [first.id]
+
+
+def test_register_visibility_across_a_stalled_issue_and_timed_retirement():
+    source = "move 3,R2\nfb_pull_data R0,R1\nnop\nadd R1,R2,R3\nstop"
+    concrete, simulated = run_both(source, feedback=((41, 6, 20),))
+    assert issue_rows(concrete) == issue_rows(simulated)
+    for state, first_ready in ((concrete, 40), (simulated, 8)):
+        issues = [event for event in state.events if event.kind == "q1_issue"]
+        assert [set(row.meta["register_snapshot"]) for row in issues] == [
+            set(), set(), {"R2"}, {"R2", "R0", "R1"}, {"R2", "R0", "R1"},
+        ]
+        # The receive owns a single issue slot until 40 ns. Its stalled fetch
+        # still permits the independent clocked write to retire at 8 ns.
+        assert [(write.register, write.time.value, write.value.value) for write in state.register_history] == [
+            ("R2", first_ready, 3), ("R0", 44, 6), ("R1", 44, 20), ("R3", 64, 23),
+        ]
 
 
 @pytest.mark.parametrize("receive", ["fb_pop_data 1,R0", "fb_pull_data R3,R0"])

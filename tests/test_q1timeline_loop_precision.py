@@ -13,7 +13,7 @@ def analyze(source: str, **kwargs):
 
 @pytest.mark.parametrize("target,setup,compiled_target", [("@end", "", 5), ("5", "", 5), ("R1", "move 6,R1\n", 6)])
 @pytest.mark.parametrize("count,remaining,waits,loop_ns", [
-    (2, 1, [4], 24), (1, 0, [20, 4], 4), (0, 0xFFFFFFFF, [4], 24),
+    (2, 1, [4], 32), (1, 0, [20, 4], 20), (0, 0xFFFFFFFF, [4], 32),
 ])
 def test_resolved_forward_loop_matches_concrete_decrement_timing_and_target(target, setup, compiled_target,
                                                                           count, remaining, waits, loop_ns):

@@ -553,7 +553,7 @@ def test_comparison_q1_validation_links_only_the_clipped_rt_alternative():
 def test_incomplete_alternative_can_end_before_a_recorded_q1_branch_choice():
     program = parse_q1asm("move 1,R0\nnop\nset_cond 1,1,0,8\nfb_acq_tb_mock 1,1,1,4\n"
                           "set_cond 0,0,0,4\nloop R0,@end\nwait 20\nend: stop", file="compare.q1asm")
-    compared, = simulate_programs({"a": program}, simulation={"startup_delay_ns": 20},
+    compared, = simulate_programs({"a": program}, simulation={"startup_delay_ns": 36},
                                   branch_assumptions={"a:set_cond:2:1": "both"}, branch_choices={("a", 5, 1): False})
     terminal, = events(compared, "branch_terminal", "taken")
     assert terminal.source.line == 4

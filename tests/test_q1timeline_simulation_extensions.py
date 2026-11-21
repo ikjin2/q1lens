@@ -50,12 +50,12 @@ def test_zero_packets_and_same_time_enqueue_keep_four_ns_spacing(prepared, confi
 
 
 @pytest.mark.parametrize("prepared", [False, True])
-@pytest.mark.parametrize("receiver,ready", [("fb_pop_data 7,R1", 108), ("fb_pull_data R0,R1", 112)])
-def test_zero_packet_allows_feedback_wait_and_independent_peer(prepared, receiver, ready):
+@pytest.mark.parametrize("receiver", ["fb_pop_data 7,R1", "fb_pull_data R0,R1"])
+def test_zero_packet_allows_feedback_wait_and_independent_peer(prepared, receiver):
     state, peer = run({"s": f"wait 0\n{receiver}\nwait 4\nstop", "peer": "wait 120\nstop"}, prepared,
                       startup_delay_ns=4, inputs={"feedback": [{"target": "s", "time_ns": 100, "id": 7, "value": 42}]})
     assert status(state) == status(peer) == "completed"
-    assert [packet.rt_t0.value for packet in state.rt_packets] == [4, ready]
+    assert [packet.rt_t0.value for packet in state.rt_packets] == [4, 104]
     assert state.registers["R1"] == Concrete(42)
     assert peer.rt_time_ns == Concrete(124)
 
@@ -129,7 +129,7 @@ def test_full_multiply_words_and_flags_in_every_executor(mode, op, left, right, 
     assert not state.rt_packets
     if mode == "simulation":
         multiply = next(event for event in events(state, "q1_issue") if event.meta["op"] == op)
-        assert multiply.duration == Concrete(24)
+        assert multiply.duration == Concrete(28 if form == "rr" else 24)
 
 
 @pytest.mark.parametrize("prepared", [False, True])

@@ -1,17 +1,16 @@
 from __future__ import annotations
 
 import operator
-import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from q1timeline.diagnostics import Diagnostic
 from q1timeline.q1asm.ast import Arg, SourceLocation
+from q1timeline.q1asm.parser import parameter_integer
 
 
 CompareOp = Literal["<", "<=", "==", "!=", ">=", ">"]
 SymbolTable = dict[str, "Value"]
-_INTEGER_TEXT_RE = re.compile(r"^[+-]?(?:0[xX][0-9a-fA-F]+|0[bB][01]+|\d+)$")
 
 
 class Value:
@@ -125,14 +124,8 @@ def value_to_json(value: Value) -> dict[str, Any]:
 def symbol_table_from_params(params: dict[str, Any]) -> SymbolTable:
     symbols: SymbolTable = {}
     for key, raw_value in params.items():
-        if isinstance(raw_value, int) and not isinstance(raw_value, bool):
-            symbols[key] = Concrete(raw_value)
-        elif isinstance(raw_value, str) and _INTEGER_TEXT_RE.match(raw_value.strip()):
-            text = raw_value.strip()
-            base = 0 if text.lower().lstrip("+-").startswith(("0x", "0b")) else 10
-            symbols[key] = Concrete(int(text, base))
-        else:
-            symbols[key] = Symbolic(str(raw_value))
+        word = parameter_integer(raw_value)
+        symbols[key] = Concrete(word) if word is not None else Symbolic(str(raw_value))
     return symbols
 
 

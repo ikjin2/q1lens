@@ -11,10 +11,10 @@ def analyze(source: str, **kwargs):
 
 
 @pytest.mark.parametrize("prefix", ["", "wait 100\n"])
-@pytest.mark.parametrize("target", ["@join", "4"])
+@pytest.mark.parametrize("target", ["@join", "5"])
 def test_side_effect_free_equal_q1_paths_resume_a_common_exact_suffix(prefix: str, target: str) -> None:
     target = str(int(target) + 1) if prefix and target.isdigit() else target
-    source = prefix + f"jge R7,1,{target}\nnop\njmp @join\njoin: wait 100\nwait 40\nstop"
+    source = prefix + f"jge R7,1,{target}\nnop\nnop\nnop\njoin: wait 100\nwait 40\nstop"
     state = analyze(source)
     branch = next(event for event in state.events if event.kind == "q1_issue" and event.meta.get("op") == "jge")
 
@@ -22,7 +22,7 @@ def test_side_effect_free_equal_q1_paths_resume_a_common_exact_suffix(prefix: st
     assert branch.meta["branch_taken"] == "runtime_dependent"
     assert branch.meta["branch_join_proven"]
     assert state.rt_time_ns == Concrete(240 if prefix else 140)
-    assert [packet.q1_issue_t0 for packet in state.rt_packets[-2:]] == [Concrete(28 if prefix else 24), Concrete(32 if prefix else 28)]
+    assert [packet.q1_issue_t0 for packet in state.rt_packets[-2:]] == [Concrete(32 if prefix else 28), Concrete(36 if prefix else 32)]
     assert not state.metadata.get("branches", {}).get("assumptions")
     assert not any(item.category == "unresolved_branch" for item in state.diagnostics)
     assert analyze_underflow(state).status == "not_detected_under_current_assumptions"
@@ -30,7 +30,7 @@ def test_side_effect_free_equal_q1_paths_resume_a_common_exact_suffix(prefix: st
 
 @pytest.mark.parametrize("seed", [0, 1, 0xFFFFFFFF])
 def test_proven_join_packet_stream_matches_concrete_execution_for_both_paths(seed: int) -> None:
-    source = "jge R7,1,@join\nnop\njmp @join\njoin: wait 100\nwait 40\nstop"
+    source = "jge R7,1,@join\nnop\nnop\nnop\njoin: wait 100\nwait 40\nstop"
     state = analyze(source)
     concrete = analyze(f"move {seed},R7\nnop\n" + source, execution_mode="concrete")
 
@@ -65,7 +65,7 @@ def test_side_effects_unknown_targets_and_different_q1_clocks_do_not_form_a_prov
 
 
 def test_join_proof_does_not_flush_a_pending_write_to_manufacture_agreement() -> None:
-    state = analyze("move 100,R1\njge R7,1,@join\nnop\njmp @join\njoin: wait 100\nstop")
+    state = analyze("move 100,R1\njge R7,1,@join\nnop\nnop\nnop\njoin: wait 100\nstop")
     branch = next(event for event in state.events if event.kind == "q1_issue" and event.meta.get("op") == "jge")
 
     assert not branch.meta.get("branch_join_proven")
@@ -74,7 +74,7 @@ def test_join_proof_does_not_flush_a_pending_write_to_manufacture_agreement() ->
 
 @pytest.mark.parametrize("choice", ["collapsed", "taken", "fallthrough", "both"])
 def test_explicit_branch_selection_keeps_its_requested_presentation(choice: str) -> None:
-    state = analyze("jge R7,1,@join\nnop\njmp @join\njoin: wait 100\nstop",
+    state = analyze("jge R7,1,@join\nnop\nnop\nnop\njoin: wait 100\nstop",
                     branch_assumptions={"seq0:branch:join.q1asm:1:jge:join": choice})
     branch = next(event for event in state.events if event.kind == "q1_issue" and event.meta.get("op") == "jge")
 
@@ -86,7 +86,7 @@ def test_explicit_branch_selection_keeps_its_requested_presentation(choice: str)
 
 @pytest.mark.parametrize("prefix", ["fb_pop_data 5,R8\nnop\n", "wait R8\n"])
 def test_common_join_does_not_remove_prior_feedback_or_unknown_duration_boundaries(prefix: str) -> None:
-    state = analyze(prefix + "jge R7,1,@join\nnop\njmp @join\njoin: wait 100\nstop")
+    state = analyze(prefix + "jge R7,1,@join\nnop\nnop\nnop\njoin: wait 100\nstop")
     branch = next(event for event in state.events if event.kind == "q1_issue" and event.meta.get("op") == "jge")
 
     assert branch.meta["branch_join_proven"]
@@ -112,16 +112,16 @@ def test_equal_wait_path_durations_prove_common_rt_time_without_inventing_q1_arr
 
 @pytest.mark.parametrize("wait_first", [False, True])
 def test_equal_join_q1_time_proves_queue_timing_only_when_wait_packet_arrivals_also_match(wait_first: bool) -> None:
-    fallthrough = "wait 100\n" + "nop\n" * 5 if wait_first else "nop\n" * 5 + "wait 100\n"
+    fallthrough = "wait 100\n" + "nop\n" * 3 if wait_first else "nop\n" * 3 + "wait 100\n"
     source = f"jge R7,1,@other\n{fallthrough}jmp @join\nother: wait 100\n" + "nop\n" * 4 + "join: wait 40\nstop"
     state = analyze(source)
     branch = next(event for event in state.events if event.kind == "q1_issue" and event.meta.get("op") == "jge")
 
     assert branch.meta["branch_rt_join_proven"]
     assert branch.meta["branch_join_proven"] == (not wait_first)
-    assert branch.meta["join_q1_time_ns"] == 44
+    assert branch.meta["join_q1_time_ns"] == 48
     assert state.rt_time_ns == Concrete(140)
-    assert state.rt_packets[-1].q1_issue_t0 == Concrete(44)
+    assert state.rt_packets[-1].q1_issue_t0 == Concrete(48)
     assert analyze_underflow(state).status == "not_detected_under_current_assumptions"
     assert bool(state.metadata["underflow"].get("all_paths_safe")) == wait_first
 
@@ -156,7 +156,7 @@ def test_wait_join_uses_a_known_conditional_skip_duration_on_both_paths(nominal)
 
 
 def test_timing_join_marks_both_side_arms_visited_before_a_later_numeric_register_return() -> None:
-    state = analyze("jge R7,1,@join\nnop\njmp @join\njoin: wait 100\nmove 1,R0\nnop\njmp R0\nstop")
+    state = analyze("jge R7,1,@join\nnop\nnop\nnop\njoin: wait 100\nmove 1,R0\nnop\njmp R0\nstop")
     returned = next(event for event in state.events if event.kind == "q1_issue" and event.source.raw == "jmp R0")
 
     assert {1, 2} <= state.executed_pcs
@@ -220,7 +220,7 @@ def test_common_ready_register_values_do_not_reuse_side_arm_provenance_as_the_on
 
 def test_copies_of_one_untouched_canonical_source_preserve_sparse_facts_across_a_join() -> None:
     state = analyze(".DEF SOURCE R8\n.DEF DEST R1\nand R9,5,R8\nnop\njge R7,1,@other\n"
-                    "move $SOURCE,$DEST\nnop\nnop\njmp @join\nother: move R8,R1\nnop\n"
+                    "move $SOURCE,$DEST\njmp @join\nother: move R8,R1\nnop\n"
                     "join: move R6,R8\nnop\nand R1,2,R2\nnop\nadd R2,100,R2\nnop\nwait R2\nstop")
     branch = next(event for event in state.events if event.kind == "q1_issue" and event.meta.get("op") == "jge")
     step = state.register_provenance["R1"]["steps"][0]
@@ -301,7 +301,7 @@ def test_equal_wait_join_does_not_expand_reserved_or_different_conditional_costs
 
 
 def test_equal_conditional_wait_join_can_prove_an_identical_packet_supply_prefix() -> None:
-    source = ("set_cond 1,1,0,100\njge R7,1,@other\n" + "nop\n" * 5 + "wait 100\njmp @join\n"
+    source = ("set_cond 1,1,0,100\njge R7,1,@other\n" + "nop\n" * 3 + "wait 100\njmp @join\n"
               "other: wait 100\n" + "nop\n" * 4 + "join: set_cond 0,0,0,4\nwait 40\nstop")
     state = analyze(source)
     branch = next(event for event in state.events if event.kind == "q1_issue" and event.meta.get("op") == "jge")

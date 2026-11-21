@@ -3,6 +3,11 @@
 DEFAULT_FEEDBACK_QUEUE_CAPACITY = 32
 
 
+def feedback_q1_completion(issue_end_ns: int, arrival_ns: int | float) -> int:
+    """q1simulator 1.4.1 fetches the instruction, then waits on the arrival's Q1 tick."""
+    return max(issue_end_ns, int(arrival_ns // 4) * 4)
+
+
 def feedback_pop_limitation(identifier: int) -> str | None:
     if 0xFF < identifier <= 0xFFFF:
         return (f"fb_pop_data selector {identifier} exceeds the documented 8-bit LINQ range. "

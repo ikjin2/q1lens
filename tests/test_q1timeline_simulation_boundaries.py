@@ -546,7 +546,7 @@ def test_simulation_exports_terminal_for_q1_only_fault_and_unresolved_stall():
     stalled, = simulate_programs({"seq": program})
     assert status(stalled) == "blocked" and not events(stalled, "q1_issue")
     assert stalled.metadata["execution"]["terminal"] == {
-        "local_time_ns": 0, "category": "analysis_incomplete", "display_reason": "No scheduled input can resume feedback_input.",
+        "local_time_ns": 4, "category": "analysis_incomplete", "display_reason": "No scheduled input can resume feedback_input.",
     }
 
 
@@ -883,20 +883,28 @@ def test_time_limit_reports_the_lowered_slot_of_an_active_q1_branch(prepared):
 
 
 @pytest.mark.parametrize(("source", "reason", "start", "line", "options"), [
-    ("move 3,R0\nnop\nadd R0,1,R1\nfb_pull_data R2,R3\nstop", "feedback_input", 20, 4, {"max_time_ns": 20}),
+    ("move 3,R0\nnop\nadd R0,1,R1\nfb_pull_data R2,R3\nstop", "feedback_input", 20, 4,
+     {"max_time_ns": 25, "inputs": {"feedback": [{"target": "seq", "time_ns": 40, "id": 1, "value": 3}]}}),
     ("wait 4\nwait 4\nstop", "queue_full", 4, 2, {"max_time_ns": 12, "queue_capacity": 1}),
 ])
 def test_time_limit_does_not_clip_a_completed_q1_issue_while_q1_is_stalled(source, reason, start, line, options):
     state, = run(source, **options)
     issue = events(state, "q1_issue")[-1]
     stall, = events(state, "q1_stall")
-    assert issue.t1 == stall.t0 == Concrete(start)
+    assert issue.t1 == Concrete(start)
+    assert stall.t0 == Concrete(start + (4 if reason == "feedback_input" else 0))
     assert "planned_q1_end_ns" not in issue.meta and "observation_cutoff_ns" not in issue.meta
     assert stall.t1 == Concrete(options["max_time_ns"]) and stall.meta["reason"] == reason
     diagnostic, = state.diagnostics
     assert diagnostic.source == stall.source and diagnostic.source.line == line
     assert not diagnostic.related_events and diagnostic.details["display_message"] == "Reached simulation time limit."
     assert diagnostic.details["time_limit_local_ns"] == options["max_time_ns"]
+
+
+def test_feedback_observation_cutoff_during_fetch_has_no_fifo_stall():
+    state, = run("fb_pull_data R0,R1\nstop", max_time_ns=2)
+    assert state.q1_time_ns == Concrete(2)
+    assert not events(state, "q1_stall") and not state.register_history
 
 
 @pytest.mark.parametrize("limit", [7, 8])
@@ -930,10 +938,10 @@ def test_time_limit_does_not_publish_acquisition_or_feedback_before_completion(l
     assert [event.t0.value for event in events(control, "feedback_receive")] == expected_times
 
 
-@pytest.mark.parametrize("limit", [31, 32, 35, 36])
+@pytest.mark.parametrize("limit", [39, 40, 59, 60])
 def test_time_limit_does_not_publish_loop_counter_before_branch_completion(limit) -> None:
     state, = run("move 2,R0\nnop\nagain: loop R0,@again\nstop", max_time_ns=limit)
-    expected = [(time, value) for time, value in [(8, 2), (32, 1), (36, 0)] if time <= limit]
+    expected = [(time, value) for time, value in [(8, 2), (40, 1), (60, 0)] if time <= limit]
     assert status(state) == "step_limit"
     assert [(write.time.value, write.value.value) for write in state.register_history] == expected
     assert state.registers["R0"] == Concrete(expected[-1][1])

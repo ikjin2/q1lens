@@ -510,7 +510,7 @@ simulation:
         assert receives == [236, 236]
     prepared = run.prepare_statistics("control", {}, set())
     case = run.run("control", "R2", {}, prepared=prepared)
-    assert case == {"status": "completed", "engine_completed": True, "word": 17, "q1_ns": 248}
+    assert case == {"status": "completed", "engine_completed": True, "word": 17, "q1_ns": 244}
 
 
 @pytest.mark.parametrize("i,q,shift,scale,expected", [

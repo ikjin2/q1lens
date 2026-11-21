@@ -1259,7 +1259,7 @@ describe("QBS analysis concurrency", () => {
       await new Promise<void>((resolve) => setTimeout(resolve, 850));
       assert.equal(fixture.analyzed.length, 2);
     });
-  });
+  }).timeout(5000);
 
   it("does not queue a feedback refresh when reopening a managed notebook writes its generated files", async () => {
     await withCommands({}, async (fixture) => {

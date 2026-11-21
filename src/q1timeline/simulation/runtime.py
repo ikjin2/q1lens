@@ -23,8 +23,11 @@ from q1timeline.analysis.trigger_counters import TriggerCounters
 from q1timeline.analysis.values import Concrete, Unknown, resolve_arg_value, resolve_def_values, symbol_table_from_params, value_to_json
 from q1timeline.diagnostic_catalog import RT_QUEUE_UNDERFLOW_DESCRIPTION
 from q1timeline.diagnostics import Diagnostic
-from q1timeline.feedback_fifo import feedback_pop_limitation, take_feedback
+from q1timeline.feedback_fifo import feedback_pop_limitation, feedback_q1_completion, take_feedback
+from q1timeline.q1asm import core as q1_core
+from q1timeline.q1asm import core_rt
 from q1timeline.q1asm.ast import Instr, Program, SourceLocation
+from q1timeline.q1asm.compiled_addresses import next_source_position
 from q1timeline.q1asm.instruction_table import get_instruction_spec, rt_duration_arg_for_instruction
 from q1timeline.q1asm.linq_commands import (
     LINQ_CONFIGURATION_STREAMS, MOCK_LIMITATION, PACKED_LINQ_CONFIGS, PACKED_LINQ_OPERATIONS,
@@ -32,7 +35,7 @@ from q1timeline.q1asm.linq_commands import (
 )
 
 
-_SUPPORTED = core._CONCRETE_OPS | {
+_SUPPORTED = q1_core.LOCAL_OPS | {
     "set_cond", "wait_trigger", "set_latch_en", "latch_rst", "fb_com_data", "fb_cmd",
     "fb_pop_data", "fb_pull_data", "fb_acq_tb_id", "fb_acq_iq_id",
     "fb_acq_tb_valid", "fb_acq_iq_shift", "acquire_weighed", "acquire_weighted",
@@ -173,6 +176,9 @@ class _Sequencer:
     queue: deque = field(default_factory=deque)
     reserved: int = 0
     q1_done: bool = False
+    q1_fetch_ns: int = 0
+    q1_feedback_delay_ns: int = 0
+    queued_q1_fetch_ns: list[int] = field(default_factory=list)
     admitted_q1_issue: _AdmittedQ1Issue = field(default_factory=_AdmittedQ1Issue)
     stop_instruction: Instr | None = None
     stop_issue_id: str | None = None
@@ -186,6 +192,7 @@ class _Sequencer:
     waiting: str | None = None
     waiting_since: int = 0
     feedback: list[dict] = field(default_factory=list)
+    feedback_issue_registers: dict | None = None
     trigger_tokens: dict[int, deque] = field(default_factory=dict)
     trigger_counters: TriggerCounters = field(default_factory=TriggerCounters)
     uncertain_trigger_counts: dict[int, int] = field(default_factory=dict)
@@ -741,7 +748,9 @@ class _Runtime:
 
     def close_waits(self, seq: _Sequencer) -> core.TimelineEvent | None:
         if seq.waiting is not None:
-            if seq.state.record_trace:
+            if seq.waiting == "feedback_input":
+                seq.state.q1_time_ns = Concrete(self.now)
+            if seq.state.record_trace and self.now >= seq.waiting_since:
                 self.emit(seq, "q1_stall", seq.waiting_since, end=self.now,
                           meta={"reason": seq.waiting, "pending": True}, lane="debug.q1_stall")
             seq.waiting = None
@@ -792,7 +801,7 @@ class _Runtime:
                 break
             self.now_ticks, self.now_phase = ticks, phase
             if action == "q1":
-                self.q1(seq)
+                self.q1(seq, data)
             elif action == "enqueue":
                 seq.reserved -= 1
                 seq.queue.append(data)
@@ -809,6 +818,12 @@ class _Runtime:
                         seq.rt_prefill_since = time
                         self.schedule(time + POSSIBLE_INITIAL_BUFFER_NS, 2, name, "rt_prefill_deadline")
             elif action == "q1_stop":
+                instruction, issue, code = data
+                seq.stop_instruction = instruction
+                core._record_stop_code(seq.state, instruction, {}, code=code)
+                if issue is not None:
+                    issue.meta["stop_code"] = code
+                    seq.stop_issue_id = issue.id
                 seq.q1_done = True
                 self.start_buffered_rt(seq)
                 self.wake_empty_rt(seq)
@@ -824,6 +839,10 @@ class _Runtime:
                 self.start_buffered_rt(seq)
             elif action == "feedback":
                 self.feedback(seq, data)
+            elif action == "feedback_retry":
+                if seq.waiting == "feedback_input" and seq.waiting_since == data:
+                    seq.waiting = None
+                    self.q1(seq, seq.state.q1_time_ns.value)
             elif action == "triggers":
                 self.trigger(seq, data)
             elif action == "generated_trigger_arrival":
@@ -959,6 +978,24 @@ class _Runtime:
         for name, seq in self.sequencers.items():
             signal_summary = signals.get(name, {})
             terminal = self.terminal_edges.get(name)
+            if seq.stop_instruction is not None and seq.state.metadata["execution"]["status"] == "completed":
+                # The physical trace uses scenario startup and backpressure. Report elapsed
+                # Q1 on the same executed path using the reference clock's 32 RT slots.
+                delay = seq.q1_feedback_delay_ns
+                if seq.queued_q1_fetch_ns:
+                    origin = seq.state.rt_packets[0].rt_t0.value
+                    reference_sync_ns = 0
+                    for fetch, packet in zip(seq.queued_q1_fetch_ns, seq.state.rt_packets):
+                        release = packet.rt_t0.value - origin + reference_sync_ns
+                        delay = max(delay, q1_core.queued_q1_completion(fetch, release) - fetch)
+                        if packet.op == "wait_sync" and name in self.sync_participants:
+                            reference_sync_ns += q1_core.reference_sync_adjustment(
+                                packet.meta["operand_snapshot"][-1], packet.meta["queue_duration_ns"])
+                elapsed = seq.q1_fetch_ns + delay
+                seq.state.metadata["execution"].update(
+                    scheduled_q1_end_ns=seq.state.q1_time_ns.value, q1_elapsed_ns=elapsed,
+                )
+                seq.state.q1_time_ns = Concrete(elapsed)
             if terminal is not None:
                 edge, _, category = terminal
                 execution = seq.state.metadata["execution"]
@@ -1091,11 +1128,12 @@ class _Runtime:
         self.terminal_edges[state.sequencer_id] = (Concrete(self.now), instruction.source, state.diagnostics[-1].category)
         seq.failed = True
 
-    def q1(self, seq: _Sequencer) -> None:
+    def q1(self, seq: _Sequencer, q1_start: int | None = None) -> None:
         state = seq.state
         if seq.q1_done:
             return
-        state.q1_time_ns = Concrete(self.now)
+        q1_start = self.now if q1_start is None else q1_start
+        state.q1_time_ns = Concrete(q1_start)
         instruction = core._execution_instruction(state)
         if instruction is None:
             if state.pc == len(state.instructions_by_pc) and any(
@@ -1195,48 +1233,71 @@ class _Runtime:
                 self.emit(seq, "feedback_discard", self.now, instruction=instruction,
                     meta={"requested_id": requested_id, "input_event_ids": [item["event_id"] for item in discarded]}, lane="rt.feedback")
             if feedback is None:
-                seq.waiting, seq.waiting_since = "feedback_input", self.now
+                if state.record_trace and seq.feedback_issue_registers is None:
+                    seq.feedback_issue_registers = core._register_issue_metadata(state, instruction, scope)
+                fetch_end = q1_start + spec.q1_time_model(instruction)
+                seq.waiting, seq.waiting_since = "feedback_input", fetch_end
+                if self.now < fetch_end:
+                    # Even a receiver with no future inputs must finish its fetch
+                    # before the scheduler can declare a pending FIFO stall.
+                    self.schedule(fetch_end, 3, state.sequencer_id, "feedback_retry", fetch_end)
                 self.start_buffered_rt(seq)
                 return
         if instruction.op == "set_cond":
             resolved_condition = tuple(resolve_arg_value(arg, scope) for arg in instruction.args)
-            # Readiness permits unknown mask/operator only when disabled.
-            condition_values = tuple(value.value if isinstance(value, Concrete) else 0 for value in resolved_condition)
-            if condition_values[0] and condition_values[2] > 5:
+            if resolved_condition[0].value and resolved_condition[2].value > 5:
                 self.stop_on_q1_validation(seq, instruction, ("blocked", "Conditional operators 6 and 7 have no supported semantics."))
                 return
-        core._begin_execution_step(state)
+        effects = core._resolved_core_issue(state, instruction, scope)
+        taken = choice if choice is not None else effects.taken if effects is not None else None
+        target = core._arg_int(instruction.args[-1], scope) if spec.category == "branch" else None
+        state.next_pc, state.next_interior_pc = next_source_position(
+            state.compiled_addresses, instruction, state.interior_pc, len(state.instructions_by_pc),
+            taken=taken, target=target,
+        )
         register_metadata = None
         before = None
         if state.record_trace:
-            register_metadata = core._register_issue_metadata(state, instruction, scope)
+            register_metadata = seq.feedback_issue_registers or core._register_issue_metadata(state, instruction, scope)
+            seq.feedback_issue_registers = None
             before = dict(state.alu_flags) if state.alu_flags is not None else None
             state.current_resolved_args = core._resolved_args_for_instruction(instruction, scope, state)
         event_start = len(state.events)
         pending_start = len(state.pending_register_writes)
         duration = binding.duration_ns if binding is not None else None
-        if normalized_op == "upd_thres":
+        if effects is not None:
+            if choice is not None:
+                # Timing follows the selected arm while metadata retains the natural decision.
+                branch_cost = core.branch_duration(core._branch_taken_duration(instruction, state, seq.symbols), choice)
+                effects = replace(effects, q1_duration=branch_cost)
+            duration = effects.q1_duration
+            if effects.wait_duration is not None:
+                rt_duration = effects.wait_duration
+        elif normalized_op == "upd_thres":
             duration = get_instruction_spec(normalized_op).q1_time_model(instruction)
         elif duration is None:
             duration = spec.q1_time_model(core._instruction_for_q1_timing(instruction, state, seq.symbols))
-        state.q1_time_ns = Concrete(self.now + duration)
+        q1_end = q1_start + duration
+        if feedback is not None:
+            fetch_end = q1_end
+            q1_end = feedback_q1_completion(fetch_end, feedback["arrival_ns"])
+            if state.record_trace and q1_end > fetch_end:
+                self.emit(seq, "q1_stall", fetch_end, end=q1_end, meta={"reason": "feedback_input"}, lane="debug.q1_stall")
+        seq.q1_fetch_ns += duration
+        if feedback is not None:
+            seq.q1_feedback_delay_ns = max(seq.q1_feedback_delay_ns,
+                feedback_q1_completion(seq.q1_fetch_ns, feedback["arrival_ns"]) - seq.q1_fetch_ns)
+        if ((spec.emits_rt_packet or instruction.op == "stop")
+                and len(state.rt_packets) >= q1_core.RT_FIFO_CAPACITY):
+            seq.queued_q1_fetch_ns.append(seq.q1_fetch_ns)
+        state.q1_time_ns = Concrete(q1_end)
         packet_id = f"{state.sequencer_id}:p{len(state.rt_packets)}" if spec.emits_rt_packet else None
         future_latch = spec.category == "latched" and state.q1_time_ns.value > self.max_time
         latch_state_before = None
         phase_reset_before = state.pending_phase_reset
         setter_ids_before = None
-        if instruction.op in {"mulu16", "muls16"}:
-            left, right = [resolve_arg_value(arg, scope).value & 0xFFFF for arg in instruction.args[:2]]
-            if instruction.op == "muls16":
-                left = left - 0x10000 if left & 0x8000 else left
-                right = right - 0x10000 if right & 0x8000 else right
-            value = Concrete((left * right) & 0xFFFFFFFF)
-            register = core._register_name(instruction.args[2], state)
-            provenance = core._binary_provenance(state, instruction, instruction.args[0], instruction.args[1], register, value)
-            core._set_alu_flags(state, instruction, core._logic_flags(value.value))
-            core._schedule_register_write(state, instruction, register, value, provenance)
-        elif spec.category == "classical":
-            core._execute_classical(state, instruction, seq.symbols)
+        if spec.category == "classical":
+            core._execute_classical(state, instruction, seq.symbols, core_issue=effects)
         elif spec.category == "latched":
             setter_ids_before = seq.setter_ids.copy()
             if instruction.op in {"reset_netzero", "set_time_ref"}:
@@ -1250,7 +1311,8 @@ class _Runtime:
                           meta={"field": field_name, "value": True}, lane="state.pending")
             elif instruction.op == "set_cond":
                 if not future_latch:
-                    seq.condition = condition_values
+                    # A disabled condition can have unread mask/operator registers.
+                    seq.condition = tuple(0 if value is None else value for value in effects.condition)
                 self.emit(seq, "latched_state_pending", state.q1_time_ns.value, instruction=instruction,
                           meta={"field": "condition", "value": core._plain_value(resolved_condition)}, lane="state.pending")
             else:
@@ -1264,7 +1326,7 @@ class _Runtime:
                 else:
                     latch_state_before = copied_latches
                 state.rt_time_ns = state.q1_time_ns
-                core._execute_latched(state, instruction, seq.symbols)
+                core._execute_latched(state, instruction, seq.symbols, latch_write=effects.latch_write if effects else None)
                 state.rt_time_ns = old_rt
                 if future_latch:
                     state.latched_state = observed_latches
@@ -1287,7 +1349,7 @@ class _Runtime:
         issue = None
         if state.record_trace or spec.emits_rt_packet or (instruction.op == "stop" and state.latched_state.pending_since):
             issue = core._emit_q1_issue(
-                state, instruction, Concrete(self.now), state.q1_time_ns, packet_id,
+                state, instruction, Concrete(q1_start), state.q1_time_ns, packet_id,
                 register_metadata=register_metadata,
             )
             issue.meta.update(linq_meta)
@@ -1310,8 +1372,9 @@ class _Runtime:
                     if issue is not None:
                         event.meta["q1_issue_event_id"] = issue.id
         if spec.category == "branch":
-            core._execute_concrete_branch(state, instruction, issue, seq.symbols, q1_t0=Concrete(self.now),
-                                          defer_register_write=True, forced_decision=choice)
+            core._execute_concrete_branch(state, instruction, issue, seq.symbols, q1_t0=Concrete(q1_start),
+                                          defer_register_write=True, forced_decision=choice, branch_issue=effects,
+                                          projected=effects is not None)
             if issue is not None:
                 issue.meta["branch_occurrence"] = occurrence
         if state.record_trace:
@@ -1320,7 +1383,7 @@ class _Runtime:
             if feedback is not None:
                 issue.meta["input_event_ids"] = [feedback["event_id"]]
         for pending in state.pending_register_writes[pending_start:]:
-            ready_time = state.q1_time_ns.value + (0 if instruction.op == "loop" else 4)
+            ready_time = state.q1_time_ns.value + 4 * core.register_write_delay_slots(instruction.op)
             pending.meta["scheduled_ready_ns"] = ready_time
             self.schedule(ready_time, 1, state.sequencer_id, "register_ready", pending)
         admitted = seq.admitted_q1_issue
@@ -1348,9 +1411,9 @@ class _Runtime:
             phase_reset = applies_latched_state and state.pending_phase_reset is True
             updates = core._consume_applied_state(state) if applies_latched_state else {}
             settings = self.latched_snapshot(state) if applies_latched_state else {}
-            settings.update({field: updates[field] for field in ("phase_delta", "phase_reset") if field in updates})
+            settings.update({field: updates[field] for field in core_rt.ONE_SHOTS if field in updates})
             packet = core.RtPacket(packet_id, state.sequencer_id, instruction.source, instruction.op, Concrete(rt_duration),
-                                   Concrete(self.now), state.q1_time_ns, None, None, "exact",
+                                   Concrete(q1_start), state.q1_time_ns, None, None, "exact",
                                    {"operand_snapshot": operands, "applied_state": settings,
                                     "q1_issue_event_id": issue.id, **linq_meta})
             if seq.condition_branch_id:
@@ -1375,14 +1438,12 @@ class _Runtime:
         if instruction.op == "illegal":
             self.schedule(state.q1_time_ns.value, 1, state.sequencer_id, "illegal_fault", (instruction, issue))
         elif instruction.op == "stop":
-            seq.stop_instruction = instruction
-            code = core._record_stop_code(state, instruction, scope)
-            if issue is not None:
-                issue.meta["stop_code"] = code
-                seq.stop_issue_id = issue.id
-            self.schedule(state.q1_time_ns.value, 1, state.sequencer_id, "q1_stop")
+            self.schedule(state.q1_time_ns.value, 1, state.sequencer_id, "q1_stop",
+                          (instruction, issue, effects.stop_code))
         else:
-            self.schedule(state.q1_time_ns.value, 3, state.sequencer_id, "q1")
+            # An off-grid receipt may finish on an earlier Q1 tick. Resume on
+            # the logical Q1 clock without moving the global event queue back.
+            self.schedule(max(self.now, state.q1_time_ns.value), 3, state.sequencer_id, "q1", state.q1_time_ns.value)
 
     def illegal_fault(self, seq: _Sequencer, instruction: Instr, issue: core.TimelineEvent | None) -> None:
         state = seq.state
@@ -1593,13 +1654,12 @@ class _Runtime:
                     if applied_state["phase"] != command.settings.get("phase"):
                         setter_ids.pop("phase", None)
             seq.rt_phase_revision = command.phase_revision
-        one_shot_fields = {"phase_delta", "phase_reset"}
         committed_setter_ids = {}
         if not skipped:
             committed_setter_ids = {field: setter_id for field, setter_id in setter_ids.items()
-                                    if field in one_shot_fields or seq.rt_setter_ids.get(field) != setter_id}
+                                    if field in core_rt.ONE_SHOTS or seq.rt_setter_ids.get(field) != setter_id}
             seq.rt_setter_ids.update({field: setter_id for field, setter_id in committed_setter_ids.items()
-                                      if field not in one_shot_fields})
+                                      if field not in core_rt.ONE_SHOTS})
         meta = {**packet.meta, "rt_packet_id": packet.id, "applied_state": applied_state,
                 "applied_state_mode": "snapshot", "applied_updated_fields": sorted(updated_fields),
                 "applied_setter_event_ids": setter_ids, "committed_setter_event_ids": committed_setter_ids,
@@ -1646,7 +1706,7 @@ class _Runtime:
         if not skipped:
             changed = [key for key, value in applied_state.items() if seq.rt_settings.get(key) != value]
             seq.rt_settings.update({field: value for field, value in applied_state.items()
-                                    if field not in one_shot_fields})
+                                    if field not in core_rt.ONE_SHOTS})
             settings = {**seq.rt_settings, **applied_state, "_updated_fields": sorted(updated_fields.union(changed)),
                         "_phase_reset": command.phase_reset, "_netzero_reset": command.netzero_reset, "_rt_packet_id": packet.id}
             if "scope_enable" in settings["_updated_fields"] and not settings["scope_enable"]:
@@ -2397,9 +2457,9 @@ class _Runtime:
             return
         event = self.emit(seq, "feedback_receive", self.now, source=source,
                           meta={**data, "depth": depth + 1}, lane="rt.feedback")
-        seq.feedback.append({**data, "event_id": event.id})
+        seq.feedback.append({**data, "arrival_ns": self.now, "event_id": event.id})
         if seq.waiting == "feedback_input":
-            self.resume_q1(seq)
+            self.schedule(self.now, 3, seq.state.sequencer_id, "feedback_retry", seq.waiting_since)
 
     def forward_qtm_trigger(self, seq: _Sequencer, command: _Command, mode: str, source_event_id: str,
                             input_event_ids: list[str] | None = None) -> None:

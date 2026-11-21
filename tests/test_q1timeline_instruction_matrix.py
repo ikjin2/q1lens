@@ -8,10 +8,14 @@ Macro address layouts have separate assembler golden vectors.
 """
 from __future__ import annotations
 
+from dataclasses import replace
+from unittest.mock import patch
+
 import pytest
 
 from q1timeline.analysis.interpreter import interpret_program
-from q1timeline.analysis.values import Concrete
+from q1timeline.analysis.values import Concrete, Unknown
+from q1timeline.q1asm import core
 from q1timeline.q1asm.instruction_table import INSTRUCTION_TABLE
 from q1timeline.q1asm.parser import parse_q1asm
 from q1timeline.simulation.runtime import _SUPPORTED, simulate_programs
@@ -104,6 +108,52 @@ def test_every_runtime_supported_opcode_and_signature_has_an_explicit_case():
                        for actual in kinds), (op, signature.args)
 
 
+@pytest.mark.parametrize("op", sorted(core.LOCAL_OPS))
+def test_analysis_issues_each_resolved_local_signature_through_core(op):
+    for args in SIGNATURE_EXAMPLES[op]:
+        source = ("move 8,R0\nmove 1,R1\nmove 4,R2\nmove 0,R3\nmove 9,R4\nnop\ncmp R0,1\n"
+                  f"{op} {args}\nnop\ndone: stop")
+        with patch.object(core, "issue", wraps=core.issue) as issued:
+            interpret_program(parse_q1asm(source), sequencer_id="s")
+        assert [call.args[0].op for call in issued.call_args_list if call.args[0].pc == 7] == [op], args
+
+
+def test_analysis_projects_core_words_latches_and_rt_duration(monkeypatch):
+    original = core.issue
+
+    def issue_with_distinct_effects(item, operands, flags):
+        result = original(item, operands, flags)
+        if item.op == "add":
+            return replace(result, words=(7,))
+        if item.op == "set_mrk":
+            return replace(result, latch_write=replace(result.latch_write, value=9))
+        if item.op == "wait":
+            return replace(result, wait_duration=12)
+        return result
+
+    monkeypatch.setattr(core, "issue", issue_with_distinct_effects)
+    program = parse_q1asm("move 2,R0\nnop\nadd R0,1,R1\nset_mrk 3\nwait 8\nupd_param 4\nstop R1")
+    state = interpret_program(program, sequencer_id="s")
+    assert state.registers["R1"] == Concrete(7)
+    assert state.rt_packets[0].duration == Concrete(12)
+    update, = [e for e in state.events if e.kind == "upd_param"]
+    assert update.meta["applied_state"]["marker"] == 9
+
+
+def test_analysis_routes_bound_aliases_but_keeps_symbolic_and_unready_reads_abstract():
+    program = parse_q1asm(".DEF ACC R0\nmove {seed},$ACC\nnop\nsub 1,$ACC,R2\n"
+                          "add R3,4,R4\nset_mrk R3\nwait R3\nmove 7,R0\nstop $ACC")
+    with patch.object(core, "issue", wraps=core.issue) as issued:
+        state = interpret_program(program, sequencer_id="s", params={"seed": 13})
+    assert [(call.args[0].op, call.args[1]) for call in issued.call_args_list] == [
+        ("move", (13,)), ("nop", ()), ("sub", (1, 13)), ("move", (7,)),
+    ]
+    assert state.registers["R2"] == Concrete(12)
+    assert isinstance(state.registers["R4"], Unknown)
+    assert isinstance(state.rt_packets[0].duration, Unknown)
+    assert next(e for e in state.events if e.kind == "stop").meta["stop_code"]["kind"] == "unknown"
+
+
 @pytest.mark.parametrize("op,args", [(op, args) for op, examples in SIGNATURE_EXAMPLES.items() for args in examples])
 def test_supported_signature_executes(op, args):
     # The subject starts at PC7. Numeric target 9 reaches the NOP for a macro
@@ -135,7 +185,7 @@ def test_supported_signature_executes(op, args):
         assert next(event for event in state.events if event.kind == "feedback_send").meta["value"] == 8
     if op in {"acquire", "acquire_weighed", "acquire_weighted"}:
         result = next(event for event in state.events if event.kind == "acquisition_result")
-        assert (result.t0, result.meta["i"], result.meta["q"]) == (Concrete(52), 2, -1)
+        assert (result.t0, result.meta["i"], result.meta["q"]) == (Concrete(60 if args.count("R") == 3 else 52), 2, -1)
 
 
 @pytest.mark.parametrize("mode", ["concrete", "simulation"])
@@ -149,7 +199,7 @@ def test_branch_truth_table_uses_signed_unsigned_comparisons_and_overflow(op, a,
     assert state.registers["R5"] == Concrete(int(expected))
     branch = issue(state, op)
     assert branch.meta["branch_taken"] is expected
-    assert branch.duration == Concrete((24 if op == "jge" else 16) if expected else 4)
+    assert branch.duration == Concrete(16 if expected else 4)
 
 
 @pytest.mark.parametrize("mode", ["concrete", "simulation"])
@@ -234,9 +284,9 @@ def test_weighted_aliases_and_operand_forms_share_independent_integral(op, regis
     }}, simulation={"physical": {"sequencers": {"s": {"input": {"kind": "constant", "i": 0.5, "q": 0.25}}}}})
     assert status(state) == "completed"
     result = next(event for event in state.events if event.kind == "acquisition_result")
-    assert (result.t0, result.meta["i"], result.meta["q"], result.meta["bin_index"]) == (Concrete(28), 0, 1, 1)
+    assert (result.t0, result.meta["i"], result.meta["q"], result.meta["bin_index"]) == (Concrete(36 if register_operands else 28), 0, 1, 1)
     assert result.meta["weights"] == [0, 1]
-    assert state.rt_time_ns == Concrete(44)
+    assert state.rt_time_ns == Concrete(52 if register_operands else 44)
     assert next(event for event in state.events if event.kind == "acquire").meta["op"] == op
 
 

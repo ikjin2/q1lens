@@ -30,11 +30,16 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Install declared development dependencies
         run: python -m pip install '.[dev]'
-      - name: Run the complete regular suite with skip reasons
+      - name: Compare the complete Q1ASM example and tutorial corpus
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force output/ci/python | Out-Null
-          python -m pytest -q -ra tests --junitxml=output/ci/python/junit.xml 2>&1 | Tee-Object output/ci/python/pytest.log
+          python -m pytest -q -ra tests/test_q1timeline_core_corpus.py --junitxml=output/ci/python/core-corpus.xml 2>&1 | Tee-Object output/ci/python/core-corpus.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Run the remaining regular suite with skip reasons
+        shell: pwsh
+        run: |
+          python -m pytest -q -ra tests --ignore=tests/test_q1timeline_core_corpus.py --junitxml=output/ci/python/junit.xml 2>&1 | Tee-Object output/ci/python/pytest.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Verify the cursor frequency project baseline
         shell: pwsh

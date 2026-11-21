@@ -1,7 +1,10 @@
-# Shared external inputs in path playback
+# External inputs in Concrete and Play
 
-The main Play control accepts project-scoped trigger and LINQ scenarios in
-`q1timeline.yml`. These are explicit assumptions for analytical path playback.
+Concrete and the main Play control accept project-scoped trigger and LINQ
+receiver schedules in `q1timeline.yml`. Concrete uses these schedules in
+ordinary analysis, watch mode and DEF runs. It stops at a receive that still
+needs an arrival. The Python functions `analyze_text` and `analyze_documents`
+accept the same mapping through `external_inputs` in Concrete mode.
 The Hardware event-driven simulation uses `simulation.inputs`.
 
 ```yaml
@@ -101,13 +104,15 @@ produces an overflow diagnostic linked to the rejected arrival. The point
 follows the active time basis. Play checks arrivals through the completion
 of the receiver's `stop` instruction, including arrivals at that completion time.
 
-`fb_pull_data` reads the oldest entry into its ID and data destinations and
-takes 8 ns once data is available. `fb_pop_data` discards entries up to the
-requested ID and takes 4 ns once that ID is available. The wait delays Q1 and
+`fb_pull_data` reads the oldest entry into its ID and data destinations.
+`fb_pop_data` discards entries up to the requested ID. Both use the
+q1simulator 1.4.1 Q1 clock: fetch takes 4 ns, and completion is the later
+of fetch completion and the matching arrival rounded down to a 4 ns tick.
+The schedule and arrival markers retain the supplied timestamps. The wait delays Q1 and
 later enqueues. Already recorded RT work keeps its timing. The inspector shows
 the scheduled entry, source instruction, register destinations and discarded
 entries. Its timestamps follow the active time basis for the receiver. When a
-receiver has no schedule, `fb_pop_data` retains the editable
-per-occurrence assumption and `fb_pull_data` reports missing input. Play marks
+receiver has no schedule, the editable `fb_pop_data` assumption adds the
+chosen wait to the 4 ns fetch. An unscheduled `fb_pull_data` reports missing input. Play marks
 queue timing incomplete when backpressure shifts Q1 before a scheduled receipt
 or leaves a terminal feedback wait unchecked. [Qblox LINQ data receiving](https://docs.qblox.com/en/main/products/architecture/sequencers/linq_based_feedback.html#data-receiving)

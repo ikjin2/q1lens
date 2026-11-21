@@ -12,7 +12,9 @@ import yaml
 from q1timeline.analysis.alignment import SIMULATION_ALIGNMENT_MODE
 from q1timeline.analysis.trigger_counters import TRIGGER_COUNTER_PARAMETERS, trigger_counter_settings_valid
 from q1timeline.diagnostics import Diagnostic
-from q1timeline.external_inputs import validate_external_inputs
+from q1timeline.external_inputs import concrete_receiver_inputs, validate_external_inputs
+from q1timeline.feedback_fifo import DEFAULT_FEEDBACK_QUEUE_CAPACITY
+from q1timeline.q1asm.core_devices import ExternalInputs
 from q1timeline.q1asm.ast import SourceLocation
 from q1timeline.simulation.config import validate_simulation
 
@@ -75,6 +77,12 @@ class ProjectConfig:
     simulation: dict[str, Any] = field(default_factory=dict)
     external_inputs: dict[str, Any] = field(default_factory=dict)
     alignment_mode_explicit: bool = False
+
+    def concrete_inputs(self, seq: SequencerConfig, params: dict) -> ExternalInputs:
+        return concrete_receiver_inputs(
+            self.external_inputs, seq.id, params, seq.hardware_parameters,
+            self.simulation.get("feedback_queue_capacity", DEFAULT_FEEDBACK_QUEUE_CAPACITY),
+        )
 
     def sequencer_metadata(self) -> dict[str, dict[str, str | int | None]]:
         return {seq.id: {"module": seq.module, "module_type": seq.module_type, "sequencer_index": seq.sequencer_index}

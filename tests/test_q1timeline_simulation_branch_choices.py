@@ -17,7 +17,7 @@ def test_forcing_loop_fallthrough_preserves_decrement_and_flags():
     forced = changed_loops[1]
     assert forced.meta["natural_branch_taken"] is True and forced.meta["branch_taken"] is False
     assert forced.meta["flags_after"] == normal_loops[1].meta["flags_after"]
-    assert forced.duration == Concrete(4)
+    assert forced.duration == Concrete(20)
     assert changed.registers["R0"] == Concrete(1)
     write = next(item for item in changed.register_history if item.event_id == forced.id)
     assert write.time == forced.t1

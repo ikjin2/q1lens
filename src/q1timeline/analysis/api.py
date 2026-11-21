@@ -10,6 +10,7 @@ from q1timeline.analysis.alignment import SIMULATION_ALIGNMENT_MODE, align_timel
 from q1timeline.analysis.hardware_readiness import analyze_hardware_readiness
 from q1timeline.analysis.interpreter import AnalysisState, interpret_program
 from q1timeline.analysis.underflow import analyze_underflows
+from q1timeline.external_inputs import concrete_receiver_inputs, validate_external_inputs
 from q1timeline.project import is_valid_alignment_mode, is_valid_branch_policy, validate_params_json_mapping
 from q1timeline.q1asm.parser import parse_q1asm
 from q1timeline.sequence import sequence_weight_lengths
@@ -29,6 +30,7 @@ def analyze_text(
     execution_mode: str = "analysis",
     max_steps: int = 10000,
     simulation: dict[str, Any] | None = None,
+    external_inputs: dict[str, Any] | None = None,
     sequence: dict[str, Any] | None = None,
     hardware_readiness: bool = False,
 ) -> dict[str, Any]:
@@ -51,6 +53,7 @@ def analyze_text(
         execution_mode=execution_mode,
         max_steps=max_steps,
         simulation=simulation,
+        external_inputs=validate_external_inputs(external_inputs, [sequencer]) if external_inputs is not None else None,
         sequence=sequence,
     )
     if execution_mode != "simulation":
@@ -79,6 +82,7 @@ def analyze_documents(
     execution_mode: str = "analysis",
     max_steps: int = 10000,
     simulation: dict[str, Any] | None = None,
+    external_inputs: dict[str, Any] | None = None,
     sequences: dict[str, dict[str, Any]] | None = None,
     hardware_readiness: bool = False,
 ) -> dict[str, Any]:
@@ -92,6 +96,7 @@ def analyze_documents(
     _validate_params(params)
     validated_documents = _validate_documents(documents)
     sequencer_ids = _unique_sequencer_ids(validated_documents.keys())
+    receivers = validate_external_inputs(external_inputs, sequencer_ids.values()) if external_inputs is not None else None
     if execution_mode == "simulation":
         from q1timeline.simulation.runtime import simulate_programs
 
@@ -113,6 +118,7 @@ def analyze_documents(
                 execution_mode=execution_mode,
                 max_steps=max_steps,
                 sequence=sequence_by_id.get(sequencer_ids[file]),
+                external_inputs=receivers,
             )
             for file, text in validated_documents.items()
         ]
@@ -142,6 +148,7 @@ def _analyze_program_text(
     execution_mode: str,
     max_steps: int,
     simulation: dict[str, Any] | None = None,
+    external_inputs: dict[str, Any] | None = None,
     sequence: dict[str, Any] | None = None,
 ) -> AnalysisState:
     if execution_mode == "simulation":
@@ -161,6 +168,8 @@ def _analyze_program_text(
         branch_assumptions=branch_assumptions,
         execution_mode=execution_mode,
         max_steps=max_steps,
+        external=(concrete_receiver_inputs(external_inputs, sequencer_id, params or {})
+                  if execution_mode == "concrete" and external_inputs is not None else None),
     )
     state.metadata["weight_lengths"] = sequence_weight_lengths(sequence)
     return state

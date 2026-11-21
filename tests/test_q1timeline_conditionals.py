@@ -45,10 +45,10 @@ def test_negative_else_duration_is_invalid(enabled: int, mode: str) -> None:
     assert state.conditional_enable == Concrete(0)
 
 
-@pytest.mark.parametrize("configuration, enabled", [
-    ("set_cond 1,1,0,20", True), ("set_cond R0,R1,R2,20", None),
+@pytest.mark.parametrize("configuration, enabled, q1_ns", [
+    ("set_cond 1,1,0,20", True, 24), ("set_cond R0,R1,R2,20", None, 32),
 ])
-def test_active_or_unresolved_condition_does_not_assert_rt_outputs(configuration: str, enabled) -> None:
+def test_active_or_unresolved_condition_does_not_assert_rt_outputs(configuration: str, enabled, q1_ns: int) -> None:
     state = analyze(f"set_mrk 3\nset_awg_offs 100,0\n{configuration}\nplay 0,1,40\nacquire 0,0,8\nstop")
 
     conditions = [event for event in state.events if event.meta.get("field") == "set_cond"]
@@ -65,7 +65,7 @@ def test_active_or_unresolved_condition_does_not_assert_rt_outputs(configuration
     assert all(event.confidence == "unknown" for event in state.events if event.lane.startswith("rt."))
     assert {"marker", "awg_offset"} <= state.latched_state.pending_event_ids.keys()
     assert isinstance(state.rt_time_ns, Unknown)
-    assert state.q1_time_ns == Concrete(24)
+    assert state.q1_time_ns == Concrete(q1_ns)
 
 
 def test_disabling_condition_keeps_elapsed_time_unknown_and_pending_output_settings() -> None:
@@ -528,12 +528,14 @@ def test_conditional_boundary_does_not_hide_a_proven_earlier_queue_failure() -> 
     assert warning.source.line < len(prefix.splitlines()) + 1
 
 
-def test_enabled_condition_stays_an_explicit_concrete_execution_boundary() -> None:
+def test_enabled_condition_on_zero_trigger_count_skips_play_in_concrete() -> None:
     state = analyze("set_cond 1,1,0,20\nplay 0,1,40\nstop", mode="concrete")
 
-    assert state.metadata["execution"]["status"] == "blocked"
-    assert state.metadata["execution"]["steps"] == 0
-    assert state.rt_packets == []
+    assert state.metadata["execution"]["status"] == "completed"
+    assert state.metadata["execution"]["steps"] == 3
+    packet, = state.rt_packets
+    assert packet.duration == Concrete(20)
+    assert packet.meta["conditional_skipped"] is True
 
 
 @pytest.mark.parametrize("conditional_prefix", ["", "wait 4\n"])

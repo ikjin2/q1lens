@@ -25,8 +25,8 @@ def test_late_fifo_pull_and_selective_pop_preserve_both_destinations_and_raw_wor
     ir = execute(playback)
     assert ir["playback"]["status"] == "completed"
     pull, pop = ir["playback"]["feedback"]
-    assert (pull["id"], pull["armed_at_ns"], pull["arrival_ns"], pull["available_at_ns"], pull["completed_at_ns"]) == (9, 4, 16, 16, 24)
-    assert (pop["id"], pop["arrival_ns"], pop["available_at_ns"], pop["completed_at_ns"]) == (5, 16, 24, 28)
+    assert (pull["id"], pull["armed_at_ns"], pull["arrival_ns"], pull["available_at_ns"], pull["completed_at_ns"]) == (9, 4, 16, 16, 16)
+    assert (pop["id"], pop["arrival_ns"], pop["available_at_ns"], pop["completed_at_ns"]) == (5, 16, 16, 20)
     assert [pull["discarded_input_event_ids"], pop["discarded_input_event_ids"]] == [[], []]
     inputs = ir["playback"]["external_inputs"]["feedback"][0]["arrivals"]
     assert [pull["input_event_id"], pop["input_event_id"]] == [entry["event_id"] for entry in inputs]
@@ -39,7 +39,7 @@ def test_late_fifo_pull_and_selective_pop_preserve_both_destinations_and_raw_wor
     assert all(ir["source_map"]["by_event_id"][write["event_id"]] == write["source"] for write in writes)
     first, second = playback.runners[0].state.rt_packets
     assert (first.rt_t0.value, first.rt_t1.value, first.q1_issue_t0.value) == (0, 100, 0)
-    assert (second.rt_t0.value, second.q1_issue_t0.value) == (100, 32)
+    assert (second.rt_t0.value, second.q1_issue_t0.value) == (100, 24)
     with pytest.raises(ValueError, match="Configure"):
         playback.set_feedback(pull["feedback_id"], 7, 0)
 
@@ -50,9 +50,18 @@ def test_selective_pop_discards_only_older_words_then_pull_consumes_the_next():
     pop, pull = ir["playback"]["feedback"]
     arrivals = ir["playback"]["external_inputs"]["feedback"][0]["arrivals"]
     assert pop["discarded_input_event_ids"] == [arrivals[0]["event_id"]]
-    assert (pop["input_event_id"], pop["completed_at_ns"]) == (arrivals[1]["event_id"], 12)
-    assert (pull["id"], pull["input_event_id"], pull["completed_at_ns"]) == (11, arrivals[2]["event_id"], 20)
+    assert (pop["input_event_id"], pop["completed_at_ns"]) == (arrivals[1]["event_id"], 8)
+    assert (pull["id"], pull["input_event_id"], pull["completed_at_ns"]) == (11, arrivals[2]["event_id"], 12)
     assert ir["execution"]["seq"]["queue_timing"]["status"] == "analysis_incomplete"
+
+
+def test_off_grid_arrivals_keep_physical_timestamps_and_share_a_q1_tick():
+    ir = execute(session("fb_pull_data R0,R1\nfb_pop_data 7,R2\nnop\nstop R2",
+                         schedule((11, 1, 42), (11, 7, 99))))
+    pull, pop = ir["playback"]["feedback"]
+    assert [(item["armed_at_ns"], item["available_at_ns"], item["completed_at_ns"])
+            for item in (pull, pop)] == [(0, 11, 8), (8, 11, 12)]
+    assert ir["execution"]["seq"]["stop_code"] == 99
 
 
 @pytest.mark.parametrize("selector", [1, 257])
@@ -282,7 +291,7 @@ def test_scheduled_feedback_keeps_register_readiness():
     assert any(item["category"] == "register_not_ready" for item in ir["diagnostics"])
     execution = ir["execution"]["seq"]
     assert execution["source"]["line"] == 2
-    assert execution["terminal"] == {"local_time_ns": 28, "category": "playback_boundary",
+    assert execution["terminal"] == {"local_time_ns": 20, "category": "playback_boundary",
                                      "display_reason": execution["reason"], "core": "q1"}
 
 

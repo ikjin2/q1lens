@@ -64,7 +64,7 @@ def test_loop_with_a_separate_target_register_keeps_its_macro_timing(mode):
     state = run("move 2,R0\nmove 6,R1\nnop\nloop R0,R1\nwait 20\nwait 4\nstop\n", mode)
 
     issue, = [event for event in state.events if event.kind == "q1_issue" and event.source.line == 4]
-    assert issue.meta["op"] == "loop" and issue.duration == Concrete(24)
+    assert issue.meta["op"] == "loop" and issue.duration == Concrete(32)
     assert state.registers == {"R0": Concrete(1), "R1": Concrete(6)}
     assert [event.duration.value for event in state.events if event.kind == "wait"] == [4]
     assert not state.diagnostics

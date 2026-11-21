@@ -173,6 +173,7 @@ class RunSnapshot:
         self.sources = {}
         self.names = {}
         self.memories = {}
+        self.external = {seq.id: config.concrete_inputs(seq, self.params) for seq in config.sequencers} if self.mode == "concrete" else {}
         self.diagnostics = list(config.diagnostics)
         source_bytes = {}
         for seq in config.sequencers:
@@ -270,7 +271,7 @@ class RunSnapshot:
                                         acquisition_names=self.names[name].acquisitions if name in self.names else None,
                                         execution_mode="concrete", max_steps=self.max_steps,
                                         strict_q1asm=self.strict, branch_policy=config.analysis.branch_policy,
-                                        prepared=prepared[name] if prepared else None)
+                                        prepared=prepared[name] if prepared else None, external=self.external[name])
                       for name, program in programs.items()]
         for state, seq in zip(states, config.sequencers):
             state.metadata.update(module=seq.module, module_type=seq.module_type,

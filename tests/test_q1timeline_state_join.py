@@ -96,7 +96,7 @@ def test_different_waveforms_keep_the_prefix_uncertain_and_the_common_suffix_exa
 
 
 def test_different_waveforms_can_have_an_identical_proven_queue_supply():
-    source = ("jge R7,1,@other\n" + "nop\n" * 5 + "play 0,1,100\njmp @join\nother: play 2,3,100\n"
+    source = ("jge R7,1,@other\n" + "nop\n" * 3 + "play 0,1,100\njmp @join\nother: play 2,3,100\n"
               + "nop\n" * 4 + "join: wait 40\nstop")
     state = analyze(source)
     branch = next(event for event in state.events if event.kind == "q1_issue" and event.meta.get("op") == "jge")
@@ -265,7 +265,7 @@ def test_common_rt_state_joins_compose_after_q1_arrival_has_become_unknown():
 
 
 def test_ordinary_wait_and_play_can_share_queue_timing_without_sharing_outputs():
-    source = ("jge R7,1,@other\n" + "nop\n" * 5 + "wait 100\njmp @join\nother: play 0,1,100\n"
+    source = ("jge R7,1,@other\n" + "nop\n" * 3 + "wait 100\njmp @join\nother: play 0,1,100\n"
               + "nop\n" * 4 + "join: wait 40\nstop")
     state = analyze(source)
     branch = next(event for event in state.events if event.kind == "q1_issue" and event.meta.get("op") == "jge")

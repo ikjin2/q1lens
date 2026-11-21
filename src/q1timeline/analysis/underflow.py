@@ -328,7 +328,8 @@ def _queue_packets(state: AnalysisState):
                              for index, value in enumerate(periods)))
         for instruction in instructions:
             spec = get_instruction_spec(instruction.op)
-            if spec.category == "classical" and len({signature.q1_time_ns for signature in spec.signatures}) == 1:
+            # ALU fetch cost depends on the encoded operands, which stay fixed across iterations.
+            if spec.category == "classical":
                 if meta.get("counter_reg") not in _register_write_operands(instruction, state):
                     continue
             elif instruction.op in constant_ops:

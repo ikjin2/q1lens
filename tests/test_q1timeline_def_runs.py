@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from q1timeline.def_runs import RunSnapshot, numeric_defs, sweep_plan
-from q1timeline.analysis.interpreter import interpret_program
+from q1timeline.analysis.interpreter import interpret_program, prepare_def_program
 from q1timeline.q1asm.parser import parse_q1asm
 
 
@@ -35,6 +35,33 @@ def program(tmp_path, text, *, config="", sequencers=None):
 
 def axis(name="X", lower="0", upper="2", step="1"):
     return {"name": name, "min": lower, "max": upper, "step": step}
+
+
+def test_def_statistics_uses_project_receiver_schedule(tmp_path):
+    project = program(tmp_path, ".DEF T 4\nwait_trigger 1,$T\nfb_pop_data 9,R0\nnop\nstop R0",
+                      config="external_inputs:\n  triggers:\n"
+                             "    - {id: start, address: 1, targets: [sum], times_ns: [20]}\n"
+                             "  feedback:\n    - {target: sum, arrivals: [{time_ns: 60, id: 9, value: 7}]}\n")
+    sim = snapshot(project)
+    prepared = {"sum": prepare_def_program(sim.programs["sum"], params={}, strict_q1asm=False, varying={"T"})}
+    for binding in (None, prepared):
+        result = sim.run("sum", "R0", {"T": 8}, prepared=binding)
+        assert (result["status"], result["word"], result["q1_ns"]) == ("completed", 7, 68)
+
+
+def test_simulation_sweep_and_replay_report_elapsed_q1_through_a_full_queue(tmp_path):
+    source = ".DEF DWELL 100\n" + "wait $DWELL\n" * 34 + "stop"
+    run = snapshot(program(tmp_path, source), execution_mode="simulation")
+    inputs = {"revision": run.revision, "sequencer": "sum", "uri": run.sources["sum"]["uri"],
+              "registers": [], "observe_time": True, "overrides": {"DWELL": "100"}}
+    target, selection, values = run.inputs(inputs)
+    detail = run.run(target, selection, values, detail=True)
+    prepared = run.prepare_statistics("sum", values, {"DWELL"})
+    row = run.run("sum", selection, values, prepared=prepared)
+    assert row["status"] == detail["case"]["status"] == "completed"
+    assert row["q1_ns"] == detail["case"]["q1_ns"] == 240
+    clocks = detail["ir"]["execution"]["sum"]
+    assert clocks["q1_elapsed_ns"] == 240 and clocks["scheduled_q1_end_ns"] == 236
 
 
 def test_numeric_defs_come_from_valid_declarations():
@@ -276,8 +303,8 @@ def test_statistics_keeps_simulation_feedback_and_blocking(tmp_path):
 def test_statistics_keeps_concrete_queue_error(tmp_path, monkeypatch):
     from q1timeline.analysis import underflow
 
-    monkeypatch.setattr(underflow, "ASSUMED_INITIAL_BUFFER_NS", 12)
-    monkeypatch.setattr(underflow, "POSSIBLE_INITIAL_BUFFER_NS", 24)
+    monkeypatch.setattr(underflow, "ASSUMED_INITIAL_BUFFER_NS", 32)
+    monkeypatch.setattr(underflow, "POSSIBLE_INITIAL_BUFFER_NS", 48)
     run = snapshot(program(tmp_path, ".DEF N 1\nmove 7,R2\nwait 4\nmove $N,R0\n"
                            "nop\nagain: nop\nloop R0,@again\nwait 4\nstop\n"))
     prepared = run.prepare_statistics("sum", {"N": 1}, {"N"})
@@ -361,7 +388,7 @@ def test_worker_batches_and_reproduces_selected_case(tmp_path):
         call("sweep", **time_only, axes=[axis()], statistics_only=True)
         summary = call("batch")["summary"]
         assert summary["registers"] == {}
-        assert summary["time"] == {"count": 3, "min": 40, "max": 40, "mean": 40, "deviation": 0}
+        assert summary["time"] == {"count": 3, "min": 44, "max": 44, "mean": 44, "deviation": 0}
         assert "error" in call("sweep", **{**time_only, "observe_time": False}, axes=[axis()])
 
         sampled = {**multi, "observe_time": True}
@@ -377,7 +404,7 @@ def test_worker_batches_and_reproduces_selected_case(tmp_path):
         for case_id, row in enumerate(rows, 1):
             x, y = (int(row["defs"][name]) for name in ("X", "Y"))
             assert x in range(-100, 101, 3) and y in range(-70, 61, 2)
-            assert row["id"] == case_id and row["words"]["R2"] == (x + y) % (2**32) and row["q1_ns"] == 40
+            assert row["id"] == case_id and row["words"]["R2"] == (x + y) % (2**32) and row["q1_ns"] == 44
         assert not call("batch")["rows"]
         detail = call("run", **{**sampled, "overrides": rows[-1]["defs"]}, case_id=6)
         assert detail["case"] == rows[-1] and "ir" in detail

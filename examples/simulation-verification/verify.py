@@ -38,7 +38,7 @@ def check(case: str, ir: dict) -> dict:
     if case == "01-digital":
         assert register(ir, "counter", "R1") == register(ir, "counter", "R2") == 3
         assert [write["value"]["value"] for write in ir["register_history"] if write["register"] == "R1"] == [0, 1, 2, 3]
-        assert [write["time"]["value"] for write in ir["register_history"] if write["register"] == "R1"] == [12, 32, 80, 244]
+        assert [write["time"]["value"] for write in ir["register_history"] if write["register"] == "R1"] == [12, 32, 92, 252]
         assert any(event["meta"]["reason"] == "queue_full" for event in events(ir, "q1_stall"))
         assert max(event["meta"]["depth"] for event in events(ir, "rt_queue_enqueue")) == 2
         return {"R1": 3, "R2": 3, "max_queue_depth": 2, "queue_full_stalls": len(events(ir, "q1_stall"))}

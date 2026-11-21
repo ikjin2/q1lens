@@ -143,7 +143,9 @@ def replay_queues(
         queue = queues[name]
         packet = queue.packets[queue.index]
         queue.blocked = False
-        queue.ready_ns = time + packet.q1_issue_t1.value - packet.q1_issue_t0.value
+        # Replay independently applies FIFO backpressure under this queue scenario.
+        fetch_ns = packet.q1_issue_t1.value - packet.q1_issue_t0.value - packet.meta.get("q1_fifo_stall_ns", 0)
+        queue.ready_ns = time + fetch_ns
         schedule(time, 2, name, "issue")
 
     def release_sync(time: int) -> None:

@@ -14,7 +14,7 @@ def _events(state, kind, op=None):
 
 
 @pytest.mark.parametrize(("branch", "taken_duration"), [
-    ("jnz @body", 16), ("jnz 2", 16), ("jge R0,1,@body", 24), ("jge R0,1,2", 24),
+    ("jnz @body", 16), ("jnz 2", 16), ("jge R0,1,@body", 28), ("jge R0,1,2", 28),
 ])
 def test_known_back_edge_replays_analytical_source_and_rt_packet_occurrences(branch, taken_duration):
     source = f"move 3,R0\nnop\nbody: play 0,1,100\nsub R0,1,R0\nnop\n{branch}\nstop"
@@ -23,7 +23,7 @@ def test_known_back_edge_replays_analytical_source_and_rt_packet_occurrences(bra
     for state in (analysis, concrete):
         branches = _events(state, "q1_issue", branch.split()[0])
         assert [(event.source.line, event.duration, event.meta["branch_taken"]) for event in branches] == [
-            (6, Concrete(taken_duration), True), (6, Concrete(taken_duration), True), (6, Concrete(4), False),
+            (6, Concrete(taken_duration), True), (6, Concrete(taken_duration), True), (6, Concrete(taken_duration - 12), False),
         ]
         plays = [event for event in _events(state, "play") if event.meta["path"] == 0]
         assert [(event.source.line, event.t0, event.t1) for event in plays] == [
@@ -63,7 +63,7 @@ def test_replayed_back_edge_stops_when_its_status_becomes_unknown():
     state = _run(source)
     first, second = _events(state, "q1_issue", "jz")
     assert (first.duration, first.meta["branch_taken"]) == (Concrete(16), True)
-    assert (first.t1, second.t1) == (Concrete(52), Concrete(96))
+    assert (first.t1, second.t1) == (Concrete(48), Concrete(88))
     assert second.meta["branch_taken"] == "runtime_dependent"
     unresolved, = [event for event in _events(state, "branch_region") if event.t1 is None]
     assert unresolved.t0 == Concrete(8) and unresolved.meta["q1_issue_event_id"] == second.id
@@ -296,8 +296,8 @@ def test_nested_revisit_without_its_child_header_retains_the_observed_partial_bo
 
 
 @pytest.mark.parametrize(("setup", "counts", "rt_end", "q1_end"), [
-    ("move R1,R2", (3, 2, 1), 24, 180),
-    ("add R1,1,R2\nnop", (4, 3, 2), 36, 300),
+    ("move R1,R2", (3, 2, 1), 24, 284),
+    ("add R1,1,R2\nnop", (4, 3, 2), 36, 428),
 ])
 def test_affine_child_counts_preserve_elapsed_rt_q1_and_register_availability(setup, counts, rt_end, q1_end):
     source = f"move 3,R1\nnop\nmiddle: {setup}\ninner: wait 4\nloop R2,@inner\nloop R1,@middle\nstop"
@@ -357,8 +357,8 @@ def test_nested_count_from_an_unproved_mutating_register_keeps_the_first_child()
 
 
 @pytest.mark.parametrize(("initial", "setup", "stop_q1"), [
-    (0, "sub R1,4,R2\nnop\nsub R4,R2,R2\nnop", 320),
-    (4, "sub R4,R1,R2\nnop", 272),
+    (0, "sub R1,4,R2\nnop\nsub R4,R2,R2\nnop", 436),
+    (4, "sub R4,R1,R2\nnop", 388),
 ])
 def test_affine_child_count_preserves_words_across_a_fixed_modular_quotient(initial, setup, stop_q1):
     source = (f"move 3,R1\nmove 4,R3\nmove {initial},R4\nnop\nmiddle: {setup}\ninner: wait R3\n"
@@ -418,9 +418,9 @@ def test_affine_child_summary_ids_are_local_to_the_comparison_path():
 
 
 @pytest.mark.parametrize(("initial", "step", "periods", "final", "stop_q1"), [
-    (4, "add R3,4,R3", (8, 16, 24), 16, 232),
-    (12, "sub R3,4,R3", (24, 16, 8), 0, 232),
-    (8, "nop", (16, 16, 16), 8, 208),
+    (4, "add R3,4,R3", (8, 16, 24), 16, 336),
+    (12, "sub R3,4,R3", (24, 16, 8), 0, 336),
+    (8, "nop", (16, 16, 16), 8, 312),
 ])
 def test_invariant_child_count_composes_affine_dwell_and_register_ready_edge(initial, step, periods, final, stop_q1):
     source = (f"move 3,R1\nmove {initial},R3\nnop\nmiddle: move 2,R2\ninner: wait R3\nloop R2,@inner\n"
@@ -486,8 +486,8 @@ def test_nested_zero_dwell_endpoint_spacing_uses_the_actual_child_count(initial,
     state = _run(source, loop_preview_counts=previews)
     concrete = _run(source, execution_mode="concrete")
     assert state.rt_time_ns == concrete.rt_time_ns == Concrete(sum(periods))
-    assert state.q1_time_ns == concrete.q1_time_ns == Concrete(236)
-    assert _events(state, "q1_issue", "stop")[0].t0 == Concrete(232)
+    assert state.q1_time_ns == concrete.q1_time_ns == Concrete(340)
+    assert _events(state, "q1_issue", "stop")[0].t0 == Concrete(336)
     assert state.registers == concrete.registers == {"R1": Concrete(0), "R2": Concrete(0), "R3": Concrete(final)}
     assert [event.t0.value for event in _events(concrete, "wait") if event.duration == Concrete(0)] == list(zero_starts)
     child, parent = _events(state, "loop_block")
@@ -536,9 +536,9 @@ def test_terminal_dwell_wrap_with_a_later_body_read_remains_unproved():
 
 
 @pytest.mark.parametrize(("prelude", "count_setup", "extra_wait", "step", "periods", "stop_q1", "final_dwell"), [
-    ("move 4,R3\n", "move R1,R2", "", "add R3,4,R3", (12, 16, 12), 232, 16),
-    ("move 4,R3\n", "move R1,R2", "\nwait 0", "add R3,4,R3", (24, 24, 16), 256, 16),
-    ("move 12,R3\nmove 4,R4\n", "sub R4,R1,R2\nnop", "", "sub R3,4,R3", (12, 16, 12), 272, 0),
+    ("move 4,R3\n", "move R1,R2", "", "add R3,4,R3", (12, 16, 12), 336, 16),
+    ("move 4,R3\n", "move R1,R2", "\nwait 0", "add R3,4,R3", (24, 24, 16), 360, 16),
+    ("move 12,R3\nmove 4,R4\n", "sub R4,R1,R2\nnop", "", "sub R3,4,R3", (12, 16, 12), 388, 0),
 ])
 def test_joint_child_count_and_dwell_has_exact_nonlinear_rt_sum(prelude, count_setup, extra_wait, step, periods, stop_q1, final_dwell):
     source = (f"move 3,R1\n{prelude}nop\nmiddle: {count_setup}\ninner: wait R3{extra_wait}\nloop R2,@inner\n"
@@ -601,7 +601,7 @@ def test_affine_child_count_keeps_invariant_latched_setter_and_commit(setup, set
     concrete = _run(source, execution_mode="concrete")
     child, parent = _events(state, "loop_block")
     assert state.rt_time_ns == concrete.rt_time_ns == Concrete(24)
-    assert state.q1_time_ns == concrete.q1_time_ns == Concrete(208)
+    assert state.q1_time_ns == concrete.q1_time_ns == Concrete(312)
     assert state.registers == concrete.registers == {"R1": Concrete(0), "R2": Concrete(0)}
     assert getattr(state.latched_state, field) == getattr(concrete.latched_state, field) == Concrete(value)
     assert field not in state.latched_state.pending_event_ids
@@ -637,7 +637,7 @@ def test_affine_child_count_preserves_the_signed_awg_pair_and_commit_links(prelu
     child, parent = _events(state, "loop_block")
     assert state.rt_time_ns == concrete.rt_time_ns == Concrete(24)
     stop, = _events(state, "q1_issue", "stop")
-    assert stop.t0 == _events(concrete, "q1_issue", "stop")[0].t0 == Concrete(204 + 4 * prelude.count("\n"))
+    assert stop.t0 == _events(concrete, "q1_issue", "stop")[0].t0 == Concrete(340 if prelude else 308)
     assert state.registers == concrete.registers
     assert state.registers["R1"] == state.registers["R2"] == Concrete(0)
     assert getattr(state.latched_state, field) == getattr(concrete.latched_state, field) == tuple(map(Concrete, values))

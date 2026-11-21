@@ -60,11 +60,11 @@ def check(case: str, ir: dict) -> dict:
         equal(underflows[0]["meta"]["depth"], 0, "empty RT queue")
         equal(underflows[0]["meta"]["simulated"], True, "model failure provenance")
         equal([(event["kind"], event["meta"].get("reason"), event["t0"]["value"], event["t1"]["value"]) for event in pending],
-              [("q1_stall", "feedback_input", 4, 1200)], "unresolved feedback wait")
+              [("q1_stall", "feedback_input", 8, 1200)], "unresolved feedback wait")
         equal(receives, [], "no invented or post-failure input")
         equal(writes, [], "no invented register write")
         equal([item["category"] for item in errors], ["rt_queue_underflow"], "error diagnostic")
-        return {"status": status, "underflow_ns": 1200, "pending_feedback_since_ns": 4,
+        return {"status": status, "underflow_ns": 1200, "pending_feedback_since_ns": 8,
                 "configured_feedback_arrival_ns": 1600 if case == "06-feedback-too-late" else None}
     equal(underflows, [], "no underflow")
     if case == "07-feedback-overflow":
@@ -109,14 +109,14 @@ def check(case: str, ir: dict) -> dict:
     equal([event["meta"]["value"] for event in receives], values, "input FIFO values")
     equal([event["meta"]["input_index"] for event in receives], list(range(len(values))), "distinct input occurrences")
     equal(times(receives), [400] * len(values), "input arrival times")
-    equal([(event["t0"]["value"], event["t1"]["value"], event["meta"]["reason"]) for event in stalls], [(4, 400, "feedback_input")], "wait then resume")
+    equal([(event["t0"]["value"], event["t1"]["value"], event["meta"]["reason"]) for event in stalls], [(8, 400, "feedback_input")], "wait then resume")
     equal([(write["register"], write["time"]["value"], write["value"]["value"]) for write in writes],
-          [(f"R{index}", 408 + 8 * index, value) for index, value in enumerate(values)], "FIFO register values and readiness")
+          [(f"R{index}", 404 + 8 * index, value) for index, value in enumerate(values)], "FIFO register values and readiness")
     equal([write["meta"]["provenance"]["input_event_id"] for write in writes], [event["id"] for event in receives], "writer-to-input origins")
     equal(len(set(event["id"] for event in receives)), len(values), "duplicate values retain distinct event IDs")
     equal(times(events(ir, "stop")), [1200], "RT completion after its finite wait")
     return {"status": status, "feedback_arrival_ns": 400, "register_values": values,
-            "readable_ns": [408 + 8 * index for index in range(len(values))], "input_indices": list(range(len(values)))}
+            "readable_ns": [404 + 8 * index for index in range(len(values))], "input_indices": list(range(len(values)))}
 
 
 def run_case(case: str, directory: Path) -> dict:

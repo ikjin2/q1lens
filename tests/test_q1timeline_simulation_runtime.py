@@ -37,8 +37,8 @@ def test_buffered_rt_has_no_startup_event_or_cost_for_q1_only_work() -> None:
         "inputs": {"feedback": [{"target": "seq", "time_ns": 2_100_000, "id": 5, "value": 7}]},
     })
     assert status(late) == "completed"
-    assert events(late, "rt_queue_enqueue")[0].t0 == Concrete(2_100_008)
-    assert events(late, "wait")[0].t0 == Concrete(2_100_012)
+    assert events(late, "rt_queue_enqueue")[0].t0 == Concrete(2_100_004)
+    assert events(late, "wait")[0].t0 == Concrete(2_100_008)
     assert late.metadata["simulation"]["initial_buffer"]["prefill_ns"] == 4
 
 
@@ -87,7 +87,7 @@ def test_underflow_closes_unresumed_feedback_stall_with_pending_cause() -> None:
     state, = run("wait 4\nfb_pop_data 5,R0\nstop", startup_delay_ns=20)
     assert status(state) == "error"
     stall = events(state, "q1_stall")[0]
-    assert (stall.t0.value, stall.t1.value, stall.meta["reason"], stall.meta["pending"]) == (4, 24, "feedback_input", True)
+    assert (stall.t0.value, stall.t1.value, stall.meta["reason"], stall.meta["pending"]) == (8, 24, "feedback_input", True)
     assert state.diagnostics[-1].category == "rt_queue_underflow"
     assert state.diagnostics[-1].source is not None
 
@@ -140,7 +140,7 @@ def test_feedback_routes_wake_waiting_q1_and_keep_writer_input_provenance() -> N
     assert receive.t0 == Concrete(216)
     assert receiver.registers["R1"] == Concrete(8)
     write = next(write for write in receiver.register_history if write.register == "R0")
-    assert write.time == Concrete(224)
+    assert write.time == Concrete(220)
     assert write.meta["provenance"]["input_event_id"] == receive.id
     assert receive.meta["source_event_id"] == events(sender, "feedback_send")[0].id
 
@@ -322,7 +322,7 @@ def test_pop_and_pull_wait_for_full_linq_plus_site_delay_and_underflow_only_when
         arrival = events(receiver, "feedback_receive")[0]
         assert arrival.t0 == Concrete(784)  # 204 + 380 LINQ + 200 site transport.
         issue = next(event for event in events(receiver, "q1_issue") if event.meta["op"].startswith("fb_"))
-        assert issue.t0 == arrival.t0
+        assert issue.t0 == Concrete(8) and issue.t1 == arrival.t0
         assert issue.meta["input_event_ids"] == [arrival.id]
         assert receiver.registers["R1"] == Concrete(7)
         if "pull" in receive:

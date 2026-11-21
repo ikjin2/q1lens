@@ -2,8 +2,32 @@
 
 Select `analysis.execution_mode: simulation` in `q1timeline.yml`, or pass
 `--execution-mode simulation` to `q1lens q1timeline analyze`. In VS Code,
-`q1lens.q1timeline.executionMode: project` follows the YAML. The independent
-`concrete` and compact `analysis` modes keep their existing behavior.
+`q1lens.q1timeline.executionMode: project` follows the YAML.
+
+Concrete runs a pure single-sequencer step for each issued instruction. Simulation
+and Play share resolved Q1 results, compiled branch addresses, register visibility
+rules and latch capture. Simulation schedules physical queues and devices. Play
+uses analytical clocks and can follow a user-selected branch. Concrete can consume
+[scheduled receiver inputs](external-inputs.md).
+
+Q1 issue times use q1simulator 1.4.1, ISA 2, for the operand forms it executes.
+For example, `add R0,1,R2` takes 12 ns and `add R0,R1,R2` takes 16 ns.
+A flag branch takes 16 ns on a jump and 4 ns on fallthrough. Three-operand
+`jlt` and `jge` take 28/16 ns with a literal target and 32/20 ns with a
+register target. A source `loop` takes 32/20 ns. Device instructions outside
+the reference's executable set use the Q1Lens instruction table.
+Q1Lens resolves branch addresses and flags using its Q1ASM execution model,
+so full-program times also depend on which instructions ran. For a comparison
+that includes every iteration of a loop targeting `@_start`, clear q1simulator's
+default `skip_loops` setting.
+[q1simulator ISA 2 parser](https://github.com/sldesnoo-Delft/q1simulator/blob/v1.4.1/q1simulator/q1parser.py#L236-L249)
+and [execution core](https://github.com/sldesnoo-Delft/q1simulator/blob/v1.4.1/q1simulator/q1core.py).
+
+The core dispatches every mnemonic in the instruction table. An executed
+`sw_req`, `play_pulse` or `fb_acq_tb_mock` produces an explicit execution
+boundary. The first two lack verified execution actions in the project model.
+For the last, the documented signature specifies a duration while the description
+specifies a sample count. [Qblox Q1ASM guide](https://docs.qblox.com/en/2026.10.1/products/qblox_instruments/q1/index.html#fb_acq_tb_mock-instt)
 
 The simulator uses Q1Lens instruction semantics and a shared discrete-event clock.
 It has no q1simulator dependency. Register writes become readable after their
@@ -15,6 +39,26 @@ to exclude it. Each enabled peer must execute the matching barrier before RT
 continues. An excluded sequencer that executes `wait_sync` reports an
 unsupported configuration at that instruction.
 The trace records flags, branches, iterations, reads, writes and their provenance.
+
+The reported Q1 time of a completed run is elapsed from the first instruction.
+q1simulator places the start of Q1 at −40 ns relative to RT time zero. Q1Lens
+reports elapsed time from 0 ns and accounts for that lead when an RT instruction
+or `stop` waits for one of the 32 FIFO slots. For example, 34 consecutive
+`wait 100` instructions and a `stop` take 240 ns of Q1 elapsed time.
+Simulation also records `execution[seq].scheduled_q1_end_ns`, the Q1 stop
+time on the scenario clock used by its event trace. The corresponding elapsed
+value is `execution[seq].q1_elapsed_ns`. RT completion includes queued work
+that drains after the Q1 core stops.
+
+For the elapsed Q1 metric, FIFO releases after each enabled synchronization
+barrier include q1simulator's 200 ns sync overhead. The scenario RT timeline
+keeps its configured barrier timing. In multi-sequencer Simulation, the
+elapsed metric also includes each participant's observed wait for its peers.
+An initial `wait_sync` gives both engines a common launch reference. With
+staggered launches, q1simulator's per-sequencer origins can depend on which
+host thread reaches its first barrier before the next sequencer starts.
+[Reference sync barrier](https://github.com/sldesnoo-Delft/q1simulator/blob/v1.4.1/q1simulator/sync_barrier.py)
+and [sequencer launch offsets](https://github.com/sldesnoo-Delft/q1simulator/blob/v1.4.1/q1simulator/event_distributor.py#L119-L126).
 
 Analytical and path-playback queue checks model a finite 32-packet RT FIFO and
 assume 1 ms of initial RT buffer time. This is an unmeasured modeling assumption:
@@ -164,12 +208,15 @@ Display alignment does not change execution.
 
 `fb_pop_data id, Rdata` discards entries ahead of the requested ID, waits if
 the matching entry has yet to arrive, and writes its payload to `Rdata`. It
-takes 4 ns on Q1 once the entry is available. `fb_pull_data Rid, Rdata` takes
+fetches in 4 ns. `fb_pull_data Rid, Rdata` takes
 the oldest available FIFO entry regardless of ID and writes its ID to `Rid`
-and its payload to `Rdata`. Both operands are destination registers. It waits
-when the queue is empty and takes 8 ns on Q1 once an entry is available. Q1
-can stall while RT continues and may underflow. See the [Qblox LINQ receive
-semantics](https://docs.qblox.com/en/main/products/architecture/sequencers/linq_based_feedback.html#data-receiving).
+and its payload to `Rdata`. Both operands are destination registers. Q1Lens uses
+the q1simulator 1.4.1 fetch cost of 4 ns for both instructions. A waiting
+receive completes at the later of fetch completion and the arrival rounded
+down to a 4 ns Q1 tick. The input event retains its physical arrival time.
+Q1 can stall while RT continues and may underflow.
+[q1simulator receive timing](https://github.com/sldesnoo-Delft/q1simulator/blob/v1.4.1/q1simulator/q1core.py#L635-L657)
+· [Qblox LINQ receive semantics](https://docs.qblox.com/en/main/products/architecture/sequencers/linq_based_feedback.html#data-receiving)
 Analysis, Simulation and scheduled Play report unresolved firmware behavior for
 a selective pop above 255. Analysis retains earlier FIFO matches and leaves
 the affected receiver's remaining FIFO state incomplete.
@@ -378,7 +425,8 @@ zero-duration iterations cannot be proven. A terminal `stop` after a
 zero-duration packet uses the nominal empty-FIFO check. Queue replay can still
 find later dequeues due to packet availability or synchronization.
 
-`mulu32` and `muls32` execute on Q1 in 24 ns, with both destinations readable
+`mulu32` and `muls32` take 24 ns with an immediate input and 28 ns with two
+register inputs, with both destinations readable
 4 ns after issue completion. Both sources are read before either destination is
 written. Identical physical destinations are rejected because write priority is
 unverified. Analysis keeps that destination unknown. ZF uses the full product,
@@ -910,6 +958,41 @@ Execution is bounded by instruction and time limits. Unknown inputs and unsuppor
 instructions stop explicitly. Unverified QTM timing and encodings, multiword
 feedback formats, and undocumented firmware behavior remain outside the
 instruction model.
+
+### Independent checks for the 29 device instructions
+
+The Qblox Instruments 1.4.1 dummy Cluster assembled one valid form of each
+device instruction and rejected a form exceeding its maximum operand count. Its bundled
+assembler also reproduced the saved results for 795 operand-type patterns
+and 4,176 immediate-boundary cases across those instructions. These tests
+check accepted source encodings. [Operand types](../tests/fixtures/q1asm_signatures.json) · [Immediate boundaries](../tests/fixtures/q1asm_operand_boundaries.json)
+
+The device differential tests feed both engines the same receiver arrivals and
+compare completed Q1 issues, register values, and RT packet boundaries. A common
+trigger aligns the analytical and scheduled RT clocks. Concrete includes a FIFO
+wait in the receive issue's duration. Simulation emits separate stall events and
+can report a register write becoming ready between two issue boundaries.
+Both use common definitions for LINQ command decoding and trigger counter rules.
+The tests also check fixed command vectors and the settings each engine actually
+stores. [Device differential tests](../tests/test_q1timeline_device_differential.py)
+
+The q1simulator 1.4.0 release documents partial QCM/QRM LINQ
+coverage and excludes bus queueing and QTM-specific instructions. [q1simulator release notes](https://pypi.org/project/q1simulator/1.4.0/)
+
+### Pending hardware-in-the-loop measurements
+
+For each run, retain the module type and firmware, driver version, Q1ASM,
+configuration and stimulus together with raw readbacks, status flags and the
+time reference used for each capture. Compare the observations below against
+the corresponding model assumption before treating it as hardware evidence.
+
+| Pending measurement | Input and observation |
+| --- | --- |
+| LINQ payload packing and receive selector | Send distinguishable bit patterns through extra-byte and multiword modes. Read back FIFO IDs and raw words in order. In separate bounded runs, compare a documented selector with an assembler-accepted selector above 255 (for example 1 and 257). Record discarded, consumed or outstanding entries and sequencer status. Vary the fourth operand of `fb_acq_tb_mock` and record both word count and spacing. [LINQ receiving](https://docs.qblox.com/en/main/products/architecture/sequencers/linq_based_feedback.html#data-receiving) · [Q1ASM reference](https://docs.qblox.com/en/main/products/qblox_instruments/q1/index.html#fb_acq_tb_mock-instt) |
+| QTM fine delay, TDC recovery and bursts | Sweep adjacent fine-delay codes and move calibrated edges across both gate boundaries. Vary edge spacing in pairs and longer bursts. Capture gate displacement, raw tags, missed counts and LINQ delivery times. The reference gives a command unit of 1/128 ns, nominal 39 ps steps, and sustained/burst TDC dead times of 44 ns and under 20 ns. Measure code rounding and loss on the target module. [QTM specifications](https://docs.qblox.com/en/main/products/architecture/modules/qtm.html#specifications) |
+| Trigger delivery and simultaneous requests | Measure one route first, then issue two distinguishable requests at the same launch slot and at adjacent slots. Sweep arrivals across latch enable/reset and `wait_trigger`. Capture source and receiver markers, counter decisions and conflict flags against a common clock. The documented backplane uses a 28 ns grid and 212 ns propagation. [Trigger network](https://docs.qblox.com/en/main/products/architecture/sequencers/trigger_handling.html#trigger-network) |
+| LINQ receive FIFO overflow and recovery | The documented FIFO holds 32 entries of 32 bits each. Pause reads and send 31, 32 and 33 numbered words at a spacing known to deliver isolated words. Repeat with a read coincident with an arrival. Record the first missing or rejected word, retained order, Q1/RT progress, error flags and recovery after restart. [Receiver FIFO specification](https://docs.qblox.com/en/2026.10.1/products/architecture/sequencers/linq_based_feedback.html#data-receiving) |
+| Firmware-specific command effects | Record Q1/RT progress and observable output for `sw_req` and `play_pulse` on a supporting module. For `upd_thres`, Concrete records writes at indices 0–3 and Simulation models the low/high count thresholds at 0/1. Compare classification results before and after writing each index. For `play_netzero` and `reset_netzero`, capture the output waveform and residual area across a reset and retrigger. |
 
 Use the [verification workspace](../examples/simulation-verification/README.md)
 for runnable examples and expected values, and [continuous validation](ci-validation.md)

@@ -28,11 +28,28 @@ from q1timeline.analysis.values import (
 )
 from q1timeline.diagnostics import Diagnostic
 from q1timeline.feedback_fifo import feedback_pop_limitation
+from q1timeline.q1asm import core, core_rt
 from q1timeline.q1asm.ast import Arg, Instr, Program, SourceLocation
-from q1timeline.q1asm.compiled_addresses import CompiledAddresses, CompiledTarget, compile_addresses
+from q1timeline.q1asm.compiled_addresses import CompiledAddresses, CompiledTarget, compile_addresses, source_position
+from q1timeline.q1asm.core import (
+    FLAG_NAMES as _ALU_FLAG_NAMES,
+    FlagCase as _AluFlagCase,
+    branch_on_flags as _status_branch_decision,
+    possible_flags as _possible_alu_flags,
+    rt_dequeue_spacing_ns as _rt_dequeue_spacing_ns,
+)
+from q1timeline.q1asm.core_alu import (
+    add_flags as _add_flags,
+    logic_flags as _logic_flags,
+    operand_ranges as _alu_operand_ranges,
+    register_write_delay_slots,
+    shift_flags as _shift_flags,
+    sub_flags as _sub_flags,
+)
 from q1timeline.q1asm.instruction_table import (
     STATUS_BRANCH_OPS,
     InstructionSpec,
+    branch_duration,
     get_instruction_spec,
     rt_duration_arg_for_instruction,
 )
@@ -68,16 +85,9 @@ _ACQUISITION_FEEDBACK_TYPES = {
 }
 _VALUE_ORIGIN_SERIALS = count(1)
 _WRAPPING_CLASSICAL_OPS = {"add", "sub", "and", "or", "xor", "asl", "asr", "lsl", "lsr"}
-_ALU_FLAG_NAMES = ("zf", "nf", "cf", "of")
-_AluFlagCase = tuple[bool, bool, bool, bool]
-ILLEGAL_INSTRUCTION_FLAG = "SEQUENCE_PROCESSOR_RT_EXEC_ILLEGAL_INSTRUCTION"
-_CONCRETE_OPS = {
-    "nop", "stop", "illegal", "move", "not", "cmp", "test", *_WRAPPING_CLASSICAL_OPS,
-    "mulu16", "muls16", "mulu32", "muls32", "mulu32l", "mulu32h", "muls32l", "muls32h",
-    "jmp", "jlt", "jge", "loop", *STATUS_BRANCH_OPS,
-    "set_mrk", "set_freq", "reset_ph", "set_ph", "set_ph_delta", "set_awg_gain", "set_awg_offs",
-    "set_digital", "set_scope_en", "wait", "wait_sync", "upd_param", "play", "acquire", "acquire_weighed", "acquire_weighted",
-}
+ILLEGAL_INSTRUCTION_FLAG = core.ILLEGAL_INSTRUCTION_FLAG
+# Analysis probes and Play admit external operations through their own handlers.
+_LOCAL_EXECUTION_OPS = core.LOCAL_OPS - {"set_cond"}
 
 
 @dataclass(frozen=True)
@@ -177,6 +187,8 @@ class LatchedState:
     phase_delta: Value | None = None
     digital: tuple[Value, Value, Value] | None = None
     scope_enable: Value | None = None
+    netzero_reset: bool = False
+    time_ref: bool = False
     pending_since: dict[str, SourceLocation] = field(default_factory=dict)
     pending_event_ids: dict[str, str] = field(default_factory=dict)
 
@@ -201,6 +213,9 @@ class AnalysisState:
     conditional_else_duration: Value = field(default_factory=lambda: Concrete(0))
     conditional_time_unknown: bool = False
     q1_time_ns: Value = field(default_factory=lambda: Concrete(0))
+    rt_fifo_starts: tuple[Value, ...] = ()
+    reference_sync_ns: Value = field(default_factory=lambda: Concrete(0))
+    q1_fifo_stall_ns: int = 0
     rt_time_ns: Value = field(default_factory=lambda: Concrete(0))
     rt_trigger_epoch: int = 0
     netzero_window: _NetZeroWindow | None = None
@@ -330,6 +345,7 @@ def interpret_program(
     execution_mode: Literal["analysis", "concrete"] = "analysis",
     max_steps: int = 10000,
     prepared: PreparedDefProgram | None = None,
+    external: core.ExternalInputs | None = None,
 ) -> AnalysisState:
     if not isinstance(execution_mode, str) or execution_mode not in {"analysis", "concrete"}:
         raise ValueError(f"Invalid execution mode: {execution_mode}")
@@ -342,8 +358,7 @@ def interpret_program(
     )
     state.pc = 0
     if execution_mode == "concrete":
-        _run_concrete_program(state, symbols, waveform_names or {}, acquisition_names or {}, max_steps)
-        _apply_ready_register_writes(state)
+        _run_concrete_program(state, symbols, waveform_names or {}, acquisition_names or {}, max_steps, external=external)
     else:
         state.analysis_back_edge_limit = max_steps
         _run_program_loop(state, symbols, waveform_names or {}, acquisition_names or {})
@@ -394,7 +409,9 @@ def _prepare_program(
     return state, symbols
 
 
-def _end_concrete_execution(state: AnalysisState, status: str, reason: str, instruction: Instr | None = None) -> None:
+def _end_concrete_execution(
+    state: AnalysisState, status: str, reason: str, instruction: Instr | None = None, *, category: str | None = None,
+) -> None:
     pc = instruction.pc if instruction is not None else state.pc
     location = {"pc": pc}
     if state.compiled_addresses is not None:
@@ -406,11 +423,76 @@ def _end_concrete_execution(state: AnalysisState, status: str, reason: str, inst
         state.metadata["execution"]["source"] = _source_to_json(source)
     state.diagnostics.append(Diagnostic(
         severity="error" if status == "error" else "warning",
-        category="analysis_incomplete" if status != "error" else "invalid_argument_value",
+        category=category or ("analysis_incomplete" if status != "error" else "invalid_argument_value"),
         message=f"{state.metadata['execution']['mode'].capitalize()} execution {status}: {reason}",
         source=source,
         details={"execution_status": status, **location},
     ))
+
+
+@dataclass
+class _ConcreteMachine:
+    code: tuple[Instr, ...]
+    state: core.CoreState
+    external: core.ExternalInputs | None
+    retired_writes: tuple[core.RegisterWrite, ...] = ()
+
+
+def _concrete_bound_instruction(instruction: Instr, state: AnalysisState, scope: SymbolTable) -> Instr:
+    """Bind aliases and parameters at the issue boundary, preserving physical register operands."""
+    bound = _instruction_for_q1_timing(instruction, state, {}, scope=scope)
+    if any(arg.kind == "label" for arg in bound.args):
+        bound = replace(bound, args=[
+            Arg("imm", _arg_int(arg, scope), arg.raw) if arg.kind == "label" else arg for arg in bound.args
+        ])
+    if bound.op in core.BRANCH_OPS and instruction.args[-1].raw.startswith("$"):
+        alias = instruction.args[-1].raw[1:]
+        source = state.symbol_origins.get("defs", {}).get(alias, {}).get("raw", "")
+        if source.startswith("@"):
+            bound = replace(bound, args=[*bound.args[:-1], replace(bound.args[-1], raw=source)])
+    return bound
+
+
+def _resolved_core_issue(
+    state: AnalysisState, instruction: Instr, scope: SymbolTable, *, analysis: bool = False,
+) -> core.Issue | None:
+    """Return the local effect when the operands needed for this issue are resolved."""
+    if instruction.op not in core.LOCAL_OPS:
+        return None
+    destinations = core.destination_indexes(instruction.op)
+    if analysis:
+        # A visible word can be stale while its replacement is in the write pipeline.
+        if state.pending_register_writes and any(
+            _pending_register_write(state, register) is not None
+            for _, register in _register_read_operands(instruction, state)
+        ):
+            return None
+        if instruction.op == "loop":
+            # The counter is read and written. A project parameter with the same
+            # name does not initialize it, and its decrement cannot feed the target.
+            counter = _register_name(instruction.args[0], state)
+            if not isinstance(state.registers.get(counter), Concrete) or counter == _register_name(instruction.args[1], state):
+                return None
+        # A symbolic destination or overlapping halves of a product has no exact write.
+        registers = {_register_name(instruction.args[i], state) for i in destinations}
+        if None in registers or len(registers) != len(destinations):
+            return None
+    words = tuple(_arg_int(arg, scope) for i, arg in enumerate(instruction.args) if i not in destinations)
+    if any(word is None for index, word in enumerate(words)
+           if analysis or instruction.op != "set_cond" or words[0] != 0 or index not in (1, 2)):
+        return None
+    if (instruction.op in STATUS_BRANCH_OPS or instruction.op == "jge" and len(instruction.args) == 1
+            ) and core.branch_on_flags(instruction.op, state.alu_flags) is None:
+        return None
+    bound = _concrete_bound_instruction(instruction, state, scope)
+    try:
+        return core.issue(bound, words, state.alu_flags)
+    except ValueError:
+        # Analysis can describe unsupported concrete values (e.g. a shift by 33)
+        # with an unknown result or a diagnostic at the instruction that uses them.
+        if analysis:
+            return None
+        raise
 
 
 def _run_concrete_program(
@@ -419,26 +501,38 @@ def _run_concrete_program(
     waveform_names: dict[int, str],
     acquisition_names: dict[int, str],
     max_steps: int,
+    *, external: core.ExternalInputs | None = None,
 ) -> None:
     execution = state.metadata["execution"] = {
         "mode": "concrete", "status": "completed", "steps": 0, "max_steps": max_steps,
         "timing_model": "analytical", "address_model": _address_model(state),
         "assumptions": [
             "Sequencers execute independently; wait_sync uses a local timing origin.",
-            "Q1/RT timing is analytical; queue backpressure and external feedback are not simulated.",
+            "Q1 elapsed includes the 32-entry RT FIFO and a 40 ns Q1 startup lead.",
             "Source PCs are kept for navigation. Branch operands use compiled Q1ASM addresses."
             if state.compiled_addresses is not None else "PC values index source instructions.",
         ],
     }
+    if external is not None and (external.trigger_arrivals is not None or external.feedback_arrivals):
+        execution["assumptions"][1] = (
+            "Q1 elapsed includes the 32-entry RT FIFO. Trigger and LINQ arrivals use supplied receiver times."
+        )
     errors = [diagnostic for diagnostic in state.diagnostics
               if diagnostic.severity == "error" and not diagnostic.details.get("source_line_skipped")]
     if errors:
         status = "error" if any(item.category != "unresolved_symbol" for item in errors) else "blocked"
         _end_concrete_execution(state, status, errors[0].message)
         return
+    layout = state.compiled_addresses
+    code = (tuple(target.interior or state.instructions_by_pc[target.source_pc] for target in layout.targets.values())
+            if layout else tuple(state.instructions_by_pc.values()))
+    machine = _ConcreteMachine(code, core.CoreState(
+        pc=_compiled_pc(state, state.pc), flags=core.Flags(**state.alu_flags) if state.alu_flags is not None else None,
+        registers=tuple(_arg_int(Arg("reg", f"R{i}", f"R{i}"), state.registers) for i in range(64)),
+        q1_ns=state.q1_time_ns.value, rt_ns=state.rt_time_ns.value,
+    ), external)
     trace: list[ExecutedStep] = []
     while not state.stopped:
-        _apply_ready_register_writes(state)
         instruction = _execution_instruction(state)
         if instruction is None:
             if state.pc == len(state.instructions_by_pc) and any(
@@ -451,7 +545,6 @@ def _run_concrete_program(
         if execution["steps"] >= max_steps:
             _end_concrete_execution(state, "step_limit", f"Reached the {max_steps} instruction limit.", instruction)
             break
-        _begin_execution_step(state)
         if state.record_trace:
             scope = _scope(symbols, state)
             flags_before = dict(state.alu_flags) if state.alu_flags is not None else None
@@ -460,7 +553,7 @@ def _run_concrete_program(
             continuation = _has_jump_continuation(state, instruction)
             state.current_resolved_args = _resolved_args_for_instruction(instruction, scope, state)
             try:
-                _execute_instruction(state, instruction, symbols, waveform_names, acquisition_names)
+                _execute_instruction(state, instruction, symbols, waveform_names, acquisition_names, machine=machine)
             finally:
                 state.current_resolved_args = []
             branch_taken, branch_target = False, None
@@ -477,12 +570,16 @@ def _run_concrete_program(
                 trace.append(_executed_step(state, instruction, event_start, rt_start,
                                             branch_taken, branch_target, continuation))
         else:
-            _execute_instruction(state, instruction, symbols, waveform_names, acquisition_names)
+            _execute_instruction(state, instruction, symbols, waveform_names, acquisition_names, machine=machine)
         if execution["status"] != "completed" and "fault" not in execution:
             break
         state.executed_pcs.add(state.pc)
         state.q1_issue_index += 1
         execution["steps"] += 1
+        for write in machine.retired_writes:
+            provenance = state.pending_register_writes.pop(0)
+            assert provenance.register == f"R{write.index}"
+            _apply_register_write(state, replace(provenance, value=Concrete(write.value)))
         if "fault" in execution:
             break
         _advance_execution(state)
@@ -570,7 +667,7 @@ def _concrete_instruction_ready(
     state: AnalysisState, instruction: Instr, symbols: SymbolTable,
     spec: InstructionSpec, has_invalid_arguments: bool, diagnostic_start: int,
     *, supported_ops: set[str] | None = None, allow_symbolic_operands: bool = False,
-    rt_duration_error: Diagnostic | None = None,
+    rt_duration_error: Diagnostic | None = None, scope: SymbolTable | None = None,
 ) -> bool:
     diagnostics = state.diagnostics[diagnostic_start:]
     errors = [item for item in diagnostics if (item.severity == "error" and item.category != "unresolved_symbol") or item.category == "register_not_ready"]
@@ -582,12 +679,13 @@ def _concrete_instruction_ready(
         _end_concrete_execution(state, "error", rt_duration_error.message, instruction)
         state.diagnostics[-1].details.update(rt_duration_error.details)
         return False
-    if (instruction.op not in (_CONCRETE_OPS if supported_ops is None else supported_ops)
+    if (instruction.op not in (_LOCAL_EXECUTION_OPS if supported_ops is None else supported_ops)
             and not _set_cond_is_disabled(state, instruction, symbols)):
         status = "error" if spec.category == "unknown" else "blocked"
         _end_concrete_execution(state, status, f"{instruction.op} has no supported concrete execution semantics.", instruction)
         return False
-    scope = _scope(symbols, state)
+    if scope is None:
+        scope = _scope(symbols, state)
     condition_disabled = _set_cond_is_disabled(state, instruction, symbols)
     if instruction.op in {"mulu32", "muls32"} and not has_invalid_arguments:
         if _register_name(instruction.args[2], state) == _register_name(instruction.args[3], state):
@@ -951,24 +1049,69 @@ def _execute_instruction(
     waveform_names: dict[int, str],
     acquisition_names: dict[int, str],
     *,
+    machine: _ConcreteMachine | None = None,
+    share_resolved_issue: bool = False,
     allow_symbolic_operands: bool = False,
     rt_condition_decision: bool | None = None,
 ) -> None:
     binding = state.bound_instructions.get(instruction.pc) if state.interior_pc is None else None
     spec, has_invalid_arguments, diagnostic_start = _validate_instruction(state, instruction, symbols, binding)
-    scope = _scope(symbols, state) if state.record_trace or spec.emits_rt_packet or instruction.op == "set_cond" else {}
+    needs_scope = state.execution_mode == "concrete" or state.record_trace or spec.emits_rt_packet or instruction.op in core.LOCAL_OPS
+    scope = _scope(symbols, state) if needs_scope else {}
     register_metadata = _register_issue_metadata(state, instruction, scope) if state.record_trace else None
     duration_error = None if has_invalid_arguments else _invalid_rt_duration(instruction, spec, scope)
 
+    transition = None
+    core_issue = None
     if state.execution_mode == "concrete":
         if not _concrete_instruction_ready(
             state, instruction, symbols, spec, has_invalid_arguments, diagnostic_start,
-            supported_ops=(_CONCRETE_OPS | {instruction.op}) if allow_symbolic_operands else None,
-            allow_symbolic_operands=allow_symbolic_operands, rt_duration_error=duration_error,
+            supported_ops=(core.SOURCE_OPS if machine is not None else
+                           (_LOCAL_EXECUTION_OPS | {instruction.op}) if allow_symbolic_operands else None),
+            allow_symbolic_operands=allow_symbolic_operands, rt_duration_error=duration_error, scope=scope,
         ):
             return
-        if spec.category == "branch" and not _concrete_branch_destination_ready(state, instruction, _scope(symbols, state)):
-            return
+        if machine is not None:
+            bound = _concrete_bound_instruction(instruction, state, scope)
+            try:
+                transition = core.step(machine.state, machine.code, instruction=bound, external=machine.external)
+            except core.FeedbackOverflow as error:
+                state.q1_time_ns = Concrete(error.time_ns)
+                category = "feedback_queue_overflow"
+                _end_concrete_execution(state, "error", str(error), instruction, category=category)
+                details = {"capacity": error.capacity, "id": error.identifier, "reason": "queue_full", "time_basis": "q1"}
+                state.diagnostics[-1].details.update(details, time_ns=error.time_ns)
+                state.metadata["execution"]["terminal"] = {"core": "q1", "local_time_ns": error.time_ns,
+                                                          "category": category, "display_reason": str(error)}
+                if state.record_trace:
+                    marker = _emit_event(state, lane="rt.feedback", kind="feedback_rejected", t0=state.q1_time_ns,
+                                         t1=state.q1_time_ns, duration=Concrete(0), label="Rejected LINQ arrival",
+                                         confidence="assumed", source=instruction.source, meta=details)
+                    state.diagnostics[-1].related_events.append(marker.id)
+                return
+            except core.CoreBlocked as error:
+                _end_concrete_execution(state, "blocked", str(error), instruction)
+                return
+            except ValueError as error:
+                reason = str(error)
+                if spec.category == "branch" and reason.startswith("No instruction at compiled PC"):
+                    reason = _invalid_branch_target_reason(state, resolve_arg_value(instruction.args[-1], scope))
+                _end_concrete_execution(state, "error", reason, instruction)
+                return
+            machine.state = transition.state
+            machine.retired_writes = transition.retired_writes
+            core_issue = transition.issue
+            state.next_pc, state.next_interior_pc = source_position(
+                state.compiled_addresses, machine.state.pc, len(state.instructions_by_pc),
+            )
+        elif share_resolved_issue:
+            core_issue = _resolved_core_issue(state, instruction, scope)
+        if machine is None and spec.category == "branch":
+            taken = core_issue.taken if core_issue is not None else None
+            if not _concrete_branch_destination_ready(state, instruction, scope, taken):
+                return
+    elif state.execution_mode == "analysis" and not has_invalid_arguments and duration_error is None:
+        core_issue = _resolved_core_issue(state, instruction, scope, analysis=True)
 
     q1_t0 = state.q1_time_ns
     raw_linq_op = raw_linq_operation(_arg_int(instruction.args[0], scope)) if (
@@ -976,12 +1119,31 @@ def _execute_instruction(
     ) else None
     applies_latched_state = spec.applies_latched_state or raw_linq_op == "upd_thres"
     duration_ns = binding.duration_ns if binding is not None else None
-    if raw_linq_op == "upd_thres":
+    # Analysis revises conditional timing after it validates the destination and chooses a path.
+    analysis_conditional = state.execution_mode == "analysis" and spec.category == "branch" and instruction.op != "jmp"
+    if core_issue is not None and not analysis_conditional:
+        duration_ns = core_issue.q1_duration
+    elif raw_linq_op == "upd_thres":
         duration_ns = get_instruction_spec(raw_linq_op).q1_time_model(instruction)
     elif duration_ns is None:
         duration_ns = spec.q1_time_model(_instruction_for_q1_timing(instruction, state, symbols))
     q1_duration = Concrete(duration_ns)
-    q1_t1 = add_values(q1_t0, q1_duration)
+    q1_t1 = Concrete(transition.state.q1_ns) if transition is not None else add_values(q1_t0, q1_duration)
+    state.q1_fifo_stall_ns = 0
+    if (spec.emits_rt_packet or instruction.op == "stop") and not has_invalid_arguments and duration_error is None:
+        if transition is None:
+            release = add_values(state.rt_time_ns, state.reference_sync_ns)
+            if len(state.rt_fifo_starts) == core.RT_FIFO_CAPACITY:
+                oldest = state.rt_fifo_starts[0]
+                if isinstance(q1_t1, Concrete) and isinstance(oldest, Concrete):
+                    q1_t1 = Concrete(core.queued_q1_completion(q1_t1.value, oldest.value))
+                elif not (isinstance(q1_t1, Concrete) and isinstance(release, Concrete)
+                          and q1_t1.value >= release.value + core.Q1_START_LEAD_NS):
+                    q1_t1 = Unknown("RT FIFO release time is unresolved")
+            if spec.emits_rt_packet:
+                state.rt_fifo_starts = (*state.rt_fifo_starts[-(core.RT_FIFO_CAPACITY - 1):], release)
+        if isinstance(q1_t1, Concrete) and isinstance(q1_t0, Concrete):
+            state.q1_fifo_stall_ns = q1_t1.value - q1_t0.value - duration_ns
     state.q1_time_ns = q1_t1
 
     rt_packet_id: str | None = None
@@ -1012,7 +1174,7 @@ def _execute_instruction(
                                    details=unsupported.details)
             return
 
-    if rt_condition_decision is not False and (
+    if transition is None and rt_condition_decision is not False and (
         instruction.op != "set_cond" or state.metadata.get("execution", {}).get("mode") != "playback"
     ):
         _diagnose_analysis_incomplete_timing_effect(state, instruction, spec, symbols)
@@ -1022,7 +1184,8 @@ def _execute_instruction(
         return
 
     if spec.category == "classical":
-        _execute_classical(state, instruction, symbols)
+        if instruction.op != "nop":
+            _execute_classical(state, instruction, symbols, core_issue=core_issue)
         if state.record_trace:
             _emit_q1_issue(state, instruction, q1_t0, q1_t1, rt_packet_id, register_metadata=register_metadata)
         return
@@ -1035,7 +1198,9 @@ def _execute_instruction(
                 _end_analysis_at_issue(state, issue, "unsupported_latched_register_value", unsupported.message,
                                        details=unsupported.details)
                 return
-        pending_event = _execute_latched(state, instruction, symbols)
+        pending_event = _execute_latched(state, instruction, symbols,
+                                         latch_write=core_issue.latch_write if core_issue else None,
+                                         condition=core_issue.condition if core_issue else None)
         q1_issue_event = _emit_q1_issue(state, instruction, q1_t0, q1_t1, rt_packet_id, register_metadata=register_metadata)
         if pending_event is not None:
             pending_event.meta["q1_issue_event_id"] = q1_issue_event.id
@@ -1054,9 +1219,20 @@ def _execute_instruction(
                     details={"op": instruction.op, "selector": selector.value, "feedback_fifo_incomplete": True},
                 )
                 return
-        _execute_feedback_register_write(state, instruction, symbols)
+        if transition is None:
+            _execute_feedback_register_write(state, instruction, symbols)
+        else:
+            for index, word in zip(core.destination_indexes(instruction.op), transition.issue.words, strict=True):
+                register = _register_name(instruction.args[index], state)
+                value = Concrete(word)
+                expression = f"{instruction.op} FIFO {'id' if instruction.op == 'fb_pull_data' and index == 0 else 'payload'}"
+                provenance = _register_provenance(state, register, expression=expression, value=value,
+                                                  steps=[_provenance_step(instruction, expression, value)])
+                _schedule_register_write(state, instruction, register, value, provenance)
         q1_issue_event = _emit_q1_issue(state, instruction, q1_t0, q1_t1, rt_packet_id, register_metadata=register_metadata)
-        _emit_feedback_annotation(state, instruction, q1_issue_event, symbols)
+        receipt = (machine.external.feedback_arrivals[transition.state.devices.feedback_cursor - 1]
+                   if transition is not None else None)
+        _emit_feedback_annotation(state, instruction, q1_issue_event, symbols, receipt=receipt)
         return
 
     if state.execution_mode == "analysis" and instruction.op == "sw_req":
@@ -1068,12 +1244,15 @@ def _execute_instruction(
     if instruction.op == "illegal":
         issue = (_emit_q1_issue(state, instruction, q1_t0, q1_t1, None, register_metadata=register_metadata)
                  if state.record_trace else None)
-        _record_illegal_instruction(state, instruction, issue)
+        flag = core_issue.fault if core_issue is not None else ILLEGAL_INSTRUCTION_FLAG
+        assert flag is not None
+        _record_illegal_instruction(state, instruction, issue, flag=flag)
         return
 
     if instruction.op == "stop":
         meta = {"output_state_unknown": False} if state.conditional_time_unknown else {}
-        meta["stop_code"] = _record_stop_code(state, instruction, _scope(symbols, state))
+        meta["stop_code"] = _record_stop_code(state, instruction, scope,
+                                              code=core_issue.stop_code if core_issue is not None else None)
         if state.record_trace or state.latched_state.pending_since:
             issue = _emit_q1_issue(state, instruction, q1_t0, q1_t1, rt_packet_id, register_metadata=register_metadata)
             issue.meta["stop_code"] = meta["stop_code"]
@@ -1097,7 +1276,8 @@ def _execute_instruction(
     if spec.category == "branch" and state.execution_mode == "concrete":
         issue = _emit_q1_issue(state, instruction, q1_t0, q1_t1, None,
                                register_metadata=register_metadata) if state.record_trace else None
-        _execute_concrete_branch(state, instruction, issue, symbols, q1_t0=q1_t0)
+        _execute_concrete_branch(state, instruction, issue, symbols, q1_t0=q1_t0, branch_issue=core_issue,
+                                 projected=transition is not None)
         return
     if spec.emits_rt_packet:
         rt_packet_id = f"{state.sequencer_id}:p{len(state.rt_packets)}"
@@ -1114,7 +1294,8 @@ def _execute_instruction(
                         source=instruction.source, meta={"reason": hazard.category, "q1_issue_event_id": q1_issue_event.id})
             state.stopped = True
         else:
-            _execute_branch(state, instruction, q1_issue_event, symbols, waveform_names, acquisition_names)
+            _execute_branch(state, instruction, q1_issue_event, symbols, waveform_names, acquisition_names,
+                            branch_issue=core_issue)
         if state.stopped:
             _flush_pending_register_writes(state, completed_issue_index=state.q1_issue_index + 1)
             _invalidate_register_history(
@@ -1143,7 +1324,7 @@ def _execute_instruction(
         _execute_rt_instruction(
             state,
             instruction,
-            symbols,
+            scope,
             waveform_names,
             acquisition_names,
             q1_t0,
@@ -1152,11 +1333,26 @@ def _execute_instruction(
             q1_issue_event,
             rt_condition_decision=rt_condition_decision,
             raw_linq_op=raw_linq_op,
+            wait_duration=core_issue.wait_duration if core_issue is not None else None,
+            core_packet=transition.packet if transition is not None else None,
         )
         if state.stopped:
             return
         if state.rt_packets and state.rt_packets[-1].id == rt_packet_id:
-            _advance_after_zero_duration(state, state.rt_packets[-1], event_start - 1)
+            _advance_after_zero_duration(state, state.rt_packets[-1], event_start - 1,
+                                         next_rt=transition.state.rt_ns if transition is not None else None)
+        if transition is not None:
+            state.rt_time_ns = Concrete(transition.state.rt_ns)
+            state.reference_sync_ns = Concrete(transition.state.reference_sync_ns)
+        elif instruction.op == "wait_sync" and state.rt_packets and state.rt_packets[-1].id == rt_packet_id:
+            packet = state.rt_packets[-1]
+            dwell = resolve_arg_value(instruction.args[-1], scope)
+            adjustment = (Concrete(core.reference_sync_adjustment(dwell.value, packet.duration.value))
+                          if isinstance(dwell, Concrete) and isinstance(packet.duration, Concrete)
+                          else Unknown("Reference wait_sync duration is unresolved"))
+            if adjustment != Concrete(core.Q1_CORE_SYNC_OVERHEAD_NS):
+                packet.meta["q1_reference_sync_adjustment_ns"] = adjustment.value if isinstance(adjustment, Concrete) else None
+            state.reference_sync_ns = add_values(state.reference_sync_ns, adjustment)
         if applies_latched_state:
             _finish_nco_issue(state, q1_issue_event, rt_packet_id, event_start,
                               phase_reset, nco_pending, nco_settings)
@@ -1729,17 +1925,11 @@ def _register_write_operands(instruction: Instr, state: AnalysisState) -> set[st
 
 
 def _register_destination_argument_indexes(op: str) -> set[int]:
-    if op in {"move", "not"}:
-        return {1}
-    if op in {"add", "sub", "and", "or", "xor", "asl", "asr", "lsl", "lsr", "mulu16", "muls16", "mulu32l", "mulu32h", "muls32l", "muls32h"}:
-        return {2}
-    if op in {"mulu32", "muls32"}:
-        return {2, 3}
     if op == "fb_pop_data":
         return {1}
     if op == "fb_pull_data":
         return {0, 1}
-    return set()
+    return set(core.destination_indexes(op))
 
 
 def _pending_register_write(state: AnalysisState, register: str) -> PendingRegisterWrite | None:
@@ -1912,7 +2102,7 @@ def _schedule_register_write(
             value=value,
             provenance=provenance,
             source=instruction.source,
-            available_issue_index=state.q1_issue_index + 2,
+            available_issue_index=state.q1_issue_index + 1 + register_write_delay_slots(instruction.op),
             event_id=event_id,
             meta={
                 "op": instruction.op,
@@ -2149,93 +2339,18 @@ def _is_packed_feedback_register_form(instruction: Instr, state: AnalysisState) 
 
 
 def _official_operand_ranges(op: str, argument_count: int = 1) -> list[tuple[int, str, int, int]]:
-    signed_16 = (-32768, 32767)
     signed_32 = (-2147483648, 2147483647)
     classical_imm = (-2147483648, 0xFFFFFFFF)
-    acquisition_idx = (0, 31)
-    bin_idx = (0, 16777215)
-    feedback_idx = (0, 255)
+    if op in core.DEVICE_RANGES:
+        return list(core.DEVICE_RANGES[op])
+    if op in core_rt.OPERAND_RANGES:
+        return list(core_rt.OPERAND_RANGES[op])
     if op == "stop":
         return [(0, "stop_status", *signed_32)]
     if op == "sw_req":
         return [(0, "software_request", *signed_32)]
-    if op == "play_pulse":
-        return [(0, "fine_output_delay", 0, 2047)]
-    if op == "play_netzero":
-        return [(0, "maximum_compensation_length", 0, 0xFFFFFFFF)]
-    if op == "set_mrk":
-        return [(0, "marker", 0, 15)]
-    if op == "set_awg_gain":
-        return [(0, "awg_gain", *signed_16), (1, "awg_gain", *signed_16)]
-    if op == "set_awg_offs":
-        return [(0, "awg_offset", *signed_16), (1, "awg_offset", *signed_16)]
-    if op == "set_freq":
-        return [(0, "frequency", *signed_32)]
-    if op == "set_ph":
-        return [(0, "phase", 0, 1000000000)]
-    if op == "set_ph_delta":
-        return [(0, "phase_delta", 0, 1000000000)]
-    if op == "set_digital":
-        return [(0, "digital_value", 0, 255), (1, "digital_mask", 0, 255), (2, "digital_delay", 0, 2047)]
-    if op == "set_scope_en":
-        return [(0, "scope_enable", 0, 1)]
-    if op == "set_cond":
-        return [
-            (0, "condition_enable", 0, 1),
-            (1, "condition_mask", 0, 32767),
-            (2, "condition_operator", 0, 7),
-            (3, "else_duration", 0, _RT_DURATION_MAX),
-        ]
-    if op == "set_latch_en":
-        return [(0, "enable_flag", 0, 1)]
-    if op == "wait_trigger":
-        return [(0, "trigger_index", 0, 15)]
-    if op == "upd_thres":
-        return [(0, "threshold_index", 0, 3), (1, "threshold_value", 0, 0xFFFFFFFF)]
-    if op == "play":
-        return [(0, "waveform_index", 0, 1023), (1, "waveform_index", 0, 1023)]
-    if op in {"acquire", "acquire_digital"}:
-        return [(0, "acquisition_index", *acquisition_idx), (1, "bin_index", *bin_idx)]
-    if op in {"acquire_weighed", "acquire_weighted"}:
-        return [
-            (0, "acquisition_index", *acquisition_idx),
-            (1, "bin_index", *bin_idx),
-            (2, "weight_index", 0, 63),
-            (3, "weight_index", 0, 63),
-        ]
-    if op == "acquire_ttl":
-        return [
-            (0, "acquisition_index", *acquisition_idx),
-            (1, "bin_index", *bin_idx),
-            (2, "input_index", 0, 1),
-        ]
-    if op == "acquire_timetags":
-        return [
-            (0, "acquisition_index", *acquisition_idx),
-            (1, "bin_index", *bin_idx),
-            (2, "input_index", 0, 1),
-            (3, "tag_index", 0, 2047),
-        ]
     if op == "fb_pop_data":
         return [(0, "feedback_pop_tag", 0, 65535)]
-    if op == "fb_cmd":
-        return [(0, "feedback_channel", 0, 511), (1, "feedback_source", 0, 0xFFFFFFFF)]
-    if op == "fb_com_data":
-        return [(0, "feedback_channel", *feedback_idx), (1, "feedback_source", 0, 0xFFFFFFFF)]
-    if op in {"fb_com_cfg", "fb_acq_tb_cfg"}:
-        return [(0, "write_combine_flag", 0, 3), (1, "bit_position", 0, 1023), (2, "payload_length", 0, 127)]
-    if op in {"fb_com_extra", "fb_acq_tb_extra"}:
-        return [(0, "enable_flag", 0, 1), (1, "extra_payload_bytes", 0, 65535)]
-    if op in {"fb_acq_iq_id", "fb_acq_tb_id"}:
-        return [(0, "feedback_acquisition_channel", 0, 255)]
-    if op == "fb_acq_tb_valid":
-        return [(0, "feedback_acquisition_channel", 0, 1)]
-    if op in {"fb_llp_tags_id", "fb_llp_ttls_id", "fb_tdc_tags_id", "fb_tdc_tdelta_id"}:
-        return [(0, "feedback_channel", 0, 255)]
-    if op == "fb_acq_iq_shift":
-        return [(0, "shift_count", 0, 63)]
-    if op == "fb_acq_tb_mock":
-        return [(0, "enable_flag", 0, 1), (1, "valid_bit", 0, 1), (2, "mock_data", 0, 1)]
     if op == "jmp" or (op == "jge" and argument_count == 1):
         return [(0, "branch_target", 0, 16383)]
     if op in {"jge", "jlt"}:
@@ -2247,36 +2362,7 @@ def _official_operand_ranges(op: str, argument_count: int = 1) -> list[tuple[int
         return [(0, "branch_target", 0, 16383)]
     if op == "loop":
         return [(1, "branch_target", 0, 16383)]
-    if op in {"move", "not"}:
-        return [(0, "classical_immediate", *classical_imm)]
-    if op in {"add", "sub", "and", "or", "xor"}:
-        return [(0, "classical_immediate", *classical_imm), (1, "classical_immediate", *classical_imm)]
-    if op in {"asl", "asr"}:
-        return [
-            (0, "signed_shift_immediate", *signed_32),
-            (1, "unsigned_shift_immediate", 0, 0xFFFFFFFF),
-        ]
-    if op in {"lsl", "lsr"}:
-        return [
-            (0, "unsigned_shift_immediate", 0, 0xFFFFFFFF),
-            (1, "unsigned_shift_immediate", 0, 0xFFFFFFFF),
-        ]
-    if op == "cmp":
-        return [(0, "classical_immediate", *classical_imm), (1, "classical_immediate", *classical_imm)]
-    if op == "mulu16":
-        return [(0, "unsigned_16_immediate", 0, 0xFFFF), (1, "unsigned_16_immediate", 0, 0xFFFF)]
-    if op == "muls16":
-        return [(0, "signed_16_immediate", -32768, 32767), (1, "signed_16_immediate", -32768, 32767)]
-    if op in {"mulu32", "mulu32l", "mulu32h"}:
-        return [(0, "unsigned_32_immediate", 0, 0xFFFFFFFF), (1, "unsigned_32_immediate", 0, 0xFFFFFFFF)]
-    if op in {"muls32", "muls32l", "muls32h"}:
-        return [
-            (0, "signed_32_immediate", -2147483648, 2147483647),
-            (1, "signed_32_immediate", -2147483648, 2147483647),
-        ]
-    if op == "test":
-        return [(0, "classical_immediate", *classical_imm), (1, "classical_immediate", *classical_imm)]
-    return []
+    return _alu_operand_ranges(op)
 
 
 def _non_negative_operand_roles(op: str) -> list[tuple[int, str]]:
@@ -2375,8 +2461,13 @@ def _should_reject_unresolved_rt_index_operand(op: str, operand_role: str) -> bo
     )
 
 
-def _instruction_for_q1_timing(instruction: Instr, state: AnalysisState, symbols: SymbolTable) -> Instr:
-    scope = _scope(symbols, state)
+def _instruction_for_q1_timing(
+    instruction: Instr, state: AnalysisState, symbols: SymbolTable, *, scope: SymbolTable | None = None,
+) -> Instr:
+    if not any(arg.kind in {"symbol", "placeholder"} for arg in instruction.args):
+        return instruction
+    if scope is None:
+        scope = _scope(symbols, state)
     args: list[Arg] = []
     changed = False
     for arg in instruction.args:
@@ -2392,6 +2483,11 @@ def _instruction_for_q1_timing(instruction: Instr, state: AnalysisState, symbols
         args=args,
         source=instruction.source,
     )
+
+
+def _branch_taken_duration(instruction: Instr, state: AnalysisState, symbols: SymbolTable) -> int:
+    bound = _instruction_for_q1_timing(instruction, state, symbols)
+    return get_instruction_spec(instruction.op).q1_time_model(bound)
 
 
 def _arg_for_q1_timing(arg: Arg, state: AnalysisState, scope: SymbolTable) -> Arg:
@@ -2507,10 +2603,10 @@ def _concrete_branch_test(
 
 
 def _concrete_branch_destination_ready(
-    state: AnalysisState, instruction: Instr, scope: SymbolTable, forced_decision: bool | None = None,
+    state: AnalysisState, instruction: Instr, scope: SymbolTable, taken: bool | None = None,
 ) -> bool:
-    natural, _ = _concrete_branch_test(state, instruction, scope)
-    taken = natural if forced_decision is None else forced_decision
+    if taken is None:
+        taken, _ = _concrete_branch_test(state, instruction, scope)
     if not taken:
         return True
     target_index = 1 if instruction.op == "loop" else 2 if len(instruction.args) == 3 else 0
@@ -2524,20 +2620,27 @@ def _concrete_branch_destination_ready(
 def _execute_concrete_branch(
     state: AnalysisState, instruction: Instr, q1_issue_event: TimelineEvent | None, symbols: SymbolTable,
     *, q1_t0: Value | None = None, defer_register_write: bool = False, forced_decision: bool | None = None,
+    branch_issue: core.Issue | None = None, projected: bool = False,
 ) -> None:
     if forced_decision is not None and (type(forced_decision) is not bool or instruction.op == "jmp"):
         raise ValueError("A forced branch decision must be a boolean for a conditional branch")
     scope = _scope(symbols, state)
     target_index = 1 if instruction.op == "loop" else 2 if len(instruction.args) == 3 else 0
     target = _execution_target(state, resolve_arg_value(instruction.args[target_index], scope))
-    decision, flags = _concrete_branch_test(state, instruction, scope)
+    if branch_issue is not None:
+        decision = branch_issue.taken
+        flags = branch_issue.flags.as_dict() if branch_issue.flags is not None else None
+    else:
+        decision, flags = _concrete_branch_test(state, instruction, scope)
     if flags is not None:
         _set_alu_flags(state, instruction, flags)
     counter_write = None
     if instruction.op == "loop":
         register = _register_name(instruction.args[0], state)
-        previous = state.registers[register]
-        value = Concrete((previous.value - 1) & _CLASSICAL_REGISTER_MASK)
+        if branch_issue is None:
+            value = Concrete((state.registers[register].value - 1) & _CLASSICAL_REGISTER_MASK)
+        else:
+            value = Concrete(branch_issue.words[0])
         event_id = q1_issue_event.id if q1_issue_event is not None else ""
         provenance = {}
         if state.record_trace:
@@ -2548,19 +2651,21 @@ def _execute_concrete_branch(
             provenance = _concrete_write_provenance(state, instruction, provenance, event_id)
         counter_write = PendingRegisterWrite(
             register, value, provenance,
-            instruction.source, state.q1_issue_index + 1, event_id, {"op": "loop"},
+            instruction.source, state.q1_issue_index + 1 + register_write_delay_slots(instruction.op), event_id, {"op": "loop"},
         )
     if forced_decision is not None:
         if q1_issue_event is not None:
             q1_issue_event.meta.update(natural_branch_taken=decision, branch_overridden=True,
                                       assumption_source="user", assumed_branch_path="taken" if forced_decision else "fallthrough")
         decision = forced_decision
-    duration = 24 if instruction.op in {"loop", "jlt", "jge"} else 16
-    duration = duration if decision else 4
+    if branch_issue is not None:
+        duration = branch_issue.q1_duration
+    else:
+        duration = branch_duration(_branch_taken_duration(instruction, state, symbols), decision)
     if q1_issue_event is not None:
         q1_t0 = q1_issue_event.t0
     assert q1_t0 is not None
-    q1_t1 = add_values(q1_t0, Concrete(duration))
+    q1_t1 = state.q1_time_ns if projected else add_values(q1_t0, Concrete(duration))
     if q1_issue_event is not None:
         state.events[-1] = replace(q1_issue_event, t1=q1_t1, duration=Concrete(duration),
                                   confidence="assumed" if forced_decision is not None else q1_issue_event.confidence)
@@ -2572,10 +2677,10 @@ def _execute_concrete_branch(
             state.pending_register_writes.append(counter_write)
         else:
             _apply_register_write(state, counter_write)
-    if decision:
+    if decision and not projected:
         assert target is not None
         _set_execution_target(state, target)
-    elif forced_decision is not None:
+    elif forced_decision is not None and not projected:
         _begin_execution_step(state)
 
 
@@ -2615,9 +2720,12 @@ def _execute_branch(
     symbols: SymbolTable,
     waveform_names: dict[int, str],
     acquisition_names: dict[int, str],
+    *,
+    branch_issue: core.Issue | None = None,
 ) -> None:
     if len(instruction.args) == 1 and (instruction.op in STATUS_BRANCH_OPS or instruction.op == "jge"):
-        _execute_status_branch(state, instruction, q1_issue_event, symbols, waveform_names, acquisition_names)
+        _execute_status_branch(state, instruction, q1_issue_event, symbols, waveform_names, acquisition_names,
+                               branch_issue=branch_issue)
         return
     if state.compiled_addresses is not None and instruction.args and (instruction.op != "loop" or len(instruction.args) >= 2):
         target_index = 1 if instruction.op == "loop" else 2 if len(instruction.args) == 3 else 0
@@ -2639,13 +2747,14 @@ def _execute_branch(
                     q1_issue_event.meta.update(source_pc=instruction.pc, **_branch_target_metadata(target, state))
                     if instruction.op in {"jlt", "jge"}:
                         _execute_conditional_branch(state, instruction, q1_issue_event, symbols,
-                                                    waveform_names, acquisition_names, interior_target=target)
+                                                    waveform_names, acquisition_names, interior_target=target,
+                                                    branch_issue=branch_issue)
                         return
                     if instruction.op == "loop":
                         counter = _register_name(instruction.args[0], state)
                         count = state.registers.get(counter)
                         if isinstance(count, Concrete) and (count == Concrete(1) or target.source_pc > instruction.pc):
-                            _execute_concrete_branch(state, instruction, q1_issue_event, symbols)
+                            _execute_concrete_branch(state, instruction, q1_issue_event, symbols, branch_issue=branch_issue)
                             if state.next_interior_pc is None or _can_follow_compiled_interior(
                                 state, instruction, target, symbols
                             ):
@@ -2675,7 +2784,7 @@ def _execute_branch(
                               for _, register in _register_read_operands(instruction, state))
         if falls_through_unloaded or (target is not None and target.source_pc > instruction.pc):
             if isinstance(count, Concrete) and not pending_operand:
-                _execute_concrete_branch(state, instruction, q1_issue_event, symbols)
+                _execute_concrete_branch(state, instruction, q1_issue_event, symbols, branch_issue=branch_issue)
                 if target_label is not None:
                     q1_issue_event.meta["target_label"] = target_label
                 return
@@ -2695,6 +2804,7 @@ def _execute_branch(
                 count=count,
                 forever=False,
                 symbols=symbols,
+                branch_issue=branch_issue,
             )
             if not created:
                 _collapse_forward_loop_branch(
@@ -2712,7 +2822,7 @@ def _execute_branch(
                 q1_issue_event.meta.update(_branch_target_metadata(target, state))
                 if _emit_compact_loop(
                     state, instruction, q1_issue_event=q1_issue_event, start_pc=target.source_pc, target_label=None,
-                    counter_reg=counter_reg, count=count, forever=False, symbols=symbols,
+                    counter_reg=counter_reg, count=count, forever=False, symbols=symbols, branch_issue=branch_issue,
                 ):
                     return
             _collapse_backward_numeric_branch(
@@ -2785,7 +2895,8 @@ def _execute_branch(
                 target_arg,
             )
     elif instruction.op in {"jge", "jlt"} and len(instruction.args) >= 3:
-        _execute_conditional_branch(state, instruction, q1_issue_event, symbols, waveform_names, acquisition_names)
+        _execute_conditional_branch(state, instruction, q1_issue_event, symbols, waveform_names, acquisition_names,
+                                    branch_issue=branch_issue)
 
 
 def _revise_q1_issue_duration(state: AnalysisState, event: TimelineEvent, duration: int) -> TimelineEvent:
@@ -2798,44 +2909,6 @@ def _revise_q1_issue_duration(state: AnalysisState, event: TimelineEvent, durati
             break
     state.q1_time_ns = q1_t1
     return updated
-
-
-def _possible_alu_flags(flags: dict[str, bool] | None) -> frozenset[_AluFlagCase]:
-    known = flags or {}
-    return frozenset(product(*[(known[name],) if name in known else (False, True) for name in _ALU_FLAG_NAMES]))
-
-
-def _status_branch_decision(
-    op: str, flags: dict[str, bool] | None, cases: frozenset[_AluFlagCase] | None = None,
-) -> bool | None:
-    if cases is not None or (flags is not None and len(flags) < len(_ALU_FLAG_NAMES)):
-        possibilities = cases if cases is not None else _possible_alu_flags(flags)
-        decisions = {_status_branch_decision(op, dict(zip(_ALU_FLAG_NAMES, values))) for values in possibilities}
-        return decisions.pop() if len(decisions) == 1 else None
-    if flags is None:
-        return None
-    zf = flags["zf"]
-    nf = flags["nf"]
-    cf = flags["cf"]
-    of = flags["of"]
-    decisions = {
-        "jz": zf,
-        "jnz": not zf,
-        "jo": of,
-        "jno": not of,
-        "js": nf,
-        "jns": not nf,
-        "jg": (not zf) and (nf == of),
-        "jl": nf != of,
-        "jle": zf or (nf != of),
-        # Qblox docs describe jge, but the Core actions line appears to repeat jg.
-        "jge": nf == of,
-        "ja": (not cf) and (not zf),
-        "jae": not cf,
-        "jb": cf,
-        "jbe": cf or zf,
-    }
-    return decisions.get(op)
 
 
 def _refine_status_branch_arm(state: AnalysisState, op: str, *, taken: bool) -> None:
@@ -2882,6 +2955,8 @@ def _execute_status_branch(
     symbols: SymbolTable,
     waveform_names: dict[int, str] | None = None,
     acquisition_names: dict[int, str] | None = None,
+    *,
+    branch_issue: core.Issue | None = None,
 ) -> None:
     target_arg = _branch_target_arg(instruction.args[0], state, symbols)
     target_label = str(target_arg.value) if target_arg.kind == "label" else None
@@ -2918,13 +2993,14 @@ def _execute_status_branch(
         _collapse_undefined_label_branch(state, instruction, q1_issue_event, condition, target_label)
         return
 
-    taken_duration = 24 if instruction.op == "jge" else 16
-    decision = _status_branch_decision(instruction.op, state.alu_flags, state.alu_flag_cases)
+    taken_duration = _branch_taken_duration(instruction, state, symbols)
+    decision = (branch_issue.taken if branch_issue is not None
+                else _status_branch_decision(instruction.op, state.alu_flags, state.alu_flag_cases))
     if decision is not None:
         q1_issue_event = _revise_q1_issue_duration(
             state,
             q1_issue_event,
-            taken_duration if decision else 4,
+            branch_issue.q1_duration if branch_issue is not None else branch_duration(taken_duration, decision),
         )
         q1_issue_event.meta["branch_decision"] = "concrete"
         q1_issue_event.meta["branch_taken"] = decision
@@ -3022,7 +3098,7 @@ def _execute_status_branch(
     if assumption is not None:
         assumed_taken, assumed_path = assumption
         q1_issue_event = _revise_q1_issue_duration(
-            state, q1_issue_event, taken_duration if assumed_taken else 4,
+            state, q1_issue_event, branch_duration(taken_duration, assumed_taken),
         )
         _refine_status_branch_arm(state, instruction.op, taken=assumed_taken)
         q1_issue_event.meta["branch_taken"] = assumed_taken
@@ -3202,26 +3278,34 @@ def _execute_conditional_branch(
     acquisition_names: dict[int, str],
     *,
     interior_target: CompiledTarget | None = None,
+    branch_issue: core.Issue | None = None,
 ) -> None:
     target_arg = _branch_target_arg(instruction.args[2], state, symbols)
     target_label = str(target_arg.value) if target_arg.kind == "label" else None
     target_pc = _numeric_branch_target_pc(target_arg, state)
-    left = resolve_arg_value(instruction.args[0], _scope(symbols, state))
-    right = resolve_arg_value(instruction.args[1], _scope(symbols, state))
-    if isinstance(left, Concrete):
-        left = Concrete(left.value & _CLASSICAL_REGISTER_MASK)
-    if isinstance(right, Concrete):
-        right = Concrete(right.value & _CLASSICAL_REGISTER_MASK)
-    flags = _comparison_flags(instruction.args[0], left, instruction.args[1], right, state)
-    _set_alu_flags(state, instruction, flags)
     op = ">=" if instruction.op == "jge" else "<"
-    decision = compare_values(left, op, right)
-    bounds = _unsigned_operand_bounds(instruction.args[0], left, state)
-    if not isinstance(decision, bool) and bounds is not None and isinstance(right, Concrete):
-        if bounds[0] >= right.value:
-            decision = instruction.op == "jge"
-        elif bounds[1] < right.value:
-            decision = instruction.op == "jlt"
+    taken_duration = _branch_taken_duration(instruction, state, symbols)
+    if branch_issue is not None:
+        assert branch_issue.flags is not None and branch_issue.taken is not None
+        flags = branch_issue.flags.as_dict()
+        decision = branch_issue.taken
+    else:
+        scope = _scope(symbols, state)
+        left = resolve_arg_value(instruction.args[0], scope)
+        right = resolve_arg_value(instruction.args[1], scope)
+        if isinstance(left, Concrete):
+            left = Concrete(left.value & _CLASSICAL_REGISTER_MASK)
+        if isinstance(right, Concrete):
+            right = Concrete(right.value & _CLASSICAL_REGISTER_MASK)
+        flags = _comparison_flags(instruction.args[0], left, instruction.args[1], right, state)
+        decision = compare_values(left, op, right)
+        bounds = _unsigned_operand_bounds(instruction.args[0], left, state)
+        if not isinstance(decision, bool) and bounds is not None and isinstance(right, Concrete):
+            if bounds[0] >= right.value:
+                decision = instruction.op == "jge"
+            elif bounds[1] < right.value:
+                decision = instruction.op == "jlt"
+    _set_alu_flags(state, instruction, flags)
     condition = f"{instruction.args[0].raw} {op} {instruction.args[1].raw}"
     branch_id = _branch_id(state, instruction, target_label, target_arg.raw)
 
@@ -3236,7 +3320,8 @@ def _execute_conditional_branch(
         _emit_undefined_label(state, instruction, target_label)
 
     if isinstance(decision, bool):
-        q1_issue_event = _revise_q1_issue_duration(state, q1_issue_event, 24 if decision else 4)
+        duration = branch_issue.q1_duration if branch_issue is not None else branch_duration(taken_duration, decision)
+        q1_issue_event = _revise_q1_issue_duration(state, q1_issue_event, duration)
         q1_issue_event.meta["branch_decision"] = "concrete"
         q1_issue_event.meta["branch_taken"] = decision
         _emit_concrete_branch_region(
@@ -3294,12 +3379,12 @@ def _execute_conditional_branch(
     comparison_requested = _branch_comparison_requested(state, branch_specific_path)
     q1_issue_event.meta["branch_comparison_supported"] = comparison_limit is None
     if _prove_timing_only_branch_join(state, instruction, q1_issue_event, symbols, target_label, target_pc, branch_id,
-                                  taken_duration=24, waveform_names=waveform_names, acquisition_names=acquisition_names):
+                                  taken_duration=taken_duration, waveform_names=waveform_names, acquisition_names=acquisition_names):
         return
     if comparison_requested and comparison_limit is None and _explore_conditional_branch_both_paths(
         state, instruction, q1_issue_event, symbols, waveform_names, acquisition_names,
         condition=condition, target_label=target_label, target_pc=target_pc, branch_id=branch_id,
-        taken_duration=24,
+        taken_duration=taken_duration,
         assumption_source="branch_assumption" if branch_specific_path == "both" else "branch_policy",
     ):
         return
@@ -3339,7 +3424,7 @@ def _execute_conditional_branch(
         assumption = _branch_assumption(state.branch_policy)
     if assumption is not None:
         assumed_taken, assumed_path = assumption
-        q1_issue_event = _revise_q1_issue_duration(state, q1_issue_event, 24 if assumed_taken else 4)
+        q1_issue_event = _revise_q1_issue_duration(state, q1_issue_event, branch_duration(taken_duration, assumed_taken))
         q1_issue_event.meta["branch_taken"] = assumed_taken
         q1_issue_event.meta["branch_policy"] = state.branch_policy
         q1_issue_event.meta["assumed_branch_path"] = assumed_path
@@ -3539,7 +3624,7 @@ def _end_analysis_at_issue(
 
 def _end_unproved_nested_loop(
     state: AnalysisState, instruction: Instr, issue: TimelineEvent, count: Value | None,
-    symbols: SymbolTable | None, message: str,
+    symbols: SymbolTable | None, message: str, branch_issue: core.Issue | None,
 ) -> None:
     if (instruction.op == "loop" and symbols is not None and isinstance(issue.t0, Concrete)
             and isinstance(count, Concrete) and 1 < count.value <= _CLASSICAL_REGISTER_MASK
@@ -3548,7 +3633,7 @@ def _end_unproved_nested_loop(
         target = _execution_target(state, resolve_arg_value(instruction.args[1], _scope(symbols, state)))
         if target is not None and target.interior is None:
             # The observed edge can decrement its counter even when the following iteration is unknown.
-            _execute_concrete_branch(state, instruction, issue, symbols)
+            _execute_concrete_branch(state, instruction, issue, symbols, branch_issue=branch_issue)
     _end_analysis_at_issue(state, issue, "analytical_nested_loop_counter_varies", message)
 
 
@@ -4011,7 +4096,7 @@ def _explore_conditional_branch_both_paths(
             "assumption_source": assumption_source,
             "assumed_branch_path": "both",
             "comparison_paths": ["taken", "fallthrough"],
-            "comparison_q1_durations_ns": {"taken": taken_duration, "fallthrough": 4},
+            "comparison_q1_durations_ns": {"taken": taken_duration, "fallthrough": branch_duration(taken_duration, False)},
         }
     )
     _record_branch_assumption(
@@ -4059,7 +4144,7 @@ def _explore_conditional_branch_both_paths(
     for path, next_pc in path_specs:
         path_state = deepcopy(base_path_state)
         path_issue = next(event for event in path_state.events if event.id == q1_issue_event.id)
-        _revise_q1_issue_duration(path_state, path_issue, taken_duration if path == "taken" else 4)
+        _revise_q1_issue_duration(path_state, path_issue, branch_duration(taken_duration, path == "taken"))
         if len(instruction.args) == 1:
             _refine_status_branch_arm(path_state, instruction.op, taken=path == "taken")
         path_state.pc = next_pc
@@ -4231,7 +4316,7 @@ def _prove_timing_only_branch_join(
     for path, start in (("taken", taken_pc), ("fallthrough", instruction.pc + 1)):
         probe = deepcopy(base)
         issue = next(event for event in probe.events if event.id == q1_issue_event.id)
-        _revise_q1_issue_duration(probe, issue, taken_duration if path == "taken" else 4)
+        _revise_q1_issue_duration(probe, issue, branch_duration(taken_duration, path == "taken"))
         if len(instruction.args) == 1:
             _refine_status_branch_arm(probe, instruction.op, taken=path == "taken")
         else:
@@ -4506,6 +4591,14 @@ def _prove_timing_only_branch_join(
     state.rt_time_ns = add_values(region.t0, Concrete(elapsed["taken"]))
     state.netzero_window = a.netzero_window if a.netzero_window == b.netzero_window else None
     state.q1_time_ns = a.q1_time_ns if q1_known else Unknown("Q1 arrival is not proven at branch join")
+    state.reference_sync_ns = (a.reference_sync_ns if a.reference_sync_ns == b.reference_sync_ns
+                               else Unknown("Reference sync times differ at branch join"))
+    if a.rt_fifo_starts == b.rt_fifo_starts:
+        state.rt_fifo_starts = a.rt_fifo_starts
+    else:
+        # Paths with different packet counts or start times have different future releases.
+        state.rt_fifo_starts = (Unknown("RT FIFO contents differ at branch join"),) * max(
+            len(a.rt_fifo_starts), len(b.rt_fifo_starts))
     state.q1_issue_index = a.q1_issue_index - 1
     state.alu_flags = {key: value for key, value in (a.alu_flags or {}).items() if (b.alu_flags or {}).get(key) is value} or None
     if a.alu_flag_cases is not None or b.alu_flag_cases is not None:
@@ -5249,7 +5342,8 @@ def _bounded_loop_total(
                     low, high = interval(expression)
                     probe.registers[register] = Concrete(low) if low == high else Unknown(register)
                     probe.register_bounds[register] = low, high
-                _execute_classical(probe, item, symbols)
+                effects = _resolved_core_issue(probe, item, _scope(symbols, probe), analysis=True)
+                _execute_classical(probe, item, symbols, core_issue=effects)
                 _flush_pending_register_writes(probe, completed_issue_index=state.q1_issue_index + 2)
                 outputs = {}
                 for register in _register_write_operands(item, state):
@@ -5468,6 +5562,7 @@ def _emit_compact_loop(
     forever: bool,
     min_visible_iterations: int = 1,
     symbols: SymbolTable | None = None,
+    branch_issue: core.Issue | None = None,
 ) -> bool:
     if start_pc is None or start_pc > instruction.pc:
         return False
@@ -5496,7 +5591,7 @@ def _emit_compact_loop(
     if nested_proof == "varying_count":
         _end_unproved_nested_loop(
             state, instruction, q1_issue_event, count, symbols,
-            "The changing child loop count or its repeated work could not be proven.",
+            "The changing child loop count or its repeated work could not be proven.", branch_issue,
         )
         return True
     if nested_proof is None and evidence.revisited:
@@ -5534,13 +5629,16 @@ def _emit_compact_loop(
 
     loop_id = f"L{state.loop_counter}"
 
-    loop_q1_jump_runtime_ns = 16 if instruction.op == "jmp" else 24
-    loop_q1_continue_runtime_ns = 4
-    first_loop_edge_runtime_ns = loop_q1_jump_runtime_ns
-    # The docs also describe loop as lowering to sub + jnz; use that behavior when its prose conflicts.
-    if not forever and isinstance(count, Concrete) and count.value == 1:
-        q1_issue_event = _revise_q1_issue_duration(state, q1_issue_event, loop_q1_continue_runtime_ns)
+    loop_q1_jump_runtime_ns = _branch_taken_duration(instruction, state, symbols)
+    loop_q1_continue_runtime_ns = branch_duration(loop_q1_jump_runtime_ns, False)
+    if branch_issue is not None:
+        first_loop_edge_runtime_ns = branch_issue.q1_duration
+    elif not forever and count == Concrete(1):
         first_loop_edge_runtime_ns = loop_q1_continue_runtime_ns
+    else:
+        first_loop_edge_runtime_ns = loop_q1_jump_runtime_ns
+    if first_loop_edge_runtime_ns != loop_q1_jump_runtime_ns:
+        q1_issue_event = _revise_q1_issue_duration(state, q1_issue_event, first_loop_edge_runtime_ns)
 
     preview_events = evidence.events
     t0, t1, duration = _loop_timing(preview_events, current_rt_time=state.rt_time_ns)
@@ -5677,7 +5775,7 @@ def _emit_compact_loop(
         if affine_timing is None:
             _end_unproved_nested_loop(
                 state, instruction, q1_issue_event, count, symbols,
-                "The changing child loop count does not establish exact parent timing.",
+                "The changing child loop count does not establish exact parent timing.", branch_issue,
             )
             return True
     state.loop_counter += 1
@@ -5931,6 +6029,15 @@ def _emit_compact_loop(
     # Only the first iteration is interpreted; later previews copy events without
     # executing their arithmetic. Do not expose those copies as register writes.
     _flush_pending_register_writes(state, completed_issue_index=state.q1_issue_index + 1)
+    repeated_fifo = None
+    flat_fifo = not has_body_branch and not any(item.op == "loop" for item in body_instructions[:-1])
+    affine_packets = (affine_timing or {}).get("rt_packet_affine") or {}
+    affine_fifo = (flat_fifo and "period_affine" in (affine_timing or {})
+                   and all(packet_id in affine_packets for packet_id in evidence.packets))
+    regular_fifo = flat_fifo and (period_invariant and not affine_durations_vary or affine_fifo)
+    if (not regular_fifo and isinstance(count, Concrete) and count.value > 1 and evidence.packets
+            and counter_reg is not None and symbols is not None):
+        repeated_fifo = _replay_compact_fifo(state, start_pc, instruction.pc, counter_reg, count.value, symbols)
     invariant_values = {register: (state.registers.get(register, Unknown(register)), state.register_bounds.get(register),
                                   state.register_known_bits.get(register), state.register_value_origins.get(register))
                         for register in invariant_writes}
@@ -5968,6 +6075,7 @@ def _emit_compact_loop(
         if has_hidden_iterations and trigger_epoch_stride:
             hidden_iterations = count.value - 1 if isinstance(count, Concrete) else 1
             state.rt_trigger_epoch += trigger_epoch_stride * hidden_iterations
+        first_q1_end, first_rt_end = state.q1_time_ns, state.rt_time_ns
         _advance_compact_loop_fallthrough_state(
             state,
             loop_id=loop_id,
@@ -5980,6 +6088,17 @@ def _emit_compact_loop(
             rt_total=Concrete(affine_timing["total_duration"]["value"]) if affine_timing is not None else None,
             q1_hidden_ns=affine_timing.get("q1_hidden_ns") if affine_timing is not None else None,
         )
+        if isinstance(count, Concrete) and count.value > 1 and evidence.packets:
+            if repeated_fifo is not None and state.rt_time_ns == Concrete(repeated_fifo.rt_ns):
+                state.rt_fifo_starts = tuple(Concrete(ns) for ns in repeated_fifo.rt_fifo_starts)
+                state.reference_sync_ns = Concrete(repeated_fifo.reference_sync_ns)
+                state.q1_time_ns = Concrete(repeated_fifo.q1_ns)
+            else:
+                _advance_compact_fifo(
+                    state, list(evidence.packets.values()), count.value - 1, first_q1_end, first_rt_end,
+                    q1_period, period, invariant=regular_fifo, flat=flat_fifo,
+                    packet_slopes={key: value["slope"] for key, value in affine_packets.items()} if affine_fifo else {},
+                )
         if branch_timing_unknown and counter_reg is not None:
             state.registers[counter_reg] = Unknown(f"{counter_reg} after unproved branch paths in compact loop {loop_id}")
         if isinstance(count, Concrete):
@@ -6360,25 +6479,6 @@ def _set_alu_flags(state: AnalysisState, instruction: Instr, flags: dict[str, bo
     )
 
 
-def _sub_flags(left: int, right: int) -> dict[str, bool]:
-    mask = _CLASSICAL_REGISTER_MASK
-    sign = 0x80000000
-    a = left & mask
-    b = right & mask
-    result = (a - b) & mask
-    return {
-        "zf": result == 0,
-        "nf": bool(result & sign),
-        "cf": a < b,
-        "of": bool(((a ^ b) & (a ^ result)) & sign),
-    }
-
-
-def _logic_flags(result: int) -> dict[str, bool]:
-    result &= _CLASSICAL_REGISTER_MASK
-    return {"zf": result == 0, "nf": bool(result & 0x80000000), "cf": False, "of": False}
-
-
 def _result_bounds_flags(bounds: tuple[int, int] | None) -> dict[str, bool]:
     flags = {}
     if bounds is not None:
@@ -6509,36 +6609,6 @@ def _arithmetic_bounds_flags(
     if len(overflows) == 1:
         flags["of"] = overflows.pop()
     return flags or None
-
-
-def _add_flags(left: int, right: int) -> dict[str, bool]:
-    mask = _CLASSICAL_REGISTER_MASK
-    sign = 0x80000000
-    a = left & mask
-    b = right & mask
-    result = (a + b) & mask
-    return {
-        "zf": result == 0,
-        "nf": bool(result & sign),
-        "cf": a + b > mask,
-        "of": bool((~(a ^ b) & (a ^ result)) & sign),
-    }
-
-
-def _shift_flags(op: str, left: int, shift: int, result: int) -> dict[str, bool]:
-    mask = _CLASSICAL_REGISTER_MASK
-    result &= mask
-    unsigned_left = left & mask
-    shift &= mask
-    cf = False
-    of = False
-    if 0 < shift <= 32:
-        if op in {"asl", "lsl"}:
-            cf = bool(unsigned_left & (1 << (32 - shift)))
-            of = bool(cf != bool(result & 0x80000000))
-        else:
-            cf = bool(unsigned_left & (1 << (shift - 1)))
-    return {"zf": result == 0, "nf": bool(result & 0x80000000), "cf": cf, "of": of}
 
 
 def _binary_alu_flags(op: str, left: Value, right: Value, result: Value) -> dict[str, bool] | None:
@@ -6775,15 +6845,37 @@ def _word_interval(bounds: tuple[int, int]) -> tuple[int, int] | None:
     return (low & _CLASSICAL_REGISTER_MASK, high & _CLASSICAL_REGISTER_MASK) if low >> 32 == high >> 32 else None
 
 
-def _execute_classical(state: AnalysisState, instruction: Instr, symbols: SymbolTable) -> None:
+def _execute_classical(state: AnalysisState, instruction: Instr, symbols: SymbolTable, *, core_issue: core.Issue | None = None) -> None:
+    if core_issue is not None:
+        if core_issue.flags is not None and instruction.op != "not":
+            _set_alu_flags(state, instruction, core_issue.flags.as_dict())
+        destinations = core.destination_indexes(instruction.op)
+        for index, word in zip(destinations, core_issue.words, strict=True):
+            destination = _register_name(instruction.args[index], state)
+            assert destination is not None
+            value = Concrete(word)
+            if instruction.op == "move":
+                provenance = _move_provenance(state, instruction, instruction.args[0], destination, value)
+            elif instruction.op == "not":
+                provenance = _unary_provenance(state, instruction, instruction.args[0], destination, value)
+            else:
+                left, right = _docs_ordered_binary_args(instruction, state)
+                provenance = _binary_provenance(state, instruction, left, right, destination, value)
+            # The core supplies the exact word. The trace above records its source operands.
+            _schedule_register_write(state, instruction, destination, value, provenance,
+                                     value_origin=(f"constant:{word}", False))
+        if instruction.op == "not" and core_issue.flags is not None:
+            # Preserve Analysis's read-hazard tracking for an in-place NOT.
+            _set_alu_flags(state, instruction, core_issue.flags.as_dict())
+        return
+
     scope = _scope(symbols, state)
     destination = _register_name(instruction.args[1], state) if len(instruction.args) >= 2 else None
     if instruction.op == "move" and destination is not None:
-        value = resolve_arg_value(instruction.args[0], scope)
-        value = _wrap_concrete_classical_register_value(value)
-        value_origin = _operand_value_origin(instruction.args[0], value, state)
+        value = _wrap_concrete_classical_register_value(resolve_arg_value(instruction.args[0], scope))
         known_bits = _operand_known_bits(instruction.args[0], value, state)
         bounds = _refine_bounds_with_bits(_unsigned_operand_bounds(instruction.args[0], value, state), known_bits)
+        value_origin = _operand_value_origin(instruction.args[0], value, state)
         if bounds[0] == bounds[1]:
             value = Concrete(bounds[0])
         provenance = _move_provenance(state, instruction, instruction.args[0], destination, value)
@@ -7203,10 +7295,7 @@ def _latched_operand_value(op: str, arg: Arg, scope: SymbolTable, state: Analysi
     # Decode only the value sent to the latch. Register traces keep the raw word.
     # https://docs.qblox.com/en/main/products/qblox_instruments/q1/index.html#latched-instructions
     if isinstance(value, Concrete):
-        if op in _AWG_PAIR_SETTERS or op == "set_freq":
-            return Concrete(_signed_32_bit_register_value(value.value))
-        if op == "set_mrk":
-            return Concrete(value.value & 0xF)
+        return Concrete(core_rt.decode_register(op, value.value))
     elif op == "set_mrk" and isinstance(value, Symbolic) and _pending_register_write(state, register) is None:
         ones, zeros = _operand_known_bits(arg, value, state)
         if (ones | zeros) & 0xF == 0xF:
@@ -7237,61 +7326,45 @@ def _unsupported_register_operand(
     return None
 
 
-def _execute_latched(state: AnalysisState, instruction: Instr, symbols: SymbolTable) -> TimelineEvent | None:
+def _execute_latched(
+    state: AnalysisState, instruction: Instr, symbols: SymbolTable, *,
+    latch_write: core_rt.LatchWrite | None = None,
+    condition: tuple[int, int | None, int | None, int] | None = None,
+) -> TimelineEvent | None:
     scope = _scope(symbols, state)
     field_name: str | None = None
     value: Any = None
 
-    if instruction.op == "set_mrk" and instruction.args:
-        field_name = "marker"
-        value = _latched_operand_value(instruction.op, instruction.args[0], scope, state)
-        state.latched_state.marker = value
-    elif instruction.op == "set_awg_gain" and len(instruction.args) >= 2:
-        field_name = "awg_gain"
-        value = (
-            _latched_operand_value(instruction.op, instruction.args[0], scope, state),
-            _latched_operand_value(instruction.op, instruction.args[1], scope, state),
-        )
-        state.latched_state.awg_gain = value
-    elif instruction.op == "set_awg_offs" and len(instruction.args) >= 2:
-        field_name = "awg_offset"
-        value = (
-            _latched_operand_value(instruction.op, instruction.args[0], scope, state),
-            _latched_operand_value(instruction.op, instruction.args[1], scope, state),
-        )
-        state.latched_state.awg_offset = value
-    elif instruction.op == "set_freq" and instruction.args:
-        field_name = "frequency"
-        value = _latched_operand_value(instruction.op, instruction.args[0], scope, state)
-        state.latched_state.frequency = value
-    elif instruction.op == "set_ph":
-        field_name = "phase"
-        value = resolve_arg_value(instruction.args[0], scope)
-        state.latched_state.phase = value
-    elif instruction.op == "reset_ph":
-        field_name, value = "phase_reset", True
-        state.pending_phase_reset = True
-    elif instruction.op == "set_ph_delta" and instruction.args:
-        field_name = "phase_delta"
-        value = resolve_arg_value(instruction.args[0], scope)
-        state.latched_state.phase_delta = value
-    elif instruction.op == "set_digital" and len(instruction.args) >= 3:
-        field_name = "digital"
-        value = (
-            resolve_arg_value(instruction.args[0], scope),
-            resolve_arg_value(instruction.args[1], scope),
-            resolve_arg_value(instruction.args[2], scope),
-        )
-        state.latched_state.digital = value
-    elif instruction.op == "set_scope_en" and instruction.args:
-        field_name = "scope_enable"
-        value = resolve_arg_value(instruction.args[0], scope)
-        state.latched_state.scope_enable = value
+    if latch_write is not None or instruction.op in core_rt.LATCH_OPS:
+        if latch_write is not None:
+            field_name = latch_write.field
+            raw = latch_write.value
+            if isinstance(raw, tuple):
+                value = tuple(Concrete(word) for word in raw)
+            else:
+                value = raw if isinstance(raw, bool) else Concrete(raw)
+        else:
+            field_name = core_rt.LATCH_FIELDS[instruction.op]
+            arity = len(get_instruction_spec(instruction.op).signatures[0].args)
+            if len(instruction.args) < arity:
+                return None
+            if field_name == "phase_reset":
+                value = True
+            else:
+                values = tuple(_latched_operand_value(instruction.op, arg, scope, state)
+                               for arg in instruction.args[:arity])
+                value = values[0] if arity == 1 else values
+        if field_name == "phase_reset":
+            state.pending_phase_reset = True
+        else:
+            setattr(state.latched_state, field_name, value)
     elif instruction.op in {"set_cond", "set_time_ref"}:
         field_name = instruction.op
         value = [resolve_arg_value(arg, scope) for arg in instruction.args]
         if instruction.op == "set_cond":
-            value = tuple(value)
+            value = (tuple(Concrete(word) if word is not None else original
+                           for word, original in zip(condition, value, strict=True))
+                     if condition is not None else tuple(value))
             state.conditional_enable = value[0]
             state.conditional_mask = value[1]
             state.conditional_operator = value[2]
@@ -7326,11 +7399,9 @@ def _execute_latched(state: AnalysisState, instruction: Instr, symbols: SymbolTa
     return None
 
 
-def _rt_dequeue_spacing_ns(duration: int) -> int:
-    return 4 if duration == 0 else duration
-
-
-def _advance_after_zero_duration(state: AnalysisState, packet: RtPacket, event_start: int) -> None:
+def _advance_after_zero_duration(
+    state: AnalysisState, packet: RtPacket, event_start: int, *, next_rt: int | None = None,
+) -> None:
     if packet.op == "wait_trigger" and not packet.meta.get("conditional_skipped"):
         # The duration operand applies after an arrival. Analysis can retain
         # the nominal interval, but only Play has an observed arrival here.
@@ -7338,7 +7409,8 @@ def _advance_after_zero_duration(state: AnalysisState, packet: RtPacket, event_s
             return
     elif packet.duration != Concrete(0):
         return
-    state.rt_time_ns = add_values(state.rt_time_ns, Concrete(_rt_dequeue_spacing_ns(0)))
+    state.rt_time_ns = (Concrete(next_rt) if next_rt is not None else
+                        add_values(state.rt_time_ns, Concrete(_rt_dequeue_spacing_ns(0))))
     timing = {"queue_duration_ns": 0}
     if isinstance(state.rt_time_ns, Concrete):
         timing["next_dequeue_not_before_ns"] = state.rt_time_ns.value
@@ -7351,7 +7423,7 @@ def _advance_after_zero_duration(state: AnalysisState, packet: RtPacket, event_s
 def _execute_rt_instruction(
     state: AnalysisState,
     instruction: Instr,
-    symbols: SymbolTable,
+    scope: SymbolTable,
     waveform_names: dict[int, str],
     acquisition_names: dict[int, str],
     q1_t0: Value,
@@ -7361,12 +7433,13 @@ def _execute_rt_instruction(
     *,
     rt_condition_decision: bool | None = None,
     raw_linq_op: str | None = None,
+    wait_duration: int | None = None,
+    core_packet: core.RtPacket | None = None,
 ) -> None:
     spec = get_instruction_spec(instruction.op)
     applies_latched_state = spec.applies_latched_state or raw_linq_op == "upd_thres"
     is_linq_mock = "fb_acq_tb_mock" in {instruction.op, raw_linq_op}
     unverified_pulse = instruction.op == "play_pulse" and state.execution_mode == "analysis"
-    scope = _scope(symbols, state)
     configuration = _describe_linq_configuration(state, instruction, scope, raw_linq_op)
     duration = Concrete(0)
     t0 = state.rt_time_ns
@@ -7378,6 +7451,11 @@ def _execute_rt_instruction(
         spec.category == "sync" or (spec.timing_effect_status != "known" and instruction.op != "play_netzero")
     ):
         state.netzero_window = None
+    if core_packet is not None:
+        t0, t1 = Concrete(core_packet.rt_t0), Concrete(core_packet.rt_t1)
+        duration = Concrete(core_packet.rt_t1 - core_packet.rt_t0)
+        if state.conditional_enable != Concrete(0):
+            rt_condition_decision = not core_packet.skipped
     if state.conditional_enable != Concrete(0):
         # Execution truth and elapsed time are independent: only the selected
         # duration matters once the predicate is known. Equal durations
@@ -7386,21 +7464,23 @@ def _execute_rt_instruction(
         if ((rt_condition_decision is not None or instruction.op == "wait_trigger"
              or spec.category == "rt" and spec.timing_effect_status == "known")
                 and duration_arg_index is not None and duration_arg_index < len(instruction.args)):
-            candidate = resolve_arg_value(instruction.args[duration_arg_index], scope)
+            candidate = (Concrete(wait_duration) if wait_duration is not None
+                         else resolve_arg_value(instruction.args[duration_arg_index], scope))
         decision = rt_condition_decision if rt_condition_decision is not None else _conditional_decision(
             state.conditional_enable, state.conditional_mask, state.conditional_operator,
             enable_bounds=state.conditional_enable_bounds, operator_bounds=state.conditional_operator_bounds,
             enable_known_bits=state.conditional_enable_known_bits, operator_known_bits=state.conditional_operator_known_bits,
         )
-        if decision is not None and candidate is not None:
+        if decision is not None and (candidate is not None or core_packet is not None):
             selected_duration = candidate if decision else state.conditional_else_duration
             timing_known = ((not decision or not (is_linq_mock or unverified_pulse))
                             and isinstance(selected_duration, Concrete) and _valid_rt_duration(selected_duration.value))
             q1_issue_event.meta.pop("conditional_execution_unknown", None)
             q1_issue_event.meta.update(conditional_timing_known=timing_known, conditional_skipped=not decision)
             if not decision:
-                duration = state.conditional_else_duration
-                t1 = add_values(t0, duration)
+                if core_packet is None:
+                    duration = state.conditional_else_duration
+                    t1 = add_values(t0, duration)
                 packet = _append_packet(state, instruction, duration, q1_t0, q1_t1, t0, t1, rt_packet_id)
                 meta = {"op": instruction.op, "rt_packet_id": packet.id, "conditional_skipped": True,
                         "conditional_timing_known": timing_known, "output_state_unknown": False, "applied_state": {}}
@@ -7466,27 +7546,42 @@ def _execute_rt_instruction(
         state.netzero_window = None
         return
 
-    if duration_arg_index is not None and duration_arg_index < len(instruction.args):
+    if core_packet is not None:
+        duration_arg = instruction.args[duration_arg_index] if duration_arg_index is not None else None
+        state.rt_time_ns = t1
+    elif duration_arg_index is not None and duration_arg_index < len(instruction.args):
         duration_arg = instruction.args[duration_arg_index]
-        resolution = resolve_duration_arg(
-            duration_arg,
-            scope,
-            state.diagnostics,
-            source=instruction.source,
-        )
-        duration = resolution.value
-        if resolution.requires_unknown_region:
-            _emit_unknown_region(state, instruction, duration)
-            t1 = add_values(t0, duration)
-            state.rt_time_ns = t1
-            _append_packet(state, instruction, duration, q1_t0, q1_t1, t0, t1, rt_packet_id)
-            return
+        if wait_duration is not None:
+            duration = Concrete(wait_duration)
+        else:
+            resolution = resolve_duration_arg(duration_arg, scope, state.diagnostics, source=instruction.source)
+            duration = resolution.value
+            if resolution.requires_unknown_region:
+                _emit_unknown_region(state, instruction, duration)
+                t1 = add_values(t0, duration)
+                state.rt_time_ns = t1
+                _append_packet(state, instruction, duration, q1_t0, q1_t1, t0, t1, rt_packet_id)
+                return
         t1 = add_values(t0, duration)
         state.rt_time_ns = t1
 
     pending_event_ids = dict(state.latched_state.pending_event_ids)
-    applied_state = _consume_applied_state(state) if applies_latched_state else {}
+    if core_packet is not None:
+        applied_state = {write.field: list(write.value) if isinstance(write.value, tuple) else write.value
+                         for write in core_packet.applied}
+        if applies_latched_state:
+            state.latched_state.pending_since.clear()
+            state.latched_state.pending_event_ids.clear()
+            _clear_nco_one_shots(state)
+    else:
+        applied_state = _consume_applied_state(state) if applies_latched_state else {}
     packet = _append_packet(state, instruction, duration, q1_t0, q1_t1, t0, t1, rt_packet_id)
+    if core_packet is not None and instruction.op not in core.LOCAL_OPS:
+        packet.meta.update(op=instruction.op, operands=list(core_packet.operands),
+                           normalized_op=core_packet.device_op, device_operands=list(core_packet.device_operands))
+        if applied_state:
+            packet.meta.update(applied_state=applied_state, applied_setter_event_ids={
+                name: pending_event_ids[name] for name in applied_state if name in pending_event_ids})
     if state.conditional_time_unknown:
         packet.meta["output_state_unknown"] = applies_latched_state
     event_start = len(state.events)
@@ -7531,6 +7626,12 @@ def _execute_rt_instruction(
     elif instruction.op in {"wait_sync", "wait_trigger"}:
         unresolved = instruction.op == "wait_trigger" and state.execution_mode == "analysis"
         meta = {"rt_packet_id": packet.id}
+        if core_packet is not None and instruction.op == "wait_trigger":
+            dwell = core_packet.operands[-1]
+            timing = {"address": core_packet.operands[0], "armed_ns": core_packet.rt_t0,
+                      "arrival_ns": core_packet.rt_t1 - dwell, "resume_ns": core_packet.rt_t1,
+                      "duration_ns": dwell, "status": "received"}
+            meta["trigger_assumption"] = packet.meta["trigger_assumption"] = timing
         if unresolved:
             timing = {"trigger_arrival_unknown": True, "trigger_wait_duration_ns": _plain_value(duration)}
             meta.update(timing)
@@ -7594,6 +7695,9 @@ def _execute_rt_instruction(
             value=applied_state["marker"],
         )
     for event in state.events[event_start:]:
+        if core_packet is not None and instruction.op not in core.LOCAL_OPS and event.meta.get("rt_packet_id") == packet.id:
+            event.meta.update(op=instruction.op, normalized_op=core_packet.device_op,
+                              device_operands=list(core_packet.device_operands))
         if state.conditional_time_unknown:
             event.meta["output_state_unknown"] = applies_latched_state
         if "applied_state" in event.meta:
@@ -7784,7 +7888,7 @@ def _emit_feedback_annotation(
     state: AnalysisState,
     instruction: Instr,
     q1_issue_event: TimelineEvent,
-    symbols: SymbolTable,
+    symbols: SymbolTable, *, receipt: tuple[int, int, int] | None = None,
 ) -> None:
     annotation = FEEDBACK_ANNOTATIONS.get(instruction.op)
     if annotation is None:
@@ -7801,12 +7905,17 @@ def _emit_feedback_annotation(
         meta["feedback"] = feedback
     if instruction.args:
         meta["feedback_arg"] = instruction.args[0].raw
+    time = state.rt_time_ns
+    if receipt is not None:
+        arrival, identifier, word = receipt
+        time = Concrete(max(q1_issue_event.t0.value, arrival))
+        meta.update(arrival_ns=arrival, id=identifier, value=word, time_basis="q1")
     _emit_event(
         state,
         lane="rt.feedback",
         kind=kind,
-        t0=state.rt_time_ns,
-        t1=state.rt_time_ns,
+        t0=time,
+        t1=time,
         duration=Concrete(0),
         label=label,
         confidence=_confidence_for_timing(Concrete(0), state.rt_time_ns, state.rt_time_ns),
@@ -7855,6 +7964,8 @@ def _append_packet(
         if state.conditional_time_unknown else {},
     )
     state.rt_packets.append(packet)
+    if state.q1_fifo_stall_ns:
+        packet.meta["q1_fifo_stall_ns"] = state.q1_fifo_stall_ns
     return packet
 
 
@@ -8258,6 +8369,133 @@ def _loop_q1_body_period(q1_period: Value, loop_edge_runtime_ns: int) -> Value:
     return subtract_values(q1_period, Concrete(loop_edge_runtime_ns))
 
 
+def _replay_compact_fifo(
+    state: AnalysisState, start_pc: int, end_pc: int, counter: str, count: int, symbols: SymbolTable,
+) -> core.CoreState | None:
+    """Use the concrete kernel for bounded loops whose packet or fetch sequence changes."""
+    budget = state.analysis_back_edge_limit or 10000
+    if (count - 1 > budget or state.conditional_enable != Concrete(0)
+            or not isinstance(state.q1_time_ns, Concrete) or not isinstance(state.rt_time_ns, Concrete)
+            or not isinstance(state.reference_sync_ns, Concrete)
+            or any(not isinstance(start, Concrete) for start in state.rt_fifo_starts)):
+        return None
+    registers = [_arg_int(Arg("reg", f"R{i}", f"R{i}"), state.registers) for i in range(64)]
+    registers[int(counter[1:])] = count - 1
+    layout = state.compiled_addresses
+    code = (tuple(target.interior or state.instructions_by_pc[target.source_pc] for target in layout.targets.values())
+            if layout else tuple(state.instructions_by_pc.values()))
+    start = layout.entries[start_pc] if layout else start_pc
+    stop = layout.entries.get(end_pc + 1, len(code)) if layout else end_pc + 1
+    machine = core.CoreState(pc=start, registers=tuple(registers), flags=core.Flags(**_sub_flags(count, 1)),
+                             q1_ns=state.q1_time_ns.value, rt_ns=state.rt_time_ns.value,
+                             reference_sync_ns=state.reference_sync_ns.value,
+                             rt_fifo_starts=tuple(slot.value for slot in state.rt_fifo_starts))
+    bound = {}
+    scope = _scope(symbols, state)
+    try:
+        for _ in range(budget):
+            pc = machine.pc
+            if not start <= pc < stop:
+                return machine if pc == stop else None
+            if pc not in bound:
+                bound[pc] = _concrete_bound_instruction(code[pc], state, scope)
+            if bound[pc].op not in core.LOCAL_OPS or bound[pc].op in {"stop", "illegal", "set_cond"}:
+                return None
+            machine = core.step(machine, code, instruction=bound[pc]).state
+    except ValueError:
+        return None
+    return machine if machine.pc == stop else None
+
+
+def _advance_compact_fifo(
+    state: AnalysisState, packets: list[RtPacket], repeats: int, first_q1_end: Value, first_rt_end: Value,
+    q1_period: Value, rt_period: Value, *, invariant: bool, flat: bool, packet_slopes: dict[str, int],
+) -> None:
+    """Apply FIFO bounds for omitted iterations without expanding a long periodic loop."""
+    capacity = core.RT_FIFO_CAPACITY
+    history = state.rt_fifo_starts
+    size = len(packets)
+    total = size * repeats
+    sync_end = state.reference_sync_ns
+    if not (invariant and isinstance(sync_end, Concrete) and isinstance(first_q1_end, Concrete)
+            and isinstance(q1_period, Concrete) and isinstance(rt_period, Concrete) and isinstance(state.q1_time_ns, Concrete)
+            and all(isinstance(packet.q1_issue_t1, Concrete) and isinstance(packet.rt_t0, Concrete)
+                    for packet in packets)):
+        # An unrepresented RT start cannot hold a fetch after all possible RT edges have passed.
+        if not flat:
+            total = (max(0, state.rt_time_ns.value - first_rt_end.value) // 4
+                     if isinstance(first_rt_end, Concrete) and isinstance(state.rt_time_ns, Concrete) else capacity)
+        unknown = Unknown("RT FIFO release in compact loop is unresolved")
+        if any(packet.op == "wait_sync" for packet in packets):
+            state.reference_sync_ns = unknown
+        latest_release = add_values(state.rt_time_ns, state.reference_sync_ns)
+        if len(history) + total > capacity and not (
+            isinstance(first_q1_end, Concrete) and isinstance(latest_release, Concrete)
+            and first_q1_end.value >= latest_release.value + core.Q1_START_LEAD_NS
+        ):
+            state.q1_time_ns = unknown
+        state.rt_fifo_starts = (history + (unknown,) * min(total, capacity))[-capacity:]
+        return
+
+    # At a queue admission the fetched instruction waits for the oldest of the
+    # preceding 32 RT starts. After the first 32 admissions, the gap to nominal
+    # fetch is linear for a fixed dwell and quadratic for an affine dwell.
+    stalls = 0
+    fetch_offsets = []
+    rt_slope = 0
+    rt_prefix_slopes = []
+    sync_delta = 0
+    sync_prefix = []
+    for packet in packets:
+        stalls += packet.meta.get("q1_fifo_stall_ns", 0)
+        fetch_offsets.append(packet.q1_issue_t1.value - first_q1_end.value + q1_period.value - stalls)
+        rt_prefix_slopes.append(rt_slope)
+        rt_slope += packet_slopes.get(packet.id, 0)
+        sync_prefix.append(sync_delta)
+        if packet.op == "wait_sync":
+            sync_delta += packet.meta.get("q1_reference_sync_adjustment_ns", core.Q1_CORE_SYNC_OVERHEAD_NS)
+    fetch_period = q1_period.value - stalls
+
+    def start(index: int) -> Value:
+        if index < 0:
+            return history[index]
+        iteration, within = divmod(index, size)
+        iteration += 1
+        offset = iteration * (rt_period.value + rt_prefix_slopes[within])
+        offset += rt_slope * iteration * (iteration - 1) // 2
+        offset += sync_end.value + (iteration - 1) * sync_delta + sync_prefix[within]
+        return Concrete(packets[within].rt_t0.value + offset)
+
+    delay = 0
+    first = max(0, capacity - len(history))
+    head = min(total, capacity + size)
+    peaks = []
+    if rt_slope < 0:
+        # A decreasing dwell gives a concave quadratic release-minus-fetch bound.
+        for packet_index in range(size):
+            shift, within = divmod(packet_index - capacity, size)
+            first_delta = rt_period.value + sync_delta + shift * rt_slope + rt_prefix_slopes[within] - fetch_period
+            peak = first_delta // -rt_slope
+            for iteration in (peak, peak + 1):
+                index = (iteration - 1) * size + packet_index
+                if capacity <= index < total:
+                    peaks.append(index)
+    for indices in (range(first, head), range(max(head, total - size), total), peaks):
+        for index in indices:
+            release = start(index - capacity)
+            iteration, within = divmod(index, size)
+            fetch = first_q1_end.value + iteration * fetch_period + fetch_offsets[within]
+            if isinstance(release, Concrete):
+                delay = max(delay, core.queued_q1_completion(fetch, release.value) - fetch)
+            elif not (isinstance(first_rt_end, Concrete)
+                      and fetch >= first_rt_end.value + sync_end.value + core.Q1_START_LEAD_NS):
+                state.q1_time_ns = Unknown("RT FIFO release before compact loop is unresolved")
+    state.rt_fifo_starts = tuple(start(index) for index in range(max(-len(history), total - capacity), total))
+    state.reference_sync_ns = Concrete(sync_end.value + repeats * sync_delta)
+    if isinstance(state.q1_time_ns, Concrete):
+        state.q1_time_ns = Concrete(state.q1_time_ns.value - repeats * stalls + delay)
+
+
 def _advance_compact_loop_fallthrough_state(
     state: AnalysisState,
     *,
@@ -8332,24 +8570,27 @@ def _source_to_json(source: SourceLocation) -> dict[str, Any]:
     }
 
 
-def _record_stop_code(state: AnalysisState, instruction: Instr, scope: SymbolTable) -> Any:
-    value: Value = Concrete(0)
-    if instruction.args:
-        operand = instruction.args[0]
-        register = _physical_read_register(operand, state)
-        value = resolve_arg_value(operand, scope)
-        if register is not None and _pending_register_write(state, register) is not None:
-            value = Unknown(f"Stop status register {register} is not ready")
-    code = _signed_32_bit_register_value(value.value) if isinstance(value, Concrete) else _plain_value(value)
+def _record_stop_code(state: AnalysisState, instruction: Instr, scope: SymbolTable, *, code: int | None = None) -> Any:
+    if code is None:
+        value: Value = Concrete(0)
+        if instruction.args:
+            operand = instruction.args[0]
+            register = _physical_read_register(operand, state)
+            value = resolve_arg_value(operand, scope)
+            if register is not None and _pending_register_write(state, register) is not None:
+                value = Unknown(f"Stop status register {register} is not ready")
+        code = _signed_32_bit_register_value(value.value) if isinstance(value, Concrete) else _plain_value(value)
     if "execution" in state.metadata:
         state.metadata["execution"].update(stop_code=code, stop_source=_source_to_json(instruction.source))
     return code
 
 
-def _record_illegal_instruction(state: AnalysisState, instruction: Instr, issue: TimelineEvent | None) -> None:
+def _record_illegal_instruction(
+    state: AnalysisState, instruction: Instr, issue: TimelineEvent | None, *, flag: str = ILLEGAL_INSTRUCTION_FLAG,
+) -> None:
     reason = "Illegal Q1ASM instruction executed."
     source = _source_to_json(instruction.source)
-    fault = {"flag": ILLEGAL_INSTRUCTION_FLAG, "sequencer_status": "STOPPED",
+    fault = {"flag": flag, "sequencer_status": "STOPPED",
              "q1_time_ns": _plain_value(state.q1_time_ns), "source": source}
     if "execution" in state.metadata:
         execution = state.metadata["execution"]
@@ -8374,24 +8615,11 @@ def _record_illegal_instruction(state: AnalysisState, instruction: Instr, issue:
 def _consume_applied_state(state: AnalysisState, *, consume: bool = True) -> dict[str, Any]:
     applied: dict[str, Any] = {}
     pending = state.latched_state.pending_since
-    if "marker" in pending and state.latched_state.marker is not None:
-        applied["marker"] = _plain_value(state.latched_state.marker)
-    if "awg_gain" in pending and state.latched_state.awg_gain is not None:
-        applied["awg_gain"] = [_plain_value(value) for value in state.latched_state.awg_gain]
-    if "awg_offset" in pending and state.latched_state.awg_offset is not None:
-        applied["awg_offset"] = [_plain_value(value) for value in state.latched_state.awg_offset]
-    if "frequency" in pending and state.latched_state.frequency is not None:
-        applied["frequency"] = _plain_value(state.latched_state.frequency)
-    if "phase" in pending and state.latched_state.phase is not None:
-        applied["phase"] = _plain_value(state.latched_state.phase)
-    if "phase_delta" in pending and state.latched_state.phase_delta is not None:
-        applied["phase_delta"] = _plain_value(state.latched_state.phase_delta)
-    if state.pending_phase_reset is True:
-        applied["phase_reset"] = True
-    if "digital" in pending and state.latched_state.digital is not None:
-        applied["digital"] = [_plain_value(value) for value in state.latched_state.digital]
-    if "scope_enable" in pending and state.latched_state.scope_enable is not None:
-        applied["scope_enable"] = _plain_value(state.latched_state.scope_enable)
+    fields, _ = core_rt.latch_commit_fields(pending, state.pending_phase_reset is True)
+    for name in fields:
+        value = True if name == "phase_reset" else getattr(state.latched_state, name)
+        if value is not None:
+            applied[name] = _plain_value(value)
     if consume:
         pending.clear()
         state.latched_state.pending_event_ids.clear()
@@ -8400,9 +8628,11 @@ def _consume_applied_state(state: AnalysisState, *, consume: bool = True) -> dic
 
 
 def _clear_nco_one_shots(state: AnalysisState) -> None:
+    pending = state.latched_state.pending_since.keys() | state.latched_state.pending_event_ids.keys()
+    _, retained = core_rt.latch_commit_fields(pending, state.pending_phase_reset is True, skipped=True)
     state.pending_phase_reset = False
     state.latched_state.phase_delta = None
-    for field in ("phase_reset", "phase_delta"):
+    for field in pending.difference(retained):
         state.latched_state.pending_since.pop(field, None)
         state.latched_state.pending_event_ids.pop(field, None)
 

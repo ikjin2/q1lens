@@ -291,6 +291,7 @@ def _analyze_config(config: ProjectConfig) -> list[AnalysisState]:
             acquisition_names=sequence_names.acquisitions if sequence_names else None,
             branch_policy=config.analysis.branch_policy,
             execution_mode=config.analysis.execution_mode,
+            external=config.concrete_inputs(sequencer, config.params) if config.analysis.execution_mode == "concrete" else None,
             max_steps=config.analysis.max_steps,
         )
         state.metadata["hardware_parameters"] = dict(sequencer.hardware_parameters)

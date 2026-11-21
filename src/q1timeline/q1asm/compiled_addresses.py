@@ -27,6 +27,39 @@ class CompiledAddresses:
     labels: dict[str, int]
 
 
+def next_compiled_pc(pc: int, item: Instr, *, taken: bool | None, target: int | None,
+                     fault: bool, code_size: int) -> int:
+    """Advance by the assembled instruction width, including entry into a macro interior."""
+    if fault:
+        return pc
+    if taken:
+        if target is None or not 0 <= target < code_size:
+            raise ValueError(f"No instruction at compiled PC {target}")
+        return target
+    return pc + (2 if (item.op, len(item.args)) in _BRANCH_INTERIORS else 1)
+
+
+def source_position(layout: CompiledAddresses | None, address: int, source_count: int) -> tuple[int, int | None]:
+    if layout is None:
+        return address, None
+    if address == len(layout.targets):
+        return source_count, None
+    target = layout.targets[address]
+    return target.source_pc, address if target.interior is not None else None
+
+
+def next_source_position(layout: CompiledAddresses | None, item: Instr, interior_pc: int | None,
+                         source_count: int, *, taken: bool | None = None,
+                         target: int | None = None) -> tuple[int, int | None]:
+    """Return the source cursor after an admitted Q1 issue in a scheduled engine."""
+    pc = layout.entries[item.pc] if layout else item.pc
+    if interior_pc is not None:
+        pc = interior_pc
+    address = next_compiled_pc(pc, item, taken=taken, target=target, fault=False,
+                               code_size=len(layout.targets) if layout else source_count)
+    return source_position(layout, address, source_count)
+
+
 def compile_addresses(instructions: Mapping[int, Instr], labels: Mapping[str, int]) -> CompiledAddresses | None:
     if not any((item.op, len(item.args)) in _BRANCH_INTERIORS for item in instructions.values()):
         return None

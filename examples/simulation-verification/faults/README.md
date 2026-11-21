@@ -22,8 +22,8 @@ All times below are local nanoseconds. Startup is explicitly 200 ns; it is a mod
 | Case | Deliberate condition | Checked result |
 | --- | --- | --- |
 | `01-feedback-missing` | No feedback while Q1 waits after enqueuing one 1000 ns RT wait | RT runs 200–1200 ns, then underflows at 1200; status `error`, feedback stall remains pending, no register value is invented |
-| `02-feedback-delayed` | Feedback ID 5/value 7 arrives at 400 ns | Q1 waits from 4 to 400 ns, R0 becomes readable at 408, status `completed` |
-| `03-feedback-duplicate` | ID 5 receives values 7, 7, 9 at the same 400 ns timestamp | FIFO R0/R1/R2 = 7/7/9 at 408/416/424; identical values remain separate input occurrences and writer origins |
+| `02-feedback-delayed` | Feedback ID 5/value 7 arrives at 400 ns | Fetch ends at 8 ns, Q1 waits until 400 ns, R0 becomes readable at 404 ns, status `completed` |
+| `03-feedback-duplicate` | ID 5 receives values 7, 7, 9 at the same 400 ns timestamp | R0, R1 and R2 become readable with values 7, 7 and 9 at 404, 412 and 420 ns. Each write links to its own input occurrence. |
 | `04-trigger-missing` | `wait_trigger 1,4` never receives a trigger | RT is pending from 200 ns; status `blocked`, no completed stop or fabricated trigger |
 | `05-queue-full` | Six 40 ns RT waits with queue capacity 2 | Four Q1 stalls, depth at most 2, every packet enqueued/dequeued/executed once in order, RT completes at 440 ns |
 | `06-feedback-too-late` | Feedback would arrive at 1600 ns, beyond the RT wait deadline | Underflow at 1200 ns; the failed sequencer does not publish the future input or register write |

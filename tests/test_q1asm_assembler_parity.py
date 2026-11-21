@@ -35,34 +35,36 @@ def _signature_summary(op: str) -> set[tuple[tuple[str, ...], int]]:
     ("op", "expected"),
     [
         ("stop", {((), 4), (("I",), 4), (("R",), 4)}),
-        ("add", {(("I", "R", "R"), 12), (("R", "I", "R"), 12), (("R", "R", "R"), 12)}),
-        ("sub", {(("I", "R", "R"), 12), (("R", "I", "R"), 12), (("R", "R", "R"), 12)}),
-        ("and", {(("I", "R", "R"), 12), (("R", "I", "R"), 12), (("R", "R", "R"), 12)}),
-        ("or", {(("I", "R", "R"), 12), (("R", "I", "R"), 12), (("R", "R", "R"), 12)}),
-        ("xor", {(("I", "R", "R"), 12), (("R", "I", "R"), 12), (("R", "R", "R"), 12)}),
-        ("asl", {(("I", "R", "R"), 12), (("R", "I", "R"), 12), (("R", "R", "R"), 12)}),
-        ("asr", {(("I", "R", "R"), 12), (("R", "I", "R"), 12), (("R", "R", "R"), 12)}),
-        ("lsl", {(("I", "R", "R"), 12), (("R", "I", "R"), 12), (("R", "R", "R"), 12)}),
-        ("lsr", {(("I", "R", "R"), 12), (("R", "I", "R"), 12), (("R", "R", "R"), 12)}),
-        ("cmp", {(("I", "R"), 12), (("R", "I"), 12), (("R", "R"), 12)}),
-        ("test", {(("I", "R"), 12), (("R", "I"), 12), (("R", "R"), 12)}),
-        ("mulu16", {(("I", "R", "R"), 12), (("R", "I", "R"), 12), (("R", "R", "R"), 12)}),
-        ("muls16", {(("I", "R", "R"), 12), (("R", "I", "R"), 12), (("R", "R", "R"), 12)}),
-        ("mulu32l", {(("I", "R", "R"), 20), (("R", "I", "R"), 20), (("R", "R", "R"), 20)}),
-        ("mulu32h", {(("I", "R", "R"), 20), (("R", "I", "R"), 20), (("R", "R", "R"), 20)}),
-        ("muls32", {(("I", "R", "R", "R"), 24), (("R", "I", "R", "R"), 24), (("R", "R", "R", "R"), 24)}),
-        ("muls32l", {(("I", "R", "R"), 20), (("R", "I", "R"), 20), (("R", "R", "R"), 20)}),
-        ("muls32h", {(("I", "R", "R"), 20), (("R", "I", "R"), 20), (("R", "R", "R"), 20)}),
-        ("jge", {(("I/L",), 24), (("R",), 24), (("R", "I", "I/L"), 24), (("R", "I", "R"), 24)}),
-        ("jlt", {(("R", "I", "I/L"), 24), (("R", "I", "R"), 24)}),
-        ("loop", {(("R", "I/L"), 24), (("R", "R"), 24)}),
-        ("set_awg_gain", {(("I", "I"), 4), (("R", "R"), 4)}),
-        ("set_awg_offs", {(("I", "I"), 4), (("R", "R"), 4)}),
-        ("set_cond", {(("I", "I", "I", "I"), 4), (("R", "R", "R", "I"), 4)}),
+        ("add", {(("I", "R", "R"), 12), (("R", "I", "R"), 12), (("R", "R", "R"), 16)}),
+        ("sub", {(("I", "R", "R"), 12), (("R", "I", "R"), 12), (("R", "R", "R"), 16)}),
+        ("and", {(("I", "R", "R"), 12), (("R", "I", "R"), 12), (("R", "R", "R"), 16)}),
+        ("or", {(("I", "R", "R"), 12), (("R", "I", "R"), 12), (("R", "R", "R"), 16)}),
+        ("xor", {(("I", "R", "R"), 12), (("R", "I", "R"), 12), (("R", "R", "R"), 16)}),
+        ("asl", {(("I", "R", "R"), 12), (("R", "I", "R"), 12), (("R", "R", "R"), 16)}),
+        ("asr", {(("I", "R", "R"), 12), (("R", "I", "R"), 12), (("R", "R", "R"), 16)}),
+        ("lsl", {(("I", "R", "R"), 12), (("R", "I", "R"), 12), (("R", "R", "R"), 16)}),
+        ("lsr", {(("I", "R", "R"), 12), (("R", "I", "R"), 12), (("R", "R", "R"), 16)}),
+        ("cmp", {(("I", "R"), 12), (("R", "I"), 12), (("R", "R"), 16)}),
+        ("test", {(("I", "R"), 12), (("R", "I"), 12), (("R", "R"), 16)}),
+        ("mulu16", {(("I", "R", "R"), 12), (("R", "I", "R"), 12), (("R", "R", "R"), 16)}),
+        ("muls16", {(("I", "R", "R"), 12), (("R", "I", "R"), 12), (("R", "R", "R"), 16)}),
+        ("mulu32l", {(("I", "R", "R"), 20), (("R", "I", "R"), 20), (("R", "R", "R"), 24)}),
+        ("mulu32h", {(("I", "R", "R"), 20), (("R", "I", "R"), 20), (("R", "R", "R"), 24)}),
+        ("mulu32", {(("I", "R", "R", "R"), 24), (("R", "I", "R", "R"), 24), (("R", "R", "R", "R"), 28)}),
+        ("muls32", {(("I", "R", "R", "R"), 24), (("R", "I", "R", "R"), 24), (("R", "R", "R", "R"), 28)}),
+        ("muls32l", {(("I", "R", "R"), 20), (("R", "I", "R"), 20), (("R", "R", "R"), 24)}),
+        ("muls32h", {(("I", "R", "R"), 20), (("R", "I", "R"), 20), (("R", "R", "R"), 24)}),
+        ("jge", {(("I/L",), 16), (("R",), 16), (("R", "I", "I/L"), 28), (("R", "I", "R"), 32)}),
+        ("jlt", {(("R", "I", "I/L"), 28), (("R", "I", "R"), 32)}),
+        ("loop", {(("R", "I/L"), 32), (("R", "R"), 32)}),
+        ("set_awg_gain", {(("I", "I"), 4), (("R", "R"), 8)}),
+        ("set_awg_offs", {(("I", "I"), 4), (("R", "R"), 8)}),
+        ("set_cond", {(("I", "I", "I", "I"), 4), (("R", "R", "R", "I"), 12)}),
         ("set_digital", {(("I", "I", "I"), 4), (("R", "I", "R"), 4)}),
         ("reset_netzero", {((), 4)}),
-        ("play", {(("I", "I", "I"), 4), (("R", "R", "I"), 4)}),
-        ("acquire_weighted", {(("I", "I", "I", "I", "I"), 4), (("I", "R", "R", "R", "I"), 4)}),
+        ("play", {(("I", "I", "I"), 4), (("R", "R", "I"), 8)}),
+        ("acquire_weighed", {(("I", "I", "I", "I", "I"), 4), (("I", "R", "R", "R", "I"), 12)}),
+        ("acquire_weighted", {(("I", "I", "I", "I", "I"), 4), (("I", "R", "R", "R", "I"), 12)}),
         ("acquire_timetags", {(("I", "I", "I", "I", "I"), 8), (("I", "R", "I", "R", "I"), 8)}),
         ("fb_acq_iq_shift", {(("I", "I"), 4), (("R", "I"), 4)}),
         ("fb_acq_tb_cfg", {(("I", "I", "I", "I"), 4), (("R", "I"), 4)}),
@@ -70,11 +72,11 @@ def _signature_summary(op: str) -> set[tuple[tuple[str, ...], int]]:
         ("fb_acq_tb_mock", {(("I", "I", "I", "I"), 4), (("R", "I"), 4)}),
         ("fb_com_cfg", {(("I", "I", "I", "I"), 4), (("R", "I"), 4)}),
         ("fb_com_extra", {(("I", "I", "I"), 4), (("R", "I"), 4)}),
-        ("fb_pull_data", {(("R", "R"), 8)}),
+        ("fb_pull_data", {(("R", "R"), 4)}),
         ("fb_cmd", {(("I", "I", "I"), 4), (("I", "R", "I"), 4)}),
     ],
 )
-def test_current_docs_signatures_and_q1_runtimes_are_encoded(
+def test_assembler_signatures_and_default_q1_runtimes_are_encoded(
     op: str, expected: set[tuple[tuple[str, ...], int]]
 ) -> None:
     assert _signature_summary(op) == expected
@@ -557,7 +559,7 @@ def test_status_branches_use_concrete_cmp_test_and_shift_flags(source: str, expe
     [
         ("move 5,R0\nnop\ncmp R0,3\nnop\njg @taken\nwait 4\nstop\ntaken: wait 8\nstop\n", "jg", "16"),
         ("move 1,R0\nnop\ncmp R0,3\nnop\njg @taken\nwait 4\nstop\ntaken: wait 8\nstop\n", "jg", "4"),
-        ("move 3,R0\nnop\ncmp R0,3\nnop\njge @taken\nwait 4\nstop\ntaken: wait 8\nstop\n", "jge", "24"),
+        ("move 3,R0\nnop\ncmp R0,3\nnop\njge @taken\nwait 4\nstop\ntaken: wait 8\nstop\n", "jge", "16"),
         ("move 1,R0\nnop\ncmp R0,3\nnop\njge @taken\nwait 4\nstop\ntaken: wait 8\nstop\n", "jge", "4"),
     ],
 )
@@ -574,7 +576,7 @@ def test_single_iteration_loop_uses_continue_q1_runtime() -> None:
     state = _state("move 1,R0\nnop\nbody: nop\nloop R0,@body\nstop\n")
     loop_issue = next(event for event in state.events if event.kind == "q1_issue" and event.meta["op"] == "loop")
 
-    assert str(loop_issue.duration) == "4"
+    assert str(loop_issue.duration) == "20"
 
 
 def test_compact_loop_final_hidden_iteration_uses_continue_q1_runtime() -> None:
@@ -582,9 +584,9 @@ def test_compact_loop_final_hidden_iteration_uses_continue_q1_runtime() -> None:
     stop_issue = next(event for event in state.events if event.kind == "q1_issue" and event.meta["op"] == "stop")
     loop_block = next(event for event in state.events if event.kind == "loop_block")
 
-    assert str(stop_issue.t0) == "44"
-    assert loop_block.meta["loop_q1_jump_runtime_ns"] == 24
-    assert loop_block.meta["loop_q1_continue_runtime_ns"] == 4
+    assert str(stop_issue.t0) == "68"
+    assert loop_block.meta["loop_q1_jump_runtime_ns"] == 32
+    assert loop_block.meta["loop_q1_continue_runtime_ns"] == 20
 
 
 def test_fb_cmd_accepts_register_payload_and_emits_feedback_event() -> None:
@@ -613,11 +615,11 @@ def test_fb_pull_data_writes_fifo_id_and_payload_destinations() -> None:
     }
 
 
-def test_fb_pull_data_q1_issue_duration_accounts_for_two_register_writes() -> None:
+def test_fb_pull_data_q1_issue_takes_one_tick_with_data_ready() -> None:
     state = _state("fb_pull_data R4,R5\nstop\n")
 
     issue = next(event for event in state.events if event.kind == "q1_issue" and event.label == "fb_pull_data")
-    assert str(issue.duration) == "8"
+    assert str(issue.duration) == "4"
 
 
 def test_fb_pull_data_feedback_flow_uses_fifo_send_channel() -> None:

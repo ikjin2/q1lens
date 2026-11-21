@@ -644,6 +644,14 @@ def _analyze_command(args: argparse.Namespace) -> int:
                         print(f"q1timeline analyze: {message}", file=sys.stderr)
                     return 2
             continue
+        try:
+            external = config.concrete_inputs(sequencer, params) if execution_mode == "concrete" else None
+        except ValueError as exc:
+            if args.format == "vscode-json":
+                _print_vscode_payload(_vscode_error_payload("config_error", str(exc), diagnostics))
+            else:
+                print(f"q1timeline analyze: {exc}", file=sys.stderr)
+            return 2
         state = interpret_program(
             program,
             sequencer_id=sequencer.id,
@@ -655,6 +663,7 @@ def _analyze_command(args: argparse.Namespace) -> int:
             loop_preview_counts=loop_preview_counts,
             strict_q1asm=args.q1asm_strict,
             execution_mode=execution_mode,
+            external=external,
             max_steps=max_steps,
         )
         if sequence_names is not None:

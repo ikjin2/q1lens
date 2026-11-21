@@ -12,6 +12,19 @@ _NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SYMBOL_RE = re.compile(r"^\$?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
 _REGISTER_RE = re.compile(r"^R(?:0[xX][0-9A-Fa-f]+|0|[1-9]\d*)$", re.IGNORECASE)
 _INTEGER_RE = re.compile(r"^-?(?:0[xX][0-9A-Fa-f]+|0|[1-9]\d*)$")
+_PARAM_INTEGER_RE = re.compile(r"^[+-]?(?:0[xX][0-9a-fA-F]+|0[bB][01]+|\d+)$")
+
+
+def parameter_integer(value: object) -> int | None:
+    """Decode an integer from project parameters, whose syntax includes binary strings."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if _PARAM_INTEGER_RE.fullmatch(text):
+            base = 0 if text.lower().lstrip("+-").startswith(("0x", "0b")) else 10
+            return int(text, base)
+    return None
 
 
 def parse_integer_literal(raw: str) -> int:

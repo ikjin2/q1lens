@@ -8,15 +8,45 @@ import sys
 import pytest
 
 from q1timeline.analysis.values import Concrete
+from q1timeline.analysis.api import analyze_documents, analyze_text
+from q1timeline.cli import main
 from q1timeline.playback import PlaybackSession
 from q1timeline.external_inputs import validate_external_inputs
 from q1timeline.project import ConfigLoadError, load_project_config
 from q1timeline.render.html import render_html
+from q1timeline.watch.watcher import run_watch_once
 
 
 def inputs(*times, targets=("a", "b"), address=1):
     return {"triggers": [{"id": "shot_start", "address": address,
                           "targets": list(targets), "times_ns": list(times)}]}
+
+
+def test_concrete_receivers_reach_cli_watch_and_text_apis(tmp_path):
+    source = "wait_trigger 2,4\nfb_pop_data 9,R0\nnop\nstop R0"
+    config = inputs(16, targets=("s",), address=2)
+    config["feedback"] = [{"target": "s", "arrivals": [{"time_ns": 60, "id": 9, "value": -7}]}]
+    (tmp_path / "s.q1asm").write_text(source, encoding="utf-8")
+    project = tmp_path / "q1timeline.yml"
+    project.write_text(json.dumps({
+        "sequencers": [{"id": "s", "file": "s.q1asm"}], "external_inputs": config,
+        "analysis": {"execution_mode": "concrete"},
+    }), encoding="utf-8")
+    out = tmp_path / "cli.json"
+    assert main(["analyze", "--project", str(project), "--out", str(out)]) == 0
+    watch = run_watch_once(project, tmp_path / "watch")
+    assert watch.ok
+    for timeline in (
+        json.loads(out.read_text(encoding="utf-8")),
+        json.loads(watch.timeline_ir.read_text(encoding="utf-8")),
+        analyze_text(source, sequencer_id="s", execution_mode="concrete", external_inputs=config),
+        analyze_documents({"s.q1asm": source}, execution_mode="concrete", external_inputs=config),
+    ):
+        assert timeline["execution"]["s"]["stop_code"] == -7
+        trigger, = [e for e in timeline["events"] if e["kind"] == "wait_trigger"]
+        assert trigger["meta"]["trigger_assumption"]["resume_ns"] == 20
+        receive, = [e for e in timeline["events"] if e["kind"] == "feedback_pop"]
+        assert receive["meta"]["arrival_ns"] == 60
 
 
 def run(session):

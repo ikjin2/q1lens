@@ -77,22 +77,22 @@ def test_compact_loop_keeps_an_unknown_history_gap_then_restores_proven_affine_v
     counter = _writes(ir, "R0")
     assert [write["value"]["kind"] for write in counter] == ["concrete", "unknown", "concrete"]
     assert counter[-1]["value"]["value"] == 0
-    assert counter[-1]["time"]["value"] == 112
+    assert counter[-1]["time"]["value"] == 144
     arithmetic = _writes(ir, "R1")
     assert arithmetic[1]["value"]["value"] == 1
     invalidated = next(write for write in arithmetic if write["meta"].get("invalidated"))
     assert invalidated["value"]["kind"] == "unknown"
-    assert invalidated["time"]["value"] == 52
+    assert invalidated["time"]["value"] == 60
     assert arithmetic[-1]["meta"]["affine"] is True
     assert arithmetic[-1]["value"]["value"] == 3
-    assert arithmetic[-1]["time"]["value"] == 112
+    assert arithmetic[-1]["time"]["value"] == 144
     assert _writes(ir, "R2")[0]["value"]["value"] == 3
 
 
 def test_one_iteration_loop_keeps_body_value_and_records_zero_counter() -> None:
     ir = analyze_text("move 1,R0\nnop\nbody: move 9,R1\nloop R0,@body\nstop")
     assert _writes(ir, "R1")[0]["value"]["value"] == 9
-    assert _writes(ir, "R1")[0]["time"]["value"] == 16
+    assert _writes(ir, "R1")[0]["time"]["value"] == 32
     assert _writes(ir, "R0")[-1]["value"]["value"] == 0
     assert not any(write["meta"].get("invalidated") for write in ir["register_history"])
 
@@ -105,14 +105,14 @@ def test_unreset_inner_loop_preserves_observed_decrements_before_unknown_tail() 
     inner = _writes(ir, "R1")
     first_completion, = [write for write in inner if write["meta"].get("loop_complete")]
     assert first_completion["event_id"] == child["meta"]["loop_q1_issue_event_id"]
-    assert (first_completion["value"]["value"], first_completion["time"]["value"]) == (0, 52)
+    assert (first_completion["value"]["value"], first_completion["time"]["value"]) == (0, 76)
 
     outer = _writes(ir, "R0")
     first_decrement, = [write for write in outer if write["meta"].get("op") == "loop"]
-    assert (first_decrement["value"]["value"], first_decrement["time"]["value"]) == (1, 76)
+    assert (first_decrement["value"]["value"], first_decrement["time"]["value"]) == (1, 108)
     assert not first_decrement["meta"].get("loop_complete")
     outer_issue = next(event for event in ir["events"] if event["id"] == first_decrement["event_id"])
-    assert (outer_issue["t0"]["value"], outer_issue["t1"]["value"], outer_issue["meta"]["branch_taken"]) == (52, 76, True)
+    assert (outer_issue["t0"]["value"], outer_issue["t1"]["value"], outer_issue["meta"]["branch_taken"]) == (76, 108, True)
     boundary, = [event for event in ir["events"] if event["kind"] == "unknown_region"]
     assert boundary["source"]["line"] == 7 and boundary["t0"]["value"] == 0
     assert boundary["meta"]["q1_issue_event_id"] == first_decrement["event_id"]
@@ -120,7 +120,7 @@ def test_unreset_inner_loop_preserves_observed_decrements_before_unknown_tail() 
     assert boundary["meta"]["q1_proof_cutoff"] is True
     assert any(item["category"] == "analysis_incomplete" and boundary["id"] in item["related_events"]
                for item in ir["diagnostics"])
-    assert all(writes[-1]["meta"]["invalidated"] and writes[-1]["time"]["value"] == 76 for writes in (inner, outer))
+    assert all(writes[-1]["meta"]["invalidated"] and writes[-1]["time"]["value"] == 108 for writes in (inner, outer))
     assert not any(event["kind"] == "stop" for event in ir["events"])
 
     concrete = analyze_text(source, execution_mode="concrete", max_steps=16)
@@ -128,7 +128,7 @@ def test_unreset_inner_loop_preserves_observed_decrements_before_unknown_tail() 
     assert execution["status"] == "step_limit"
     assert _writes(concrete, "R0")[-1]["value"]["value"] == 1
     wrap, = [write for write in _writes(concrete, "R1") if write["value"].get("value") == 0xFFFFFFFF]
-    assert wrap["meta"]["previous_value"]["value"] == 0 and wrap["time"]["value"] == 108
+    assert wrap["meta"]["previous_value"]["value"] == 0 and wrap["time"]["value"] == 148
     assert not any(event["kind"] == "stop" for event in concrete["events"])
 
 
@@ -167,7 +167,7 @@ def test_collapsed_branch_invalidates_prior_register_values() -> None:
     invalidation = _writes(ir, "R0")[-1]
     assert invalidation["value"]["kind"] == "unknown"
     assert invalidation["meta"]["invalidated"] is True
-    assert invalidation["time"]["value"] == 32
+    assert invalidation["time"]["value"] == 36
 
 
 def test_register_history_serializes_each_sequencer_and_keeps_local_time() -> None:

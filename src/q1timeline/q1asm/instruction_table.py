@@ -57,6 +57,11 @@ def get_instruction_spec(op: str) -> InstructionSpec:
     return spec if spec is not None else _unknown_spec(normalized)
 
 
+def branch_duration(taken_duration: int, taken: bool) -> int:
+    """The ISA 2 simulator charges three extra Q1 ticks for an executed jump."""
+    return taken_duration if taken else taken_duration - 12
+
+
 def rt_duration_arg(op: str) -> int | None:
     return get_instruction_spec(op).rt_duration_arg
 
@@ -276,9 +281,9 @@ INSTRUCTION_TABLE: dict[str, InstructionSpec] = {
     "stop": _spec("stop", "control", [_sig(""), _sig("I"), _sig("R")]),
     "nop": _spec("nop", "classical", [_sig("")]),
     "jmp": _spec("jmp", "branch", [_sig("I/L", 16), _sig("R", 16)]),
-    "jge": _spec("jge", "branch", [_sig("R,I,I/L", 24), _sig("R,I,R", 24), _sig("I/L", 24), _sig("R", 24)]),
-    "jlt": _spec("jlt", "branch", [_sig("R,I,I/L", 24), _sig("R,I,R", 24)]),
-    "loop": _spec("loop", "branch", [_sig("R,I/L", 24), _sig("R,R", 24)]),
+    "jge": _spec("jge", "branch", [_sig("R,I,I/L", 28), _sig("R,I,R", 32), _sig("I/L", 16), _sig("R", 16)]),
+    "jlt": _spec("jlt", "branch", [_sig("R,I,I/L", 28), _sig("R,I,R", 32)]),
+    "loop": _spec("loop", "branch", [_sig("R,I/L", 32), _sig("R,R", 32)]),
     "move": _spec("move", "classical", [_sig("I,R"), _sig("R,R")]),
     "not": _spec("not", "classical", [_sig("I,R", 12), _sig("R,R", 12)]),
     "add": _spec("add", "classical", [_sig("R,I,R", 12), _sig("R,R,R", 16)]),
@@ -292,7 +297,7 @@ INSTRUCTION_TABLE: dict[str, InstructionSpec] = {
     "set_cond": _spec(
         "set_cond",
         "latched",
-        [_sig("I,I,I,I"), _sig("R,R,R,I")],
+        [_sig("I,I,I,I"), _sig("R,R,R,I", 12)],
         modifies_latched_state=True,
         timing_effect_status="analysis_incomplete",
     ),
@@ -305,13 +310,13 @@ INSTRUCTION_TABLE: dict[str, InstructionSpec] = {
     "set_awg_gain": _spec(
         "set_awg_gain",
         "latched",
-        [_sig("I,I"), _sig("R,R")],
+        [_sig("I,I"), _sig("R,R", 8)],
         modifies_latched_state=True,
     ),
     "set_awg_offs": _spec(
         "set_awg_offs",
         "latched",
-        [_sig("I,I"), _sig("R,R")],
+        [_sig("I,I"), _sig("R,R", 8)],
         modifies_latched_state=True,
     ),
     "set_digital": _spec(
@@ -374,7 +379,7 @@ INSTRUCTION_TABLE: dict[str, InstructionSpec] = {
     "play": _spec(
         "play",
         "rt",
-        [_sig("I,I,I"), _sig("R,R,I")],
+        [_sig("I,I,I"), _sig("R,R,I", 8)],
         emits_rt_packet=True,
         advances_rt_time=True,
         rt_duration_arg=2,
@@ -392,7 +397,7 @@ INSTRUCTION_TABLE: dict[str, InstructionSpec] = {
     "acquire_weighed": _spec(
         "acquire_weighed",
         "rt",
-        [_sig("I,I,I,I,I"), _sig("I,R,R,R,I")],
+        [_sig("I,I,I,I,I"), _sig("I,R,R,R,I", 12)],
         emits_rt_packet=True,
         advances_rt_time=True,
         rt_duration_arg=4,
@@ -435,7 +440,7 @@ INSTRUCTION_TABLE: dict[str, InstructionSpec] = {
         applies_latched_state=True,
     ),
     "fb_pop_data": _spec("fb_pop_data", "feedback", [_sig("I,R")]),
-    "fb_pull_data": _spec("fb_pull_data", "feedback", [_sig("R,R", 8)]),
+    "fb_pull_data": _spec("fb_pull_data", "feedback", [_sig("R,R")]),
     "fb_com_data": _spec(
         "fb_com_data",
         "rt",
@@ -568,25 +573,25 @@ INSTRUCTION_TABLE.update(
 
 INSTRUCTION_TABLE.update(
     {
-        "add": _spec("add", "classical", [_sig("I,R,R", 12), _sig("R,I,R", 12), _sig("R,R,R", 12)]),
-        "sub": _spec("sub", "classical", [_sig("I,R,R", 12), _sig("R,I,R", 12), _sig("R,R,R", 12)]),
-        "and": _spec("and", "classical", [_sig("I,R,R", 12), _sig("R,I,R", 12), _sig("R,R,R", 12)]),
-        "or": _spec("or", "classical", [_sig("I,R,R", 12), _sig("R,I,R", 12), _sig("R,R,R", 12)]),
-        "xor": _spec("xor", "classical", [_sig("I,R,R", 12), _sig("R,I,R", 12), _sig("R,R,R", 12)]),
-        "asl": _spec("asl", "classical", [_sig("I,R,R", 12), _sig("R,I,R", 12), _sig("R,R,R", 12)]),
-        "asr": _spec("asr", "classical", [_sig("I,R,R", 12), _sig("R,I,R", 12), _sig("R,R,R", 12)]),
-        "lsl": _spec("lsl", "classical", [_sig("I,R,R", 12), _sig("R,I,R", 12), _sig("R,R,R", 12)]),
-        "lsr": _spec("lsr", "classical", [_sig("I,R,R", 12), _sig("R,I,R", 12), _sig("R,R,R", 12)]),
-        "mulu16": _spec("mulu16", "classical", [_sig("I,R,R", 12), _sig("R,I,R", 12), _sig("R,R,R", 12)]),
-        "muls16": _spec("muls16", "classical", [_sig("I,R,R", 12), _sig("R,I,R", 12), _sig("R,R,R", 12)]),
-        "mulu32": _spec("mulu32", "classical", [_sig("I,R,R,R", 24), _sig("R,I,R,R", 24), _sig("R,R,R,R", 24)]),
-        "muls32": _spec("muls32", "classical", [_sig("I,R,R,R", 24), _sig("R,I,R,R", 24), _sig("R,R,R,R", 24)]),
-        "mulu32l": _spec("mulu32l", "classical", [_sig("I,R,R", 20), _sig("R,I,R", 20), _sig("R,R,R", 20)]),
-        "mulu32h": _spec("mulu32h", "classical", [_sig("I,R,R", 20), _sig("R,I,R", 20), _sig("R,R,R", 20)]),
-        "muls32l": _spec("muls32l", "classical", [_sig("I,R,R", 20), _sig("R,I,R", 20), _sig("R,R,R", 20)]),
-        "muls32h": _spec("muls32h", "classical", [_sig("I,R,R", 20), _sig("R,I,R", 20), _sig("R,R,R", 20)]),
-        "cmp": _spec("cmp", "classical", [_sig("R,I", 12), _sig("R,R", 12), _sig("I,R", 12)]),
-        "test": _spec("test", "classical", [_sig("R,I", 12), _sig("R,R", 12), _sig("I,R", 12)]),
+        "add": _spec("add", "classical", [_sig("I,R,R", 12), _sig("R,I,R", 12), _sig("R,R,R", 16)]),
+        "sub": _spec("sub", "classical", [_sig("I,R,R", 12), _sig("R,I,R", 12), _sig("R,R,R", 16)]),
+        "and": _spec("and", "classical", [_sig("I,R,R", 12), _sig("R,I,R", 12), _sig("R,R,R", 16)]),
+        "or": _spec("or", "classical", [_sig("I,R,R", 12), _sig("R,I,R", 12), _sig("R,R,R", 16)]),
+        "xor": _spec("xor", "classical", [_sig("I,R,R", 12), _sig("R,I,R", 12), _sig("R,R,R", 16)]),
+        "asl": _spec("asl", "classical", [_sig("I,R,R", 12), _sig("R,I,R", 12), _sig("R,R,R", 16)]),
+        "asr": _spec("asr", "classical", [_sig("I,R,R", 12), _sig("R,I,R", 12), _sig("R,R,R", 16)]),
+        "lsl": _spec("lsl", "classical", [_sig("I,R,R", 12), _sig("R,I,R", 12), _sig("R,R,R", 16)]),
+        "lsr": _spec("lsr", "classical", [_sig("I,R,R", 12), _sig("R,I,R", 12), _sig("R,R,R", 16)]),
+        "mulu16": _spec("mulu16", "classical", [_sig("I,R,R", 12), _sig("R,I,R", 12), _sig("R,R,R", 16)]),
+        "muls16": _spec("muls16", "classical", [_sig("I,R,R", 12), _sig("R,I,R", 12), _sig("R,R,R", 16)]),
+        "mulu32": _spec("mulu32", "classical", [_sig("I,R,R,R", 24), _sig("R,I,R,R", 24), _sig("R,R,R,R", 28)]),
+        "muls32": _spec("muls32", "classical", [_sig("I,R,R,R", 24), _sig("R,I,R,R", 24), _sig("R,R,R,R", 28)]),
+        "mulu32l": _spec("mulu32l", "classical", [_sig("I,R,R", 20), _sig("R,I,R", 20), _sig("R,R,R", 24)]),
+        "mulu32h": _spec("mulu32h", "classical", [_sig("I,R,R", 20), _sig("R,I,R", 20), _sig("R,R,R", 24)]),
+        "muls32l": _spec("muls32l", "classical", [_sig("I,R,R", 20), _sig("R,I,R", 20), _sig("R,R,R", 24)]),
+        "muls32h": _spec("muls32h", "classical", [_sig("I,R,R", 20), _sig("R,I,R", 20), _sig("R,R,R", 24)]),
+        "cmp": _spec("cmp", "classical", [_sig("R,I", 12), _sig("R,R", 16), _sig("I,R", 12)]),
+        "test": _spec("test", "classical", [_sig("R,I", 12), _sig("R,R", 16), _sig("I,R", 12)]),
         "sw_req": _spec("sw_req", "control", [_sig("I"), _sig("R")]),
         "set_digital": _spec(
             "set_digital",
@@ -606,7 +611,7 @@ INSTRUCTION_TABLE.update(
         "acquire_weighted": _spec(
             "acquire_weighted",
             "rt",
-            [_sig("I,I,I,I,I"), _sig("I,R,R,R,I")],
+            [_sig("I,I,I,I,I"), _sig("I,R,R,R,I", 12)],
             emits_rt_packet=True,
             advances_rt_time=True,
             rt_duration_arg=4,

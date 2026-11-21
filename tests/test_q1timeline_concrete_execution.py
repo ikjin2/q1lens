@@ -107,7 +107,7 @@ def test_trace_records_overflow_flags_before_and_after() -> None:
 @pytest.mark.parametrize("source", [
     "wait R0\nstop", "move {COUNT},R0\nstop",
     "jz @done\ndone: stop", "fb_pop_data 0,R0\nstop", "wait_trigger 0,4\nstop",
-    "set_cond 1,1,0,4\nstop", "mulu16 R1,3,R0\nstop", "acquire 0,R0,4\nstop",
+    "set_cond R0,R1,R2,4\nstop", "mulu16 R1,3,R0\nstop", "acquire 0,R0,4\nstop",
 ])
 def test_unknown_inputs_and_unimplemented_semantics_block_before_execution(source: str) -> None:
     state = execute(source, branch_policy="assume_true")

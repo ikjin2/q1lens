@@ -96,7 +96,7 @@ def test_numeric_and_register_targets_on_each_side_of_each_macro(mode, macro, at
     executed_macro = next((event for event in issues(state) if event.meta["op"] == macro.split()[0]), None)
     assert (executed_macro is not None) is at_entry
     if at_entry and executed_macro.meta["branch_taken"]:
-        assert executed_macro.duration == Concrete(24)
+        assert executed_macro.duration == Concrete(32 if macro.startswith("loop") else 28)
 
 
 @pytest.mark.parametrize("mode", ["analysis", *MODES])
@@ -150,7 +150,7 @@ def test_interior_fallthrough_starts_at_next_source_entry(mode, macro, lowered, 
 
 @pytest.mark.parametrize("register_target", [False, True])
 @pytest.mark.parametrize(("op", "compare", "taken", "duration"), [
-    ("jnz", 1, False, 4), ("jnz", 0, True, 16), ("jge", 2, False, 4), ("jge", 0, True, 24),
+    ("jnz", 1, False, 4), ("jnz", 0, True, 16), ("jge", 2, False, 4), ("jge", 0, True, 16),
 ])
 def test_status_branch_to_interior_matches_concrete_selected_path(register_target, op, compare, taken, duration):
     setup, target = ("move 6,R2", "R2") if register_target else ("nop", "6")
@@ -266,7 +266,8 @@ def test_first_macro_applies_effects_before_selecting_an_interior(register_targe
     first = trace[3]
     assert (first.meta["source_pc"], first.meta["compiled_pc"], first.meta["compiled_target_pc"]) == (3, 3, 7)
     assert first.meta["branch_taken"] is taken
-    assert first.duration == Concrete(24 if taken else 4)
+    jump_ns = 32 if macro.startswith("loop") or register_target else 28
+    assert first.duration == Concrete(jump_ns if taken else jump_ns - 12)
     assert analysis.alu_flags == issues(concrete)[3].meta["flags_after"]
     assert analysis.alu_flags_source.line == 4
     if taken:
@@ -305,7 +306,7 @@ def test_first_macro_keeps_unsafe_or_unknown_interior_path_incomplete(macro, see
     assert first.source.line == 3
     assert first.meta["branch_taken"] == (True if ready else "runtime_dependent")
     if ready:
-        assert first.duration == Concrete(24)
+        assert first.duration == Concrete(32 if macro.startswith("loop") else 28)
         assert state.registers["R0"] == Concrete(seed - 1 if macro.startswith("loop") else seed)
         assert state.alu_flags_source.line == 3
     assert "R1" not in state.registers
@@ -320,7 +321,7 @@ def test_loop_self_interior_is_ignored_only_on_known_fallthrough(count):
     assert loop.meta["compiled_target_pc"] == 3
     if count == 1:
         assert loop.meta["branch_taken"] is False
-        assert loop.duration == Concrete(4)
+        assert loop.duration == Concrete(20)
         assert state.registers["R0"] == Concrete(0)
         assert state.rt_packets[0].duration == Concrete(8)
     else:
@@ -338,7 +339,7 @@ def test_legacy_comparison_does_not_traverse_its_own_branch_slot(op, seed, taken
     branch = issues(state)[2]
     assert branch.meta["compiled_target_pc"] == 3
     assert branch.meta["branch_taken"] is taken
-    assert branch.duration == Concrete(24 if taken else 4)
+    assert branch.duration == Concrete(28 if taken else 16)
     assert not any(event.meta.get("macro_source_op") for event in issues(state))
     if taken:
         assert branch.meta["reason"] == "compiled_interior_branch_target"
@@ -460,7 +461,7 @@ def test_unloaded_conditional_target_is_ignored_on_fallthrough(mode, branch, tar
     edge, wait, stop = issues(state)[-3:]
     assert edge.meta["op"] == branch
     assert edge.meta["branch_taken"] is False
-    assert edge.duration == Concrete(4)
+    assert edge.duration == Concrete({"jnz": 4, "loop": 20, "jlt": 16, "jge": 16}[branch])
     assert wait.meta["op"] == "wait"
     assert stop.meta["stop_code"] == 17
     assert state.rt_packets[0].duration == Concrete(4)

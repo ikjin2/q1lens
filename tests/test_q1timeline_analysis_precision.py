@@ -391,15 +391,15 @@ def test_compound_status_branches_use_only_proved_flag_completions(branch: str, 
     assert _status_branch_decision(branch, flags) is expected
 
 
-@pytest.mark.parametrize("branch, taken_duration", [("jge R7,1,@join", 24), ("jlt R7,1,@join", 24),
-                                                   ("jz @join", 16), ("jge @join", 24)])
+@pytest.mark.parametrize("branch, taken_duration", [("jge R7,1,@join", 28), ("jlt R7,1,@join", 28),
+                                                   ("jz @join", 16), ("jge @join", 16)])
 @pytest.mark.parametrize("taken", [False, True])
 def test_assumed_branches_use_the_selected_path_q1_issue_cost(branch: str, taken_duration: int, taken: bool) -> None:
     state = analyze(f"{branch}\nwait 100\nstop\njoin: wait 40\nstop\n",
                     branch_policy="assume_true" if taken else "assume_false")
     issue = next(event for event in state.events if event.kind == "q1_issue")
 
-    assert issue.duration == Concrete(taken_duration if taken else 4)
+    assert issue.duration == Concrete(taken_duration if taken else taken_duration - 12)
     assert state.rt_packets[0].q1_issue_t0 == issue.t1
 
 
@@ -409,8 +409,8 @@ def test_compared_branch_paths_have_their_own_q1_issue_cost() -> None:
     by_path = {path: [packet for packet in state.rt_packets if packet.meta.get("branch_comparison_path") == path]
                for path in ("taken", "fallthrough")}
 
-    assert [packet.q1_issue_t0 for packet in by_path["taken"]] == [Concrete(24), Concrete(28)]
-    assert [packet.q1_issue_t0 for packet in by_path["fallthrough"]] == [Concrete(24), Concrete(28)]
+    assert [packet.q1_issue_t0 for packet in by_path["taken"]] == [Concrete(28), Concrete(32)]
+    assert [packet.q1_issue_t0 for packet in by_path["fallthrough"]] == [Concrete(36), Concrete(40)]
     assert analyze_underflow(state).status == "analysis_incomplete"
 
 
@@ -652,7 +652,7 @@ def test_analytical_rt_register_validation_preserves_duration_validation():
 @pytest.mark.parametrize(("waveform_index", "expected_alternatives"), [(1023, 2), (1024, 0)])
 def test_joined_queue_replay_requires_both_rt_register_admissions(waveform_index, expected_alternatives):
     state = analyze(f"move 0,R1\nnop\nwait 8\njlt R7,1,@taken\nmove {waveform_index},R0\njmp @join\n"
-                    "taken: move 1,R0\nnop\njoin: nop\nplay R0,R1,4\nupd_param 4\nstop")
+                    "taken: move 1,R0\nnop\nnop\njoin: nop\nplay R0,R1,4\nupd_param 4\nstop")
     region, = [event for event in state.events if event.kind == "branch_region"]
 
     assert region.meta["branch_rt_join_proven"] is True

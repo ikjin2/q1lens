@@ -17,7 +17,7 @@ def compare(source, op, target="end", line=2):
     return ir, state
 
 
-@pytest.mark.parametrize("op,jump_duration", [("jz", 16), ("jge", 24), ("jb", 16)])
+@pytest.mark.parametrize("op,jump_duration", [("jz", 16), ("jge", 16), ("jb", 16)])
 def test_compare_status_paths_keep_independent_q1_and_rt_times(op, jump_duration):
     ir, state = compare(f"cmp R0,5\n{op} @end\nwait 12\nend: upd_param 4\nstop", op)
     common, = [event for event in ir["events"] if event["kind"] == "q1_issue" and event["meta"].get("op") == op]
@@ -159,7 +159,7 @@ def test_direct_branch_choice_precedes_automatic_comparison(path):
     assert branch["meta"]["assumed_branch_path"] == (path or "both")
     if path is None:
         assert branch["meta"]["comparison_paths"] == ["taken", "fallthrough"]
-        assert branch["meta"]["comparison_q1_durations_ns"] == {"taken": 24, "fallthrough": 4}
+        assert branch["meta"]["comparison_q1_durations_ns"] == {"taken": 28, "fallthrough": 16}
     else:
         assert "comparison_paths" not in branch["meta"]
         assert branch["meta"]["assumption_source"] == "branch_assumption"

@@ -42,6 +42,13 @@ def test_static_stop_preserves_unknown_when_register_is_unresolved_or_unready():
         assert stop["meta"]["stop_code"]["kind"] == "unknown"
 
 
+@pytest.mark.parametrize("word,code", [(-(1 << 32), 0), ((1 << 33) - 1, -1)])
+def test_analysis_stop_reads_the_signed_low_word_of_a_register_parameter(word, code):
+    state = interpret_program(parse_q1asm("stop R0"), sequencer_id="s", params={"R0": word})
+    stop, = [event for event in state.events if event.kind == "stop"]
+    assert stop.meta["stop_code"] == code
+
+
 @pytest.mark.parametrize("mode", ["concrete", "simulation"])
 def test_prepared_q1_only_execution_keeps_stop_code_without_rt_trace(mode):
     program = parse_q1asm(".DEF CODE 7\nstop $CODE\nstop 91\n", file="code.q1asm")

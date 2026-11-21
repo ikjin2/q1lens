@@ -25,9 +25,10 @@ from q1timeline.analysis.values import Concrete, Unknown, add_values, resolve_ar
 from q1timeline.diagnostics import Diagnostic
 from q1timeline.ir.serialize import timeline_ir_from_states
 from q1timeline.external_inputs import resolve_feedback_sources, resolve_trigger_sources, validate_external_inputs
-from q1timeline.feedback_fifo import DEFAULT_FEEDBACK_QUEUE_CAPACITY, feedback_pop_limitation, take_feedback
+from q1timeline.feedback_fifo import DEFAULT_FEEDBACK_QUEUE_CAPACITY, feedback_pop_limitation, feedback_q1_completion, take_feedback
 from q1timeline.project import ConfigLoadError, load_project_config, load_single_file_config
 from q1timeline.q1asm.ast import Instr, SourceLocation
+from q1timeline.q1asm.compiled_addresses import next_source_position
 from q1timeline.q1asm.instruction_table import get_instruction_spec, rt_duration_arg_for_instruction
 from q1timeline.q1asm.parser import parse_q1asm
 from q1timeline.sequence import load_sequence_names
@@ -158,7 +159,7 @@ class PlaybackSession:
             state.metadata["execution"] = {
                 "mode": "playback", "status": "paused", "steps": 0,
                 "timing_model": "analytical", "address_model": core._address_model(state),
-                "assumptions": ["One executed path; feedback receipts are assumed and queue backpressure is not simulated.",
+                "assumptions": ["One executed path with assumed feedback receipts and a 32-entry RT FIFO.",
                                 "External trigger times are assumed receiver arrivals on the unaligned analytical RT clock; hardware transport latency is not modeled."],
             }
             sources = [source for source in self.trigger_sources if seq in source["targets"]]
@@ -327,7 +328,7 @@ class PlaybackSession:
             _, invalid, diagnostic_start = core._validate_instruction(state, instruction, runner.symbols)
             if not core._concrete_instruction_ready(
                 state, instruction, runner.symbols, spec, invalid, diagnostic_start,
-                supported_ops=core._CONCRETE_OPS | {instruction.op}, allow_symbolic_operands=True,
+                supported_ops=core._LOCAL_EXECUTION_OPS | {instruction.op}, allow_symbolic_operands=True,
                 rt_duration_error=duration_error,
             ):
                 execution = state.metadata["execution"]
@@ -385,7 +386,10 @@ class PlaybackSession:
                 return self._block(runner, instruction, f"{instruction.op} duration is unknown.")
         event_start = len(state.events)
         continuation = core._has_jump_continuation(state, instruction)
-        core._begin_execution_step(state)
+        if spec.category != "branch":
+            state.next_pc, state.next_interior_pc = next_source_position(
+                state.compiled_addresses, instruction, state.interior_pc, len(state.instructions_by_pc),
+            )
         state.current_resolved_args = core._resolved_args_for_instruction(instruction, scope, state)
         diagnostic_start = len(state.diagnostics)
         flags_before = dict(state.alu_flags) if state.alu_flags is not None else None
@@ -409,7 +413,8 @@ class PlaybackSession:
                 names = self.sequence_names.get(state.sequencer_id)
                 core._execute_instruction(state, instruction, runner.symbols,
                                           names.waveforms if names else {}, names.acquisitions if names else {},
-                                          allow_symbolic_operands=True, rt_condition_decision=decision)
+                                          allow_symbolic_operands=True, rt_condition_decision=decision,
+                                          share_resolved_issue=True)
         finally:
             state.current_resolved_args = []
         execution = state.metadata["execution"]
@@ -495,7 +500,7 @@ class PlaybackSession:
         spec, invalid, diagnostic_start = core._validate_instruction(state, instruction, runner.symbols)
         if not core._concrete_instruction_ready(
             state, instruction, runner.symbols, spec, invalid, diagnostic_start,
-            supported_ops=core._CONCRETE_OPS | {"wait_trigger"}, allow_symbolic_operands=True,
+            supported_ops=core._LOCAL_EXECUTION_OPS | {"wait_trigger"}, allow_symbolic_operands=True,
         ):
             execution = state.metadata["execution"]
             return self._block(runner, instruction, execution["reason"], error=execution["status"] == "error")
@@ -571,6 +576,7 @@ class PlaybackSession:
             return
         feedback_id = f"{state.sequencer_id}:feedback:{state.q1_issue_index}"
         assumption = dict(self.feedback_choices.get(feedback_id, {"value": None, "delay_ns": 0, "source": "default"}))
+        # Play's manual "Additional wait" specifies a stall on top of fetch.
         delay = Concrete(assumption["delay_ns"])
         state.q1_time_ns = add_values(state.q1_time_ns, delay)
         issue = next(event for event in state.events[event_start:] if event.kind == "q1_issue")
@@ -662,11 +668,10 @@ class PlaybackSession:
                 return self._block(runner, instruction, limitation)
         else:
             destinations["id"] = core._register_name(instruction.args[0], state)
-        armed = available = state.q1_time_ns.value
+        armed = state.q1_time_ns.value
         receipt, discarded = take_feedback(fifo.pending, requested_id)
         while receipt is None and fifo.arrivals:
-            available = fifo.arrivals[0]["time_ns"]
-            overflow = fifo.advance(available)
+            overflow = fifo.advance(fifo.arrivals[0]["time_ns"])
             if overflow is not None:
                 return self._feedback_overflow(runner, instruction, overflow)
             receipt, skipped = take_feedback(fifo.pending, requested_id)
@@ -694,10 +699,10 @@ class PlaybackSession:
         if state.metadata["execution"].get("status") in {"error", "blocked"}:
             execution = state.metadata["execution"]
             return self._block(runner, instruction, execution["reason"], error=execution["status"] == "error")
-        delay = Concrete(available - armed)
-        state.q1_time_ns = add_values(state.q1_time_ns, delay)
+        state.q1_time_ns = Concrete(feedback_q1_completion(state.q1_time_ns.value, receipt["time_ns"]))
         issue = state.events[event_start]
         value = receipt["value"] & 0xFFFFFFFF
+        available = max(armed, receipt["time_ns"])
         input_details.update(status="received", input_event_id=receipt["event_id"], id=receipt["id"], value=value,
                              arrival_ns=receipt["time_ns"], available_at_ns=available, completed_at_ns=state.q1_time_ns.value)
         write_roles = ("id", "data") if "id" in destinations else ("data",)
@@ -720,14 +725,14 @@ class PlaybackSession:
                 event, meta=meta, confidence="assumed",
                 t0=event.t0 if event.kind == "q1_issue" else Concrete(available),
                 t1=state.q1_time_ns if event.kind == "q1_issue" else Concrete(available),
-                duration=add_values(event.duration, delay) if event.kind == "q1_issue" else Concrete(0),
+                duration=Concrete(state.q1_time_ns.value - armed) if event.kind == "q1_issue" else Concrete(0),
             )
         runner.feedback_assumptions.append(feedback_id)
         runner.scheduled_feedback_gap = True
         self.assumption_references += len(discarded)
         self.feedback.append({**input_details, "feedback_id": feedback_id, "event_id": issue.id,
                               "sequencer_id": state.sequencer_id, "op": instruction.op, "step": self.steps,
-                              "assumption_source": "scenario", "assumed": True, "delay_ns": delay.value,
+                              "assumption_source": "scenario", "assumed": True, "delay_ns": available - armed,
                               "source": core._source_to_json(instruction.source)})
         return True
 
@@ -743,8 +748,11 @@ class PlaybackSession:
         target_value = resolve_arg_value(target_arg, scope)
         target = core._execution_target(state, target_value)
         conditional = instruction.op != "jmp"
+        effects = core._resolved_core_issue(state, instruction, scope)
         value = None
-        if instruction.op == "loop":
+        if effects is not None:
+            natural = effects.taken
+        elif instruction.op == "loop":
             previous = resolve_arg_value(instruction.args[0], scope)
             value = core._wrap_concrete_classical_register_value(core.subtract_values(previous, Concrete(1)))
             natural = value.value != 0 if isinstance(value, Concrete) else None
@@ -763,7 +771,8 @@ class PlaybackSession:
         if taken and target is None:
             return self._block(runner, instruction, core._invalid_branch_target_reason(state, target_value))
         origin = "user" if choice is not None else "default" if natural is None else "calculated"
-        duration = (24 if instruction.op in {"loop", "jlt", "jge"} else 16) if taken else 4
+        duration = (effects.q1_duration if effects is not None and choice is None else
+                    core.branch_duration(core._branch_taken_duration(instruction, state, runner.symbols), taken))
         t0 = state.q1_time_ns
         t1 = add_values(t0, Concrete(duration))
         state.q1_time_ns = t1
@@ -771,27 +780,37 @@ class PlaybackSession:
             state, instruction, t0, t1, None,
             register_metadata=core._register_issue_metadata(state, instruction, scope),
         )
-        if natural is not None and target is not None:
-            # Keep arithmetic, status flags and loop counter writes identical to concrete execution.
-            core._execute_concrete_branch(state, instruction, issue, runner.symbols, defer_register_write=True)
-            issue = core._revise_q1_issue_duration(state, issue, duration)
+        if effects is not None and target is not None:
+            # The chosen arm sets the clock; its natural condition still sets the flags and counter.
+            core._execute_concrete_branch(state, instruction, issue, runner.symbols, defer_register_write=True,
+                                          branch_issue=replace(effects, q1_duration=duration), projected=True)
         elif instruction.op == "loop":
             register = core._register_name(instruction.args[0], state)
-            core._set_alu_flags(state, instruction, core._sub_flags(previous.value, 1) if isinstance(previous, Concrete) else None)
+            if effects is not None:
+                value = Concrete(effects.words[0])
+                flags = effects.flags.as_dict()
+            else:
+                flags = core._sub_flags(previous.value, 1) if isinstance(previous, Concrete) else None
+            core._set_alu_flags(state, instruction, flags)
             provenance = core._register_provenance(
                 state, register, expression=f"{register} - 1", value=value,
                 steps=[core._provenance_step(instruction, f"{register} - 1", value)],
             )
             state.pending_register_writes.append(core.PendingRegisterWrite(
                 register, value, core._concrete_write_provenance(state, instruction, provenance, issue.id),
-                instruction.source, state.q1_issue_index + 1, issue.id, {"op": "loop"},
+                instruction.source, state.q1_issue_index + 1 + core.register_write_delay_slots(instruction.op),
+                issue.id, {"op": "loop"},
             ))
         elif len(instruction.args) == 3:
-            core._set_alu_flags(state, instruction, core._sub_flags(left.value, right.value)
-                                if isinstance(left, Concrete) and isinstance(right, Concrete) else None)
-        core._begin_execution_step(state)
-        if taken:
-            core._set_execution_target(state, target)
+            if effects is not None:
+                flags = effects.flags.as_dict()
+            else:
+                flags = core._sub_flags(left.value, right.value) if isinstance(left, Concrete) and isinstance(right, Concrete) else None
+            core._set_alu_flags(state, instruction, flags)
+        state.next_pc, state.next_interior_pc = next_source_position(
+            state.compiled_addresses, instruction, state.interior_pc, len(state.instructions_by_pc),
+            taken=taken, target=target_value.value if isinstance(target_value, Concrete) else None,
+        )
         source_branch_id = core._branch_id(state, instruction, str(target_arg.value) if target_arg.kind == "label" else None, target_arg.raw)
         decision = "default" if origin == "default" else "assumed" if assumed else "concrete"
         metadata = {

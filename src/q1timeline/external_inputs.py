@@ -1,9 +1,13 @@
-"""Project-scoped, explicit external-input assumptions for analytical playback."""
+"""Project-scoped receiver inputs for analytical Concrete and Play execution."""
 from __future__ import annotations
 
 from copy import deepcopy
 import re
 from typing import Any, Iterable
+
+from q1timeline.feedback_fifo import DEFAULT_FEEDBACK_QUEUE_CAPACITY
+from q1timeline.q1asm.core_devices import ExternalInputs
+from q1timeline.q1asm.trigger_counters import TRIGGER_COUNTER_PARAMETERS
 
 
 def validate_external_inputs(config: dict | None, sequencer_ids: Iterable[str]) -> dict:
@@ -92,3 +96,21 @@ def resolve_trigger_sources(config: dict, params: dict[str, Any]) -> list[dict]:
             raise ValueError(f"External trigger {source['id']!r}: address {address!r} must resolve to an integer in 1..15")
         result.append({**deepcopy(source), "resolved_address": resolved})
     return result
+
+
+def concrete_receiver_inputs(
+    config: dict, sequencer: str, params: dict, settings: dict | None = None,
+    feedback_queue_capacity: int = DEFAULT_FEEDBACK_QUEUE_CAPACITY,
+) -> ExternalInputs:
+    sources = [s for s in config.get("triggers", ()) if sequencer in s["targets"]]
+    triggers = resolve_trigger_sources({"triggers": sources}, params)
+    arrivals = sorted((time, s["resolved_address"]) for s in triggers for time in s["times_ns"])
+    feedback = next((s["arrivals"] for s in config.get("feedback", ()) if s["target"] == sequencer), ())
+    return ExternalInputs(
+        trigger_arrivals=tuple(arrivals) if triggers else None,
+        scheduled_addresses=frozenset(s["resolved_address"] for s in triggers),
+        feedback_arrivals=tuple((a["time_ns"], a["id"], a["value"] & 0xFFFFFFFF)
+                                for a in sorted(feedback, key=lambda a: a["time_ns"])),
+        trigger_settings=tuple((key, value) for key, value in (settings or {}).items() if key in TRIGGER_COUNTER_PARAMETERS),
+        feedback_queue_capacity=feedback_queue_capacity,
+    )

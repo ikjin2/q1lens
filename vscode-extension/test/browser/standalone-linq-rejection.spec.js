@@ -130,9 +130,8 @@ test("standalone analytical LINQ keeps dwell but withholds unsupported extra-byt
       await expect(arrow).toHaveCount(0);
       expect(channel).toMatchObject({status: "incomplete", send_payloads: null, unconsumed_payloads: null});
 
-      const limitation = page.locator('.diagnostic[data-diagnostic-category="analysis_incomplete"]').filter({
-        has: page.getByText("self-cast.q1asm:2", {exact: true}),
-      });
+      const limitation = page.locator('.diagnostic[data-diagnostic-category="analysis_incomplete"]' +
+        ' .diagnostic-occurrence[data-diagnostic-location="self-cast.q1asm:2"]');
       const evidence = limitation.getByRole("link", {name: "Show event", exact: true});
       await expect(evidence).toHaveAttribute("data-related-event-id", config.id);
       await evidence.click();
@@ -162,9 +161,8 @@ test("standalone Normal opens collapsed LINQ diagnostics in the inspector", asyn
   const block = (event) => svg.locator(`[data-event-id="${event.id}"]`);
   const inspector = page.locator("#event-inspector-fields");
   const field = (label) => inspector.getByText(label, {exact: true}).locator("xpath=following-sibling::dd[1]");
-  const limitation = page.locator('.diagnostic[data-diagnostic-category="analysis_incomplete"]').filter({
-    has: page.getByText("self-cast.q1asm:2", {exact: true}),
-  });
+  const limitation = page.locator('.diagnostic[data-diagnostic-category="analysis_incomplete"]' +
+    ' .diagnostic-occurrence[data-diagnostic-location="self-cast.q1asm:2"]');
   const evidence = limitation.getByRole("link", {name: "Show event", exact: true});
   const open = async ({html}) => {
     await page.goto("about:blank");

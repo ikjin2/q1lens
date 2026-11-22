@@ -347,9 +347,11 @@ describe("notebook Python environment", () => {
     assert.ok(test.panel.webview.html.includes(test.executable));
     assert.match(test.panel.webview.html, /pip/);
     assert.match(test.panel.webview.html, /uv pip/);
-    assert.match(test.panel.webview.html, /Copy Command/i);
-    assert.match(test.panel.webview.html, /Insert into Terminal/i);
-    assert.match(test.panel.webview.html, /Check Again/i);
+    assert.match(test.panel.webview.html, /data-action="copyCommand">Copy</);
+    assert.match(test.panel.webview.html, /data-action="insertCommand"[^>]*>Insert in terminal</);
+    assert.match(test.panel.webview.html, /press Enter to run it yourself/);
+    assert.match(test.panel.webview.html, /data-action="checkAgain"[^>]*>Check again</);
+    assert.match(test.panel.webview.html, /data-action="openNotebook">Open notebook</);
     assert.equal(test.copied.length, 0);
     assert.equal(test.terminals.length, 0);
     test.panel.dispose();

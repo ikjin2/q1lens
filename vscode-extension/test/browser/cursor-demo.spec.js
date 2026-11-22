@@ -3,22 +3,22 @@ const { test, expect, open, at, value, register, tab } = require("./helpers");
 test("cursor provenance follows operand register writes at their readable times", async ({ page }) => {
   await open(page, "cursor-two-shot-feedback", "QCM1", "orange_drive");
   await tab(page, "Registers");
-  await at(page, 8464);
+  await at(page, 8460);
   await page.locator('[data-register="R2"]').click();
   await expect(value(page, "register-detail")).toContainText("R2 = 782336");
   await value(page, "register-detail").getByRole("button", { name: "R3 = 782336 ↗", exact: true }).click();
-  await expect(page.getByRole("spinbutton")).toHaveValue("8448");
+  await expect(page.getByRole("spinbutton")).toHaveValue("8444");
   await expect(page.locator('[data-register="R3"]')).toHaveAttribute("aria-pressed", "true");
   await expect(value(page, "register-detail")).toContainText("R3 = 782336");
-  await expect(value(page, "register-detail")).toContainText("readable at 8448 ns");
+  await expect(value(page, "register-detail")).toContainText("readable at 8444 ns");
   await expect(value(page, "register-detail")).toContainText("Calculation: R3 << FREQ_CURSOR_SHIFT");
   await page.getByRole("button", { name: "Open source", exact: true }).click();
   expect(await page.evaluate(() => window.selectedEventId)).toBe("orange_drive:e65");
   expect((await page.evaluate(() => window.revealedSource)).line).toBe(66);
   await value(page, "register-detail").getByRole("button", { name: "R3 = 1528 ↗", exact: true }).click();
-  await expect(page.getByRole("spinbutton")).toHaveValue("8432");
+  await expect(page.getByRole("spinbutton")).toHaveValue("8428");
   await expect(value(page, "register-detail")).toContainText("R3 = 1528");
-  await expect(value(page, "register-detail")).toContainText("readable at 8432 ns");
+  await expect(value(page, "register-detail")).toContainText("readable at 8428 ns");
   await expect(value(page, "register-detail")).toContainText("Calculation: R1 - TRACKER_MIN_CENTER");
   await page.getByRole("button", { name: "Open source", exact: true }).click();
   expect(await page.evaluate(() => window.selectedEventId)).toBe("orange_drive:e63");
@@ -48,7 +48,7 @@ test("cursor applied frequency navigates to the originating setter instead of th
 test("cursor feedback provenance links receiver to sender instruction and its register writer", async ({ page }) => {
   await open(page, "cursor-two-shot-feedback", "QCM1", "orange_drive");
   await tab(page, "Registers");
-  await at(page, 8368);
+  await at(page, 8364);
   await page.locator('[data-register="R1"]').click();
   await expect(value(page, "register-detail")).toContainText("R1 = 5528");
   await page.getByRole("button", { name: "Show received input that supplied this value", exact: true }).click();
@@ -59,13 +59,13 @@ test("cursor feedback provenance links receiver to sender instruction and its re
   await expect(page.getByRole("spinbutton")).toHaveValue("7980");
   const send = page.locator(".hardware-communication").filter({ has: page.getByRole("button", { name: "7980 ns · feedback send", exact: true }) });
   await send.getByRole("button", { name: "Show sending instruction", exact: true }).click();
-  await expect(page.getByRole("spinbutton")).toHaveValue("7764");
+  await expect(page.getByRole("spinbutton")).toHaveValue("7864");
   await expect(value(page, "instruction-detail")).toContainText("R15 = 5528");
   await value(page, "instruction-detail").getByRole("button", { name: "R15 = 5528 ↗", exact: true }).click();
-  await expect(page.getByRole("spinbutton")).toHaveValue("7728");
+  await expect(page.getByRole("spinbutton")).toHaveValue("7824");
   await expect(page.locator('[data-register="R15"]')).toHaveAttribute("aria-pressed", "true");
   await expect(value(page, "register-detail")).toContainText("R15 = 5528");
-  await expect(value(page, "register-detail")).toContainText("readable at 7728 ns");
+  await expect(value(page, "register-detail")).toContainText("readable at 7824 ns");
   await page.getByRole("button", { name: "Open source", exact: true }).click();
   const source = await page.evaluate(() => window.revealedSource);
   expect(source.line).toBe(182);
@@ -80,15 +80,15 @@ for (const profile of ["two-shot-feedback", "deadband-hold"]) {
     await open(page, `cursor-${profile}`, "QCM1", "orange_drive");
     await tab(page, "Registers");
     await page.getByRole("checkbox", { name: "All 64" }).check();
-    for (const [time, frequency] of [[99, "?"], [100, "780288"], [8463, "780288"],
-      [8464, changes ? "782336" : "780288"], [changes ? 47467 : 47463, changes ? "782336" : "780288"],
-      [changes ? 47468 : 47464, "780288"]]) {
+    for (const [time, frequency] of [[99, "?"], [100, "780288"], [8459, "780288"],
+      [8460, changes ? "782336" : "780288"], [changes ? 47463 : 47459, changes ? "782336" : "780288"],
+      [changes ? 47464 : 47460, "780288"]]) {
       await at(page, time);
       await expect(register(page, "R2")).toHaveText(frequency);
     }
-    await at(page, 8464);
+    await at(page, 8460);
     await page.locator('[data-register="R2"]').click();
-    await expect(value(page, "register-detail")).toContainText("readable at 8464 ns");
+    await expect(value(page, "register-detail")).toContainText("readable at 8460 ns");
     await page.getByRole("button", { name: "Open source", exact: true }).click();
     const source = await page.evaluate(() => window.revealedSource);
     expect(source.line).toBe(68);
@@ -107,9 +107,9 @@ for (const profile of ["two-shot-feedback", "deadband-hold"]) {
     await expect(page.getByRole("button", { name: "Inspect sequencer red_cursor", exact: true })).toBeVisible();
     await page.getByRole("button", { name: "Inspect sequencer red_tracker", exact: true }).click();
     await tab(page, "Registers");
-    await at(page, changes ? 7728 : 7720);
+    await at(page, changes ? 7824 : 7808);
     await expect(register(page, "R15")).toHaveText(changes ? "5528" : "5524");
-    await at(page, changes ? 46780 : 46752);
+    await at(page, changes ? 46884 : 46836);
     await expect(register(page, "R15")).toHaveText("5524");
     if (changes) {
       // Profile IQ is defined after the program's 12-bit right shift; bins
@@ -127,6 +127,6 @@ for (const profile of ["two-shot-feedback", "deadband-hold"]) {
       await expect(value(page, "bins")).not.toContainText(rawResult);
     }
     await at(page, 60000);
-    await expect(value(page, "execution")).toContainText("blocked");
+    await expect(value(page, "execution")).toContainText("Blocked");
   });
 }

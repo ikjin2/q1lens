@@ -244,8 +244,10 @@ test("folds keep label width, leave right-side space and fit without horizontal 
   const wait = data.ir.events.find(event => event.kind === "wait" && event.source?.raw.startsWith("wait 9028"));
   const block = page.locator(`.timeline-block[data-event-id="${wait.id}"]`);
   await block.click();
-  await expect(block).toHaveAttribute("aria-expanded", "true");
-  await page.keyboard.press("Escape");
+  // This wait uses no latched parameters or registers, so it has no values popover; the strip shows it instead.
+  await expect(block).not.toHaveAttribute("aria-haspopup", "dialog");
+  await expect(page.getByRole("dialog", { name: "RT block values" })).toHaveCount(0);
+  await expect(page.locator("#q1timeline-selection .q1timeline-selection-code")).toHaveText(/^wait 9028/);
   await page.locator("#q1timeline-wait-fold-button").click();
   await expect(page.locator(".ruler .q1timeline-fold-toggle[aria-expanded='false']")).toHaveCount(0);
   expect(await stage.evaluate(node => node.scrollWidth - node.clientWidth)).toBeLessThanOrEqual(1);

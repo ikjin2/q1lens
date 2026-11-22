@@ -4,6 +4,7 @@ import { QbsTimelineTaskProvider } from "./qbs/taskProvider";
 import { parseProjectConfigLite } from "./qbs/projectDiscovery";
 import { registerSidebar } from "./qbs/sidebar";
 import { registerQ1Timeline } from "./q1timeline/register";
+import { registerVerification } from "./q1timeline/verification";
 import { registerEnvironmentCommands } from "./environment";
 import { registerPythonEnvironmentStatus } from "./pythonEnvironmentStatus";
 
@@ -11,6 +12,7 @@ export function activate(context: vscode.ExtensionContext): void {
   registerPythonEnvironmentStatus(context);
   const environment = registerEnvironmentCommands(context);
   const q1timeline = registerQ1Timeline(context);
+  registerVerification(context);
   registerCommands(context, { openQ1TimelineTarget: q1timeline.openTarget });
   registerSidebar(context);
   context.subscriptions.push(

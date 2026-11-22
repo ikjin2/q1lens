@@ -1,0 +1,13 @@
+sequencers:
+  - {id: seq0, file: ../drive.q1asm}
+  - {id: seq3, file: drive.q1asm}
+alignment:
+  mode: label:readout
+simulation:
+  startup_delay_ns: 200
+external_inputs:
+  triggers:
+    - {id: bit0, address: 1, targets: [seq0, seq3], times_ns: [12]}
+    - {id: bit1, address: 2, targets: [seq0, seq3], times_ns: [13]}
+    - {id: bit2, address: 3, targets: [seq0, seq3], times_ns: [14]}
+    - {id: bit3, address: 4, targets: [seq0, seq3], times_ns: [15]}

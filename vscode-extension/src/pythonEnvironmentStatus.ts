@@ -19,6 +19,28 @@ export interface PythonEnvironmentDisplay {
 let current: PythonEnvironmentDisplay | undefined;
 let update: (() => void) | undefined;
 let checkGeneration = 0;
+const listeners = new Set<() => void>();
+
+/** Notifies views that mirror the checked environment, such as the sidebar item. */
+export function onPythonEnvironmentChanged(listener: () => void): { dispose(): void } {
+  listeners.add(listener);
+  return { dispose: () => { listeners.delete(listener); } };
+}
+
+function notifyPythonEnvironmentChanged(): void {
+  for (const listener of [...listeners]) listener();
+}
+
+export function pythonEnvironmentError(environment: PythonEnvironmentDisplay): string | undefined {
+  const report = environment.report;
+  return environment.error || (report && (!report.supported ? "Python 3.10 or newer is required." : report.qbsError || report.q1asmError)) || undefined;
+}
+
+export function pythonEnvironmentName(environment: PythonEnvironmentDisplay): string {
+  const executable = environment.report?.executable ?? environment.pythonPath;
+  const folder = dirname(executable);
+  return !executable ? "Not selected" : /^(bin|scripts)$/i.test(basename(folder)) ? basename(dirname(folder)) : basename(executable);
+}
 
 export interface PythonEnvironmentCheck { generation: number; }
 
@@ -40,6 +62,7 @@ export function publishPythonEnvironment(environment: PythonEnvironmentDisplay, 
   if (!check) checkGeneration += 1;
   current = environment;
   update?.();
+  notifyPythonEnvironmentChanged();
 }
 
 export function pythonEnvironmentHtml(environment: PythonEnvironmentDisplay): string {
@@ -48,7 +71,7 @@ export function pythonEnvironmentHtml(environment: PythonEnvironmentDisplay): st
   })[char]!);
   const nonce = randomUUID();
   const report = environment.report;
-  const error = environment.error || (report && (!report.supported ? "Python 3.10 or newer is required." : report.qbsError || report.q1asmError));
+  const error = pythonEnvironmentError(environment);
   const state = error ? "Needs attention" : report ? "Ready" : "Checking…";
   const command = JSON.stringify([environment.pythonPath, ...environment.pythonArgs]);
   const target = JSON.stringify(environment.resource.toString()).replace(/</g, "\\u003c");
@@ -106,14 +129,13 @@ export function registerPythonEnvironmentStatus(context: vscodeTypes.ExtensionCo
     }
     const source = current.source === "vscode" ? "VS Code" : current.source === "manual" ? "Manual" : "Notebook";
     const executable = current.report?.executable ?? current.pythonPath;
-    const folder = dirname(executable);
-    const name = !executable ? "Not selected" : /^(bin|scripts)$/i.test(basename(folder)) ? basename(dirname(folder)) : basename(executable);
+    const name = pythonEnvironmentName(current);
     status.text = `$(python) Q1Lens: ${name} · ${source}`;
     status.tooltip = `${current.sourceLabel}\n${executable}\nAnalysis target: ${current.resource.fsPath}\nClick to inspect this environment.`;
     status.show();
     if (panel) panel.webview.html = pythonEnvironmentHtml(current);
   };
-  context.subscriptions.push(status, { dispose: () => { checkGeneration += 1; update = undefined; current = undefined; panel?.dispose(); } },
+  context.subscriptions.push(status, { dispose: () => { checkGeneration += 1; update = undefined; current = undefined; panel?.dispose(); notifyPythonEnvironmentChanged(); } },
     vscode.commands.registerCommand("q1lens.showPythonEnvironment", async () => {
       if (!current) { await vscode.commands.executeCommand("q1lens.checkEnvironment"); if (!current) return; }
       if (panel) { panel.reveal(); return; }

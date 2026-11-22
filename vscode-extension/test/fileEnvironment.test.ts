@@ -219,9 +219,10 @@ describe("Python environment UI", () => {
       report: { executable: "/venv/bin/python", version: "3.12", supported: true }, version: "0.2.2", installer: "uv", notice: "",
       fileEnvironment: true, sourceLabel: "VS Code selected interpreter" });
     assert.match(html, /VS Code selected interpreter/);
-    assert.match(html, /Open File/);
-    assert.match(html, /Copy Command/);
-    assert.match(html, /Insert into Terminal/);
-    assert.doesNotMatch(html, /notebook's|Open Notebook/);
+    assert.match(html, /<h1>.*Q1Lens is not installed.*<\/h1>/);
+    assert.match(html, /Open file/);
+    assert.match(html, /data-action="copyCommand">Copy</);
+    assert.match(html, /data-action="insertCommand"[^>]*>Insert in terminal</);
+    assert.doesNotMatch(html, /notebook's|Open notebook|PYTHON SETUP|Use your project's Python environment/);
   });
 });

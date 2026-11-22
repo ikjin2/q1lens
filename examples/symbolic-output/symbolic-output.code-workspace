@@ -1,0 +1,8 @@
+{
+  "folders": [{"path": ".", "name": "Q1Lens · Symbolic output"}],
+  "settings": {
+    "q1lens.pythonPath": "python",
+    "q1lens.q1timeline.pythonPath": "python",
+    "q1lens.q1timeline.updateMode": "onSave"
+  }
+}

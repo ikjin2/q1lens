@@ -16,6 +16,7 @@ class SequenceNames:
     acquisitions: dict[int, str] = field(default_factory=dict)
     diagnostics: list[Diagnostic] = field(default_factory=list)
     weight_lengths: dict[int, int] = field(default_factory=dict)
+    data: dict[str, Any] | None = field(default=None, repr=False, compare=False)
 
 
 def load_sequence_data(path: str | Path) -> dict[str, Any]:
@@ -160,6 +161,7 @@ def load_sequence_names(path: str | Path) -> SequenceNames:
         acquisitions=acquisitions,
         diagnostics=diagnostics,
         weight_lengths=sequence_weight_lengths(loaded),
+        data=loaded,
     )
 
 

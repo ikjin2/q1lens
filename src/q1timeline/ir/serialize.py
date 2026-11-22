@@ -19,6 +19,7 @@ from q1timeline.analysis.values import value_to_json
 from q1timeline.diagnostics import Diagnostic
 from q1timeline.execution.state import AnalysisState, TimelineEvent
 from q1timeline.ir.control_flow_graph import control_flow_graph_from_states
+from q1timeline.output.modules import ModuleConfig
 from q1timeline.q1asm.ast import SourceLocation
 from q1timeline.q1asm.linq_commands import LINQ_CONFIGURATION_STREAMS
 
@@ -99,6 +100,7 @@ def timeline_ir_from_states(
     project: dict[str, Any] | None = None,
     diagnostics: list[Diagnostic] | None = None,
     feedback_routes: Iterable[dict[str, Any]] = (),
+    modules: dict[str, ModuleConfig] | None = None,
 ) -> dict[str, Any]:
     _validate_unique_sequencer_ids(states)
     events = []
@@ -213,6 +215,10 @@ def timeline_ir_from_states(
     readiness = hardware_readiness_summary(states)
     if readiness is not None:
         ir["hardware_readiness"] = readiness
+    if modules or any("output_sequence" in state.metadata for state in states):
+        from q1timeline.output.timeline import output_section
+
+        ir["output"] = output_section(states, modules or {})
     return ir
 
 
@@ -306,16 +312,14 @@ def _diagnostic_to_dict(diagnostic: Diagnostic) -> dict[str, Any]:
 
 def _source_map(events: list[dict[str, Any]]) -> dict[str, Any]:
     by_event_id: dict[str, Any] = {}
-    by_source: dict[str, list[str]] = {}
+    by_source: dict[str, dict[str, None]] = {}
     for event in events:
         source = event["source"]
         by_event_id[event["id"]] = source
         for mapped_source in _source_map_sources(event):
             key = f"{mapped_source['file']}:{mapped_source['line']}"
-            event_ids = by_source.setdefault(key, [])
-            if event["id"] not in event_ids:
-                event_ids.append(event["id"])
-    return {"by_event_id": by_event_id, "by_source": by_source}
+            by_source.setdefault(key, {})[event["id"]] = None
+    return {"by_event_id": by_event_id, "by_source": {key: list(ids) for key, ids in by_source.items()}}
 
 
 def _source_map_sources(event: dict[str, Any]) -> list[dict[str, Any]]:
@@ -534,6 +538,8 @@ def _feedback_entries(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     send_configurations: dict[str, dict[str, tuple[str, tuple[int, int] | None, bool]]] = {}
     for index, event in enumerate(events):
         meta = event.get("meta") if isinstance(event.get("meta"), dict) else {}
+        if "feedback" not in meta and "feedback_streams" not in meta and "linq_configuration" not in meta:
+            continue
         sequencer_id = event["sequencer_id"]
         active = active_configurations.get(sequencer_id, {})
         configuration = meta.get("linq_configuration")
@@ -1355,10 +1361,14 @@ def _source_to_dict(source: SourceLocation) -> dict[str, Any]:
 
 
 def _jsonable(value: Any) -> Any:
+    kind = type(value)
+    if kind is str or kind is int or value is None or kind is bool or kind is float:
+        return value
     if isinstance(value, dict):
         return {str(key): _jsonable(item) for key, item in value.items()}
     if isinstance(value, list):
-        return [_jsonable(item) for item in value]
+        # Physical trace arrays contain native floats and missing samples.
+        return [item if type(item) is float or item is None else _jsonable(item) for item in value]
     if isinstance(value, tuple):
         return [_jsonable(item) for item in value]
     if isinstance(value, set):
@@ -1369,6 +1379,6 @@ def _jsonable(value: Any) -> Any:
         return value.isoformat()
     if isinstance(value, Path):
         return str(value)
-    if value is None or isinstance(value, (str, bool, int, float)):
+    if isinstance(value, (str, int, float)):
         return value
     return str(value)

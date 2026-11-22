@@ -4,7 +4,7 @@ const { test, expect } = require("./helpers");
 
 async function mount(page) {
   await page.goto("about:blank");
-  await page.setContent('<!doctype html><html><head></head><body><header class="topbar"><h1>QBS</h1><button id="refresh-button">Refresh</button></header><main id="qbs-root" class="timeline-shell"></main></body></html>');
+  await page.setContent('<!doctype html><html><head></head><body><header class="topbar"><h1>QBS</h1><button id="refresh-button" aria-label="Refresh timeline"></button><div id="qbs-tools" class="topbar-tools"></div><div id="qbs-status" class="topbar-status"></div></header><main id="qbs-root" class="timeline-shell"></main></body></html>');
   await page.evaluate(() => {
     window.messages = [];
     window.acquireVsCodeApi = () => ({ postMessage: (message) => window.messages.push(message) });
@@ -52,18 +52,23 @@ test("QBS navigation buttons and source jumps carry the displayed render identit
         ] },
       } }));
     }, renderId);
-    await page.locator('.source-actions').getByRole("button", { name: "Open qbstimeline.yml", exact: true }).click();
-    await page.locator('.source-actions').getByRole("button", { name: "Open schedule.py", exact: true }).click();
-    await page.locator('.inspector-actions').getByRole("button", { name: "Open schedule.py", exact: true }).click();
+    await expect(page.getByRole("button", { name: "Open qbstimeline.yml", exact: true })).toHaveCount(1);
+    await expect(page.getByRole("button", { name: "Open schedule.py", exact: true })).toHaveCount(1);
+    await expect(page.locator(".source-files")).toHaveText("qbstimeline.ymlschedule.pyoutput/");
+    await page.locator('.source-files').getByRole("button", { name: "Open qbstimeline.yml", exact: true }).click();
+    await page.locator('.source-files').getByRole("button", { name: "Open schedule.py", exact: true }).click();
+    await expect(page.locator('.inspector-actions').getByRole("button")).toHaveText(["Q1ASM timeline", "Source", "IR"]);
+    await page.locator('.inspector-actions').getByRole("button", { name: "Open schedule source", exact: true }).click();
     await page.locator('.inspector-actions').getByRole("button", { name: "Open QBS IR", exact: true }).click();
     await page.locator('.inspector-actions').getByRole("button", { name: "Open Full Q1ASM Timeline", exact: true }).click();
     await page.locator('[data-block-id="selected"]').dblclick();
     const actions = await page.evaluate(() => window.messages);
     expect(actions.map((message) => message.type)).toEqual([
-      "openProjectFile", "openScheduleFile", "openScheduleFile", "openIr", "openQ1Timeline", "openScheduleSource",
+      "openProjectFile", "openScheduleFile", "openScheduleSource", "openIr", "openQ1Timeline", "openScheduleSource",
     ]);
     expect(actions.every((message) => message.renderId === renderId)).toBe(true);
-    await page.getByRole("button", { name: "Refresh", exact: true }).click();
+    await expect(page.locator(".inspector-time")).toHaveText("0 → 40 ns · 40 ns · pulse-op");
+    await page.getByRole("button", { name: "Refresh timeline", exact: true }).click();
     expect(await page.evaluate(() => window.messages.at(-1))).toEqual({ type: "refresh" });
   }
 });
@@ -100,31 +105,37 @@ test("QBS zoom controls retain focus for repeated keyboard zoom without stealing
     window.dispatchEvent(new MessageEvent("message", { data: { type: "render", ir, sourceContext } })),
   { ir: data.ir, sourceContext });
   await update();
-  const view = page.locator(".stage-total");
-  const full = await view.textContent();
-  const zoomIn = page.getByRole("button", { name: "+", exact: true });
+  const view = page.locator(".timeline-stage");
+  const readout = page.locator(".stage-window");
+  const full = await view.getAttribute("data-viewport");
+  const total = await view.getAttribute("data-total");
+  await expect(readout).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Zoom selection", exact: true })).toHaveCount(0);
+  const zoomIn = page.getByRole("button", { name: "Zoom in", exact: true });
   await zoomIn.focus();
   let previous = full;
   for (let step = 0; step < 2; step += 1) {
     await page.keyboard.press("Enter");
     await expect(zoomIn).toBeFocused();
-    await expect(view).not.toHaveText(previous);
-    previous = await view.textContent();
+    await expect(view).not.toHaveAttribute("data-viewport", previous);
+    previous = await view.getAttribute("data-viewport");
+    await expect(readout).toContainText(` / ${total}`);
   }
-  const zoomOut = page.getByRole("button", { name: "-", exact: true });
+  const zoomOut = page.getByRole("button", { name: "Zoom out", exact: true });
   await zoomOut.focus();
   for (let step = 0; step < 2; step += 1) {
     await page.keyboard.press("Space");
     await expect(zoomOut).toBeFocused();
-    await expect(view).not.toHaveText(previous);
-    previous = await view.textContent();
+    await expect(view).not.toHaveAttribute("data-viewport", previous);
+    previous = await view.getAttribute("data-viewport");
   }
   const fit = page.getByRole("button", { name: "Fit", exact: true });
   await fit.focus();
   await page.keyboard.press("Enter");
   await expect(fit).toBeFocused();
-  await expect(view).toHaveText(full);
-  const refresh = page.getByRole("button", { name: "Refresh", exact: true });
+  await expect(view).toHaveAttribute("data-viewport", full);
+  await expect(readout).toHaveCount(0);
+  const refresh = page.getByRole("button", { name: "Refresh timeline", exact: true });
   await refresh.focus();
   await update();
   await expect(refresh).toBeFocused();
@@ -163,9 +174,10 @@ test("QBS target lane disclosures retain keyboard focus without changing selecti
   await selected.click();
   const stage = page.locator(".timeline-stage");
   const scrollTop = await stage.evaluate((node) => node.scrollTop);
-  const view = await page.locator(".stage-total").textContent();
+  const view = await stage.getAttribute("data-viewport");
   expect(scrollTop).toBeGreaterThan(0);
-  const row = page.locator(".timeline-row").filter({ has: page.getByText("Schedule / q60", { exact: true }) });
+  const row = page.locator(".timeline-row").filter({ has: page.getByText("q60", { exact: true }) });
+  await expect(row.locator(".lane-label-text")).toHaveAttribute("title", "Schedule / q60");
   const toggle = row.locator(".lane-toggle");
   await toggle.focus();
   for (const [key, expanded] of [["Enter", "true"], ["Space", "false"]]) {
@@ -174,7 +186,7 @@ test("QBS target lane disclosures retain keyboard focus without changing selecti
     await expect(toggle).toBeFocused();
     await expect(selected).toHaveAttribute("aria-selected", "true");
     await expect(page.locator(".inspector h2")).toHaveText("Pulse(q60)");
-    await expect(page.locator(".stage-total")).toHaveText(view);
+    await expect(stage).toHaveAttribute("data-viewport", view);
     expect(await stage.evaluate((node) => node.scrollTop)).toBe(scrollTop);
   }
   await toggle.click();
@@ -185,7 +197,7 @@ test("QBS target lane disclosures retain keyboard focus without changing selecti
   expect(await page.evaluate(() => window.messages.filter((message) => message.type === "openScheduleSource"))).toEqual([
     { type: "openScheduleSource", schedulableId: "op-60", operationId: "op-60", blockId: "operation-60" },
   ]);
-  const refresh = page.getByRole("button", { name: "Refresh", exact: true });
+  const refresh = page.getByRole("button", { name: "Refresh timeline", exact: true });
   await refresh.focus();
   await update();
   await expect(refresh).toBeFocused();
@@ -223,7 +235,7 @@ test("QBS inline Q1 lane disclosures retain keyboard focus and survive same-sour
   await mount(page);
   const update = () => page.evaluate((data) => window.dispatchEvent(new MessageEvent("message", { data: { type: "render", ...data } })), data);
   await update();
-  const fullView = await page.locator(".stage-total").textContent();
+  const fullView = await page.locator(".timeline-stage").getAttribute("data-viewport");
   await page.getByTitle("Expand target lanes", { exact: true }).click();
   const selected = page.locator('[data-block-id="x180"]');
   await selected.click();
@@ -244,9 +256,9 @@ test("QBS inline Q1 lane disclosures retain keyboard focus and survive same-sour
     await expect(toggle).toBeFocused();
     await expect(selected).toHaveAttribute("aria-selected", "true");
     await expect(page.locator(".inspector h2")).toHaveText("X(q0)");
-    await expect(page.locator(".stage-total")).toHaveText(fullView);
+    await expect(page.locator(".timeline-stage")).toHaveAttribute("data-viewport", fullView);
   }
-  const refresh = page.getByRole("button", { name: "Refresh", exact: true });
+  const refresh = page.getByRole("button", { name: "Refresh timeline", exact: true });
   await refresh.focus();
   await update();
   await expect(refresh).toBeFocused();
@@ -288,8 +300,9 @@ for (const layer of ["operation", "pulse"]) {
     const target = page.locator(`[data-block-id="${targetId}"]`);
     await expect(target).toBeVisible();
     await expect(target).toHaveAttribute("title", /40 ns \| 0 ns/);
-    const fullView = await page.locator(".stage-total").textContent();
-    expect(fullView).toContain("total 40 ns");
+    const fullView = await page.locator(".timeline-stage").getAttribute("data-viewport");
+    expect(fullView).toBe("0 ns - 40 ns");
+    await expect(page.locator(".timeline-stage")).toHaveAttribute("data-total", "40 ns");
     const clippedIds = await page.evaluate(({ ir, sourceContext }) => window.qbsTimelineModel.buildTimelineModel(ir, null, sourceContext, {
       viewport: { start: 0, end: 20e-9 }, expandedGroups: ["target:q0"],
     }).lanes.flatMap((lane) => lane.blocks.map((block) => block.id)), data);
@@ -303,7 +316,9 @@ for (const layer of ["operation", "pulse"]) {
     await page.mouse.up();
     await page.keyboard.up("Shift");
     await page.getByRole("button", { name: "Zoom selection", exact: true }).click();
-    await expect(page.locator(".stage-total")).not.toHaveText(fullView);
+    await expect(page.locator(".timeline-stage")).not.toHaveAttribute("data-viewport", fullView);
+    await expect(page.locator(".stage-window")).toContainText(" / 40 ns");
+    await expect(page.getByRole("button", { name: "Zoom selection", exact: true })).toHaveCount(0);
     await expect(target).toBeVisible();
     await expect(page.locator('[data-block-id="warmup"]')).toHaveCount(0);
     await target.click();
@@ -317,7 +332,7 @@ for (const layer of ["operation", "pulse"]) {
     await expect(target).toBeVisible();
     await expect(target).toHaveAttribute("aria-selected", "true");
     await page.getByRole("button", { name: "Fit", exact: true }).click();
-    await expect(page.locator(".stage-total")).toHaveText(fullView);
+    await expect(page.locator(".timeline-stage")).toHaveAttribute("data-viewport", fullView);
     await expect(target).toBeVisible();
   });
 }
@@ -377,7 +392,8 @@ test("QBS refresh clips timed inline Q1 events to the shrinking viewport and rec
   await zoomRange(.35, .6);
   await expect(inline).toHaveCount(2);
   await update(data.second, 2, data.secondOutput);
-  await expect(page.locator(".stage-total")).toContainText("view 19.8 ns - 20 ns");
+  await expect(page.locator(".timeline-stage")).toHaveAttribute("data-viewport", "19.8 ns - 20 ns");
+  await expect(page.locator(".stage-window")).toHaveText("19.8–20 / 20 ns");
   await expect(pulse).toHaveAttribute("aria-selected", "true");
   await expect(inline).toHaveCount(0);
   await page.getByRole("button", { name: "Fit", exact: true }).click();
@@ -398,7 +414,9 @@ test("QBS refresh clips timed inline Q1 events to the shrinking viewport and rec
   ]);
   await expect(page.locator(".source-files")).toContainText("short-output");
   await page.getByRole("button", { name: "Fit", exact: true }).click();
-  await expect(page.locator(".stage-total")).toHaveText("view 0 ns - 20 ns (20 ns) / total 20 ns");
+  await expect(page.locator(".timeline-stage")).toHaveAttribute("data-viewport", "0 ns - 20 ns");
+  await expect(page.locator(".timeline-stage")).toHaveAttribute("data-total", "20 ns");
+  await expect(page.locator(".stage-window")).toHaveCount(0);
   await expect(inline).toHaveCount(2);
 });
 
@@ -475,28 +493,28 @@ test("QBS refresh does not reinterpret a removed occurrence as a shared operatio
   await page.keyboard.up("Shift");
   await page.getByRole("button", { name: "Zoom selection", exact: true }).click();
   await expect(page.locator('[data-block-id="shared"]')).toHaveCount(0);
-  await expect(page.locator('.inspector-rows dt:has-text("Start") + dd')).toHaveText("0 ns");
-  const windowBefore = await page.locator(".stage-total").textContent();
+  await expect(page.locator(".inspector-time-range")).toHaveText("0 → 40 ns");
+  const windowBefore = await page.locator(".timeline-stage").getAttribute("data-viewport");
   await update(data.first);
-  await expect(page.locator('.inspector-rows dt:has-text("Start") + dd')).toHaveText("0 ns");
-  await expect(page.locator(".stage-total")).toHaveText(windowBefore);
+  await expect(page.locator(".inspector-time-range")).toHaveText("0 → 40 ns");
+  await expect(page.locator(".timeline-stage")).toHaveAttribute("data-viewport", windowBefore);
   await expect(page.locator(".timeline-row-pulse")).toHaveCount(1);
   await update(data.second);
   await expect(page.locator(".inspector h2")).toHaveText("No selection");
   await expect(page.locator('[data-block-id][aria-selected="true"]')).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Open Full Q1ASM Timeline", exact: true })).toHaveCount(0);
-  await expect(page.locator(".stage-total")).toHaveText(windowBefore);
+  await expect(page.locator(".timeline-stage")).toHaveAttribute("data-viewport", windowBefore);
   await expect(page.locator(".timeline-row-pulse")).toHaveCount(1);
-  await page.getByRole("button", { name: "+", exact: true }).click();
+  await page.getByRole("button", { name: "Zoom in", exact: true }).click();
   await expect(page.locator(".inspector h2")).toHaveText("No selection");
   await update(data.second, { selectedOperationId: "shared" });
   await expect(page.locator('[data-block-id="later"]')).toHaveAttribute("aria-selected", "true");
-  await expect(page.locator('.inspector-rows dt:has-text("Start") + dd')).toHaveText("50 ns");
-  await page.getByRole("button", { name: "-", exact: true }).click();
+  await expect(page.locator(".inspector-time-range")).toHaveText("50 → 90 ns");
+  await page.getByRole("button", { name: "Zoom out", exact: true }).click();
   await update(data.first);
   const later = page.locator('[data-block-id="later"]');
   await expect(later).toHaveAttribute("aria-selected", "true");
-  await expect(page.locator('.inspector-rows dt:has-text("Start") + dd')).toHaveText("50 ns");
+  await expect(page.locator(".inspector-time-range")).toHaveText("50 → 90 ns");
   await page.getByRole("button", { name: "Open Full Q1ASM Timeline", exact: true }).click();
   await later.dblclick();
   expect(await page.evaluate(() => window.messages.filter((message) => message.type === "openQ1Timeline" || message.type === "openScheduleSource"))).toEqual([
@@ -527,7 +545,7 @@ test("QBS inspector tabs keep keyboard focus and lane scrolling after selection"
   expect(scrollTop).toBeGreaterThan(0);
 
   const lowering = page.getByRole("button", { name: "Lowering", exact: true });
-  const preview = page.getByRole("button", { name: "Q1ASM Preview", exact: true });
+  const preview = page.getByRole("button", { name: "Q1ASM", exact: true });
   await lowering.focus();
   await lowering.press("Enter");
   await expect(lowering).toBeFocused();
@@ -546,7 +564,7 @@ test("QBS inspector tabs keep keyboard focus and lane scrolling after selection"
   expect(await stage.evaluate((node) => node.scrollTop)).toBe(scrollTop);
   await expect(page.locator(".inspector h2")).toHaveText("Pulse(q60)");
 
-  const refresh = page.getByRole("button", { name: "Refresh", exact: true });
+  const refresh = page.getByRole("button", { name: "Refresh timeline", exact: true });
   await refresh.focus();
   await page.evaluate(() => window.refreshTabsIr());
   await expect(refresh).toBeFocused();
@@ -582,4 +600,28 @@ test("QBS lane scrolling survives selection and same-source refresh but resets f
     } })), project);
     expect(await stage.evaluate((node) => node.scrollTop)).toBe(project === "project" ? scrollTop : 0);
   }
+});
+
+test("QBS surfaces unmapped provenance once at the top and keeps counts and files on one footer line", async ({ page }) => {
+  await mount(page);
+  const status = page.locator("#qbs-status");
+  await expect(status).toBeEmpty();
+  const ir = JSON.parse(require("node:fs").readFileSync(path.resolve(__dirname, "../fixtures/two-qubit-ir.json"), "utf8"));
+  await page.evaluate((ir) => window.dispatchEvent(new MessageEvent("message", { data: {
+    type: "render", ir, sourceContext: { projectFile: "/demo/qbstimeline.yml", scheduleFile: "/demo/schedule.py", outputDir: "/demo/output" },
+  } })), ir);
+  const chip = status.getByRole("button");
+  await expect(chip).toHaveText("5 unmapped");
+  await expect(chip).toHaveAttribute("title", /Compiler 3 · Inferred 0 · Unmapped 5/);
+  await expect(page.locator(".summary-counts")).toHaveText("8 operations8 pulses5 programs3 links");
+  await expect(page.locator(".summary-strip .summary-item").first()).toHaveAttribute("title", "Schedule operations");
+  await expect(page.locator(".lane-label-text").first()).toHaveText("q0");
+  await expect(page.locator(".lane-label-text").first()).toHaveAttribute("title", "Schedule / q0");
+  await page.locator('[data-block-id="echo_q0"]').click();
+  await expect(page.locator(".inspector-time")).toHaveText("132 → 152 ns · 20 ns · echo_q0");
+  await expect(page.locator(".inspector-actions .action-button:not(.secondary)")).toHaveCount(1);
+  await chip.click();
+  const located = page.locator('[data-block-id][data-provenance="unmapped"]:focus');
+  await expect(located).toHaveCount(1);
+  await expect(located).toHaveAttribute("aria-selected", "true");
 });

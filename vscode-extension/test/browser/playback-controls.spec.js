@@ -726,7 +726,10 @@ test("external input editor keeps confirmed settings until rerun succeeds and re
   await expect(form.getByLabel("Trigger 1 times (ns)")).toBeEnabled();
   await expect(form.getByLabel("Trigger 1 times (ns)")).toHaveValue("2000, 4000");
   await expect(form.getByRole("status")).toHaveText("Parameter TRIGGER_INDEX is unavailable");
-  await expect(form.getByRole("button", {name: "Save to project"})).toBeDisabled();
+  // Nothing has been applied yet, so there is nothing to save: the button is absent, not merely disabled.
+  await expect(form.locator('[data-trigger-action="save"]')).toBeHidden();
+  await expect(form.locator('[data-trigger-action="save"]')).toBeDisabled();
+  await expect(form.getByRole("button", {name: "Reset changes"})).toBeVisible();
   await form.getByRole("button", {name: "Apply & rerun"}).click();
   const applied = {triggers: request.triggers, overridden: true, canSave: true};
   await page.evaluate((state) => window.dispatchEvent(new MessageEvent("message", {data: {type: "externalInputsState", state}})), applied);
@@ -850,11 +853,11 @@ test("external input inspection follows the selected time basis for each receive
   await triggerTimes(4, 8, 12);
   for (const kind of ["q1_issue", "feedback_pop"]) {
     await select(manual, "a", kind, "feedback_input");
-    await linqTimes(0, 8, 16);
+    await linqTimes(0, 8, 8);
     await expect(field("Input event")).toHaveText("external-linq:a:0");
   }
   await page.getByRole("button", {name: "Local time basis"}).click();
-  await linqTimes(8, 16, 24);
+  await linqTimes(8, 16, 16);
   await page.getByRole("button", {name: "Aligned time basis"}).click();
   await select(manual, "c", "wait_trigger", "trigger_assumption");
   await expect(field("Wait armed (project ns)")).toHaveText("4");
@@ -871,7 +874,7 @@ test("external input inspection follows the selected time basis for each receive
   await select(perReceiver, "b", "wait_trigger", "trigger_assumption");
   await triggerTimes(0, 4, 8);
   await select(perReceiver, "b", "q1_issue", "feedback_input");
-  await linqTimes(-4, 4, 12);
+  await linqTimes(-4, 4, 4);
 });
 
 test("Play waiting tooltips use each receiver's time basis and current snapshot", async ({page}) => {
@@ -1563,7 +1566,7 @@ test("hardware register writers keep the exact instruction inspector inside a co
   ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
   const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>
     /type=["']application\/json["']/i.test(attributes) ? tag : "");
-  await mount(page, "completed", ir, {hardwareState: {level: "detail", sequencerId: "counter", time: 140}}, {}, shell);
+  await mount(page, "completed", ir, {hardwareState: {level: "detail", sequencerId: "counter", time: 168}}, {}, shell);
   const time = page.getByRole("spinbutton", {name: "Selected time in nanoseconds", exact: true});
   const register = (name) => page.locator(`[data-register="${name}"] strong`);
   const detail = page.locator('[data-value="register-detail"]');
@@ -1575,16 +1578,18 @@ test("hardware register writers keep the exact instruction inspector inside a co
   await page.locator('[data-register="R2"]').click();
   await expect(register("R2")).toHaveText("3");
   const file = ir.register_history.find((entry) => entry.register === "R2").source.file;
-  await expect(sourceDetail).toHaveText(`${file}:10`); await source.click();
+  // Hardware shows the file name; the full path stays in the tooltip.
+  await expect(sourceDetail).toHaveText(`${path.basename(file)}:10`);
+  await expect(sourceDetail).toHaveAttribute("title", `${file}:10`); await source.click();
   const writers = ir.register_history.filter((entry) => entry.register === "R1").reverse();
   expect(writers.map((entry) => [entry.time.value, entry.value.value, entry.source.line]))
-    .toEqual([[120,3,6],[76,2,6],[32,1,6],[16,0,4]]);
+    .toEqual([[136,3,6],[84,2,6],[32,1,6],[16,0,4]]);
   for (const writer of writers) {
     await detail.locator('[data-writer-register="R1"]').click();
     const event = ir.events.find((entry) => entry.id === writer.event_id);
     await expect(time).toHaveValue(String(writer.time.value));
     await expect(register("R1")).toHaveText(String(writer.value.value));
-    await expect(sourceDetail).toHaveText(`${file}:${writer.source.line}`);
+    await expect(sourceDetail).toHaveText(`${path.basename(file)}:${writer.source.line}`);
     await expect(inspector).toContainText(`${event.t0.value} -> ${event.t1.value}`);
     await expect(inspector).toContainText(event.label);
     await source.click(); await expect(time).toHaveValue(String(writer.time.value));
@@ -1596,8 +1601,8 @@ test("hardware register writers keep the exact instruction inspector inside a co
   await expect(time).toHaveValue("32"); await expect(register("R1")).toHaveText("0x00000001");
   await expect(inspector).toContainText("16 -> 28");
   await page.getByRole("button", {name: "Next change ›", exact: true}).click();
-  await expect(time).toHaveValue("76"); await expect(register("R1")).toHaveText("0x00000002");
-  await expect(inspector).toContainText("60 -> 72");
+  await expect(time).toHaveValue("84"); await expect(register("R1")).toHaveText("0x00000002");
+  await expect(inspector).toContainText("68 -> 80");
   await page.getByRole("button", {name: "‹ Previous change", exact: true}).click();
   await expect(time).toHaveValue("32"); await expect(register("R1")).toHaveText("0x00000001");
   await expect(inspector).toContainText("16 -> 28");
@@ -2182,7 +2187,8 @@ for (const execution of ["analysis", "playback"]) {
     await expect(rt.locator('.time-selection')).toHaveAttribute("data-time-start", "0");
     await expect(rt.locator('.time-selection')).toHaveAttribute("data-time-end", "4");
     await expect(core.locator('.time-selection')).toHaveAttribute("data-time-start", "0");
-    await expect(core.locator('.time-selection')).toHaveAttribute("data-time-end", "24");
+    // The register-form set_cond occupies 12 ns; the other five Q1 issues take 4 ns each.
+    await expect(core.locator('.time-selection')).toHaveAttribute("data-time-end", "32");
     expect(coreRange.width).toBeGreaterThan(rtRange.width);
     expect(rtRange.x).toBeCloseTo(coreRange.x, 0);
     const updateBounds = await rt.locator(`.timeline-block[data-event-id="${update.id}"]`).boundingBox();
@@ -2190,7 +2196,7 @@ for (const execution of ["analysis", "playback"]) {
     const lastIssue = await lastIssueNode.boundingBox();
     expect(Math.abs(rtRange.x + rtRange.width - updateBounds.x - updateBounds.width)).toBeLessThan(3);
     if (await lastIssueNode.getAttribute("data-issue-marker") === "true") {
-      // The 0..24 ns selection includes the issue start; its icon has a fixed hit target, even on folded time.
+      // The Q1 selection includes the issue start; its icon has a fixed hit target, even on folded time.
       expect(lastIssue.x).toBeGreaterThanOrEqual(coreRange.x - 1);
       expect(lastIssue.x).toBeLessThan(coreRange.x + coreRange.width);
     } else {
@@ -2201,7 +2207,7 @@ for (const execution of ["analysis", "playback"]) {
     await page.getByRole("button", {name: "Normal view", exact: true}).click();
     await expect(core).toBeHidden();
     await expect(rt.locator('.time-selection')).toHaveAttribute("data-time-end", "4");
-    await expect(core.locator('.time-selection')).toHaveAttribute("data-time-end", "24");
+    await expect(core.locator('.time-selection')).toHaveAttribute("data-time-end", "32");
     await rt.locator('.timeline-block-wait').click();
     await expect(page.locator('.time-selection')).toHaveCount(0);
     await expect(core.locator('.timeline-block[aria-selected="true"]')).toHaveCount(0);
@@ -2806,7 +2812,7 @@ test("actual golden-section execution folds fifteen observed wait iterations", a
   await expect(page.locator('.ruler .q1timeline-playback-fold')).toHaveCount(0);
   await expect(page.locator('#q1timeline-execution-status')).toHaveAttribute("title", /Paused.*100 instructions/);
   await expect(page.locator('.q1timeline-control-chip-feedback')).toHaveCount(2);
-  await expect(page.locator('[data-value="trace-kind"]')).toHaveText("PATH EXECUTION");
+  await expect(page.locator('[data-value="trace-kind"]')).toHaveText("Path execution");
   const hardwareTrace = await page.evaluate(() => {
     const ir = JSON.parse(document.getElementById("timeline-ir").textContent);
     const model = window.q1lensHardwareState;
@@ -3582,6 +3588,7 @@ test("feedback endpoints align with RT commands through layout, mode, zoom and e
   await source.focus();
   await expect(source).toHaveClass(/is-active/);
   await checkAnchors();
+  await page.locator("#q1timeline-toolbar-more > summary").click();
   await page.getByRole("button", {name:"Reset zoom",exact:true}).click();
   await page.setViewportSize({width:800,height:800});
   await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
@@ -4241,7 +4248,9 @@ test("TB rejection diagnostic links reveal each retained contributor and local c
     "print(json.dumps({'collision': run(), 'partial': run(partial=True), 'prepared': run(prepared=True), 'success': run(2)}))",
   ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, maxBuffer: 4 * 1024 * 1024,
     env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
-  const row = (name) => page.locator('.diagnostic[data-diagnostic-category="feedback_write_combine"]').filter({hasText: `${name}.q1asm:`});
+  // The three rejections share one diagnostic row; each occurrence keeps its own links.
+  const row = (name) => page.locator('.diagnostic[data-diagnostic-category="feedback_write_combine"]' +
+    ` .diagnostic-occurrence[data-diagnostic-location^="${name}.q1asm:"]`);
   const block = (id) => page.locator(`.timeline-block[data-block-id="${id}"]`);
   for (const [name, {ir, html}] of Object.entries(fixtures)) {
     const shell = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script>/gi, (tag, attributes) =>

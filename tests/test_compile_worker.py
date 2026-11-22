@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 from collections import UserDict
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -62,6 +63,65 @@ def test_extract_q1asm_programs_supports_dict_and_settings_objects() -> None:
     ]
     assert programs[0].relative_file == Path("q1asm/cluster0_cluster0_module2_seq0.q1asm")
     assert programs[1].program == "play 0,1,4\nstop\n"
+
+
+def test_extracts_sequence_from_slotted_settings(tmp_path: Path) -> None:
+    class Settings:
+        __slots__ = ("sequence", "init_gain_awg_path_I")
+
+    settings = Settings()
+    settings.sequence = {"program": "play 0,0,4\nstop", "waveforms": {"pulse": {"index": 0, "data": [1]}}}
+    settings.init_gain_awg_path_I = 0.5
+    program, = extract_q1asm_programs({"module": {"sequencers": {"seq0": settings}}})
+    _write_q1asm_files(tmp_path, [program])
+    path = tmp_path / program.relative_file
+    assert path.read_text(encoding="utf-8") == settings.sequence["program"]
+    sidecar = json.loads(path.with_suffix(".sequence.json").read_text(encoding="utf-8"))
+    assert sidecar["waveforms"] == settings.sequence["waveforms"]
+    assert sidecar["output_settings"]["static_gain"] == [0.5, 1]
+
+
+def test_compare_output_reads_waveform_memory_from_generated_qbs_projects(tmp_path, capsys):
+    from q1lens.cli import main
+    from qbstimeline.adapters.q1timeline import write_q1timeline_project
+
+    projects = []
+    for name, third_sample in [("before", 0.5), ("after", -0.5)]:
+        output_dir = tmp_path / name
+        settings = {
+            "channel_name": "real_output_0",
+            "connected_output_indices": [0],
+            "sequence": {
+                "program": "wait_sync 4\nplay 0,0,4\nstop",
+                "waveforms": {"pulse": {"index": 0, "data": [0, 0.25, third_sample, 0]}},
+            },
+        }
+        compiled = {"cluster0": {"module2": {"instrument_type": "QCM", "sequencers": {"seq0": settings}}}}
+        programs = extract_q1asm_programs(compiled)
+        _write_q1asm_files(output_dir, programs)
+        projects.append(str(write_q1timeline_project(output_dir, programs)))
+
+    code = main(["compare-output", *projects, "--port", "cluster0/module2.out0",
+                 "--start-ns", "0", "--end-ns", "4", "--json"])
+    assert code == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["first_difference"] == {"time_ns": 2, "before": 0.5, "after": -0.5}
+
+
+def test_compiled_sidecar_retains_dataclass_settings_inherited_from_slots(tmp_path: Path) -> None:
+    class GainSettings:
+        __slots__ = ("init_gain_awg_path_I",)
+
+    @dataclass(slots=True)
+    class SequencerSettings(GainSettings):
+        sequence: dict
+
+    settings = SequencerSettings({"program": "stop"})
+    settings.init_gain_awg_path_I = 0.5
+    program, = extract_q1asm_programs({"module": {"sequencers": {"seq0": settings}}})
+    _write_q1asm_files(tmp_path, [program])
+    sidecar = (tmp_path / program.relative_file).with_suffix(".sequence.json")
+    assert json.loads(sidecar.read_text(encoding="utf-8"))["output_settings"]["static_gain"] == [0.5, 1]
 
 
 def test_extract_q1asm_programs_disambiguates_normalized_sequencer_ids() -> None:

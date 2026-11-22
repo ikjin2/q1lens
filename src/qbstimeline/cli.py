@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 
+from q1lens.verification_cli import add_verification_commands, run_verification
 from qbstimeline.compile_worker import analyze_project
 from qbstimeline.consistency import build_consistency_report
 from qbstimeline.diagnostic_bundle import verify_diagnostics_bundle, write_diagnostics_bundle
@@ -30,6 +31,8 @@ def main(argv: Sequence[str] | None = None, *, prog: str = "qbstimeline") -> int
     args = parser.parse_args(raw_argv)
     args.prog = prog
     try:
+        if args.command in {"verify", "equiv", "compare-output"}:
+            return run_verification(args)
         if args.command == "analyze":
             return _analyze_command(args)
         if args.command == "build":
@@ -54,6 +57,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str = "qbstimeline") -> int
 def _build_parser(*, prog: str = "qbstimeline") -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog=prog, description=DESCRIPTION)
     subparsers = parser.add_subparsers(dest="command")
+    add_verification_commands(subparsers)
 
     analyze = subparsers.add_parser("analyze", help="Compile a qbstimeline project into QBS IR")
     analyze.add_argument("--project", required=True, help="Path to qbstimeline.yml")

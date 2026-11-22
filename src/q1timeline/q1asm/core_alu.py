@@ -57,12 +57,37 @@ def _unsigned_lt(left: Word, right: Word) -> Flag:
     return ULT(left, right)
 
 
+def flag_not(flag: Flag) -> Flag:
+    if isinstance(flag, bool):
+        return not flag
+    from z3 import Not
+    return Not(flag)
+
+
+def flag_and(left: Flag, right: Flag) -> Flag:
+    if isinstance(left, bool):
+        return right if left else False
+    if isinstance(right, bool):
+        return left if right else False
+    from z3 import And
+    return And(left, right)
+
+
+def flag_or(left: Flag, right: Flag) -> Flag:
+    if isinstance(left, bool):
+        return True if left else right
+    if isinstance(right, bool):
+        return True if right else left
+    from z3 import Or
+    return Or(left, right)
+
+
 def _flags(word: Word, carry: Flag, overflow: Flag) -> dict[str, Flag]:
     word &= _MASK
     if not isinstance(word, int):
         from z3 import BoolVal
-        carry = BoolVal(carry) if isinstance(carry, bool) else carry
-        overflow = BoolVal(overflow) if isinstance(overflow, bool) else overflow
+        carry = BoolVal(carry, ctx=word.ctx) if isinstance(carry, bool) else carry
+        overflow = BoolVal(overflow, ctx=word.ctx) if isinstance(overflow, bool) else overflow
     return {"zf": word == 0, "nf": (word & _SIGN) != 0, "cf": carry, "of": overflow}
 
 
@@ -86,13 +111,13 @@ def sub_flags(left: Word, right: Word) -> dict[str, Flag]:
 
 def shift_flags(op: str, left: Word, shift: Word, result: Word) -> dict[str, Flag]:
     shift &= _MASK
-    active = (shift != 0) & _unsigned_lt(shift, 33)
+    active = flag_and(shift != 0, _unsigned_lt(shift, 33))
     if op in {"asl", "lsl"}:
         carry_bit = (left & (1 << ((32 - shift) & 31))) != 0
         overflow = carry_bit != ((result & _SIGN) != 0)
-        return _flags(result, active & carry_bit, active & overflow)
+        return _flags(result, flag_and(active, carry_bit), flag_and(active, overflow))
     carry_bit = (left & (1 << ((shift - 1) & 31))) != 0
-    return _flags(result, active & carry_bit, False)
+    return _flags(result, flag_and(active, carry_bit), False)
 
 
 def _signed(word: int, width: int) -> int:

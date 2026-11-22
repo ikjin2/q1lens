@@ -1,0 +1,9 @@
+move 5,R0
+move 4096,R1
+nop
+ramp: set_awg_gain R1,R1
+play 0,0,20
+add R1,4096,R1
+nop
+loop R0,@ramp
+stop

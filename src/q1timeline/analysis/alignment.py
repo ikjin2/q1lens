@@ -264,10 +264,13 @@ def _apply_alignment_metadata(
         else:
             event.meta.pop("aligned_time_nominal", None)
         event.meta["local_t0"] = _plain_time(event.t0)
-        event.meta["aligned_t0"] = _plain_time(add_values(event.t0, offset))
-        if event.t1 is not None:
+        event.meta["aligned_t0"] = _aligned_time(event.t0, offset)
+        if event.t1 is event.t0 and event.t1 is not None:
+            event.meta["local_t1"] = event.meta["local_t0"]
+            event.meta["aligned_t1"] = event.meta["aligned_t0"]
+        elif event.t1 is not None:
             event.meta["local_t1"] = _plain_time(event.t1)
-            event.meta["aligned_t1"] = _plain_time(add_values(event.t1, offset))
+            event.meta["aligned_t1"] = _aligned_time(event.t1, offset)
 
 
 def _anchor_time(mode: str, anchor: TimelineEvent) -> Value | None:
@@ -286,6 +289,12 @@ def _plain_offset(value: Value):
 
 def _plain_time(value: Value):
     return value.value if isinstance(value, Concrete) else str(value)
+
+
+def _aligned_time(value: Value, offset: Value):
+    if isinstance(value, Concrete) and isinstance(offset, Concrete):
+        return value.value + offset.value
+    return _plain_time(add_values(value, offset))
 
 
 def _alignment_diagnostic_details(

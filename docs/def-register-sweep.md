@@ -1,11 +1,11 @@
 # Run with DEF values in VS Code
 
 1. Open a `.q1asm` file and run **Q1Lens: Open Timeline Preview**. Click **Sweep** next to **Instruction** in the toolbar. To try it with a small program, open [sum.q1asm](../examples/def-register-sweep/sum.q1asm).
-2. In **Run inputs**, choose a sequencer if the project has several. The register checkboxes show those referenced by the selected program. Choose **Show all registers** to see R0–R63. Edit a numeric DEF, check the registers you want to observe, and click **Run from start**. Check **Q1 time** to include the full program time in the results. The table shows the declaration, the draft input, and the value from the last displayed execution. **Reset** or **Reset all DEFs** restores the draft from the declaration. Run again to apply it.
+2. In the **Sweep** panel, choose a sequencer if the project has several. The register checkboxes show those referenced by the selected program. Choose **Show all registers** to see R0–R63. Edit a numeric DEF in the **Run input** column, check the registers you want to observe, and click **Run from start**. Check **Q1 time** to include the full program time in the results. The table shows the declaration and the draft input. After a run it adds a **Last run** column with the value from the last displayed execution. **Reset** and **Reset all DEFs** appear when a draft differs from its declaration and restore it. Run again to apply it.
 3. Select an executed instruction or use **Previous instruction** and **Next instruction**. The trace shows register reads and readable values at issue. Pending writes show their planned availability, and a clipped issue shows its planned end alongside the observed interval. **Q1 time** measures elapsed time from the first instruction through `stop`, including waits for feedback and a full 32-entry RT FIFO. Instruction costs follow q1simulator 1.4.1 ISA 2 for supported forms. Simulation trace events use the project's physical schedule.
-4. In **Sweep ranges**, choose one or two axes. Enter integer bounds and a positive step, check the combination count, and select **Start sweep**. The sweep requires at least one checked register or **Q1 time**. **Plots and cases** supports up to 4,096 combinations. **Statistics only** supports up to 1,000,000 combinations and reuses fixed program preparation. Both modes run every grid point, hold the other DEFs fixed, and report only the selected metrics. **Stop sweep** keeps the results reported through the current batch.
+4. To sweep a DEF, fill in **Min**, **Max**, or **Step** on its row. An empty **Min** or **Max** uses the declared value and an empty **Step** uses 1, as the placeholders show. Up to two DEFs can have a range. The first one you enter is the horizontal plot axis. Enter integer bounds and a positive step, check the combination count, and select **Start sweep**. The sweep requires at least one checked register or **Q1 time**. **Plots and cases** supports up to 4,096 combinations. **Statistics only** supports up to 1,000,000 combinations and reuses fixed program preparation. Both modes run every grid point, hold the other DEFs fixed, and report only the selected metrics. **Stop sweep** keeps the results reported through the current batch.
 5. Use **Plot metric** to switch the scatter plot or heatmap and histogram among the selected metrics. A completed case can supply Q1 time even if a selected register value is undetermined. The plots use the saved results.
-6. Select a case in the results table, scatter plot, or heatmap to reproduce its trace. The extension checks the reproduced raw words and any selected Q1 time against the saved case. The sweep remains visible while you inspect the trace.
+6. The result line shows the reported cases and, when they differ, how many are readable, undetermined, blocked, failed, limited, or unexecuted. Hover it for the run settings. Statistics show four significant digits, with the exact value on hover. The **Cases** table opens on **Needs attention**, which lists cases that did not complete, carry diagnostics, or fail a comparison. Choose **All** for every case. Select a case in the table, scatter plot, or heatmap to reproduce its trace. The extension checks the reproduced raw words and any selected Q1 time against the saved case. The sweep remains visible while you inspect the trace.
 
 After a **Plots and cases** sweep, enter a **Formula** and select **Plot formula**. For example, `atan2(R1, R0)` uses the observed final register values with the selected signed or unsigned interpretation. Use `atan2(INPUT_Y, INPUT_X)` for programs with those DEF inputs. Use `$NAME` to refer explicitly to a DEF. Formulas support arithmetic, parentheses, powers (`**` or `^`), constants `pi` and `e`, and functions such as `abs`, `sqrt`, `log`, `sin`, and `atan2`. Trigonometric functions use radians. Formulas use the saved cases and omit values that are unavailable or non-finite.
 
@@ -25,12 +25,11 @@ DEF inputs apply to the selected sequencer instance and leave source files and p
 
 ## Prove a property or find a reachable path
 
-The `q1timeline prove` command uses Z3 to explore one sequencer over an inclusive range of one numeric DEF. Other DEFs keep their source values. Arithmetic and status flags follow the Q1 core, including 32-bit wraparound, wide multiplication and register write delays. Conditional jumps split execution on their actual flag or register predicates. Loops consume the instruction budget each time they execute.
+For automatic queue boundaries, assertion comments and clickable counterexamples in VS Code, see [Program verification](verification.md).
 
-Install the optional Z3 dependency from the repository root, then check the sum example with its declared `Y=10`.
+The lower-level `q1timeline prove` command explores one sequencer over an inclusive range of one numeric DEF. Other DEFs keep their source values. Arithmetic and status flags follow the Q1 core, including 32-bit wraparound, wide multiplication and register write delays. Conditional jumps split execution on their actual flag or register predicates. Loops consume the instruction budget each time they execute. For example, check the sum program with its declared `Y=10`.
 
 ```shell
-python -m pip install -e ".[smt]"
 q1lens q1timeline prove examples/def-register-sweep/sum.q1asm --range X=0..1013 --assert "R2 < 1024"
 q1lens q1timeline prove examples/def-register-sweep/sum.q1asm --range X=0..1014 --assert "R2 < 1024" --replay-ir output/smt-def-sweep/x1014.json
 q1lens q1timeline render --ir output/smt-def-sweep/x1014.json --out output/smt-def-sweep/x1014.html --mode debug
@@ -58,10 +57,12 @@ q1lens q1timeline prove examples/def-register-sweep/queue.q1asm --range N=1..37 
 q1lens q1timeline prove examples/def-register-sweep/queue.q1asm --range N=1..38 --underflow-at 4 --replay-ir output/underflow.json
 ```
 
+Use `--underflow-at` as a CI check. It exits 0 when underflow is `unreachable` across the input range, 1 when a reproduced witness makes it `reachable`, and 2 when the result is `unknown`.
+
 For `N=37`, the next packet arrives exactly at the dequeue deadline. Extending the range to 38 produces the witness `N=38`. Concrete replays its Q1 instruction path and Simulation independently confirms the underflow at 1,188 ns. For this query the exported timeline is the fixed-start Simulation trace. The queue result is specific to the supplied startup delay and the modeled local instructions. Scenarios involving external triggers, LINQ traffic or acquisition hardware need their own Simulation inputs.
 
 ### Cross-check Analysis summaries
 
-With the `dev` and `smt` extras installed, run `python -m pytest -q tests/test_q1timeline_analysis_smt_oracle.py`. The tests take time and register bounds reported by Analysis and ask Z3 whether any permitted input violates them. Analysis summarizes the loop or merges the branches. The verifier follows the individual instructions on each feasible path.
+With the `dev` extra installed, run `python -m pytest -q tests/test_q1timeline_analysis_smt_oracle.py`. The tests check whether any permitted input violates the time or register bounds reported by Analysis. Analysis summarizes the loop or merges the branches. The verifier follows the individual instructions on each feasible path.
 
-The cases cover loop durations that vary by iteration, zero-duration RT packets, and the Q1 clock at the 32-entry FIFO boundary. The branch tests cover equal clocks across both paths and a join with equal RT time but different Q1 completion times. For the symbolic-input cases, Z3 ranges over all 32-bit input words.
+The cases cover loop durations that vary by iteration, zero-duration RT packets, and the Q1 clock at the 32-entry FIFO boundary. The branch tests cover equal clocks across both paths and a join with equal RT time but different Q1 completion times. The symbolic-input cases range over all 32-bit input words.

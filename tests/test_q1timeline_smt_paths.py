@@ -60,10 +60,12 @@ def test_queue_threshold_against_every_input_in_simulation(capsys, tmp_path):
         else:
             assert run.metadata["execution"]["status"] == "completed"
     assert violations == {38: 1188}
+    code, result = prove(capsys, "queue.q1asm", "N=1..38", "--underflow-at", "4", "--max-steps", "1")
+    assert (code, result["status"]) == (2, "unknown")
     code, result = prove(capsys, "queue.q1asm", "N=1..37", "--underflow-at", "4")
-    assert (code, result["status"]) == (1, "unreachable")
+    assert (code, result["status"]) == (0, "unreachable")
     timeline = tmp_path / "underflow.json"
     code, result = prove(capsys, "queue.q1asm", "N=1..38", "--underflow-at", "4", "--replay-ir", str(timeline))
-    assert (code, result["status"], result["witness"]) == (0, "reachable", {"N": 38})
+    assert (code, result["status"], result["witness"]) == (1, "reachable", {"N": 38})
     assert result["replay"]["underflow_ns"] == violations[38]
     assert any(row["kind"] == "underflow_warning" for row in json.loads(timeline.read_text())["events"])

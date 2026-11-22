@@ -408,13 +408,26 @@ describe("timeline webview assets", () => {
   it("distinguishes the displayed baseline from a pending save or clear", () => {
     const script = readFileSync(join(__dirname, "..", "src", "q1timeline", "media", "timeline.js"), "utf-8");
     const source = extractFunctionSource(script, "renderComparisonStatus");
-    const node = { textContent: "", title: "" };
-    const render = Function("document", `${source}\nreturn renderComparisonStatus;`)({ getElementById: () => node });
+    const legends: string[][] = [];
+    const node = { textContent: "", title: "", hidden: false, append: (legend: any) => legends.push(legend.keys) };
+    const element = () => ({ className: "", textContent: "", keys: [] as string[], setAttribute() {},
+      append(this: any, item: any) { this.keys.push(item.textContent); } });
+    const render = Function("document", `${source}\nreturn renderComparisonStatus;`)(
+      { getElementById: () => node, createElement: element });
     render({ mode: "saved", nextMode: "previous", pending: true });
-    assert.match(node.textContent, /Current comparison: saved baseline/);
-    assert.match(node.textContent, /Next analysis: previous analysis. Reanalyze/);
+    assert.equal(node.hidden, false);
+    assert.match(node.textContent, /^vs saved baseline/);
+    assert.match(node.textContent, /next: previous analysis · reanalyze to update/);
     render({ mode: "previous" });
-    assert.equal(node.textContent, "Current comparison: previous analysis.");
+    assert.equal(node.textContent, "vs previous analysis");
+    assert.deepEqual(legends.at(-1), ["added", "changed", "shifted", "removed"]);
+    // With nothing to compare the status takes no room in the toolbar.
+    render({ mode: "none" });
+    assert.equal(node.hidden, true);
+    assert.equal(node.textContent, "");
+    render({ mode: "none", nextMode: "saved", pending: true });
+    assert.equal(node.hidden, false);
+    assert.equal(node.textContent, "next: saved baseline · reanalyze to update");
   });
 
   it("defines the shared renderer asset contract", () => {
@@ -1741,11 +1754,24 @@ describe("timeline webview assets", () => {
     assert.match(toolbarSource, /node\.className = "q1timeline-toolbar"/);
     assert.match(toolbarSource, /setIconOnlyToolbarButton\(refreshButton, "refresh", "Refresh"\)/);
     assert.match(toolbarSource, /setToolbarStatusIcon\(autoUpdateIndicator, "sync", `Auto-update: \$\{initialUpdateMode\}`\)/);
-    assert.match(toolbarSource, /setIconOnlyToolbarButton\(basisButton, basis === "aligned" \? "aligned" : "local", basis === "aligned" \? "Aligned time basis" : "Local time basis"\)/);
-    assert.match(toolbarSource, /setIconOnlyToolbarButton\(normalButton, "normal", "Normal view"\)/);
-    assert.match(toolbarSource, /setIconOnlyToolbarButton\(debugButton, "debug", "Debug view"\)/);
+    // The three view toggles are labelled words; their accessible names keep the full phrase.
+    assert.match(script, /function setTextToolbarButton\(button, text, label\)/);
+    assert.match(toolbarSource, /setTextToolbarButton\(basisButton, basis === "aligned" \? "Aligned" : "Local", basis === "aligned" \? "Aligned time basis" : "Local time basis"\)/);
+    assert.match(toolbarSource, /setTextToolbarButton\(normalButton, "Normal", "Normal view"\)/);
+    assert.match(toolbarSource, /setTextToolbarButton\(debugButton, "Debug", "Debug view"\)/);
+    assert.match(toolbarSource, /\["time", "Time", "Time scale"\]/);
     assert.match(toolbarSource, /setIconOnlyToolbarButton\(zoomSelectionButton, "zoomSelection", "Zoom selection"\)/);
-    assert.match(toolbarSource, /setIconOnlyToolbarButton\(zoomEventButton, "zoomEvent", "Zoom selected event"\)/);
+    // Zooming to the selected event belongs to the selection strip, which exists only while something is selected.
+    const selectionSource = extractFunctionSource(script, "ensureSelectionNode");
+    assert.ok(selectionSource);
+    assert.match(selectionSource, /setIconOnlyToolbarButton\(zoomEventButton, "zoomEvent", "Zoom selected event"\)/);
+    assert.doesNotMatch(toolbarSource, /zoomEventButton/);
+    // Run, view, zoom, tools and status are separate groups; rarely used actions sit in the overflow menu.
+    assert.equal(toolbarSource.match(/node\.append\(toolbarSeparator\(\)\)/g)?.length, 3);
+    for (const id of ["q1timeline-reset-zoom-button", "q1timeline-pan-left-button", "q1timeline-pan-right-button"]) {
+      assert.ok(toolbarSource.includes(`"${id}"`));
+    }
+    assert.match(toolbarSource, /issueStatus\.id = "q1timeline-issue-status"/);
     assert.doesNotMatch(toolbarSource, /textContent = "Refresh"/);
     assert.doesNotMatch(toolbarSource, /textContent = "Zoom selection"/);
     assert.doesNotMatch(toolbarSource, /textContent = "Zoom event"/);

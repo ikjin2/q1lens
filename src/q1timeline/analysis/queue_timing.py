@@ -108,6 +108,8 @@ def replay_queues(
     for name, packets in streams.items():
         prefix: list[RtPacket] = []
         previous_end = None
+        empty_fifo = not has_sync and not prefill_startup
+        next_dequeue = None
         for packet in packets:
             if packet.op == "wait_sync" and packet.meta.get("conditional_skipped") is not True and name not in participants:
                 results[name].incomplete_reason = DISABLED_SYNC_REASON
@@ -117,7 +119,7 @@ def replay_queues(
             if not all(isinstance(value, Concrete) and type(value.value) is int for value in times):
                 results[name].incomplete_reason = f"Unknown packet timing at {packet.id}."
                 break
-            start, end, duration = (value.value for value in times)
+            start, end, duration = packet.q1_issue_t0.value, packet.q1_issue_t1.value, packet.duration.value
             if end <= start or duration < 0 or (previous_end is not None and start < previous_end):
                 results[name].incomplete_reason = f"Invalid packet timing at {packet.id}."
                 break
@@ -127,6 +129,13 @@ def replay_queues(
                 break
             prefix.append(packet)
             previous_end = end
+            if empty_fifo:
+                empty_fifo = ((next_dequeue is None or end >= next_dequeue) and packet.op not in {"wait_sync", "wait_trigger"}
+                              and not packet.meta.get("q1_fifo_stall_ns") and "trigger_counter_assumption" not in packet.meta)
+                next_dequeue = end + (duration or 4)
+        if empty_fifo:
+            _replay_empty_fifo(prefix, results[name], initial_buffer_ns)
+            continue
         schedule_inputs = (trigger_schedules or {}).get(name)
         counters = ScheduledTriggerCounters(schedule_inputs) if schedule_inputs and any(
             "trigger_counter_assumption" in packet.meta for packet in prefix
@@ -253,6 +262,20 @@ def replay_queues(
             queue.result.incomplete_packet = queue.sync
             queue.result.incomplete_details = {"missing_sync_participants": missing}
     return results
+
+
+def _replay_empty_fifo(packets: list[RtPacket], result: QueueReplayResult, initial_buffer_ns: int) -> None:
+    """Each enqueue can be consumed immediately when it is at or after the preceding RT dwell."""
+    guarded_dequeue = None
+    for packet in packets:
+        enqueue = packet.q1_issue_t1.value
+        if guarded_dequeue is not None:
+            result.required_buffer_ns += enqueue - guarded_dequeue
+            if result.required_buffer_ns > initial_buffer_ns:
+                result.failure = QueueTimingFailure(packet, enqueue, guarded_dequeue, guarded_dequeue - enqueue)
+                break
+        result.records.append(QueueTimingRecord(packet, enqueue, enqueue, 0))
+        guarded_dequeue = enqueue + packet.duration.value if packet.duration.value else None
 
 
 def _trigger_timing(packet: RtPacket) -> tuple[int, int] | None:

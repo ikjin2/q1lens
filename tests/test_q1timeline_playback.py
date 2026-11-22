@@ -25,6 +25,15 @@ def finish(playback: PlaybackSession) -> dict:
     return playback.snapshot()
 
 
+@pytest.mark.parametrize("other_index", ["R0", "R1"], ids=["fully-bound", "partly-symbolic"])
+def test_playback_stops_before_issuing_invalid_register_waveform_index(other_index: str) -> None:
+    playback = session(f"move 1024,R0\nnop\nplay R0,{other_index},4\nstop")
+    ir = finish(playback)
+    assert playback.status == "blocked"
+    assert "waveform_index" in playback.reason
+    assert not any(event["kind"] == "play" for event in ir["events"])
+
+
 @pytest.mark.parametrize("edge", ["sub R31,1,R31\njnz @body", "loop R31,@body"])
 def test_executed_loops_keep_concrete_timing_flags_and_register_history(edge: str) -> None:
     source = f"move 15,R31\nbody: wait 65535\n{edge}\nwait 16975\nstop"
@@ -326,6 +335,7 @@ def test_zero_loop_counter_wraps_and_partial_count_is_not_claimed_complete() -> 
     ("wait R0\nstop", "duration"),
     ("jmp R0\nstop", "destination"),
     ("fb_pull_data R0,R1\nstop", "external timing"),
+    ("sw_req 1\nstop", "sw_req"),
 ])
 def test_unknown_timing_and_external_boundaries_do_not_execute(source: str, reason: str) -> None:
     playback = session(source)

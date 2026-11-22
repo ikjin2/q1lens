@@ -1,0 +1,7 @@
+set_latch_en 1,4
+wait 20
+set_cond 1,15,4,4
+wait 24
+set_cond 0,0,0,4
+readout: upd_param 4
+stop

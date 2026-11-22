@@ -88,10 +88,12 @@ def run(args: argparse.Namespace) -> int:
     except ModuleNotFoundError as exc:
         if exc.name != "z3":
             raise
-        print("q1timeline prove requires q1lens[smt]. In a source checkout run: pip install -e '.[smt]'.", file=sys.stderr)
+        print("Install the current q1lens package in this Python environment. In a source checkout run: pip install -e .", file=sys.stderr)
         return 2
     except (OSError, ValueError) as exc:
         print(f"q1timeline prove: {exc}", file=sys.stderr)
         return 2
     print(json.dumps(report, indent=2))
+    if query.kind == "underflow":
+        return {"unreachable": 0, "reachable": 1, "unknown": 2}[report["status"]]
     return {"proved": 0, "reachable": 0, "counterexample": 1, "unreachable": 1, "unknown": 2}[report["status"]]

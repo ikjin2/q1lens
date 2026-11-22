@@ -66,24 +66,30 @@ async function geometry(page) {
     const rect = node.getBoundingClientRect();
     return { x: rect.x, y: rect.y, width: rect.width,
       nameX: node.querySelector("dt").getBoundingClientRect().x,
-      valueX: node.querySelector("dd").getBoundingClientRect().x };
+      valueRight: node.querySelector("dd").getBoundingClientRect().right };
   }));
 }
 
-test("Parameters use aligned columns and reflow into one column in a narrow window", async ({ page }) => {
+test("Parameters fill equal columns with the value beside its name and reflow into one column in a narrow window", async ({ page }) => {
   await mount(page);
   await panel(page).locator("summary").click();
   await expect(rows(page)).toHaveCount(6);
+  // The explanation is a tooltip on the title, not a paragraph above the list.
+  await expect(panel(page).locator(".parameters-help")).toHaveCount(0);
+  await expect(panel(page).locator(".parameters-title")).toHaveAttribute("title", /not live hardware or register values/);
   const wide = await geometry(page);
   expect(wide[1].y).toBeCloseTo(wide[0].y, 0);
   expect(wide[1].x).toBeGreaterThan(wide[0].x + wide[0].width);
-  expect(wide[2].x).toBeCloseTo(wide[0].x, 0);
-  expect(wide[2].nameX).toBeCloseTo(wide[0].nameX, 0);
-  expect(wide[2].valueX).toBeCloseTo(wide[0].valueX, 0);
-  expect(wide[3].nameX).toBeCloseTo(wide[1].nameX, 0);
-  expect(wide[3].valueX).toBeCloseTo(wide[1].valueX, 0);
-  await expect(rows(page).nth(1)).toContainText("override");
-  await expect(rows(page).nth(1)).toContainText("← base 800");
+  for (const cell of wide) {
+    // Equal columns: the name starts at the cell's left edge and the value ends at its right edge.
+    expect(cell.width).toBeCloseTo(wide[0].width, 0);
+    expect(cell.nameX).toBeCloseTo(cell.x, 0);
+    expect(cell.valueRight).toBeCloseTo(cell.x + cell.width, 0);
+  }
+  // The overridden value leads the list.
+  await expect(rows(page).first().locator("dt")).toHaveText("CH1_INIT_DELAY");
+  await expect(rows(page).first()).toContainText("override");
+  await expect(rows(page).first()).toContainText("← base 800");
   await expect(rows(page).last().locator("dd > code")).toHaveText("9007199254740993");
   await page.screenshot({ path: test.info().outputPath("parameters-two-columns.png"), fullPage: true });
 
@@ -92,7 +98,7 @@ test("Parameters use aligned columns and reflow into one column in a narrow wind
   for (let index = 1; index < narrow.length; index += 1) {
     expect(narrow[index].x).toBeCloseTo(narrow[0].x, 0);
     expect(narrow[index].y).toBeGreaterThan(narrow[index - 1].y);
-    expect(narrow[index].valueX).toBeCloseTo(narrow[0].valueX, 0);
+    expect(narrow[index].valueRight).toBeCloseTo(narrow[0].valueRight, 0);
   }
   expect(await panel(page).locator(".parameters-list").evaluate((node) => node.scrollWidth <= node.clientWidth + 1)).toBe(true);
   await page.screenshot({ path: test.info().outputPath("parameters-one-column.png"), fullPage: true });
@@ -151,16 +157,19 @@ test("Edit appears on hover or keyboard focus and keeps parameter editing intact
   await search.click();
   await query.fill("a");
   await page.mouse.move(0, 0);
-  const row = rows(page).first();
+  // The overridden CH1_INIT_DELAY is listed first; ACQ_DUR follows it.
+  const row = rows(page).nth(1);
   const edit = row.getByRole("button", { name: "Edit ACQ_DUR", exact: true });
-  const otherEdit = rows(page).nth(1).getByRole("button", { name: "Edit CH1_INIT_DELAY", exact: true });
+  const otherEdit = rows(page).first().getByRole("button", { name: "Edit CH1_INIT_DELAY", exact: true });
   await expect(edit).toHaveCSS("opacity", "0");
   await row.hover();
   await expect(edit).toHaveCSS("opacity", "1");
   await page.mouse.move(0, 0);
   await expect(edit).toHaveCSS("opacity", "0");
   await panel(page).locator(".parameters-list-scroll").focus();
-  await page.keyboard.press("Tab");
+  for (let presses = 0; presses < 4 && !(await edit.evaluate((node) => node === document.activeElement)); presses += 1) {
+    await page.keyboard.press("Tab");
+  }
   await expect(edit).toBeFocused();
   await expect(edit).toHaveCSS("opacity", "1");
   await page.keyboard.press("Enter");

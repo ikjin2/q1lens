@@ -571,6 +571,8 @@ describe("timelineModel", () => {
 
     assert.equal(q0Target.kind, "target");
     assert.equal(q0Target.label, "Schedule / q0");
+    assert.equal(q0Target.displayLabel, "q0");
+    assert.equal(q0Target.title, "Schedule / q0");
     assert.equal(q0Target.expandable, true);
     assert.equal(q0Target.expanded, false);
     assert.equal(q0Target.childrenCount, 1);
@@ -931,8 +933,14 @@ describe("timelineModel", () => {
     ];
     const model = buildTimelineModel(payload, "second");
     assert.equal(model.inspector.title, "Second occurrence");
-    assert.equal(model.inspector.rows.find((row: any) => row.label === "Start").value, "20 ns");
+    assert.deepEqual(model.inspector.timing, { startLabel: "20 ns", durationLabel: "10 ns", rangeLabel: "20 → 30 ns" });
+    assert.equal(model.inspector.idLabel, "shared");
+    assert.equal(model.inspector.rows.some((row: any) => ["Start", "Duration", "Operation ID"].includes(row.label)), false);
     assert.equal(model.inspector.rows.find((row: any) => row.label === "Q1ASM").value, "seq0:L8");
+    assert.deepEqual(model.inspector.sourceAction, {
+      label: "Open schedule source",
+      message: { type: "openScheduleSource", schedulableId: "shared", operationId: "shared", blockId: "second" },
+    });
     assert.equal(model.inspector.actions[0].message.blockId, "second");
     assert.equal(model.inspector.q1asmDrilldown.targetLine, 8);
   });
@@ -1814,7 +1822,7 @@ describe("timelineModel", () => {
       { label: "Open Full Q1ASM Timeline", message: { type: "openQ1Timeline", blockId: "pulse:cz", operationId: "cz_q0_q1" } },
     ]);
     assert.equal(model.inspector.title, "CZFluxPulse");
-    assert.equal(model.inspector.rows.find((row: { label: string; value: string }) => row.label === "Duration")?.value, "88 ns");
+    assert.deepEqual(model.inspector.timing, { startLabel: "44 ns", durationLabel: "88 ns", rangeLabel: "44 → 132 ns" });
     assert.equal(model.inspector.rows.find((row: { label: string; value: string }) => row.label === "Symbolic duration")?.value, "T_CZ");
   });
 
@@ -1835,10 +1843,8 @@ describe("timelineModel", () => {
         { label: "Open schedule.py", message: { type: "openScheduleFile" } },
       ],
     });
-    assert.deepEqual(model.inspector.actions.slice(-2), [
-      { label: "Open qbstimeline.yml", message: { type: "openProjectFile" } },
-      { label: "Open schedule.py", message: { type: "openScheduleFile" } },
-    ]);
+    // Project files are linked once, from the source context; the inspector keeps selection actions only.
+    assert.deepEqual(model.inspector.actions.map((action: { message: { type: string } }) => action.message.type), ["openQ1Timeline"]);
   });
 
   it("labels notebook source actions before generated schedule actions", () => {
@@ -1870,6 +1876,7 @@ describe("timelineModel", () => {
     const model = buildTimelineModel(payload, "pulse:cz");
 
     assert.deepEqual(model.inspector.tabs.map((tab: { id: string }) => tab.id), ["summary", "lowering", "q1asm"]);
+    assert.deepEqual(model.inspector.tabs.map((tab: { label: string }) => tab.label), ["Summary", "Lowering", "Q1ASM"]);
     assert.equal(model.inspector.tabs.find((tab: { id: string }) => tab.id === "q1asm")?.message, undefined);
     assert.deepEqual(model.inspector.actions[0], {
       label: "Open Full Q1ASM Timeline",
@@ -2065,6 +2072,7 @@ describe("timelineModel", () => {
     assert.equal(model.viewport.endLabel, "132 ns");
     assert.equal(model.viewport.durationLabel, "88 ns");
     assert.equal(model.viewport.isZoomed, true);
+    assert.equal(model.viewport.windowLabel, "44–132 / 132 ns");
     assert.deepEqual(model.ticks.map((tick: { label: string }) => tick.label), ["44 ns", "66 ns", "88 ns", "110 ns", "132 ns"]);
 
     const blocks = model.lanes.flatMap((lane: { blocks: any[] }) => lane.blocks);
@@ -2141,7 +2149,7 @@ describe("timelineModel", () => {
         assert.equal(model.inspector.selectedId, "shared");
         assert.equal(model.inspector.actions[0].message.blockId, "shared");
         assert.equal(model.inspector.actions[0].message.operationId, "shared");
-        assert.equal(model.inspector.rows.find((row: any) => row.label === "Start").value, "0 ns");
+        assert.equal(model.inspector.timing.startLabel, "0 ns");
       }
     }
     const alias = buildTimelineModel({ operations: [operations[1]] }, "shared");

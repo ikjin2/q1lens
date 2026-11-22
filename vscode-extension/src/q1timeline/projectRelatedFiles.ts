@@ -8,7 +8,7 @@ function collectProjectRelatedPaths(projectPath, projectText) {
   const text = typeof projectText === "string" ? projectText : "";
   collectYamlProjectPaths(text, root, related);
   for (const line of text.split(/\r?\n/)) {
-    const match = line.match(/^\s*-?\s*(file|sequence_json|params|display)\s*:\s*(.+?)\s*$/);
+    const match = line.match(/^\s*-?\s*(file|sequence_json|snapshot|params|display)\s*:\s*(.+?)\s*$/);
     if (!match) {
       continue;
     }
@@ -43,7 +43,7 @@ function collectPathValues(value, root, related, seen) {
     return;
   }
   for (const [key, child] of Object.entries(value)) {
-    if (["file", "sequence_json", "params", "display"].includes(String(key)) && typeof child === "string" && child) {
+    if (["file", "sequence_json", "snapshot", "params", "display"].includes(String(key)) && typeof child === "string" && child) {
       related.add(path.resolve(root, child));
       continue;
     }

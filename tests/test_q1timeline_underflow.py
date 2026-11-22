@@ -235,12 +235,12 @@ def test_timing_dependencies_and_control_flow_keep_compact_loop_incomplete(body:
     assert not [item for item in state.diagnostics if item.category in UNDERFLOW_CATEGORIES]
 
 
-def test_invalid_zero_loop_count_does_not_report_the_prefix_as_complete() -> None:
+def test_wrapped_zero_loop_count_has_exact_rt_time_and_unexpanded_queue() -> None:
     state, result = _analyze("move 0,R0\nbody: wait 100\nloop R0,@body\nstop\n")
 
-    assert any(item.category == "invalid_argument_value" for item in state.diagnostics)
+    assert state.rt_time_ns.value == 100 * (1 << 32)
     assert result.status == "analysis_incomplete"
-    assert any(item.details.get("reason") == "invalid_loop_count" for item in state.diagnostics)
+    assert any(item.details.get("reason") == "compact_loop_timing_unexpanded" for item in state.diagnostics)
 
 
 @pytest.mark.parametrize("tail,reason", [

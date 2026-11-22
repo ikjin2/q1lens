@@ -14,7 +14,7 @@ from fractions import Fraction
 
 import pytest
 
-from q1timeline.simulation.signals import MAX_TOTAL_SAMPLES, SignalModel, validate_physical_config
+from q1timeline.simulation.signals import MAX_TOTAL_SAMPLES, SignalModel, _rotation, validate_physical_config
 
 
 def memory(i=None, q=None, weights=None):
@@ -34,6 +34,18 @@ def code(value, bits):
     scale = 2 ** (bits - 1)
     rounded = int((Decimal.from_float(float(value)) * scale).to_integral_value(rounding=ROUND_HALF_EVEN))
     return min(scale - 1, max(-scale, rounded))
+
+
+def test_binary_phase_rotations_and_their_immediate_neighbors_are_bit_exact():
+    for index in range(-32, 33):
+        phase = index / 32
+        for turns in (phase, math.nextafter(phase, -math.inf), math.nextafter(phase, math.inf)):
+            fraction = turns % 1
+            quadrant = fraction * 4
+            expected = ((1 + 0j, 1j, -1 + 0j, -1j)[int(quadrant) % 4] if quadrant.is_integer()
+                        else complex(math.cos(math.tau * fraction), math.sin(math.tau * fraction)))
+            rotation = _rotation(turns)
+            assert (rotation.real.hex(), rotation.imag.hex()) == (expected.real.hex(), expected.imag.hex())
 
 
 @pytest.mark.parametrize("bits", range(2, 25))
@@ -64,7 +76,9 @@ def test_every_converter_width_signed_ties_and_rails(bits, stage):
 @pytest.mark.parametrize("bits", [2, 12, 24])
 def test_clipping_and_half_lsb_error_bound(bits):
     scale = 2 ** (bits - 1)
-    values = [-1.25, -1, -0.321, 0, 0.271, (scale - 1) / scale, 1, 1.25]
+    upper_tie = 1 - 0.5 / scale
+    values = [-1.25, math.nextafter(-1, -math.inf), -1, -0.321, 0, 0.271, (scale - 1) / scale,
+              math.nextafter(upper_tie, 0), upper_tie, 1, 1.25]
     model = SignalModel({"sequencers": {"s": {"adc_bits": bits, "input": {
         "kind": "trace", "i": values, "q": [0] * len(values), "source": "synthetic clipping fixture",
     }}}}, {"s": memory()})
@@ -74,7 +88,7 @@ def test_clipping_and_half_lsb_error_bound(bits):
     for x, y in zip(values, actual):
         if -1 <= x <= (scale - 1) / scale:
             assert abs(x - y) <= 0.5 / scale
-    assert result["clipping"]["adc_samples"] == 3
+    assert result["clipping"]["adc_samples"] == 5
 
 
 @pytest.mark.parametrize("i,q,rotation,integral", [(0.25, 0, 0, 1), (-0.25, 0, 0, -1),

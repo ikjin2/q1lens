@@ -45,6 +45,43 @@
     return formatScaled(value, "s");
   }
 
+  function splitDurationLabel(label) {
+    const match = /^(.*\S)\s+(\S+)$/.exec(String(label));
+    return match ? { value: match[1], unit: match[2] } : { value: String(label), unit: "" };
+  }
+
+  // "132 → 152 ns": the unit is written once when both ends share it.
+  function rangeLabel(startSeconds, endSeconds, separator) {
+    const startLabel = formatDuration(startSeconds);
+    const endLabel = formatDuration(endSeconds);
+    const start = splitDurationLabel(startLabel);
+    const end = splitDurationLabel(endLabel);
+    return start.unit && start.unit === end.unit
+      ? `${start.value}${separator}${endLabel}`
+      : `${startLabel}${separator}${endLabel}`;
+  }
+
+  // "132–280 / 564 ns" while zoomed: visible window against the schedule length.
+  function windowLabel(viewport, total) {
+    const totalLabel = formatDuration(total);
+    const unit = splitDurationLabel(totalLabel).unit;
+    const start = splitDurationLabel(formatDuration(viewport.start));
+    const end = splitDurationLabel(formatDuration(viewport.end));
+    return unit && start.unit === unit && end.unit === unit
+      ? `${start.value}–${end.value} / ${totalLabel}`
+      : `${rangeLabel(viewport.start, viewport.end, "–")} / ${totalLabel}`;
+  }
+
+  function inspectorTiming(startSeconds, durationSeconds) {
+    const start = startSeconds || 0;
+    const duration = durationSeconds || 0;
+    return {
+      startLabel: formatDuration(start),
+      durationLabel: formatDuration(duration),
+      rangeLabel: duration > 0 ? rangeLabel(start, start + duration, " → ") : formatDuration(start),
+    };
+  }
+
   function pct(value, total) {
     if (!total) {
       return 0;
@@ -477,6 +514,7 @@
       startLabel: formatDuration(viewport.start),
       endLabel: formatDuration(viewport.end),
       durationLabel: formatDuration(viewportDuration(viewport)),
+      windowLabel: windowLabel(viewport, total),
       isZoomed: viewport.start > 0 || viewport.end < total,
     };
   }
@@ -730,6 +768,8 @@
       const isExpanded = expanded.has(group.groupId);
       const parent = {
         label: group.target === "other" ? "Schedule" : `Schedule / ${group.target}`,
+        displayLabel: group.target === "other" ? "Schedule" : group.target,
+        title: group.target === "other" ? "Schedule" : `Schedule / ${group.target}`,
         kind: "target",
         groupId: group.groupId,
         target: group.target,
@@ -1254,14 +1294,13 @@
         { label: "Lane", value: pulse.lane },
         { label: "Summary", value: pulse.display_subtitle },
         { label: "Operation", value: pulse.operation_id },
-        { label: "Start", value: formatDuration(pulse.abs_time || 0) },
-        { label: "Duration", value: formatDuration(pulse.duration || 0) },
         { label: "Symbolic duration", value: symbolicDuration?.label },
         { label: "Provenance", value: provenance.label },
         { label: "Evidence", value: provenance.description },
         { label: "Inference reason", value: provenance.status === "inferred" ? mapping?.inference_reason : "" },
         { label: "Q1ASM", value: mapping ? `${mapping.sequencer}:L${line}` : "" },
       ]),
+      timing: inspectorTiming(pulse.abs_time, pulse.duration),
       actions: [
         { label: "Open Full Q1ASM Timeline", message: { type: "openQ1Timeline", blockId: pulse.id, operationId: pulse.operation_id } },
       ],
@@ -1287,11 +1326,10 @@
       title: operation.label || operation.id,
       subtitle: "Schedule operation",
       rows: inspectorRows([
-        { label: "Operation ID", value: operationId },
-        { label: "Start", value: formatDuration(operation.abs_time || 0) },
-        { label: "Duration", value: formatDuration(operation.duration || 0) },
         { label: "Q1ASM", value: mapping ? `${mapping.sequencer}:L${line}` : "" },
       ]),
+      timing: inspectorTiming(operation.abs_time, operation.duration),
+      idLabel: operationId,
       actions: [
         { label: "Open Full Q1ASM Timeline", message: { type: "openQ1Timeline", operationId, blockId: selectedBlock.id } },
       ],
@@ -1323,7 +1361,7 @@
         title: "No selection",
         subtitle: "Select a block",
         rows: [],
-        actions: [{ label: "Open QBS IR", message: { type: "openIr" } }],
+        actions: [],
         selectedId: undefined,
       };
     }
@@ -1535,7 +1573,7 @@
       tabs: [
         { id: "summary", label: "Summary" },
         { id: "lowering", label: "Lowering" },
-        { id: "q1asm", label: "Q1ASM Preview" },
+        { id: "q1asm", label: "Q1ASM" },
       ],
       loweringRows: inspectorRows([
         { label: "Provenance", value: provenance?.label },
@@ -1551,6 +1589,11 @@
         }))),
       ]),
       q1asmDrilldown: buildQ1asmDrilldown(ir, selectedBlock, mapping),
+      ...(selectedBlock?.q1asmSourceMessage
+        ? { sourceAction: { label: "Open Q1ASM source", message: selectedBlock.q1asmSourceMessage } }
+        : selectedBlock?.scheduleSourceMessage
+          ? { sourceAction: { label: "Open schedule source", message: selectedBlock.scheduleSourceMessage } }
+          : {}),
     };
   }
 
@@ -1580,16 +1623,6 @@
           ? [{ label: "Open generated schedule.py", message: { type: "openScheduleFile" } }]
           : []),
       ],
-    };
-  }
-
-  function appendSourceActions(inspector, source) {
-    if (!source) {
-      return inspector;
-    }
-    return {
-      ...inspector,
-      actions: [...inspector.actions, ...source.actions],
     };
   }
 
@@ -1667,7 +1700,7 @@
       ),
     ].map(stackLaneBlocks);
     const source = buildSourceContext(sourceContext);
-    const baseInspector = appendSourceActions(buildInspector(ir, selectedBlock, values), source);
+    const baseInspector = buildInspector(ir, selectedBlock, values);
     return {
       totalSeconds: total,
       totalLabel: formatDuration(total),
@@ -1679,10 +1712,10 @@
       provenanceCoverage: provenanceCoverageSummary(ir),
       source,
       artifactSummary: [
-        { label: "Operations", value: String((ir.operations || []).length) },
-        { label: "Symbolic pulses", value: String((ir.symbolic_pulses || []).length) },
-        { label: "Q1ASM programs", value: String((ir.q1asm_programs || []).length) },
-        { label: "Provenance links", value: String((ir.q1asm_provenance || []).length) },
+        { label: "operations", title: "Schedule operations", value: String((ir.operations || []).length) },
+        { label: "pulses", title: "Symbolic pulses", value: String((ir.symbolic_pulses || []).length) },
+        { label: "programs", title: "Q1ASM programs", value: String((ir.q1asm_programs || []).length) },
+        { label: "links", title: "Provenance links", value: String((ir.q1asm_provenance || []).length) },
       ],
     };
   }

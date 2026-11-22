@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +33,7 @@ class ProjectConfig:
     artifacts_analog_pulse_diagram: bool
     source_notebook: Path | None = None
     notebook_schedule: NotebookScheduleConfig | None = None
+    module_types: dict[str, str] = field(default_factory=dict)
 
 
 def load_project_config(path: str | Path) -> ProjectConfig:
@@ -58,6 +59,9 @@ def load_project_config(path: str | Path) -> ProjectConfig:
 
     outputs = _mapping(raw.get("outputs", {}), "outputs")
     low_level = _mapping(raw.get("low_level", {}), "low_level")
+    module_types = _mapping(low_level.get("module_types", {}), "low_level.module_types")
+    if any(not isinstance(name, str) or not name or kind not in ("QCM", "QRM") for name, kind in module_types.items()):
+        raise ConfigLoadError("low_level.module_types must map compiled module paths to QCM or QRM")
     artifacts = _mapping(raw.get("artifacts", {}), "artifacts")
     source = _mapping(raw.get("source", {}), "source")
 
@@ -93,6 +97,7 @@ def load_project_config(path: str | Path) -> ProjectConfig:
         artifacts_analog_pulse_diagram=_bool_value(artifacts, "analog_pulse_diagram", False),
         source_notebook=source_notebook,
         notebook_schedule=notebook_schedule,
+        module_types=module_types,
     )
 
 

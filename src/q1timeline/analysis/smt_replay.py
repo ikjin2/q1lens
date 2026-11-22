@@ -80,7 +80,9 @@ def confirm_witness(program: Program, symbol: str, query: Query, result: Verific
                 from q1timeline.simulation.runtime import simulate_programs
 
                 bound = with_def_values(program, {symbol: result.def_value})
-                scenario = {"startup_delay_ns": query.value, "max_time_ns": result.register_value + 1}
+                scenario = {"max_time_ns": result.register_value + 1}
+                if not query.buffered_start:
+                    scenario["startup_delay_ns"] = query.value
                 state, = simulate_programs({state.sequencer_id: bound}, max_steps=result.steps + 1, simulation=scenario)
                 if not any(e.kind == "underflow_warning" and e.t0.value == result.register_value for e in state.events):
                     raise ValueError("Simulation did not reproduce the predicted RT queue underflow.")

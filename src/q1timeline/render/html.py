@@ -10,7 +10,9 @@ from pathlib import Path
 from typing import Any
 
 from q1timeline.analysis.alignment import SIMULATION_ALIGNMENT_MODE
-from q1timeline.diagnostic_catalog import RT_QUEUE_UNDERFLOW_DESCRIPTION, describe_diagnostic, underflow_label
+from q1timeline.diagnostic_catalog import (
+    RT_QUEUE_UNDERFLOW_DESCRIPTION, describe_diagnostic, diagnostic_priority, underflow_label,
+)
 from q1timeline.q1asm.instruction_table import INSTRUCTION_TABLE, STATUS_BRANCH_OPS
 
 
@@ -169,7 +171,7 @@ def render_html(
     {_parameters_panel(ir.get("analysis", {}))}
     {_diagnostics_panel(diagnostics, event_dom_ids, source_events)}
     <details id="q1timeline-analysis-details" class="analysis-details">
-      <summary>Analysis details</summary>
+      <summary>Details</summary>
       <div id="q1timeline-analysis-details-body">
         <header>
           <h1>Q1ASM Live Timeline</h1>
@@ -1516,16 +1518,21 @@ def _control_flow_connector_svgs(
     return parts
 
 
+_PARAMETERS_HELP = ("Values used for this timeline analysis, not live hardware or register values. "
+                    "Overrides do not change the parameter file.")
+
+
 def _parameters_panel(analysis: dict[str, Any]) -> str:
     parameters = analysis.get("parameters")
-    if not isinstance(parameters, list):
+    if not isinstance(parameters, list) or not parameters:
         return ""
     override_count = sum(bool(parameter.get("overridden")) for parameter in parameters)
     summary = f"Parameters · {len(parameters)}"
     if override_count:
         summary += f" · {override_count} overridden"
     rows = []
-    for index, parameter in enumerate(parameters):
+    # Overridden values first: they are the ones that differ from the parameter file.
+    for index, parameter in sorted(enumerate(parameters), key=lambda item: not item[1].get("overridden")):
         annotation = ""
         if parameter.get("overridden"):
             base = parameter.get("base_value_json")
@@ -1545,14 +1552,12 @@ def _parameters_panel(analysis: dict[str, Any]) -> str:
     )
     return (
         '<details id="q1timeline-parameters" class="analysis-parameters">'
-        f'<summary><span class="parameters-title">{summary}</span>'
+        f'<summary><span class="parameters-title" title="{_PARAMETERS_HELP}">{summary}</span>'
         '<button class="parameters-search-toggle" type="button" aria-label="Search parameters" '
-        'aria-controls="q1timeline-parameter-search" aria-expanded="false" hidden>'
+        'title="Search parameters" aria-controls="q1timeline-parameter-search" aria-expanded="false" hidden>'
         '<svg aria-hidden="true" width="12" height="12" viewBox="0 0 16 16" fill="none" '
         'stroke="currentColor" stroke-width="1.5"><circle cx="6.5" cy="6.5" r="4.5"/>'
-        '<path d="m10 10 4 4"/></svg> Search</button></summary>'
-        '<p class="parameters-help">Values used for this timeline analysis, not live hardware or register values. '
-        'Overrides do not change the parameter file.</p>'
+        '<path d="m10 10 4 4"/></svg></button></summary>'
         '<div id="q1timeline-parameter-search" class="parameters-search" hidden>'
         '<input class="parameters-search-input" type="search" placeholder="Search parameters" '
         'aria-label="Search parameters by name">'
@@ -1600,26 +1605,32 @@ def _network_conflict_display_message(diagnostic: dict[str, Any], offset: int | 
     return f"Trigger network '{network}' has {qualifier}conflicting launch slots at {slot(first)} and {slot(second)}."
 
 
+_DIAGNOSTIC_SEVERITIES = ("error", "warning", "info", "hint")
+_DIAGNOSTIC_FILE_FOLD_COUNT = 30
+
+
 def _diagnostics_panel(
     diagnostics: list[dict[str, Any]], event_dom_ids: dict[str, str], events: list[dict[str, Any]],
 ) -> str:
-    counts = {severity: 0 for severity in ("error", "warning", "info", "hint")}
+    if not diagnostics:
+        return ""
+    counts = {severity: 0 for severity in _DIAGNOSTIC_SEVERITIES}
     for diagnostic in diagnostics:
         severity = str(diagnostic.get("severity", "info"))
         counts[severity] = counts.get(severity, 0) + 1
     summary = " · ".join(f"{counts[severity]} {severity}" + ("s" if counts[severity] != 1 else "")
-                         for severity in ("error", "warning", "info", "hint") if counts[severity]) or "No issues"
+                         for severity in _DIAGNOSTIC_SEVERITIES if counts[severity])
     tb_evidence_ids = {event_id for diagnostic in diagnostics if diagnostic.get("category") == "feedback_write_combine"
                        for event_id in diagnostic.get("related_events", [])}
     tb_evidence = {event["id"]: event for event in events if event["id"] in tb_evidence_ids} if tb_evidence_ids else {}
-    error_items = "".join(_diagnostic_item(diagnostic, event_dom_ids, tb_evidence)
-                          for diagnostic in diagnostics if diagnostic.get("severity") in {"error", "warning"})
-    secondary_diagnostics = [diagnostic for diagnostic in diagnostics if diagnostic.get("severity") not in {"error", "warning"}]
-    secondary_items = "".join(_diagnostic_item(diagnostic, event_dom_ids, tb_evidence) for diagnostic in secondary_diagnostics[:25])
+    primary = [diagnostic for diagnostic in diagnostics if diagnostic.get("severity") in {"error", "warning"}]
+    secondary = [diagnostic for diagnostic in diagnostics if diagnostic.get("severity") not in {"error", "warning"}]
+    error_items = _diagnostic_group_items(primary, event_dom_ids, tb_evidence)
+    secondary_items = _diagnostic_group_items(secondary[:25], event_dom_ids, tb_evidence)
     critical_html = f'<ol class="diagnostics-critical">{error_items}</ol>' if error_items else ""
     secondary_html = ""
     if secondary_items:
-        secondary_count = len(secondary_diagnostics)
+        secondary_count = len(secondary)
         secondary_label = f"{secondary_count} note" + ("" if secondary_count == 1 else "s")
         secondary_html = (
             '<details class="diagnostics-secondary" data-default-open="false">'
@@ -1629,11 +1640,191 @@ def _diagnostics_panel(
         )
     return (
         '<section class="diagnostics" aria-label="Diagnostics">'
-        f"<h2>Diagnostics</h2>"
-        f'<p class="diagnostic-summary">{escape(summary)}</p>'
+        '<div class="diagnostics-heading"><h2>Diagnostics</h2>'
+        f'<p class="diagnostic-summary">{escape(summary)}</p></div>'
         f"{critical_html}"
         f"{secondary_html}"
         "</section>"
+    )
+
+
+def _diagnostic_group_items(
+    diagnostics: list[dict[str, Any]], event_dom_ids: dict[str, str], tb_evidence: dict[str, dict[str, Any]],
+) -> str:
+    """Render one row per severity and category, most consequential first."""
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for diagnostic in diagnostics:
+        entry = _diagnostic_entry(diagnostic, event_dom_ids, tb_evidence)
+        groups.setdefault((entry["severity"], entry["category"]), []).append(entry)
+    order = {key: index for index, key in enumerate(groups)}
+
+    def rank(key: tuple[str, str]) -> tuple[int, int, int]:
+        severity, category = key
+        severity_rank = (_DIAGNOSTIC_SEVERITIES.index(severity) if severity in _DIAGNOSTIC_SEVERITIES
+                         else len(_DIAGNOSTIC_SEVERITIES))
+        return severity_rank, diagnostic_priority(category), order[key]
+
+    return "".join(_diagnostic_group_item(groups[key]) for key in sorted(groups, key=rank))
+
+
+def _diagnostic_entry(
+    diagnostic: dict[str, Any], event_dom_ids: dict[str, str], tb_evidence: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    presentation = describe_diagnostic(diagnostic)
+    source = diagnostic.get("source") if isinstance(diagnostic.get("source"), dict) else {}
+    source_file = str(source.get("file") or "")
+    filename = source_file.replace("\\", "/").rsplit("/", 1)[-1]
+    summary = presentation["summary"].strip()
+    if presentation["category"] == "rt_queue_underflow":
+        summary = RT_QUEUE_UNDERFLOW_DESCRIPTION
+    details = diagnostic.get("details") or {}
+    if presentation["category"] == "pending_hardware_state" and isinstance(details, dict) and isinstance(details.get("pending_fields"), list):
+        summary = "Not applied: " + ", ".join(str(field) for field in details["pending_fields"])
+    if source_file:
+        summary = summary.replace(source_file, filename)
+    if presentation["category"] == "analysis_incomplete":
+        summary = re.sub(r"^(?:Underflow )?analysis incomplete:\s*", "", summary, flags=re.IGNORECASE)
+    if summary.casefold().startswith(presentation["title"].casefold() + ":"):
+        summary = summary[len(presentation["title"]) + 1:].strip()
+    if (re.sub(r"\W+", "", summary).casefold() == re.sub(r"\W+", "", presentation["title"]).casefold()
+            or summary == presentation["category"]):
+        summary = ""
+    conflict_index = diagnostic.get("_network_conflict_index")
+    related_events = diagnostic.get("related_events", [])
+    extra_links = ""
+    if presentation["category"] == "feedback_write_combine" and len(set(related_events)) > 1:
+        for event_id in dict.fromkeys(related_events):
+            evidence = tb_evidence.get(event_id)
+            if evidence is None:
+                continue
+            meta = evidence.get("meta", {})
+            cutoff = _plain_number(meta.get("observation_cutoff_ns"))
+            planned = _plain_number(meta.get("planned_rt_end_ns"))
+            if evidence["kind"] == "feedback_contribution":
+                role = "contribution"
+            elif (evidence["lane"].startswith("rt.") and cutoff is not None and planned is not None
+                  and cutoff == _value_number(evidence.get("t1"), fallback=math.nan) < planned):
+                role = "RT cutoff"
+            else:
+                continue
+            extra_links += _related_event_link([event_id], event_dom_ids,
+                                               label=f'Show {evidence["sequencer_id"]} {role}', tb_evidence=True)
+    line = source.get("line") or 1
+    column = source.get("column") or 1
+    location = f"{filename}:{line}" if filename else ""
+    if related_events:
+        label = str(line) if filename else "event"
+        hint = f"{location} · show in timeline" if location else "Show in timeline"
+        chip = (
+            f'<a class="diagnostic-location" href="#{escape(_event_dom_id(related_events[0], event_dom_ids), quote=True)}" '
+            f'data-related-event-id="{escape(related_events[0], quote=True)}" '
+            f'data-related-event-ids="{escape(json.dumps(related_events), quote=True)}" aria-label="Show event" '
+            f'title="{escape(hint, quote=True)}">{escape(label)}</a>'
+        )
+    elif filename:
+        # A plain label here: the standalone page cannot open an editor. The VS Code webview turns it into a button.
+        chip = (
+            f'<span class="diagnostic-location" data-source-file="{escape(source_file, quote=True)}" '
+            f'data-source-line="{escape(str(line), quote=True)}" data-source-column="{escape(str(column), quote=True)}" '
+            f'title="{escape(location, quote=True)}">{escape(str(line))}</span>'
+        )
+    else:
+        chip = ""
+    return {
+        "severity": str(diagnostic.get("severity", "info")), "category": presentation["category"],
+        "title": presentation["title"], "summary": summary, "filename": filename, "location": location, "chip": chip,
+        "extra_links": extra_links, "conflict_index": conflict_index if type(conflict_index) is int else None,
+    }
+
+
+def _diagnostic_variants(entries: list[dict[str, Any]], *, merge: bool) -> list[dict[str, Any]]:
+    """Group entries by message; messages that differ in one word share a row."""
+    variants: list[dict[str, Any]] = []
+    by_message: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        if entry["conflict_index"] is not None:
+            variants.append({"text": entry["summary"], "conflict_index": entry["conflict_index"],
+                             "items": [(entry, "")]})
+            continue
+        variant = by_message.get(entry["summary"])
+        if variant is None:
+            variant = by_message[entry["summary"]] = {"text": entry["summary"], "conflict_index": None, "items": []}
+            variants.append(variant)
+        variant["items"].append((entry, ""))
+    if not merge:
+        return variants
+    buckets: dict[int, list[dict[str, Any]]] = {}
+    for variant in variants:
+        if variant["conflict_index"] is None and variant["text"]:
+            buckets.setdefault(len(variant["text"].split(" ")), []).append(variant)
+    for bucket in buckets.values():
+        if len(bucket) < 2:
+            continue
+        token_lists = [variant["text"].split(" ") for variant in bucket]
+        differing = [index for index in range(len(token_lists[0]))
+                     if len({tokens[index] for tokens in token_lists}) > 1]
+        if len(differing) != 1:
+            continue
+        position = differing[0]
+        template = list(token_lists[0])
+        template[position] = "…" + template[position][len(template[position].rstrip(".,;:")):]
+        merged_items = []
+        for variant, tokens in zip(bucket, token_lists):
+            qualifier = tokens[position].rstrip(".,;:")
+            if qualifier.isdigit() and position:
+                qualifier = f"{tokens[position - 1]} {qualifier}"
+            merged_items.extend((entry, qualifier) for entry, _ in variant["items"])
+        bucket[0]["text"], bucket[0]["items"] = " ".join(template), merged_items
+        for variant in bucket[1:]:
+            variants.remove(variant)
+    return variants
+
+
+def _diagnostic_locations(items: list[tuple[dict[str, Any], str]], *, fold: bool) -> str:
+    by_file: dict[str, list[str]] = {}
+    previous: dict[str, str] = {}
+    for entry, qualifier in items:
+        if not entry["chip"]:
+            continue
+        # A run of occurrences with the same qualifier names it once.
+        repeated = previous.get(entry["filename"]) == qualifier
+        previous[entry["filename"]] = qualifier
+        label = (f'<span class="diagnostic-qualifier">{escape(qualifier)}</span>'
+                 if qualifier and not repeated else "")
+        extra = f'<span class="related-events">{entry["extra_links"]}</span>' if entry["extra_links"] else ""
+        by_file.setdefault(entry["filename"], []).append(
+            f'<span class="diagnostic-occurrence" data-diagnostic-location="{escape(entry["location"], quote=True)}">'
+            f'{label}{entry["chip"]}{extra}</span>')
+    parts = []
+    for filename, chips in by_file.items():
+        name = f'<span class="diagnostic-source">{escape(filename)}:</span>' if filename else ""
+        if fold:
+            parts.append(f'<details class="diagnostic-file"><summary>{name}<span class="diagnostic-count">'
+                         f'{len(chips)}</span></summary>{"".join(chips)}</details>')
+        else:
+            parts.append(f'<span class="diagnostic-file">{name}{"".join(chips)}</span>')
+    return f'<span class="diagnostic-locations">{"".join(parts)}</span>' if parts else ""
+
+
+def _diagnostic_group_item(entries: list[dict[str, Any]]) -> str:
+    first = entries[0]
+    severity = escape(first["severity"])
+    variants = _diagnostic_variants(entries, merge=first["severity"] != "error")
+    fold = len(entries) > _DIAGNOSTIC_FILE_FOLD_COUNT
+    rows = []
+    for variant in variants:
+        attrs = (f' data-network-conflict-index="{variant["conflict_index"]}"'
+                 if variant["conflict_index"] is not None else "")
+        message = f'<p class="diagnostic-message"{attrs}>{escape(variant["text"])}</p>' if variant["text"] else ""
+        rows.append(f'<div class="diagnostic-variant">{message}{_diagnostic_locations(variant["items"], fold=fold)}</div>')
+    count = f'<span class="diagnostic-count">{len(entries)}</span>' if len(entries) > 1 else ""
+    return (
+        f'<li class="diagnostic severity-{severity}" data-diagnostic-category="{escape(first["category"], quote=True)}" '
+        f'data-diagnostic-count="{len(entries)}">'
+        '<div class="diagnostic-heading">'
+        f'<strong>{severity}</strong> <span class="diagnostic-title">{escape(first["title"])}</span>{count}</div>'
+        f'{"".join(rows)}'
+        "</li>"
     )
 
 
@@ -1701,63 +1892,6 @@ def _feedback_balance_item(channel: dict[str, Any]) -> str:
         f"matched {matched}/{receives}; sends={sends}; payloads={send_payloads}; "
         f"discarded payloads={discarded_payloads}; unmatched receives={unmatched_receives}; "
         f"unconsumed payloads={unconsumed_payloads}{uncertainty}"
-        "</li>"
-    )
-
-
-def _diagnostic_item(
-    diagnostic: dict[str, Any], event_dom_ids: dict[str, str], tb_evidence: dict[str, dict[str, Any]],
-) -> str:
-    severity = escape(str(diagnostic.get("severity", "info")))
-    presentation = describe_diagnostic(diagnostic)
-    title = escape(presentation["title"])
-    source = diagnostic.get("source") if isinstance(diagnostic.get("source"), dict) else {}
-    source_file = str(source.get("file") or "")
-    filename = source_file.replace("\\", "/").rsplit("/", 1)[-1]
-    location = f'{filename}:{source.get("line") or 1}' if filename else ""
-    summary = presentation["summary"].strip()
-    if presentation["category"] == "rt_queue_underflow":
-        summary = RT_QUEUE_UNDERFLOW_DESCRIPTION
-    details = diagnostic.get("details") or {}
-    if presentation["category"] == "pending_hardware_state" and isinstance(details, dict) and isinstance(details.get("pending_fields"), list):
-        summary = "Not applied: " + ", ".join(str(field) for field in details["pending_fields"])
-    if source_file:
-        summary = summary.replace(source_file, filename)
-    if presentation["category"] == "analysis_incomplete":
-        summary = re.sub(r"^(?:Underflow )?analysis incomplete:\s*", "", summary, flags=re.IGNORECASE)
-    if summary.casefold().startswith(presentation["title"].casefold() + ":"):
-        summary = summary[len(presentation["title"]) + 1:].strip()
-    if (re.sub(r"\W+", "", summary).casefold() == re.sub(r"\W+", "", presentation["title"]).casefold()
-            or summary == presentation["category"]):
-        summary = ""
-    conflict_index = diagnostic.get("_network_conflict_index")
-    message_attrs = f' data-network-conflict-index="{conflict_index}"' if type(conflict_index) is int else ""
-    message = f'<p class="diagnostic-message"{message_attrs}>{escape(summary)}</p>' if summary else ""
-    related_events = diagnostic.get("related_events", [])
-    related = _related_event_link(related_events, event_dom_ids, label="Show event") if related_events else ""
-    if presentation["category"] == "feedback_write_combine" and len(set(related_events)) > 1:
-        for event_id in dict.fromkeys(related_events):
-            evidence = tb_evidence.get(event_id)
-            if evidence is None:
-                continue
-            meta = evidence.get("meta", {})
-            cutoff = _plain_number(meta.get("observation_cutoff_ns"))
-            planned = _plain_number(meta.get("planned_rt_end_ns"))
-            if evidence["kind"] == "feedback_contribution":
-                role = "contribution"
-            elif (evidence["lane"].startswith("rt.") and cutoff is not None and planned is not None
-                  and cutoff == _value_number(evidence.get("t1"), fallback=math.nan) < planned):
-                role = "RT cutoff"
-            else:
-                continue
-            related += _related_event_link([event_id], event_dom_ids,
-                                           label=f'Show {evidence["sequencer_id"]} {role}', tb_evidence=True)
-    return (
-        f'<li class="diagnostic severity-{severity}" data-diagnostic-category="{escape(presentation["category"], quote=True)}">'
-        '<div class="diagnostic-heading">'
-        f"<strong>{severity}</strong> <span class=\"diagnostic-title\">{title}</span>"
-        f'<span class="diagnostic-source">{escape(location)}</span>'
-        f'<span class="related-events">{related}</span></div>{message}'
         "</li>"
     )
 
@@ -2510,14 +2644,12 @@ button[aria-pressed="true"] { background: #17202a; color: #fff; }
 .analysis-parameters { margin: 0 16px 8px; font-size: 12px; container-type: inline-size; }
 .analysis-parameters > summary { cursor: pointer; padding: 8px 0; font-size: 14px; font-weight: 700; }
 .analysis-parameters .parameters-search-toggle { float: right; display: inline-flex; align-items: center; gap: 4px; font-size: 12px; font-weight: normal; }
-.parameters-help { margin: 0 0 8px; color: var(--vscode-descriptionForeground, #4b5563); }
 .parameters-list-scroll { max-height: 240px; overflow: auto; }
-.parameters-list { display: grid; grid-template-columns: minmax(0, 1fr); column-gap: 24px; margin: 0; }
-.parameter-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-content: start; padding: 4px 0; border-bottom: 1px solid var(--vscode-panel-border, #d8dee6); overflow-wrap: anywhere; }
+.parameters-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr)); column-gap: 28px; margin: 0; }
+.parameter-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 12px; align-content: start; padding: 3px 0; border-bottom: 1px solid var(--vscode-panel-border, #d8dee6); overflow-wrap: anywhere; }
 .parameter-row[hidden], .parameters-search[hidden], .parameters-search-toggle[hidden] { display: none; }
-.parameter-row dt { min-width: 0; padding-right: 12px; }
-.parameter-value { min-width: 0; margin: 0; }
-@container (min-width: 720px) { .parameters-list { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.parameter-row dt { min-width: 0; }
+.parameter-value { min-width: 0; margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
 .parameters-search { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 8px; }
 .parameters-search-count { margin-left: auto; color: var(--vscode-descriptionForeground, #4b5563); white-space: nowrap; }
 .parameters-empty { color: var(--vscode-descriptionForeground, #4b5563); }
@@ -2537,23 +2669,42 @@ button[aria-pressed="true"] { background: #17202a; color: #fff; }
 .parameter-input:focus-visible, .parameters-search-input:focus-visible, .analysis-parameters button:focus-visible { outline: 1px solid var(--vscode-focusBorder, #007acc); outline-offset: 2px; }
 .parameter-error { flex-basis: 100%; color: var(--vscode-errorForeground, #c72c2c); }
 .parameter-status { display: block; color: var(--vscode-descriptionForeground, #4b5563); }
-.diagnostics { margin: 16px 16px 0; padding: 10px 12px; border: 1px solid var(--vscode-panel-border, #d8dee6); }
-.diagnostics ol { margin: 8px 0 0; padding: 0; list-style: none; }
+.diagnostics { margin: 16px 16px 0; padding: 10px 12px; border: 1px solid var(--vscode-panel-border, #d8dee6); container-type: inline-size; }
+.diagnostics ol { margin: 6px 0 0; padding: 0; list-style: none; }
+.diagnostics-heading { display: flex; align-items: baseline; gap: 10px; }
+.diagnostics-heading h2 { margin: 0; }
 .diagnostics-secondary { margin-top: 8px; }
 .diagnostics-secondary > summary,
 .confidence-legend > summary,
 .feedback-balance > summary { cursor: pointer; font-size: 12px; }
 .panel-title { font-weight: 700; font-size: 14px; }
 .panel-summary { margin-left: 6px; color: var(--vscode-descriptionForeground, #4b5563); font-size: 12px; }
-.diagnostic { margin: 4px 0; font-size: 12px; }
+.diagnostic { display: grid; grid-template-columns: minmax(0, 21em) minmax(0, 1fr); column-gap: 14px; row-gap: 2px; align-items: baseline; margin: 0; padding: 5px 0; border-top: 1px solid var(--vscode-panel-border, #d8dee6); font-size: 12px; }
 .diagnostic-summary { margin: 0; color: var(--vscode-descriptionForeground, #4b5563); font-size: 12px; }
 .diagnostic-title { font-weight: 700; }
-.diagnostic-heading { display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px; }
-.diagnostic-source { margin-left: auto; color: var(--vscode-descriptionForeground, #4b5563); }
-.diagnostic-message { margin: 3px 0 0; }
+.diagnostic-heading { grid-column: 1; display: flex; align-items: baseline; gap: 6px; }
+.diagnostic-heading strong { flex: none; width: 12px; font-size: 0; text-align: center; }
+.diagnostic-heading strong::before { font-size: 11px; content: "\\2022"; }
+.severity-error .diagnostic-heading strong::before { content: "\\2715"; }
+.severity-warning .diagnostic-heading strong::before { content: "\\25B2"; }
+.diagnostic-count { margin-left: auto; color: var(--vscode-descriptionForeground, #4b5563); font-variant-numeric: tabular-nums; }
+.diagnostic-variant { grid-column: 2; display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 12px; min-width: 0; }
+.diagnostic-message { margin: 0; color: var(--vscode-descriptionForeground, #4b5563); }
+.diagnostic-locations, .diagnostic-file, .diagnostic-occurrence { display: inline-flex; flex-wrap: wrap; align-items: baseline; }
+.diagnostic-locations { gap: 3px 12px; }
+.diagnostic-file { gap: 3px; }
+.diagnostic-occurrence { gap: 3px; }
+.diagnostic-source, .diagnostic-qualifier { color: var(--vscode-descriptionForeground, #4b5563); }
+.diagnostic-qualifier { font-size: 11px; }
+.diagnostics .diagnostic-location { padding: 0 4px; border: 0; border-radius: 3px; background: var(--vscode-button-secondaryBackground, #eef0f3); color: var(--vscode-button-secondaryForeground, inherit); font: 11px/1.5 var(--vscode-editor-font-family, monospace); font-variant-numeric: tabular-nums; text-decoration: none; }
+.diagnostics :is(a, [role="button"]).diagnostic-location { cursor: pointer; }
+.diagnostics a.diagnostic-location { box-shadow: inset 0 -1.5px 0 var(--vscode-textLink-foreground, #0b62c4); }
+.diagnostics .diagnostic-location:focus-visible { outline: 1px solid var(--vscode-focusBorder, #007acc); outline-offset: 1px; }
+details.diagnostic-file > summary { cursor: pointer; display: inline-flex; gap: 6px; }
+@container (max-width: 560px) { .diagnostic { grid-template-columns: minmax(0, 1fr); } .diagnostic-variant { grid-column: 1; padding-left: 1.4em; } }
 .diagnostic.severity-error :is(strong, .diagnostic-message),
 .diagnostic-error-message { color: var(--q1timeline-error-color); }
-.severity-warning strong { color: #a45516; }
+.severity-warning strong { color: var(--vscode-editorWarning-foreground, #a45516); }
 .related-events { margin-left: 6px; }
 .confidence-legend { margin: 16px 16px 0; padding: 10px 12px; border: 1px solid var(--vscode-panel-border, #d8dee6); }
 .confidence-legend ul { list-style: none; display: flex; flex-wrap: wrap; gap: 12px; padding: 0; margin: 0; font-size: 12px; }

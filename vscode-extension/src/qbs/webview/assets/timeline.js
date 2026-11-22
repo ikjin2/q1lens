@@ -49,6 +49,44 @@ function button(className, text, onClick) {
   return node;
 }
 
+const SVG_NS = "http://www.w3.org/2000/svg";
+const ICON_PATHS = {
+  fit: "M3 6V3h3M10 3h3v3M13 10v3h-3M6 13H3v-3",
+  zoomOut: "M4 8h8",
+  zoomIn: "M4 8h8M8 4v8",
+  warning: "M8 2.5l6 10.5H2zM8 6.5v3M8 11.2v.1",
+};
+
+function icon(name) {
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("class", "icon");
+  svg.setAttribute("viewBox", "0 0 16 16");
+  svg.setAttribute("aria-hidden", "true");
+  const path = document.createElementNS(SVG_NS, "path");
+  path.setAttribute("d", ICON_PATHS[name]);
+  svg.appendChild(path);
+  return svg;
+}
+
+function iconButton(name, label, onClick) {
+  const node = button("icon-button", "", onClick);
+  node.appendChild(icon(name));
+  node.setAttribute("aria-label", label);
+  node.title = label;
+  return node;
+}
+
+// Controls that sit beside the schedule title; created on demand for hosts with an older page shell.
+function topbarSlot(id, className) {
+  let slot = document.getElementById(id);
+  if (!slot) {
+    slot = element("div", className);
+    slot.id = id;
+    document.querySelector(".topbar")?.appendChild(slot);
+  }
+  return slot;
+}
+
 function postRenderAction(message) {
   vscode.postMessage({ ...message, ...(currentRenderId !== undefined ? { renderId: currentRenderId } : {}) });
 }
@@ -387,7 +425,7 @@ function renderLane(lane, selectedInspectorId) {
     toggle.dataset.laneToggleId = lane.groupId;
     toggle.setAttribute("aria-expanded", lane.expanded ? "true" : "false");
     toggle.title = lane.expanded ? "Collapse target lanes" : "Expand target lanes";
-    const labelText = element("span", "lane-label-text", lane.label);
+    const labelText = element("span", "lane-label-text", lane.displayLabel || lane.label);
     if (lane.title) {
       labelText.title = lane.title;
     }
@@ -398,7 +436,7 @@ function renderLane(lane, selectedInspectorId) {
     label.appendChild(labelText);
     label.appendChild(element("span", "lane-child-count", String(lane.childrenCount)));
   } else {
-    const labelText = element("span", "lane-label-text", lane.label);
+    const labelText = element("span", "lane-label-text", lane.displayLabel || lane.label);
     if (lane.title) {
       labelText.title = lane.title;
     }
@@ -425,33 +463,38 @@ function renderLane(lane, selectedInspectorId) {
 
 function renderZoomControls(model) {
   const controls = element("div", "zoom-controls");
-  controls.appendChild(button("icon-button", "-", () => zoomTimeline(1.25, 0.5))).title = "Zoom out";
-  controls.appendChild(button("icon-button", "+", () => zoomTimeline(0.8, 0.5))).title = "Zoom in";
-  controls.appendChild(button("tool-button", "Fit", fitTimeline)).title = "Show full schedule";
-  const selectionButton = button("tool-button", "Zoom selection", zoomToSelection);
-  selectionButton.disabled = !model.selectionRange;
-  selectionButton.title = "Shift-drag a time range to enable";
-  controls.appendChild(selectionButton);
+  controls.appendChild(iconButton("fit", "Fit", fitTimeline)).title = "Show full schedule";
+  controls.appendChild(iconButton("zoomOut", "Zoom out", () => zoomTimeline(1.25, 0.5)));
+  controls.appendChild(iconButton("zoomIn", "Zoom in", () => zoomTimeline(0.8, 0.5)));
+  // Shift-dragging a time range adds this button.
+  if (model.selectionRange) {
+    const selectionButton = button("tool-button", "Zoom selection", zoomToSelection);
+    selectionButton.title = `${model.selectionRange.startLabel} - ${model.selectionRange.endLabel}`;
+    controls.appendChild(selectionButton);
+  }
   return controls;
+}
+
+function renderTopbarTools(model) {
+  const tools = [renderZoomControls(model)];
+  if (model.selectionRange) {
+    tools.push(element("span", "stage-selection", `${model.selectionRange.durationLabel} selected`));
+  }
+  if (model.viewport.isZoomed) {
+    const visible = element("span", "stage-window", model.viewport.windowLabel);
+    visible.title = "Visible window / schedule length";
+    tools.push(visible);
+  }
+  topbarSlot("qbs-tools", "topbar-tools").replaceChildren(...tools);
 }
 
 function renderTimeline(model) {
   const section = element("section", "timeline-stage");
   section.addEventListener("pointerdown", beginTimelineDrag);
   section.addEventListener("wheel", handleWheelZoom, { passive: false });
-  const header = element("div", "stage-header");
-  const title = element("div", "stage-heading");
-  title.appendChild(element("div", "stage-title", "Q1Lens"));
-  title.appendChild(
-    element(
-      "div",
-      "stage-total",
-      `view ${model.viewport.startLabel} - ${model.viewport.endLabel} (${model.viewport.durationLabel}) / total ${model.totalLabel}`,
-    ),
-  );
-  header.appendChild(title);
-  header.appendChild(renderZoomControls(model));
-  section.appendChild(header);
+  section.dataset.viewport = `${model.viewport.startLabel} - ${model.viewport.endLabel}`;
+  section.dataset.total = model.totalLabel;
+  renderTopbarTools(model);
   section.appendChild(renderRuler(model));
 
   const lanes = element("div", "timeline-lanes");
@@ -529,7 +572,6 @@ function renderQ1asmDrilldown(drilldown) {
   }
 
   const header = element("div", "q1asm-drilldown-header");
-  const title = element("div", "q1asm-drilldown-title", drilldown.title || "Q1ASM Preview");
   const meta = element("div", "q1asm-drilldown-meta");
   if (drilldown.sequencer) {
     meta.appendChild(element("span", "q1asm-chip", drilldown.sequencer));
@@ -537,7 +579,6 @@ function renderQ1asmDrilldown(drilldown) {
   if (drilldown.lineRangeLabel) {
     meta.appendChild(element("span", "q1asm-chip", `L${drilldown.lineRangeLabel}`));
   }
-  header.appendChild(title);
   header.appendChild(meta);
   panel.appendChild(header);
 
@@ -560,8 +601,18 @@ function renderQ1asmDrilldown(drilldown) {
 
 function renderInspector(model) {
   const inspector = element("aside", "inspector");
-  inspector.appendChild(element("div", "inspector-kicker", model.inspector.subtitle));
   inspector.appendChild(element("h2", "", model.inspector.title));
+  const timing = model.inspector.timing;
+  if (timing) {
+    const time = element("div", "inspector-time");
+    time.appendChild(element("span", "inspector-time-range", timing.rangeLabel));
+    const meta = [timing.durationLabel, model.inspector.idLabel].filter(Boolean).map((text) => ` · ${text}`).join("");
+    time.appendChild(element("span", "inspector-time-meta", meta));
+    time.title = `Start ${timing.startLabel}, duration ${timing.durationLabel}`;
+    inspector.appendChild(time);
+  } else if (model.inspector.subtitle && !(model.inspector.rows || []).length) {
+    inspector.appendChild(element("p", "empty-state inspector-hint", model.inspector.subtitle));
+  }
   if (model.inspector.tabs?.length) {
     const activeExists = model.inspector.tabs.some((tab) => !tab.message && tab.id === activeInspectorTab);
     if (!activeExists) {
@@ -579,11 +630,25 @@ function renderInspector(model) {
     inspector.appendChild(notice);
   }
 
+  // One row of actions for the selection; project files are linked once, in the footer.
   const actions = element("div", "inspector-actions");
+  const addAction = (className, text, action) => {
+    const node = button(className, text, () => postRenderAction(action.message));
+    node.setAttribute("aria-label", action.label);
+    node.title = action.label;
+    actions.appendChild(node);
+  };
   for (const action of model.inspector.actions) {
-    actions.appendChild(button("action-button", action.label, () => postRenderAction(action.message)));
+    if (action.message?.type === "openQ1Timeline") {
+      addAction("action-button", "Q1ASM timeline", action);
+    } else if (action.message?.type !== "openIr") {
+      addAction("action-button secondary", action.label, action);
+    }
   }
-  actions.appendChild(button("action-button secondary", "Open QBS IR", () => postRenderAction({ type: "openIr" })));
+  if (model.inspector.sourceAction) {
+    addAction("action-button secondary", "Source", model.inspector.sourceAction);
+  }
+  addAction("action-button secondary", "IR", { label: "Open QBS IR", message: { type: "openIr" } });
   inspector.appendChild(actions);
   return inspector;
 }
@@ -610,7 +675,7 @@ function revealProvenance(status) {
 function renderProvenanceLegend(coverage) {
   const legend = element("section", "provenance-legend");
   legend.setAttribute("aria-label", coverage.ariaLabel);
-  legend.appendChild(element("div", "provenance-legend-title", "Provenance coverage"));
+  legend.appendChild(element("div", "provenance-legend-title", "Provenance"));
   const items = element("div", "provenance-legend-items");
   items.setAttribute("role", "list");
   for (const entry of coverage.entries || []) {
@@ -632,40 +697,59 @@ function renderProvenanceLegend(coverage) {
   return legend;
 }
 
+function sourceLinkText(source, action) {
+  if (action.message.type === "openProjectFile") return source.projectLabel || action.label;
+  if (action.message.type === "openNotebookFile") return source.scheduleLabel || action.label;
+  return /generated/.test(action.label) ? action.label.replace(/^Open /, "") : source.scheduleLabel || action.label;
+}
+
+// Unmapped symbolic blocks are the one count worth a glance; the full breakdown stays in the footer legend.
+function renderProvenanceStatus(coverage) {
+  const slot = topbarSlot("qbs-status", "topbar-status");
+  const count = (status) => coverage.entries.find((entry) => entry.status === status)?.count || 0;
+  const status = count("unmapped") ? "unmapped" : count("inferred") ? "inferred" : "";
+  if (!status) {
+    slot.replaceChildren();
+    return;
+  }
+  const chip = button("status-chip", "", () => revealProvenance(status));
+  chip.dataset.provenance = status;
+  if (status === "unmapped") chip.appendChild(icon("warning"));
+  chip.appendChild(element("span", "", `${count(status)} ${status}`));
+  const breakdown = coverage.entries.map((entry) => `${entry.label} ${entry.count}`).join(" · ");
+  chip.title = `${breakdown}. Locate next ${status} symbolic block`;
+  chip.setAttribute("aria-label", `${count(status)} ${status} symbolic blocks. ${breakdown}. Locate next.`);
+  slot.replaceChildren(chip);
+}
+
 function renderSummary(model) {
+  renderProvenanceStatus(model.provenanceCoverage);
   const summary = element("section", "summary-strip");
-  if (model.source) {
-    const source = element("div", "source-card");
-    const title = element("div", "source-title", "Source");
-    const files = element("div", "source-files");
-    files.appendChild(element("span", "", model.source.projectLabel));
-    files.appendChild(element("span", "", model.source.scheduleLabel));
-    files.appendChild(element("span", "", model.source.outputLabel));
-    const actions = element("div", "source-actions");
-    for (const action of model.source.actions) {
-      actions.appendChild(button("source-button", action.label, () => postRenderAction(action.message)));
-    }
-    source.appendChild(title);
-    source.appendChild(files);
-    source.appendChild(actions);
-    summary.appendChild(source);
-  }
-  summary.appendChild(renderProvenanceLegend(model.provenanceCoverage));
+  const counts = element("div", "summary-counts");
   for (const item of model.artifactSummary) {
-    const stat = element("div", "summary-item");
+    const stat = element("span", "summary-item");
+    stat.title = item.title || item.label;
     stat.appendChild(element("span", "summary-value", item.value));
-    stat.appendChild(element("span", "summary-label", item.label));
-    summary.appendChild(stat);
+    stat.appendChild(element("span", "summary-label", ` ${item.label}`));
+    counts.appendChild(stat);
   }
-  const view = element("div", "summary-item");
-  view.appendChild(element("span", "summary-value", model.viewport.durationLabel));
-  view.appendChild(element("span", "summary-label", "Visible window"));
-  summary.appendChild(view);
-  if (model.selectionRange) {
-    const selection = element("div", "summary-item");
-    selection.appendChild(element("span", "summary-value", model.selectionRange.durationLabel));
-    selection.appendChild(element("span", "summary-label", "Selected time"));
-    summary.appendChild(selection);
+  summary.appendChild(counts);
+  summary.appendChild(renderProvenanceLegend(model.provenanceCoverage));
+  if (model.source) {
+    const files = element("div", "source-files");
+    files.setAttribute("aria-label", "Project files");
+    for (const action of model.source.actions) {
+      const link = button("source-link", sourceLinkText(model.source, action), () => postRenderAction(action.message));
+      link.setAttribute("aria-label", action.label);
+      link.title = action.label;
+      files.appendChild(link);
+    }
+    if (model.source.outputLabel) {
+      const output = element("span", "source-output", `${model.source.outputLabel}/`);
+      output.title = "Output folder";
+      files.appendChild(output);
+    }
+    summary.appendChild(files);
   }
   return summary;
 }
@@ -697,7 +781,7 @@ function render(ir, explicitSelectedId, resetScroll = false) {
   const timeline = renderTimeline(model);
   root.replaceChildren(timeline, renderInspector(model), renderSummary(model));
   if (scrollTop) timeline.scrollTop = scrollTop;
-  if (focusedZoomIndex >= 0) timeline.querySelectorAll(".zoom-controls > button")[focusedZoomIndex]?.focus({ preventScroll: true });
+  if (focusedZoomIndex >= 0) document.querySelectorAll(".zoom-controls > button")[focusedZoomIndex]?.focus({ preventScroll: true });
   if (focusedLaneToggleId) {
     Array.from(root.querySelectorAll("[data-lane-toggle-id]"))
       .find((node) => node.dataset.laneToggleId === focusedLaneToggleId)?.focus({ preventScroll: true });

@@ -1,0 +1,13 @@
+# Compare both paths at the first jump. Each path tests the same received word twice.
+fb_pop_data 5,R7
+nop
+test R7,1
+jnz @active
+wait 20
+stop
+active: test R7,1
+jz @inconsistent
+wait 24
+stop
+inconsistent: wait R9
+stop

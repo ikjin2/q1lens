@@ -52,6 +52,7 @@ describe("installed asset verification", () => {
       "out/src/q1timeline/media/timeline.js",
       "out/src/q1timeline/media/timelineAdapter.js",
       "out/src/q1timeline/media/defRuns.js",
+      "out/src/q1timeline/media/verificationReplay.js",
       "out/src/q1timeline/media/hardwareState.js",
       "out/src/q1timeline/media/hardwareView.js",
       "out/src/q1timeline/media/hardwareView.css",

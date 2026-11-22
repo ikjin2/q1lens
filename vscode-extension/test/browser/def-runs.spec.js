@@ -81,17 +81,34 @@ test("DEF webview changes heatmap and histogram metrics using saved results", as
   await r63.uncheck();
   await page.getByRole("button", { name: "Show referenced registers" }).click();
   await expect(time).not.toBeChecked();
+  const start = page.getByRole("button", { name: "Start sweep" });
+  const range = (name) => page.getByRole("textbox", { name, exact: true });
+  await expect(page.locator('[data-field="plan"]')).toHaveText("Enter a Min or Max to sweep a DEF.");
+  await expect(start).toBeDisabled();
+  await range("X maximum").fill("1");
+  await expect(range("X minimum")).toHaveAttribute("placeholder", "0");
+  await range("Y maximum").fill("11");
+  await expect(page.locator('[data-field="plan"]')).toHaveText("4 combinations");
+  await expect(page.locator('[data-def-row="X"] [data-axis-count]')).toHaveText("2");
+  await expect(start).toBeEnabled();
   await r0.uncheck();
   await expect(page.getByText("Select at least one register or Q1 time.")).toBeVisible();
-  await expect(page.getByRole("button", { name: "Start sweep" })).toBeDisabled();
+  await expect(start).toBeDisabled();
   await r0.check();
   await r2.check();
   await time.check();
-  await page.getByRole("combobox", { name: "Sweep axis 2" }).selectOption("Y");
-  await page.getByRole("button", { name: "Start sweep" }).click();
+  await start.click();
+  expect(await page.evaluate(() => window.requests.filter((request) => request.action === "sweep").at(-1).axes)).toEqual([
+    { name: "X", min: "0", max: "1", step: "1" }, { name: "Y", min: "10", max: "11", step: "1" }]);
   await expect(page.locator('[data-status="cancelled"]')).toHaveText("Cancelled");
-  await expect(page.locator('[data-cases-reported]')).toHaveText("3 / 4 cases reported");
-  await expect(page.getByText("Blocked 1", { exact: true })).toBeVisible();
+  await expect(page.locator('[data-cases-reported]')).toHaveText("3 / 4 cases");
+  await expect(page.getByText("1 blocked", { exact: true })).toBeVisible();
+  await expect(page.locator(".def-counts li")).toHaveText(["1 readable", "1 undetermined", "1 blocked", "1 unexecuted"]);
+  await expect(page.locator(".def-summary")).toHaveAttribute("title", "s · Observed R0, R2, Q1 time · concrete · 10000 instruction limit · Engine completed 2");
+  const cases = page.getByRole("table", { name: "Sweep cases" });
+  await expect(page.getByRole("button", { name: "Needs attention 3" })).toHaveAttribute("aria-pressed", "true");
+  await expect(cases.locator("tbody tr")).toHaveCount(3);
+  await expect(cases.locator("tbody tr td:nth-child(3)")).toHaveText(["", "Blocked", "Final output undetermined"]);
   await expect(r2Stats.locator('[data-stat="count"]')).toHaveText("1");
   await expect(r2Stats.locator('[data-stat="mean"]')).toHaveText("-1");
   await expect(page.locator('[data-statistics="R0"] [data-stat="mean"]')).toHaveText("3");
@@ -111,12 +128,11 @@ test("DEF webview changes heatmap and histogram metrics using saved results", as
   await expect(r2Stats.locator('[data-stat="mean"]')).toHaveText("4294967295");
   await page.setViewportSize({ width: 390, height: 780 });
   const layout = await page.locator("#q1timeline-def-runs").evaluate((panel) => {
-    const cards = [...panel.querySelector(".def-setup").children].map((card) => card.getBoundingClientRect());
-    const plot = panel.querySelector(".def-plot-scroll");
-    return { stacked: cards[1].top >= cards[0].bottom,
+    const plot = panel.querySelector(".def-plot-scroll"), inputs = panel.querySelector(".def-input-table");
+    return { inputsStayInside: inputs.getBoundingClientRect().right <= panel.getBoundingClientRect().right,
       panelFits: panel.scrollWidth <= panel.clientWidth, plotFits: plot.scrollWidth <= plot.clientWidth };
   });
-  expect(layout).toEqual({ stacked: true, panelFits: true, plotFits: true });
+  expect(layout).toEqual({ inputsStayInside: true, panelFits: true, plotFits: true });
   await sweepToggle.click();
   await expect(timePlot).toBeHidden();
   await sweepToggle.click();
@@ -172,8 +188,9 @@ test("DEF webview changes heatmap and histogram metrics using saved results", as
   await expect(page.locator('svg [data-case], button[data-case]')).toHaveCount(0);
 
   await page.getByRole("combobox", { name: "Results", exact: true }).selectOption("cases");
-  await page.getByLabel("Axis 1 max").fill("4096");
-  await expect(page.getByRole("button", { name: "Start sweep" })).toBeDisabled();
+  await range("X maximum").fill("4096");
+  await expect(page.locator('[data-field="plan"]')).toHaveText("8194 combinations · Maximum 4,096 combinations.");
+  await expect(start).toBeDisabled();
   const random = page.getByRole("button", { name: "Random sample" });
   const count = page.getByRole("spinbutton", { name: "Sample count" });
   await expect(random).toBeEnabled();
@@ -191,8 +208,8 @@ test("DEF webview changes heatmap and histogram metrics using saved results", as
   await time.uncheck();
   await count.fill("5");
   await random.click();
-  await expect(page.getByRole("heading", { name: "Random sample results" })).toBeVisible();
-  await expect(page.locator('[data-cases-reported]')).toHaveText("4 / 5 samples reported");
+  await expect(page.getByRole("region", { name: "Random sample results" })).toBeVisible();
+  await expect(page.locator('[data-cases-reported]')).toHaveText("4 / 5 samples");
   await formula.press("Enter");
   await expect(page.locator('[data-field="formula-status"]')).toContainText("non-negative absolute tolerance");
   await tolerance.fill("0.5");
@@ -210,4 +227,117 @@ test("DEF webview changes heatmap and histogram metrics using saved results", as
   await expect.poll(() => page.evaluate(() => window.requests.at(-1))).toMatchObject({ action: "case", sweepId: "random-sweep", caseId: 1 });
   await expect.poll(() => page.evaluate(() => window.requests.filter((request) => request.action === "sweep").at(-1)))
     .toMatchObject({ sample_count: 5, statistics_only: false });
+});
+
+test("DEF sweep keeps one input table, a one-line result and exceptions first", async ({ page }) => {
+  await page.goto("/?case=01-digital");
+  const src = path.join(__dirname, "../../src");
+  await page.addStyleTag({ path: path.join(src, "q1timeline/media/timeline.css") });
+  await page.addScriptTag({ path: path.join(src, "q1timeline/media/defRuns.js") });
+  await page.evaluate(() => {
+    const project = "fixture.yml", uri = "file:///fixture.q1asm";
+    const report = (patch) => window.postMessage({ type: "defRunState", project, patch }, "*");
+    window.requests = [];
+    const bridge = { postMessage(message) {
+      window.requests.push(message);
+      if (message.action === "info") report({ info: { revision: "sha256", mode: "concrete", max_steps: 10000, sequencers: [{ id: "s", uri,
+        file: "fixture.q1asm", registers: ["R0"], defs: [{ name: "N", value: "4", literal: "4", line: 1 },
+          { name: "GAIN", value: "2", literal: "2", line: 2 }, { name: "OFFSET", value: "10", literal: "10", line: 3 }] }] } });
+      const axes = (message.axes || []).map(({ name, min, max, step }) => ({ name, min, last: max, step,
+        count: String((Number(max) - Number(min)) / Number(step) + 1) }));
+      const plan = { axes, total: String(axes.reduce((total, axis) => total * Number(axis.count), 1)), allowed: true, sample_limit: 25_000 };
+      if (message.action === "plan") window.postMessage({ type: "defSweepPlan", project, token: message.token, plan }, "*");
+      if (message.action === "run") report({ trace: { id: "run", sequencer: "s", registers: ["R0"], observeTime: false, mode: "concrete", maxSteps: 10000,
+        ir: { sequencers: [{ id: "s" }], events: [] }, literals: message.overrides,
+        case: { id: 0, status: "completed", engine_completed: true, defs: message.overrides, words: { R0: 1 }, diagnostics: [] } } });
+      if (message.action !== "sweep") return;
+      // Five cases: three plain results, one with a warning, one blocked.
+      const rows = [[1, "completed", 1], [2, "completed", 2], [3, "completed", 4], [4, "completed", 4], [5, "blocked", null]].map(([id, status, word]) => ({
+        id, status, engine_completed: status === "completed", defs: { GAIN: "0", N: String(id) }, words: { R0: word }, q1_ns: 16 * id,
+        diagnostics: id === 4 ? [{ severity: "warning", message: "Sample warning" }] : [] }));
+      report({ sweep: { id: "five", status: "completed", plan: { ...plan, total: "5" }, sequencer: "s", mode: "concrete", maxSteps: 10000,
+        registers: message.registers, observeTime: message.observe_time, defs: { N: "4", GAIN: "2", OFFSET: "10" }, rows } });
+    } };
+    const toolbar = document.createElement("div");
+    toolbar.innerHTML = '<span aria-label="Timeline layout"><button>Instruction</button></span>';
+    document.getElementById("hardware").before(toolbar);
+    q1lensDefRuns.mount(toolbar.firstElementChild, bridge, project, { open: true });
+  });
+  const panel = page.locator("#q1timeline-def-runs");
+  const input = (name) => panel.getByRole("textbox", { name, exact: true });
+  await expect(panel.getByRole("heading")).toHaveText(["Sweep"]);
+  await expect(panel.getByRole("table", { name: "DEF inputs" }).locator("thead th:visible")).toHaveText(["DEF", "Default", "Run input", "Min", "Max", "Step", ""]);
+
+  // Reset controls and the last-run column appear only when they have something to act on or show.
+  const reset = panel.getByRole("button", { name: "Reset OFFSET DEF" }), resetAll = panel.getByRole("button", { name: "Reset all DEFs" });
+  await expect(reset).toBeHidden();
+  await expect(resetAll).toBeHidden();
+  await input("OFFSET DEF value").fill("11");
+  await expect(reset).toBeVisible();
+  await expect(resetAll).toBeVisible();
+  await panel.getByRole("button", { name: "Run from start" }).click();
+  await expect(panel.locator('[data-def-row="OFFSET"] [data-executed]')).toHaveText("11");
+  await expect(panel.getByRole("columnheader", { name: "Last run" })).toBeVisible();
+  await reset.click();
+  await expect(input("OFFSET DEF value")).toHaveValue("10");
+  await expect(reset).toBeHidden();
+
+  // A DEF becomes an axis when a range is entered. The first range entered is the first axis, and two is the limit.
+  await input("GAIN maximum").fill("3");
+  await input("N minimum").fill("1");
+  await input("N maximum").fill("5");
+  await expect(input("OFFSET minimum")).toBeDisabled();
+  await expect(input("OFFSET step")).toHaveAttribute("title", /Two DEFs are already swept/);
+  await expect(panel.locator('[data-field="plan"]')).toHaveText("10 combinations");
+  await expect.poll(() => page.evaluate(() => window.requests.filter((request) => request.action === "plan").at(-1).axes)).toEqual([
+    { name: "GAIN", min: "2", max: "3", step: "1" }, { name: "N", min: "1", max: "5", step: "1" }]);
+  await input("GAIN maximum").fill("");
+  await expect(input("OFFSET minimum")).toBeEnabled();
+  await expect(panel.locator('[data-def-row="GAIN"] [data-axis-count]')).toBeEmpty();
+  await expect(panel.locator('[data-def-row="N"] [data-axis-count]')).toHaveText("5");
+  const primary = await panel.getByRole("button").evaluateAll((buttons) => {
+    const fill = getComputedStyle(buttons.find((button) => button.dataset.action === "sweep")).backgroundColor;
+    return buttons.filter((button) => button.offsetParent && getComputedStyle(button).backgroundColor === fill).map((button) => button.textContent);
+  });
+  expect(primary).toEqual(["Start sweep"]);
+  await panel.getByRole("checkbox", { name: "Q1 time", exact: true }).check();
+  await panel.getByRole("button", { name: "Start sweep" }).click();
+  expect(await page.evaluate(() => window.requests.at(-1))).toMatchObject({ action: "sweep", statistics_only: false,
+    axes: [{ name: "N", min: "1", max: "5", step: "1" }], overrides: { N: "4", GAIN: "2", OFFSET: "10" } });
+
+  // One result line: completion mark, reported cases, proportions and non-zero counts. Settings stay in its tooltip.
+  const summary = panel.locator(".def-summary");
+  await expect(summary.locator('[data-status="completed"]')).toHaveAccessibleName("Completed");
+  await expect(summary.locator("[data-cases-reported]")).toHaveText("5 / 5 cases");
+  await expect(summary.locator(".def-counts li")).toHaveText(["4 readable", "1 blocked"]);
+  expect(await summary.locator(".def-bar i").evaluateAll((parts) => parts.map((part) => part.style.flexGrow))).toEqual(["4", "1"]);
+  await expect(summary).toHaveAttribute("title", "s · Observed R0, Q1 time · concrete · 10000 instruction limit · Fixed DEFs GAIN=2, OFFSET=10 · Engine completed 4");
+  await expect(panel.locator('[data-field="progress"]')).not.toContainText("instruction limit");
+
+  // Rounded statistics keep their exact value.
+  const mean = panel.locator('[data-statistics="R0"] [data-stat="mean"]'), deviation = panel.locator('[data-statistics="R0"] [data-stat="deviation"]');
+  await expect(panel.getByRole("region", { name: "Observation statistics" }).locator("thead th")).toHaveText(["", "n", "min", "max", "mean", "sd"]);
+  await expect(mean).toHaveText("2.75");
+  await expect(deviation).toHaveText("1.299");
+  await expect(deviation).toHaveAttribute("title", "1.29903810568");
+  await expect(panel.locator('[data-time-statistics] [data-stat="mean"]')).toHaveText("40");
+  await expect(panel.locator('[data-time-statistics] [data-stat="mean"]')).not.toHaveAttribute("title");
+
+  // Cases open on the ones that need a look. The full list is one click away.
+  const rows = panel.getByRole("table", { name: "Sweep cases" }).locator("tbody tr");
+  const attention = panel.getByRole("button", { name: "Needs attention 2" }), all = panel.getByRole("button", { name: "All 5" });
+  await expect(attention).toHaveAttribute("aria-pressed", "true");
+  await expect(rows.locator("th")).toHaveText(["4", "5"]);
+  await expect(rows.nth(0)).toContainText("warning: Sample warning");
+  await expect(rows.nth(1)).toContainText("Blocked");
+  await all.click();
+  await expect(all).toHaveAttribute("aria-pressed", "true");
+  await expect(rows).toHaveCount(5);
+  await expect(rows.locator("td:nth-child(3)")).toHaveText(["", "", "", "", "Blocked"]);
+  await panel.getByRole("button", { name: "Case 2", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => window.requests.at(-1))).toMatchObject({ action: "case", sweepId: "five", caseId: 2 });
+
+  // Plot text is drawn at its own size instead of growing with the panel.
+  const plot = panel.locator('svg[aria-label="DEF input versus R0"]');
+  expect(await plot.evaluate((svg) => svg.getBoundingClientRect().width <= svg.viewBox.baseVal.width)).toBe(true);
 });

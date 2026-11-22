@@ -14,6 +14,9 @@ class _SafeFormatDict(UserDict):
 
 
 DIAGNOSTIC_PRESENTATIONS: dict[str, dict[str, str]] = {
+    "unreachable_branch_path": {
+        "group": "Control Flow", "title": "Proved unreachable on this path", "summary": "{message}", "fix": "",
+    },
     "trigger_network_conflict": {
         "group": "Trigger Network", "title": "Trigger launch slots conflict", "summary": "{message}",
         "fix": "Separate launch slots by at least 252 ns on the shared network.",
@@ -380,6 +383,23 @@ def describe_diagnostic(diagnostic: Any) -> dict[str, str]:
         "summary": summary,
         "fix": fix,
     }
+
+
+# Display order within one severity: lower values are listed first.
+# 1 limits what the analysis can claim or breaks execution, 2 is a program or
+# configuration defect, 3 is lint, 4 is cleanup and preview notes.
+_GROUP_PRIORITY = {
+    "Analyzer Coverage": 1, "Timing": 1, "Hardware Readiness": 1, "Trigger Network": 1, "Alignment": 1,
+    "Q1ASM Lint": 3, "Preview": 4,
+}
+_CATEGORY_PRIORITY = {"unreachable_code": 4, "unused_definition": 4, "unreachable_branch_path": 4}
+
+
+def diagnostic_priority(category: str) -> int:
+    if category in _CATEGORY_PRIORITY:
+        return _CATEGORY_PRIORITY[category]
+    group = DIAGNOSTIC_PRESENTATIONS.get(category, {}).get("group", "Diagnostics")
+    return _GROUP_PRIORITY.get(group, 2)
 
 
 def format_presentation_message(diagnostic: Any) -> str:

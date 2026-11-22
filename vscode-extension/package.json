@@ -2,7 +2,7 @@
   "name": "q1lens",
   "displayName": "Q1Lens",
   "description": "Visualize Q1ASM in VS Code.",
-  "version": "0.2.10",
+  "version": "0.2.11",
   "publisher": "q1lens",
   "author": {
     "name": "Ik Kyeong Jin",
@@ -83,12 +83,14 @@
       {
         "command": "qbsTimeline.analyzeAndOpen",
         "title": "Analyze and Open",
-        "category": "Q1Lens"
+        "category": "Q1Lens",
+        "icon": "$(play)"
       },
       {
         "command": "qbsTimeline.refresh",
         "title": "Refresh",
-        "category": "Q1Lens"
+        "category": "Q1Lens",
+        "icon": "$(refresh)"
       },
       {
         "command": "qbsTimeline.openIr",
@@ -137,6 +139,23 @@
       {
         "command": "q1timeline.refreshPreview",
         "title": "Q1Lens: Refresh Timeline Preview"
+      },
+      {
+        "command": "q1timeline.verify",
+        "title": "Q1Lens: Verify Program"
+      },
+      {
+        "command": "q1timeline.toggleAutoVerification",
+        "category": "Q1Lens",
+        "title": "Toggle Automatic Z3 Verification"
+      },
+      {
+        "command": "q1timeline.verifyAlignment",
+        "title": "Q1Lens: Verify Sequencer Alignment"
+      },
+      {
+        "command": "q1timeline.verifyEquivalence",
+        "title": "Q1Lens: Compare RT Traces Across Inputs"
       },
       {
         "command": "q1timeline.selectProjectFile",
@@ -201,7 +220,29 @@
       ]
     },
     "menus": {
+      "view/title": [
+        {
+          "command": "qbsTimeline.analyzeAndOpen",
+          "when": "view == qbsTimeline.sidebar",
+          "group": "navigation@1"
+        },
+        {
+          "command": "qbsTimeline.refresh",
+          "when": "view == qbsTimeline.sidebar",
+          "group": "navigation@2"
+        }
+      ],
       "editor/context": [
+        {
+          "command": "q1timeline.verify",
+          "when": "resourceExtname == .q1asm",
+          "group": "navigation@4"
+        },
+        {
+          "command": "q1timeline.verifyEquivalence",
+          "when": "resourceExtname == .q1asm",
+          "group": "navigation@5"
+        },
         {
           "command": "q1timeline.zoomToSelection",
           "when": "resourceExtname == .q1asm && editorHasSelection",
@@ -360,6 +401,12 @@
           ],
           "default": "onSave",
           "description": "When standalone Q1ASM timeline previews refresh."
+        },
+        "q1lens.q1timeline.verification.autoRun": {
+          "scope": "window",
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically verify saved Q1ASM files with DEFs or verification annotations in the editor."
         },
         "q1lens.q1timeline.debounceMs": {
           "scope": "resource",
@@ -623,7 +670,7 @@
     "test:extension": "npm run compile && npm run bundle && node ./out/test/runTest.js",
     "package": "vsce package",
     "verify:installed": "node ./scripts/verify-installed-assets.js",
-    "reinstall:local": "npm run package && code --install-extension q1lens-0.2.10.vsix --force && npm run verify:installed",
+    "reinstall:local": "npm run package && code --install-extension q1lens-0.2.11.vsix --force && npm run verify:installed",
     "test:browser": "playwright test"
   },
   "dependencies": {

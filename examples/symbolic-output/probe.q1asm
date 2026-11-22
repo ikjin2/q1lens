@@ -1,0 +1,9 @@
+move $N,R0
+nop
+burst: set_awg_gain $G,$G
+play 0,0,20
+wait $T
+loop R0,@burst
+set_awg_gain 1000,1000
+play 0,0,40
+stop

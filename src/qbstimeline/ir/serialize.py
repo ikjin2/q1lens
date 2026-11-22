@@ -62,6 +62,8 @@ def make_qbs_ir(
                 "sequencer_id": program.sequencer_id,
                 "file": program.relative_file.as_posix(),
                 "path": list(program.path),
+                **({"sequence_json": program.relative_file.with_suffix(".sequence.json").as_posix()}
+                   if getattr(program, "sequence", None) is not None else {}),
             }
             for program in q1asm_programs
         ],

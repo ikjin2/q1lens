@@ -142,6 +142,7 @@ def test_affine_wait_durations_match_the_declared_simulator_operand_snapshots():
 
 @pytest.mark.parametrize("body,first,step", [
     ("wait R1\nadd R1,4,R1\nnop", 40, 4),
+    ("wait R1\nadd R1,4,R1", 40, 4),  # The write is still pending at the loop edge.
     ("add R1,4,R1\nnop\nwait R1", 44, 4),
     ("add R1,4,R1\nnop\nmove R1,R3\nnop\nwait R3", 44, 4),
     ("wait R1\nsub R1,4,R1\nnop", 40, -4),
@@ -356,6 +357,19 @@ def test_exact_total_does_not_bypass_the_private_packet_expansion_limit():
     assert state.rt_time_ns == Concrete(10001 * 4 + 10001 * 10000 // 2)
     assert state.registers["R1"] == Concrete(10005)
     assert analyze_underflow(state).status == "analysis_incomplete"
+
+
+def test_nested_fifo_replay_preserves_stalls_zero_dwell_and_the_hidden_issue_limit():
+    source = ("wait_sync 4\nmove 4,R0\nouter: move 16,R1\nnop\ninner: play 0,0,0\nwait 400\n"
+              "loop R1,@inner\nloop R0,@outer\nwait 128\nstop")
+    concrete = analyze(source, execution_mode="concrete")
+    # Three hidden outer iterations each issue 2 setup, 16 * 3 inner and 1 edge.
+    exact = analyze(source, max_steps=153)
+    clipped = analyze(source, max_steps=152)
+    assert exact.q1_time_ns == concrete.q1_time_ns == Concrete(19640)
+    assert exact.rt_time_ns == clipped.rt_time_ns == concrete.rt_time_ns == Concrete(25988)
+    assert exact.rt_fifo_starts == tuple(Concrete(packet.rt_t0.value + 200) for packet in concrete.rt_packets[-32:])
+    assert isinstance(clipped.q1_time_ns, Unknown)
 
 
 def test_affine_total_does_not_recover_an_unknown_absolute_prefix():

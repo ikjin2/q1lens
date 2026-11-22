@@ -183,7 +183,7 @@ def _duration(op: str, value: int | None) -> int:
 
 
 def rt_duration(item: Instr, operands: tuple[int, ...]) -> int:
-    _check_ranges(item, operands)
+    _check_ranges(item, operands, include_registers=True)
     # The last operand is the duration on every supported RT instruction.
     return _duration(item.op, operands[-1])
 

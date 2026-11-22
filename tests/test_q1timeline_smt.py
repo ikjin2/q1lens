@@ -21,12 +21,13 @@ def test_def_sweep_example_is_proved_through_1013(capsys):
     assert (code, result["status"]) == (0, "proved")
 
 
-def test_prove_explains_how_to_install_the_optional_solver(capsys, monkeypatch):
+def test_prove_explains_how_to_repair_an_incomplete_installation(capsys, monkeypatch):
     monkeypatch.delitem(sys.modules, "q1timeline.analysis.smt", raising=False)
+    monkeypatch.delitem(sys.modules, "q1timeline.analysis.smt_execution", raising=False)
     monkeypatch.setitem(sys.modules, "z3", None)
     code = main(["q1timeline", "prove", str(SUM), "--range", "X=0..1013", "--assert", "R2 < 1024"])
     assert code == 2
-    assert "q1lens[smt]" in capsys.readouterr().err
+    assert "pip install -e ." in capsys.readouterr().err
 
 
 def test_def_sweep_counterexample_reproduces_register_writes_in_concrete_ir(tmp_path, capsys):

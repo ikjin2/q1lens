@@ -34,10 +34,10 @@ Then run `Q1Lens: Open Timeline Preview` from the Command Palette.
 
 The main **Play** control uses the saved `shot_start` scenario: one assumed
 external trigger arrives at 1000 ns on address `TRIGGER_INDEX` for all 17
-sequencers. The **Scenario input** summary beside Play shows this shared input.
-Open **Configure** to change its address, recipients, or arrival times, then
-**Apply & rerun**. Changes remain temporary until **Save to project**; **Reset**
-restores the saved scenario. An empty arrival list leaves the sequencers waiting.
+sequencers. The inputs button beside Refresh shows a count for this shared input
+and lists it in its tooltip. Open it (**Configure external inputs**) to change the
+address, recipients, or arrival times, then **Apply & rerun**. Changes remain
+temporary until **Save to project**; **Reset changes** restores the saved scenario. An empty arrival list leaves the sequencers waiting.
 
 This is analytical path playback. Trigger arrivals and feedback values are
 scenario assumptions, not hardware measurements or a full simulation of queues.

@@ -7,9 +7,9 @@
 | Job | Environment | Checks | Uploaded evidence |
 | --- | --- | --- | --- |
 | Python | Windows, Python 3.10 and 3.12 | All regular `tests/`; cursor-frequency project baseline | pytest log, JUnit XML with failures/skips, project baseline report |
-| Independent wheel | Ubuntu 24.04, Python 3.10 | Build a wheel, install it in a separate clean environment, run the five API/CLI simulation fixtures | wheel, installation/provenance report, scenario results |
+| Independent wheel | Ubuntu 24.04, Python 3.10 | Install the wheel in a clean environment, run the five simulation fixtures, exercise the installed `verify` and `equiv` commands with exit codes 0, 1 and 2 | wheel, installation report, simulation results, verification JSON |
 | Extension unit | Windows, Node 24, Python 3.12 | Compile and run the extension unit suite, including real Python environment probes | Mocha log and xUnit XML |
-| Extension host | Windows, Node 24, Python 3.12, VS Code 1.90.0 and stable | Run the registered extension commands and file/settings lifecycle tests | host log and fixture evidence |
+| Extension host | Windows, Node 24, Python 3.12, VS Code 1.90.0 and stable | Run the registered commands and file/settings lifecycle tests. Stable also installs the wheel and VSIX in isolation and opens the demo's 1188 ns queue underflow | host log, packaged extension log and verification JSON |
 | Browser DOM | Ubuntu 24.04, Node 24, Python 3.12, Chromium | Generate fresh CLI IR and exercise the hardware view in a real browser | browser report, failing screenshots/traces and fixture-generation evidence |
 
 Evidence under `output/ci/` uploads even when a test step fails, with 14-day retention. Artifact names distinguish Python and VS Code matrix versions. A test failure fails its job; no job uses `continue-on-error`.
@@ -41,6 +41,13 @@ python tools/verify_simulation_wheel.py --wheel 'dist/q1lens-*.whl' --out output
 ```
 
 The wheel argument is a quoted pattern resolved by the verifier, so the command behaves consistently in PowerShell and Bash. The verifier must select one wheel; remove ambiguity by passing an exact wheel path when testing a directory with multiple versions.
+
+To exercise the installed extension with the same wheel, run the following from the repository root after installing the extension's Node dependencies. The verifier creates a temporary VS Code profile, installs the VSIX, runs **Verify Program** and opens the counterexample. It checks that the selected timeline event is the first underflow for `N=38` at 1188 ns. The wheel check also compares the demo programs and verifies the 4 ns difference at `N=7`.
+
+```powershell
+npm --prefix vscode-extension run package -- --out ../dist/q1lens.vsix
+python tools/verify_simulation_wheel.py --wheel 'dist/q1lens-*.whl' --vsix dist/q1lens.vsix --out output/ci/installed
+```
 
 Extension and host tests, from `vscode-extension`:
 

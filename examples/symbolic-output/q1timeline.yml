@@ -1,0 +1,28 @@
+sequencers:
+  - id: probe
+    file: probe.q1asm
+    sequence_json: balanced.sequence.json
+  - id: ramp
+    file: ramp.q1asm
+    sequence_json: balanced.sequence.json
+  - id: drive
+    file: drive.q1asm
+    sequence_json: balanced.sequence.json
+  - id: boost
+    file: boost.q1asm
+    sequence_json: balanced.sequence.json
+params:
+  file: params.json
+modules:
+  Pulse:
+    type: QCM
+    channel_map:
+      probe: {out0: I}
+      ramp: {out1: I}
+  Mix:
+    type: QRM
+    channel_map:
+      drive: {out0: I}
+      boost: {out0: Q}
+alignment:
+  mode: none

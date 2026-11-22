@@ -112,7 +112,7 @@ test("closing replay, leaving detail, and moving the cursor stop playback", asyn
   await page.clock.runFor(2000);
   await expect(page.getByRole("spinbutton")).toHaveValue("32");
   await run(page).click();
-  await page.getByRole("button", { name: "Zoom out one hardware level", exact: true }).click();
+  await page.getByRole("navigation", { name: "Hardware hierarchy" }).getByRole("button", { name: "QCM0", exact: true }).click();
   await expect(replay(page)).toBeHidden();
   const overviewTime = await page.getByRole("spinbutton").inputValue();
   await page.clock.runFor(2000);
@@ -308,7 +308,7 @@ test("joint replay retains an unresolved barrier instead of releasing it", async
   await page.clock.runFor(5000);
   await expect(value(page, "replay-status")).toContainText("Recorded trace ended");
   await expect(page.getByRole("spinbutton")).toHaveValue("236");
-  await expect(projectValue(page, "early", "execution")).toContainText(/blocked.*No matching wait_sync barrier for: late\..*Observation end 236 ns/);
+  await expect(projectValue(page, "early", "execution")).toContainText(/Blocked.*No matching wait_sync barrier for: late\..*Observation end 236 ns/);
   await expect(projectValue(page, "early", "rt")).toContainText("observation ended");
   await expect(projectCard(page, "early").locator('.is-rt-wait')).toHaveCount(0);
   await expect(projectValue(page, "late", "rt")).toContainText(/stopped.*stop/);
@@ -333,7 +333,7 @@ test("all four open-project sequencers remain visible on the common clock", asyn
   await page.clock.runFor(60000);
   for (const [id, count] of [["blue_peak", 128], ["red_cursor", 75], ["red_tracker", 46], ["orange_drive", 24]]) {
     await expect(projectValue(page, id, "progress")).toHaveText(`${count} / ${count} instructions`);
-    await expect(projectValue(page, id, "execution")).toContainText("blocked");
+    await expect(projectValue(page, id, "execution")).toContainText("Blocked");
   }
   await page.screenshot({ path: test.info().outputPath("all-sequencers-replay.png"), fullPage: true });
 });

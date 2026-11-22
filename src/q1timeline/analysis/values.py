@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import operator
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any, Literal
 
+from q1timeline.analysis.expr import Expr
 from q1timeline.diagnostics import Diagnostic
 from q1timeline.q1asm.ast import Arg, SourceLocation
 from q1timeline.q1asm.parser import parameter_integer
@@ -29,6 +31,18 @@ class Concrete(Value):
 class Symbolic(Value):
     expr: str
     unresolved_symbols: tuple[str, ...] = field(default_factory=tuple, compare=False)
+    tree: Expr | None = field(default=None)
+
+    def __post_init__(self) -> None:
+        if self.tree is None:
+            try:
+                object.__setattr__(self, "tree", Expr.parse(self.expr))
+            except ValueError:
+                # Runtime provenance and unsupported ALU operations are display-only.
+                pass
+
+    def with_tree(self, tree: Expr) -> Symbolic:
+        return Symbolic(self.expr, self.unresolved_symbols, tree)
 
     def __str__(self) -> str:
         return self.expr
@@ -73,19 +87,8 @@ def subtract_values(left: Value, right: Value) -> Value:
     return _binary_op(left, "-", right)
 
 
-def multiply_value(value: Value, factor: int) -> Value:
-    if isinstance(value, Concrete):
-        return Concrete(value.value * factor)
-    if isinstance(value, Range):
-        return Range(
-            multiply_value(value.min_value, factor) if value.min_value is not None else None,
-            multiply_value(value.max_value, factor) if value.max_value is not None else None,
-        )
-    if isinstance(value, RuntimeDependent):
-        return RuntimeDependent(f"{value.source} * {factor}")
-    if isinstance(value, Unknown):
-        return Unknown(f"{value.reason} * {factor} is unknown")
-    return Symbolic(f"{_expr(value)} * {factor}", _unresolved_symbols(value))
+def multiply_value(value: Value, factor: int | Value) -> Value:
+    return _binary_op(value, "*", Concrete(factor) if isinstance(factor, int) else factor)
 
 
 def compare_values(left: Value, op: CompareOp, right: Value) -> bool | RuntimeDependent:
@@ -106,7 +109,8 @@ def value_to_json(value: Value) -> dict[str, Any]:
     if isinstance(value, Concrete):
         return {"kind": "concrete", "value": value.value, "display": str(value)}
     if isinstance(value, Symbolic):
-        return {"kind": "symbolic", "expr": value.expr, "display": str(value)}
+        return {"kind": "symbolic", "expr": value.expr, "display": value.tree.display() if value.tree is not None else str(value),
+                **({"tree": value.tree.to_json()} if value.tree is not None else {})}
     if isinstance(value, Range):
         return {
             "kind": "range",
@@ -154,6 +158,7 @@ def resolve_arg_value(
     *,
     required: bool = False,
     source: SourceLocation | None = None,
+    unresolved_index: int | None = None,
 ) -> Value:
     if diagnostics is None:
         diagnostics = []
@@ -164,27 +169,30 @@ def resolve_arg_value(
         return symbols.get(str(arg.value), Unknown(str(arg.value)))
     if arg.kind == "label":
         label_name = f"@{arg.value}"
-        return symbols.get(label_name, Symbolic(label_name))
+        return symbols[label_name] if label_name in symbols else Symbolic(label_name)
     if arg.kind in {"symbol", "placeholder"}:
         name = str(arg.value)
         for lookup_name in _symbol_lookup_names(name):
             if lookup_name in symbols:
                 value = symbols[lookup_name]
-                if required:
-                    _diagnose_unresolved_symbolic_value(value, diagnostics, source)
+                if required and isinstance(value, Symbolic):
+                    for unresolved in value.unresolved_symbols:
+                        _diagnose_unresolved_symbol(unresolved, diagnostics, source, unresolved_index)
                 return value
         if required:
-            diagnostic = Diagnostic(
-                severity="warning",
-                category="unresolved_symbol",
-                message=f"Unresolved symbol: {name}",
-                source=source,
-                details={"symbol": name},
-            )
-            if diagnostic not in diagnostics:
-                diagnostics.append(diagnostic)
-        return Symbolic(name, (name,))
+            _diagnose_unresolved_symbol(name, diagnostics, source, unresolved_index)
+        return _unresolved_symbol(name.removeprefix("$"))
     return Symbolic(arg.raw)
+
+
+@lru_cache(maxsize=256)
+def _unresolved_symbol(name: str) -> Symbolic:
+    return Symbolic(name, (name,))
+
+
+@lru_cache(maxsize=256)
+def _duration_symbol_tree(symbol: Expr) -> Expr:
+    return symbol.in_range(4, 65535)
 
 
 def _symbol_lookup_names(name: str) -> tuple[str, ...]:
@@ -199,6 +207,7 @@ def resolve_duration_arg(
     diagnostics: list[Diagnostic] | None = None,
     *,
     source: SourceLocation | None = None,
+    unresolved_index: int | None = None,
 ) -> DurationResolution:
     if diagnostics is None:
         diagnostics = []
@@ -215,8 +224,11 @@ def resolve_duration_arg(
         )
         return DurationResolution(value=Unknown(str(arg.value)), requires_unknown_region=True)
 
-    value = resolve_arg_value(arg, symbols, diagnostics, required=True, source=source)
+    value = resolve_arg_value(arg, symbols, diagnostics, required=True, source=source, unresolved_index=unresolved_index)
     if isinstance(value, Symbolic):
+        if value.tree is not None:
+            tree = value.tree
+            value = value.with_tree(_duration_symbol_tree(tree) if tree.op == "symbol" else tree.in_range(4, 65535))
         diagnostics.append(
             Diagnostic(
                 severity="info",
@@ -229,13 +241,20 @@ def resolve_duration_arg(
     return DurationResolution(value=value, requires_unknown_region=isinstance(value, Unknown))
 
 
-def _binary_op(left: Value, op: Literal["+", "-"], right: Value) -> Value:
+def _binary_op(left: Value, op: Literal["+", "-", "*"], right: Value) -> Value:
     if isinstance(left, Range):
+        if op == "*" and not isinstance(right, Concrete):
+            return Unknown("product of unresolved ranges")
+        low, high = left.min_value, left.max_value
+        if op == "*" and right.value < 0:
+            low, high = high, low
         return Range(
-            _binary_op(left.min_value, op, right) if left.min_value is not None else None,
-            _binary_op(left.max_value, op, right) if left.max_value is not None else None,
+            _binary_op(low, op, right) if low is not None else None,
+            _binary_op(high, op, right) if high is not None else None,
         )
     if isinstance(right, Range):
+        if op == "*":
+            return _binary_op(right, op, left)
         return Range(
             _binary_op(left, op, right.min_value) if right.min_value is not None else None,
             _binary_op(left, op, right.max_value) if right.max_value is not None else None,
@@ -243,31 +262,34 @@ def _binary_op(left: Value, op: Literal["+", "-"], right: Value) -> Value:
     if isinstance(left, Concrete) and isinstance(right, Concrete):
         if op == "+":
             return Concrete(left.value + right.value)
+        if op == "*":
+            return Concrete(left.value * right.value)
         return Concrete(left.value - right.value)
     if isinstance(left, RuntimeDependent) or isinstance(right, RuntimeDependent):
         return RuntimeDependent(f"{_expr(left)} {op} {_expr(right)}")
     if isinstance(left, Unknown) or isinstance(right, Unknown):
         return Unknown(f"{_expr(left)} {op} {_expr(right)} is unknown")
+    a = left.tree if isinstance(left, Symbolic) else Expr.const(left.value) if type(left.value) is int else None
+    b = right.tree if isinstance(right, Symbolic) else Expr.const(right.value) if type(right.value) is int else None
+    if a is not None and b is not None:
+        tree = {"+": operator.add, "-": operator.sub, "*": operator.mul}[op](a, b)
+        return Symbolic(str(tree), _unresolved_symbols(left, right), tree)
     return Symbolic(f"{_expr(left)} {op} {_expr(right)}", _unresolved_symbols(left, right))
 
 
-def _diagnose_unresolved_symbolic_value(
-    value: Value,
+def _diagnose_unresolved_symbol(
+    name: str,
     diagnostics: list[Diagnostic],
     source: SourceLocation | None,
+    index: int | None,
 ) -> None:
-    if not isinstance(value, Symbolic):
+    diagnostic = Diagnostic(severity="warning", category="unresolved_symbol", message=f"Unresolved symbol: {name}",
+                            source=source, details={"symbol": name})
+    # Probes can clear or replace their diagnostics after source validation.
+    if index is not None and 0 <= index < len(diagnostics) and diagnostics[index] == diagnostic:
         return
-    for symbol in value.unresolved_symbols:
-        diagnostic = Diagnostic(
-            severity="warning",
-            category="unresolved_symbol",
-            message=f"Unresolved symbol: {symbol}",
-            source=source,
-            details={"symbol": symbol},
-        )
-        if diagnostic not in diagnostics:
-            diagnostics.append(diagnostic)
+    if diagnostic not in diagnostics:
+        diagnostics.append(diagnostic)
 
 
 def _unresolved_symbols(*values: Value) -> tuple[str, ...]:

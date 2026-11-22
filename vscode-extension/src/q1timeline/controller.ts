@@ -3193,7 +3193,34 @@ export class TimelineController {
       return;
     }
     if (parsedMessage.type === "defRun") {
+      if (parsedMessage.action === "verify") {
+        const { project, revision, sequencer, uri } = parsedMessage;
+        const info = this.defRuns.state.info;
+        const seq = info?.sequencers.find((item) => item.id === sequencer && item.uri === uri);
+        if (this.panel && this.webviewReady && project === this.projectUri?.fsPath && seq && revision === info.revision) {
+          const explicitProject = this.singleFileMode ? undefined : this.projectUri;
+          const result = await vscode.commands.executeCommand("q1timeline.verify", vscode.Uri.file(seq.file),
+            explicitProject, explicitProject && seq.id, true);
+          if (this.panel && this.webviewReady && project === this.projectUri?.fsPath && this.defRuns.state.info === info) {
+            this.postWebviewMessage({ type: "verificationResult", project, revision, sequencer, result });
+          }
+        }
+        return;
+      }
       await this.defRuns.handle(parsedMessage);
+      return;
+    }
+    if (parsedMessage.type === "verifyAlignment") {
+      const project = this.projectUri;
+      const revision = this.sourceRevision;
+      if (this.panel && this.webviewReady && project) {
+        const result = await vscode.commands.executeCommand("q1timeline.verifyAlignment", project, true);
+        if (this.projectUri === project && revision === this.sourceRevision) this.postWebviewMessage({ type: "alignmentVerification", result });
+      }
+      return;
+    }
+    if (parsedMessage.type === "openVerificationWitness") {
+      if (this.panel && this.webviewReady) await vscode.commands.executeCommand("q1timeline.openVerificationWitness", parsedMessage.key, parsedMessage.index);
       return;
     }
     if (parsedMessage.type === "executionControl") {

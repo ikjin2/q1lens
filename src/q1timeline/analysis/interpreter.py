@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from itertools import product
 import json
+from time import monotonic
 from typing import Any, Literal
 
 from q1timeline.analysis.playback_loops import ExecutedStep, LOOP_PREVIEW_MAX_VISIBLE_ITERATIONS, observed_loops
@@ -191,6 +193,7 @@ def interpret_program(
     max_steps: int = 10000,
     prepared: PreparedDefProgram | None = None,
     external: core.ExternalInputs | None = None,
+    deadline: float | None = None,
 ) -> AnalysisState:
     if not isinstance(execution_mode, str) or execution_mode not in {"analysis", "concrete"}:
         raise ValueError(f"Invalid execution mode: {execution_mode}")
@@ -203,7 +206,8 @@ def interpret_program(
     )
     state.pc = 0
     if execution_mode == "concrete":
-        _run_concrete_program(state, symbols, waveform_names or {}, acquisition_names or {}, max_steps, external=external)
+        _run_concrete_program(state, symbols, waveform_names or {}, acquisition_names or {}, max_steps,
+                              external=external, deadline=deadline)
     else:
         state.analysis_back_edge_limit = max_steps
         _run_program_loop(state, symbols, waveform_names or {}, acquisition_names or {})
@@ -251,6 +255,11 @@ def _prepare_program(
     state.immutable_value_origins = _build_immutable_value_origins(symbols, value_defs, state)
     symbols.update(resolved_defs)
     _diagnose_program(state, symbols, program, recover_source=recover_source, prepared=prepared)
+    if execution_mode == "analysis" and state.static_diagnostics:
+        state.unresolved_diagnostic_by_line = {
+            item.source.line: index for index, item in enumerate(state.diagnostics)
+            if item.category == "unresolved_symbol" and isinstance(item.source, SourceLocation)
+        }
     return state, symbols
 
 
@@ -268,7 +277,7 @@ def _run_concrete_program(
     waveform_names: dict[int, str],
     acquisition_names: dict[int, str],
     max_steps: int,
-    *, external: core.ExternalInputs | None = None,
+    *, external: core.ExternalInputs | None = None, deadline: float | None = None,
 ) -> None:
     execution = state.metadata["execution"] = {
         "mode": "concrete", "status": "completed", "steps": 0, "max_steps": max_steps,
@@ -300,6 +309,8 @@ def _run_concrete_program(
     ), external)
     trace: list[ExecutedStep] = []
     while not state.stopped:
+        if deadline is not None and monotonic() >= deadline:
+            raise TimeoutError("Verification timed out.")
         instruction = _execution_instruction(state)
         if instruction is None:
             if state.pc == len(state.instructions_by_pc) and any(
@@ -1218,11 +1229,45 @@ def _revise_q1_issue_duration(state: AnalysisState, event: TimelineEvent, durati
     return updated
 
 
-def _refine_status_branch_arm(state: AnalysisState, op: str, *, taken: bool) -> None:
+def _bind_flag_expression(state: AnalysisState, op: str, left_arg: Arg, left: Value, right_arg: Arg, right: Value) -> None:
+    # Register origins identify a particular write, including a particular feedback receipt.
+    # A copy retains that identity. A later receipt from the same channel has a new one.
+    if any(_pending_register_write(state, reg) is not None for arg in (left_arg, right_arg)
+           if (reg := _physical_read_register(arg, state)) is not None):
+        return
+    a = _operand_value_origin(left_arg, left, state)
+    b = _operand_value_origin(right_arg, right, state)
+    if a is not None and b is not None:
+        # AND/TEST and SUB/CMP share their respective flag semantics.
+        op = {"and": "test", "sub": "cmp"}.get(op, op)
+        if op in {"test", "or", "xor", "add"} and b < a:
+            a, b = b, a
+        state.flag_expression = op, a, b
+        if fact := state.path_flag_facts.get(state.flag_expression):
+            state.alu_flag_cases = _possible_alu_flags(state.alu_flags) & fact[0]
+
+
+def _refine_status_branch_arm(state: AnalysisState, op: str, *, taken: bool, line: int) -> None:
     possibilities = state.alu_flag_cases if state.alu_flag_cases is not None else _possible_alu_flags(state.alu_flags)
     state.alu_flag_cases = frozenset(
         values for values in possibilities if _status_branch_decision(op, dict(zip(_ALU_FLAG_NAMES, values))) is taken
     )
+    if state.flag_expression is not None:
+        state.path_flag_facts = {**state.path_flag_facts, state.flag_expression: (state.alu_flag_cases, line)}
+
+
+def _explain_excluded_path(state: AnalysisState, issue: TimelineEvent, taken: bool) -> None:
+    fact = state.path_flag_facts.get(state.flag_expression)
+    if fact is None or not state.alu_flag_cases:
+        return
+    excluded = "fallthrough" if taken else "taken"
+    details = {"status": "proved", "excluded_path": excluded, "prior_branch_line": fact[1]}
+    issue.meta["unreachable_alternative"] = details
+    state.diagnostics.append(Diagnostic(
+        severity="info", category="unreachable_branch_path", source=issue.source, related_events=[issue.id],
+        message=f"The {excluded} edge is proved unreachable given the branch choices through line {fact[1]}.",
+        details=details,
+    ))
 
 
 def _emit_concrete_branch_region(
@@ -1304,6 +1349,8 @@ def _execute_status_branch(
     decision = (branch_issue.taken if branch_issue is not None
                 else _status_branch_decision(instruction.op, state.alu_flags, state.alu_flag_cases))
     if decision is not None:
+        if state.alu_flag_cases and _status_branch_decision(instruction.op, state.alu_flags) is None:
+            _explain_excluded_path(state, q1_issue_event, decision)
         q1_issue_event = _revise_q1_issue_duration(
             state,
             q1_issue_event,
@@ -1407,7 +1454,7 @@ def _execute_status_branch(
         q1_issue_event = _revise_q1_issue_duration(
             state, q1_issue_event, branch_duration(taken_duration, assumed_taken),
         )
-        _refine_status_branch_arm(state, instruction.op, taken=assumed_taken)
+        _refine_status_branch_arm(state, instruction.op, taken=assumed_taken, line=instruction.source.line)
         q1_issue_event.meta["branch_taken"] = assumed_taken
         q1_issue_event.meta["branch_policy"] = state.branch_policy
         q1_issue_event.meta["assumed_branch_path"] = assumed_path
@@ -1613,6 +1660,13 @@ def _execute_conditional_branch(
             elif bounds[1] < right.value:
                 decision = instruction.op == "jlt"
     _set_alu_flags(state, instruction, flags)
+    if branch_issue is None:
+        _bind_flag_expression(state, "cmp", instruction.args[0], left, instruction.args[1], right)
+        if not isinstance(decision, bool) and state.alu_flag_cases:
+            constrained = _status_branch_decision("jb" if instruction.op == "jlt" else "jae", flags, state.alu_flag_cases)
+            if constrained is not None:
+                decision = constrained
+                _explain_excluded_path(state, q1_issue_event, decision)
     condition = f"{instruction.args[0].raw} {op} {instruction.args[1].raw}"
     branch_id = _branch_id(state, instruction, target_label, target_arg.raw)
 
@@ -1732,6 +1786,8 @@ def _execute_conditional_branch(
     if assumption is not None:
         assumed_taken, assumed_path = assumption
         q1_issue_event = _revise_q1_issue_duration(state, q1_issue_event, branch_duration(taken_duration, assumed_taken))
+        _refine_status_branch_arm(state, "jb" if instruction.op == "jlt" else "jae", taken=assumed_taken,
+                                  line=instruction.source.line)
         q1_issue_event.meta["branch_taken"] = assumed_taken
         q1_issue_event.meta["branch_policy"] = state.branch_policy
         q1_issue_event.meta["assumed_branch_path"] = assumed_path
@@ -2452,8 +2508,8 @@ def _explore_conditional_branch_both_paths(
         path_state = deepcopy(base_path_state)
         path_issue = next(event for event in path_state.events if event.id == q1_issue_event.id)
         _revise_q1_issue_duration(path_state, path_issue, branch_duration(taken_duration, path == "taken"))
-        if len(instruction.args) == 1:
-            _refine_status_branch_arm(path_state, instruction.op, taken=path == "taken")
+        predicate = instruction.op if len(instruction.args) == 1 else "jb" if instruction.op == "jlt" else "jae"
+        _refine_status_branch_arm(path_state, predicate, taken=path == "taken", line=instruction.source.line)
         path_state.pc = next_pc
         path_state.next_pc = next_pc
         path_state.stopped = False
@@ -2625,7 +2681,7 @@ def _prove_timing_only_branch_join(
         issue = next(event for event in probe.events if event.id == q1_issue_event.id)
         _revise_q1_issue_duration(probe, issue, branch_duration(taken_duration, path == "taken"))
         if len(instruction.args) == 1:
-            _refine_status_branch_arm(probe, instruction.op, taken=path == "taken")
+            _refine_status_branch_arm(probe, instruction.op, taken=path == "taken", line=instruction.source.line)
         else:
             refined_registers.update(_refine_legacy_branch_arm(probe, instruction, symbols, taken=path == "taken"))
         probe.pc = start
@@ -2914,6 +2970,7 @@ def _prove_timing_only_branch_join(
     else:
         state.alu_flag_cases = None
     state.alu_flags_source = instruction.source if state.alu_flags else None
+    state.flag_expression = a.flag_expression if a.flag_expression == b.flag_expression else None
     state.alu_flags_read_hazard = a.alu_flags_read_hazard or b.alu_flags_read_hazard
     for name in ("conditional_enable", "conditional_mask", "conditional_operator", "conditional_else_duration",
                  "conditional_enable_bounds", "conditional_operator_bounds", "conditional_enable_known_bits",
@@ -3313,6 +3370,7 @@ def _affine_loop_timing(
     state: AnalysisState, body: list[Instr], evidence: _LoopEvidence, count: int,
     counter_reg: str | None, symbols: SymbolTable, *, children: Mapping[int, TimelineEvent] | None = None,
     child_count_slopes: Mapping[int, int] | None = None,
+    setters_only: bool = False,
 ) -> dict[str, Any] | None:
     child_counters = {}
     child_wait_counts = {}
@@ -3330,7 +3388,9 @@ def _affine_loop_timing(
         child_counters[edge_pc] = child_counter
         child_wait_counts.update({item.pc: (child_count, child_slope) for item in child_waits})
     if count < 2 or state.conditional_enable != Concrete(0) or any(
-        item.pc not in child_counters and item.op not in {"nop", "move", "add", "sub", "wait"} for item in body
+        item.pc not in child_counters and item.op not in {"nop", "move", "add", "sub", "wait", "play", "upd_param",
+                                                         "set_awg_gain", "set_awg_offs", "set_freq", "set_ph",
+                                                         "set_ph_delta", "reset_ph"} for item in body
     ):
         return None
     sources = {item.source for item in body}
@@ -3391,11 +3451,13 @@ def _affine_loop_timing(
         inputs = {register for _, register in _register_read_operands(item, state)}
         live_in.update((inputs & writes) - defined)
         ready_definitions.extend((index + 2, register) for register in _register_write_operands(item, state))
-    first_final = deepcopy(state)
-    _flush_pending_register_writes(first_final, completed_issue_index=state.q1_issue_index + 1)
+    # The induction step only needs register values after the first iteration's writes retire.
+    final_registers = state.registers.copy()
+    for write in sorted(state.pending_register_writes, key=lambda item: item.available_issue_index):
+        final_registers[write.register] = write.value
     for register in live_in:
         initial = samples.get(register, [(None, None)])[0][1]
-        result = first_final.registers.get(register)
+        result = final_registers.get(register)
         if initial is None or not isinstance(result, Concrete):
             return None
         initial &= _CLASSICAL_REGISTER_MASK
@@ -3412,6 +3474,8 @@ def _affine_loop_timing(
     pending = []
     packets = {}
     wait_counts = {}
+    setter_ids = {event.source: event.id for event in evidence.events if event.kind == "latched_state_pending"}
+    latch_coefficients = {}
     for index, item in enumerate(body):
         for ready, register, value in pending:
             if ready <= index:
@@ -3422,8 +3486,37 @@ def _affine_loop_timing(
             continue
         if item.op == "nop":
             continue
-        if item.op in {"move", "wait"}:
-            result = operand(item.args[0])
+        if (setters_only and item.op in {"wait", "upd_param", "play"}
+                or item.op in {"set_freq", "set_ph", "set_ph_delta", "reset_ph"}):
+            # Immutable parameters need not be bound to prove register induction.
+            # A time or waveform chosen by an evolving register is outside this proof.
+            for arg in item.args:
+                if _physical_read_register(arg, state) is not None:
+                    term = operand(arg)
+                    if term is None or term[1]:
+                        return None
+            continue
+        if item.op in _AWG_PAIR_SETTERS:
+            coefficients = []
+            for arg in item.args:
+                term = operand(arg)
+                if term is None:
+                    return None
+                intercept, slope = term
+                # The latch interprets both register and immediate gain/offset as signed.
+                intercept = _signed_32_bit_register_value(intercept)
+                final = intercept + slope * (count - 1)
+                if not (-32768 <= min(intercept, final) <= max(intercept, final) <= 32767):
+                    return None
+                coefficients.append({"intercept": intercept, "slope": slope})
+            if item.source not in setter_ids:
+                return None
+            latch_coefficients[setter_ids[item.source]] = coefficients
+            continue
+        if item.op in {"move", "wait", "upd_param", "play"}:
+            if item.op == "play" and any(operand(arg) is None or operand(arg)[1] for arg in item.args[:2]):
+                return None
+            result = operand(item.args[-1] if item.op == "play" else item.args[0])
         else:
             left_arg, right_arg = _docs_ordered_binary_args(item, state)
             left, right = operand(left_arg), operand(right_arg)
@@ -3435,7 +3528,7 @@ def _affine_loop_timing(
             return None
         intercept, slope = result
         low, high = sorted((intercept, intercept + slope * (count - 1)))
-        if item.op == "wait":
+        if item.op in {"wait", "upd_param", "play"}:
             packet_id = issues[item.source].meta.get("rt_packet_id")
             packet = evidence.packets.get(packet_id)
             if not (_valid_rt_duration(low) and _valid_rt_duration(high)) or packet is None or packet.duration != Concrete(intercept):
@@ -3467,6 +3560,8 @@ def _affine_loop_timing(
         values[register] = value
     if any(values.get(register) != (initial + step, step) for register, (initial, step) in induction.items()):
         return None
+    if setters_only:
+        return latch_coefficients
     intercept = slope = quadratic = 0
     endpoint_spacing: dict[int, int] = {}
     for packet_id, coefficients in packets.items():
@@ -3493,6 +3588,7 @@ def _affine_loop_timing(
                                           for index in range(min(count, 3))]}
     return {**period, "total_duration": value_to_json(Concrete(total)),
             "rt_packet_affine": packets,
+            **({"latched_affine": latch_coefficients} if latch_coefficients else {}),
             "final_registers": {register: (values[register][0] + values[register][1] * (count - 1)) & _CLASSICAL_REGISTER_MASK
                                 for register in writes
                                 if register not in child_counters.values()}}
@@ -3882,7 +3978,10 @@ def _emit_compact_loop(
         if first_issue is None or first_issue.source != start_instruction.source:
             return False
 
-    if not forever and isinstance(count, Concrete) and count.value <= 0:
+    if not forever and count == Concrete(0):
+        # Decrementing an unsigned zero counter takes one complete word cycle.
+        count = Concrete(1 << 32)
+    if not forever and isinstance(count, Concrete) and count.value < 0:
         _collapse_invalid_loop_count(
             state,
             instruction,
@@ -3902,6 +4001,8 @@ def _emit_compact_loop(
         # The value at the first loop edge does not prove the number of later
         # iterations if the body can overwrite that counter on each pass.
         count = Unknown(f"{counter_reg} is written inside the loop body")
+    if isinstance(count, Symbolic) and count.tree is not None:
+        count = count.with_tree(count.tree.loop_count())
 
     loop_id = f"L{state.loop_counter}"
 
@@ -3937,6 +4038,7 @@ def _emit_compact_loop(
                           for item in body_instructions[:-1])
     invariant_writes: set[str] = set()
     varying_by_source: dict[SourceLocation, set[str]] = {}
+    varying_operand_registers: dict[int, list[str]] = {}
     invariant_duration_pcs: list[int] = []
     varying_duration = False
     read_hazards = {item.source for item in evidence.diagnostics if item.category == "register_not_ready"}
@@ -3957,6 +4059,10 @@ def _emit_compact_loop(
         child = nested_children.get(item.pc)
         writes = {child.meta["counter_reg"]} if child is not None else _register_write_operands(item, state)
         reads = {register for _, register in _register_read_operands(item, state)}
+        if reads and (spec.emits_rt_packet or spec.category == "latched"):
+            # Nested bodies can visit the same PC with different inputs. Use all
+            # parent writes there until an invariant is proved for every visit.
+            varying_operand_registers[item.pc] = sorted(reads & (written_registers if evidence.children else varying))
         if child is not None or (single_path and item.source not in read_hazards
                                  and spec.category == "classical" and reads.isdisjoint(varying)):
             invariant_writes.update(writes)
@@ -3978,6 +4084,10 @@ def _emit_compact_loop(
     uncertain_latched_fields = sorted(
         field for field, setter_id in last_applied_setters.items() if setter_id in uncertain_setters
     )
+    play_operands = {item.source: item.args for item in body_instructions if item.op == "play"}
+    uncertain_waves = [event.id for event in preview_events if event.kind == "play" and event.source in play_operands
+                       and _physical_read_register(play_operands[event.source][event.meta["path"]], state)
+                       in varying_by_source.get(event.source, set())]
     condition_setters = [item for item in body_instructions if item.op == "set_cond" and item.args]
     last_condition_varying = varying_by_source.get(condition_setters[-1].source, written_registers) if condition_setters else set()
     condition_varies = bool(condition_setters and _physical_read_register(condition_setters[-1].args[0], state) in last_condition_varying)
@@ -4063,6 +4173,29 @@ def _emit_compact_loop(
         duration = Unknown(f"conditional execution in compact loop {loop_id}")
         t1 = add_values(t0, duration)
         state.conditional_time_unknown = True
+    output_setters = {}
+    if (isinstance(count, Concrete) and isinstance(duration, Symbolic) and uncertain_setters
+            and symbols is not None and not (counter_modified or varying_duration or conditional_loop_timing_unknown)):
+        output_setters = _affine_loop_timing(state, body_instructions[:-1], evidence, count.value, counter_reg,
+                                             symbols, setters_only=True) or {}
+    if (isinstance(count, Symbolic) and count.tree is not None and uncertain_setters
+            and symbols is not None and not (counter_modified or varying_duration or conditional_loop_timing_unknown)):
+        body = body_instructions[:-1]
+        terms = _affine_loop_timing(state, body, evidence, 2, counter_reg, symbols, setters_only=True)
+        if terms and uncertain_setters <= terms.keys():
+            # The first out-of-range signed latch makes every longer execution invalid.
+            # Re-run the induction proof through the last legal iteration to exclude
+            # wraparound in any intermediate ALU operand over that entire domain.
+            limit = 1 << 32
+            for pair in terms.values():
+                for term in pair:
+                    a, b = term["intercept"], term["slope"]
+                    if b:
+                        steps = (32767 - a) // b if b > 0 else (a + 32768) // -b
+                        limit = min(limit, 1 + steps)
+            if _affine_loop_timing(state, body, evidence, limit, counter_reg, symbols, setters_only=True) == terms:
+                output_setters = terms
+                count = count.with_tree(count.tree.in_range(1, limit))
     evaluated_facts = {}
     if (affine_timing is None and not forever and isinstance(count, Concrete)
             and not counter_modified and symbols is not None and not conditional_loop_timing_unknown):
@@ -4111,6 +4244,15 @@ def _emit_compact_loop(
     count_display = "forever" if forever else _display_count(count)
     counter_before = _plain_value(count) if count is not None else None
     counter_after = _counter_after(count) if count is not None else None
+    count_label = str(count_display)
+    if isinstance(count, Symbolic) and count.tree is not None:
+        count_label = count.tree.display()
+    elif count == Concrete(1 << 32):
+        count_label = f"{count_display} (0 → 2³²)"
+        counter_before = 0
+    count_expr = value_to_json(count) if count is not None else None
+    if count_expr is not None:
+        count_expr["display"] = count_label
     preview_ids = [event.id for event in preview_events]
     preview_iteration_event_ids: dict[str, list[str]] = {"0": preview_ids}
     target_meta = {} if target_label is not None else {
@@ -4150,7 +4292,7 @@ def _emit_compact_loop(
         t0=t0,
         t1=t1,
         duration=duration,
-        label=f"loop {loop_id} {count_display if forever else 'x' + str(count_display)}",
+        label=f"loop {loop_id} {count_label if forever else 'x' + count_label}",
         confidence="unknown" if state.conditional_time_unknown or varying_duration or branch_timing_unknown else
         "exact" if forever else _confidence_for_value(count),
         source=start_instruction.source,
@@ -4163,6 +4305,7 @@ def _emit_compact_loop(
             "counter_reg": counter_reg,
             "count": count_display,
             "period": value_to_json(period),
+            **({"count_expr": count_expr} if count_expr is not None else {}),
             "period_invariant": period_invariant,
             "counter_before": counter_before,
             "counter_after": counter_after,
@@ -4179,6 +4322,9 @@ def _emit_compact_loop(
             "invariant_registers": sorted(invariant_writes),
             "invariant_duration_pcs": invariant_duration_pcs,
             "uncertain_latched_fields": uncertain_latched_fields,
+            "uncertain_setter_ids": sorted(uncertain_setters),
+            **({"latched_affine": output_setters} if output_setters else {}),
+            "uncertain_waveform_ids": uncertain_waves,
             "source_start": _source_to_json(start_instruction.source),
             "source_end": _source_to_json(instruction.source),
             "first_iteration_event_ids": preview_ids,
@@ -4187,6 +4333,10 @@ def _emit_compact_loop(
     )
     if branch_timing_unknown and forever:
         loop_block.meta["period_basis"] = "first_iteration"
+    if varying_operand_registers:
+        state.metadata.setdefault("loop_varying_operand_registers", {})[loop_id] = varying_operand_registers
+    if isinstance(count, (Concrete, Symbolic)) and isinstance(period, (Concrete, Symbolic)) and period_invariant:
+        loop_block.meta["total_duration"] = value_to_json(multiply_value(count, period))
     if affine_timing is not None:
         # A nested sum proves elapsed time, but its packet sequence is still compact.
         loop_block.meta.update({key: value for key, value in affine_timing.items()
@@ -4313,7 +4463,8 @@ def _emit_compact_loop(
     regular_fifo = flat_fifo and (period_invariant and not affine_durations_vary or affine_fifo)
     if (not regular_fifo and isinstance(count, Concrete) and count.value > 1 and evidence.packets
             and counter_reg is not None and symbols is not None):
-        repeated_fifo = _replay_compact_fifo(state, start_pc, instruction.pc, counter_reg, count.value, symbols)
+        repeated_fifo = _replay_compact_fifo(state, start_pc, instruction.pc, counter_reg, count.value, symbols,
+                                             nested_proof)
     invariant_values = {register: (state.registers.get(register, Unknown(register)), state.register_bounds.get(register),
                                   state.register_known_bits.get(register), state.register_value_origins.get(register))
                         for register in invariant_writes}
@@ -4333,6 +4484,13 @@ def _emit_compact_loop(
         last_setters = {event.meta["field"]: event.id for event in preview_events if event.kind == "latched_state_pending"}
         for field, setter_id in last_setters.items():
             if setter_id not in uncertain_setters or not hasattr(state.latched_state, field):
+                continue
+            coefficients = loop_block.meta.get("latched_affine", {}).get(setter_id)
+            if coefficients and count is not None:
+                last_iteration = subtract_values(count, Concrete(1))
+                final = tuple(add_values(Concrete(term["intercept"]), multiply_value(last_iteration, term["slope"]))
+                              for term in coefficients)
+                setattr(state.latched_state, field, final)
                 continue
             value = getattr(state.latched_state, field)
             unknown = Unknown(f"{field} in compact loop {loop_id} is not evaluated")
@@ -4358,6 +4516,7 @@ def _emit_compact_loop(
             counter_reg=counter_reg,
             count=count,
             rt_period=period,
+            rt_start=t0,
             q1_body_period=period if branch_timing_unknown else q1_body_period,
             loop_q1_jump_runtime_ns=loop_q1_jump_runtime_ns,
             loop_q1_continue_runtime_ns=loop_q1_continue_runtime_ns,
@@ -5013,7 +5172,10 @@ def _execute_classical(state: AnalysisState, instruction: Instr, symbols: Symbol
     scope = _scope(symbols, state)
     destination = _register_name(instruction.args[1], state) if len(instruction.args) >= 2 else None
     if instruction.op == "move" and destination is not None:
-        value = _wrap_concrete_classical_register_value(resolve_arg_value(instruction.args[0], scope))
+        source = resolve_arg_value(instruction.args[0], scope)
+        if isinstance(source, Symbolic) and source.tree is not None and _physical_read_register(instruction.args[0], state) is None:
+            source = source.with_tree(source.tree.in_range(-(1 << 31), _CLASSICAL_REGISTER_MASK))
+        value = _wrap_concrete_classical_register_value(source)
         known_bits = _operand_known_bits(instruction.args[0], value, state)
         bounds = _refine_bounds_with_bits(_unsigned_operand_bounds(instruction.args[0], value, state), known_bits)
         value_origin = _operand_value_origin(instruction.args[0], value, state)
@@ -5159,6 +5321,7 @@ def _execute_classical(state: AnalysisState, instruction: Instr, symbols: Symbol
             elif shift_flags is not None:
                 flags.update(shift_flags)
         _set_alu_flags(state, instruction, flags or None)
+        _bind_flag_expression(state, instruction.op, left_arg, left, right_arg, right)
         left_word = left.value & _CLASSICAL_REGISTER_MASK if isinstance(left, Concrete) else None
         right_word = right.value & _CLASSICAL_REGISTER_MASK if isinstance(right, Concrete) else None
         value_origin = None
@@ -5199,6 +5362,7 @@ def _execute_classical(state: AnalysisState, instruction: Instr, symbols: Symbol
             flags = (_logic_flags(value.value) if isinstance(value, Concrete)
                      else {**_result_bounds_flags(bounds), "cf": False, "of": False})
         _set_alu_flags(state, instruction, flags)
+        _bind_flag_expression(state, instruction.op, left_arg, left, right_arg, right)
     elif instruction.op in {"mulu16", "muls16", "mulu32", "muls32", "mulu32l", "mulu32h", "muls32l", "muls32h"}:
         width = 16 if instruction.op.endswith("16") else 32
         full_product = instruction.op in {"mulu32", "muls32"}
@@ -5351,6 +5515,8 @@ def _execute_feedback_register_write(
 def _wrap_concrete_classical_register_value(value: Value) -> Value:
     if isinstance(value, Concrete):
         return Concrete(value.value & _CLASSICAL_REGISTER_MASK)
+    if isinstance(value, Symbolic) and value.tree is not None:
+        return value.with_tree(value.tree.word())
     return value
 
 
@@ -5567,7 +5733,10 @@ def _execute_rt_instruction(
         if wait_duration is not None:
             duration = Concrete(wait_duration)
         else:
-            resolution = resolve_duration_arg(duration_arg, scope, state.diagnostics, source=instruction.source)
+            resolution = resolve_duration_arg(
+                duration_arg, scope, state.diagnostics, source=instruction.source,
+                unresolved_index=state.unresolved_diagnostic_by_line.get(instruction.source.line),
+            )
             duration = resolution.value
             if resolution.requires_unknown_region:
                 _emit_unknown_region(state, instruction, duration)
@@ -5740,6 +5909,10 @@ def _emit_play_events(
         if waveform_index is not None and waveform_index < 0:
             continue
         meta = {"waveform_index": waveform_index, "path": path, "rt_packet_id": packet_id}
+        if waveform_index is None:
+            index = resolve_arg_value(arg, scope)
+            if isinstance(index, Symbolic) and index.tree is not None:
+                meta["waveform_index_expr"] = value_to_json(index.with_tree(index.tree.in_range(0, 1023)))
         if applied_state:
             meta["applied_state"] = applied_state
         _emit_event(
@@ -6192,10 +6365,103 @@ def _loop_q1_body_period(q1_period: Value, loop_edge_runtime_ns: int) -> Value:
     return subtract_values(q1_period, Concrete(loop_edge_runtime_ns))
 
 
+@dataclass(frozen=True)
+class _FifoTiming:
+    q1_ns: int
+    rt_ns: int
+    reference_sync_ns: int
+    rt_fifo_starts: tuple[int, ...]
+
+
+def _nested_fifo_plan(
+    state: AnalysisState, start: int, end: int, counter: str, repeats: int, proof: _NestedLoopProof,
+    scope: SymbolTable,
+) -> tuple[int, dict[int, tuple[int, int]], dict[int, tuple[int, int, int]]] | None:
+    """Prove a fixed instruction schedule for nested loops with immediate packet operands."""
+    code = state.instructions_by_pc
+    visits = [repeats] * (end - start + 1)
+    edges = {end: (start, counter, repeats)}
+    setups = {}
+    for edge, child in proof.children.items():
+        meta = child.meta
+        first, reg, count = meta["start_pc"], meta["counter_reg"], meta["count"]
+        # A fresh literal load before every invocation makes this counter independent
+        # of all enclosing iterations. The body must contain a slot before its edge.
+        setup = first - 1
+        while setup >= start and code[setup].op == "nop":
+            setup -= 1
+        if (first >= edge or setup < start or reg == counter or reg in setups or code[setup].op != "move"
+                or code[setup].args[0].kind != "imm" or code[setup].args[0].value != count
+                or code[setup].args[1].value != reg
+                or any(setup < parent.meta["start_pc"] <= first and edge < parent_edge
+                       for parent_edge, parent in proof.children.items())):
+            return None
+        setups[reg] = setup
+        edges[edge] = first, reg, count
+        for pc in range(first, edge + 1):
+            visits[pc - start] *= count
+
+    timings = {}
+    branches = {}
+    for pc in range(start, end + 1):
+        item = _concrete_bound_instruction(code[pc], state, scope)
+        if item.op == "loop":
+            first, reg, count = edges[pc]
+            if (item.args[0].value != reg or item.args[1].kind != "imm" or not item.args[1].raw.startswith("@")
+                    or item.args[1].value != _compiled_pc(state, first)):
+                return None
+            taken = get_instruction_spec(item.op).q1_time_model(item)
+            timings[pc] = taken, 0
+            branches[pc] = first, count, branch_duration(taken, False)
+            continue
+        if item.op == "move":
+            if (item.args[0].kind != "imm" or not _is_valid_register_arg(item.args[1]) or item.args[1].value == counter
+                    or setups.get(item.args[1].value, pc) != pc):
+                return None
+            inputs = (item.args[0].value,)
+        elif item.op in {"nop", "wait", "play", "upd_param"} and all(arg.kind == "imm" for arg in item.args):
+            inputs = tuple(arg.value for arg in item.args)
+        else:
+            return None
+        issue = core.issue(item, inputs)
+        spacing = _rt_dequeue_spacing_ns(issue.wait_duration) if issue.wait_duration is not None else 0
+        timings[pc] = issue.q1_duration, spacing
+    return sum(visits), timings, branches
+
+
+def _replay_nested_fifo(
+    machine: core.CoreState, pc: int, steps: int, timings: dict[int, tuple[int, int]],
+    branches: dict[int, tuple[int, int, int]],
+) -> _FifoTiming:
+    remaining = {}
+    q1, rt = machine.q1_ns, machine.rt_ns
+    slots = deque(machine.rt_fifo_starts, maxlen=core.RT_FIFO_CAPACITY)
+    for _ in range(steps):
+        fetch, dwell = timings[pc]
+        q1 += fetch
+        if dwell:
+            if len(slots) == core.RT_FIFO_CAPACITY:
+                q1 = core.queued_q1_completion(q1, slots[0])
+            slots.append(rt + machine.reference_sync_ns)
+            rt += dwell
+        elif pc in branches:
+            target, count, fallthrough = branches[pc]
+            left = remaining.get(pc, count) - 1
+            if left:
+                remaining[pc] = left
+                pc = target
+                continue
+            remaining.pop(pc, None)
+            q1 += fallthrough - fetch
+        pc += 1
+    return _FifoTiming(q1, rt, machine.reference_sync_ns, tuple(slots))
+
+
 def _replay_compact_fifo(
     state: AnalysisState, start_pc: int, end_pc: int, counter: str, count: int, symbols: SymbolTable,
-) -> core.CoreState | None:
-    """Use the concrete kernel for bounded loops whose packet or fetch sequence changes."""
+    proof: _NestedLoopProof | None,
+) -> core.CoreState | _FifoTiming | None:
+    """Replay hidden FIFO timing, using the concrete kernel for data-dependent schedules."""
     budget = state.analysis_back_edge_limit or 10000
     if (count - 1 > budget or state.conditional_enable != Concrete(0)
             or not isinstance(state.q1_time_ns, Concrete) or not isinstance(state.rt_time_ns, Concrete)
@@ -6216,6 +6482,13 @@ def _replay_compact_fifo(
     bound = {}
     scope = _scope(symbols, state)
     try:
+        if proof is not None and proof.children and not proof.count_slopes:
+            plan = _nested_fifo_plan(state, start_pc, end_pc, counter, count - 1, proof, scope)
+            if plan is not None:
+                steps, timings, branches = plan
+                if steps > budget:
+                    return None
+                return _replay_nested_fifo(machine, start_pc, steps, timings, branches)
         for _ in range(budget):
             pc = machine.pc
             if not start <= pc < stop:
@@ -6326,6 +6599,7 @@ def _advance_compact_loop_fallthrough_state(
     counter_reg: str | None,
     count: Value | None,
     rt_period: Value,
+    rt_start: Value,
     q1_body_period: Value,
     loop_q1_jump_runtime_ns: int,
     loop_q1_continue_runtime_ns: int,
@@ -6333,16 +6607,22 @@ def _advance_compact_loop_fallthrough_state(
     q1_hidden_ns: int | None = None,
 ) -> None:
     if not isinstance(count, Concrete):
-        state.rt_time_ns = Unknown(f"compact loop {loop_id} iteration count is not concrete")
+        known_count = isinstance(count, Symbolic) and count.tree is not None
+        if known_count and isinstance(rt_period, (Concrete, Symbolic)):
+            state.rt_time_ns = add_values(rt_start, multiply_value(count, rt_period))
+        else:
+            state.rt_time_ns = Unknown(f"compact loop {loop_id} iteration count is not concrete")
         state.q1_time_ns = Unknown(f"compact loop {loop_id} iteration count is not concrete")
         if counter_reg is not None:
-            state.registers[counter_reg] = Unknown(f"{counter_reg} after compact loop {loop_id}")
+            state.registers[counter_reg] = Concrete(0) if known_count else Unknown(f"{counter_reg} after compact loop {loop_id}")
         return
 
     hidden_iterations = max(count.value - 1, 0)
     if isinstance(rt_period, Concrete):
         hidden = subtract_values(rt_total, rt_period) if rt_total is not None else multiply_value(rt_period, hidden_iterations)
         state.rt_time_ns = add_values(state.rt_time_ns, hidden)
+    elif isinstance(rt_period, Symbolic) and rt_period.tree is not None:
+        state.rt_time_ns = add_values(rt_start, multiply_value(count, rt_period))
     else:
         state.rt_time_ns = Unknown(f"compact loop {loop_id} RT period is not concrete")
     if q1_hidden_ns is not None:

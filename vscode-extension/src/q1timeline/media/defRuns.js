@@ -7,6 +7,9 @@
   const statusName = (status) => ({ completed: "Completed", error: "Failed", blocked: "Blocked", step_limit: "Limit reached",
     undetermined: "Final output undetermined", cancelled: "Cancelled", running: "Running", stale: "Stale", unrun: "Unexecuted" })[status] || status;
   const format = (number) => Number.isInteger(number) ? String(number) : String(Number(number.toPrecision(12)));
+  // Display form: four significant digits, never fewer than the integer part. The exact value stays in the title.
+  const short = (number) => Number.isInteger(number) ? String(number) :
+    String(Number(number.toPrecision(Math.min(12, Math.max(4, Math.floor(Math.log10(Math.abs(number))) + 1)))));
   const assignments = (defs) => Object.entries(defs).map(([name, value]) => `${name}=${value}`).join(", ");
   const diagnostics = (row) => [row.reason, ...row.diagnostics.map((item) => `${item.severity}: ${item.message}`)].filter(Boolean).join(" · ");
   const metricNames = new Map([["time", "Q1 time"], ["formula", "Formula"], ["reference", "Reference"], ["error", "Error"]]);
@@ -267,7 +270,7 @@
       keys.push(`<span><i class="def-key def-plot-unrun"></i>${samples ? "Unsampled inputs" : "Unexecuted"}</span>`);
     }
     if (yAxis && stats) keys.unshift(`<span><i class="def-plot-scale${spread ? "" : " is-constant"}"></i>${esc(valueLabel)} ${colorRange}</span>`);
-    return `<div class="def-plot-scroll"><svg viewBox="0 0 ${end + 12} ${bottom + 35}" style="min-width:${minWidth}px" aria-label="${chartLabel}">
+    return `<div class="def-plot-scroll"><svg viewBox="0 0 ${end + 12} ${bottom + 35}" style="min-width:${minWidth}px;max-width:${Math.max(minWidth, end + 12)}px" aria-label="${chartLabel}">
       <text x="${left}" y="14">${esc(yLabel)}</text>${yTicks}
       <path d="M${left} ${top}V${bottom}H${end}" class="def-plot-axis"/>${marks.join("")}
       <text x="${left}" y="${bottom + 29}">${esc(xLabel)}</text></svg></div>
@@ -287,49 +290,47 @@
     panel.id = "q1timeline-def-runs";
     panel.setAttribute("aria-label", "DEF runs and sweep");
     panel.innerHTML = `<div class="def-body">
-      <h2>DEF sweep</h2>
-      <div class="def-setup">
-        <section class="def-card" aria-labelledby="def-inputs-heading">
-          <div class="def-heading"><h3 id="def-inputs-heading">Run inputs</h3><button data-action="info">Reload DEFs</button></div>
-          <div class="def-toolbar"><label>Sequencer <select data-field="seq"></select></label><code data-field="source"></code></div>
-          <div data-field="defs" class="def-table-scroll def-input-table"></div>
-          <fieldset class="def-observation">
-            <legend>Observed registers <span data-field="observed-count" class="def-muted"></span></legend>
-            <div id="q1lens-def-register-choices" class="def-register-choices">${Array.from({ length: 64 }, (_, i) => `<label hidden><input type="checkbox" data-register="R${i}">R${i}</label>`).join("")}</div>
-            <p data-field="no-registers" class="def-muted" hidden>No registers referenced in this program.</p>
-            <button type="button" data-action="toggle-registers" aria-controls="q1lens-def-register-choices" aria-expanded="false" hidden>Show all registers</button>
-          </fieldset>
-          <div class="def-toolbar">
-            <label class="def-checkbox"><input type="checkbox" data-field="observe-time">Q1 time</label>
-            <label>Interpretation <select data-field="mode"><option value="signed">Signed 32-bit</option><option value="unsigned">Unsigned 32-bit</option></select></label>
-          </div>
-          <div class="def-toolbar"><button data-action="run">Run from start</button><button data-action="reset">Reset all DEFs</button><span data-field="edited"></span></div>
-        </section>
-        <section class="def-card" aria-labelledby="def-range-heading">
-          <h3 id="def-range-heading">Sweep ranges</h3><div data-field="axes"></div>
-          <p data-field="plan" role="status" class="def-muted"></p>
-          <p data-field="observation-required" class="def-muted" hidden>Select at least one register or Q1 time.</p>
-          <div class="def-toolbar"><label>Results <select data-field="sweep-output"><option value="cases">Plots and cases</option><option value="statistics">Statistics only</option></select></label>
-          <button data-action="sweep">Start sweep</button></div>
-          <div class="def-toolbar"><label>Sample count <input type="number" data-field="sample-count" value="1000" min="1" step="1" aria-describedby="q1lens-sweep-sample-help"></label>
-          <button data-action="estimate">Estimate time</button><button data-action="sample" aria-describedby="q1lens-sweep-sample-help">Random sample</button>
-          <span data-field="setup-actions"><button data-action="cancel" hidden>Stop sweep</button></span></div>
-          <p id="q1lens-sweep-sample-help" class="def-muted" data-field="sample-help" aria-live="polite"></p>
-          <p data-field="estimate" role="status"></p>
-        </section>
-      </div>
+      <section class="def-card" aria-labelledby="q1lens-def-title">
+        <div class="def-heading"><h2 id="q1lens-def-title">Sweep</h2>
+          <div class="def-toolbar"><label>Sequencer <select data-field="seq"></select></label><code data-field="source"></code>
+          <button data-action="info">Reload DEFs</button>
+          <button data-action="verify" title="Check the saved program's DEF boundaries and assertions across their declared inputs">Verify saved program</button></div></div>
+        <div data-field="verification" role="status"></div>
+        <div data-field="defs" class="def-table-scroll def-input-table"></div>
+        <p data-field="plan" role="status" class="def-muted"></p>
+        <fieldset class="def-observation">
+          <legend>Observed registers <span data-field="observed-count" class="def-muted"></span></legend>
+          <div id="q1lens-def-register-choices" class="def-register-choices">${Array.from({ length: 64 }, (_, i) => `<label hidden><input type="checkbox" data-register="R${i}">R${i}</label>`).join("")}</div>
+          <p data-field="no-registers" class="def-muted" hidden>No registers referenced in this program.</p>
+          <button type="button" data-action="toggle-registers" aria-controls="q1lens-def-register-choices" aria-expanded="false" hidden>Show all registers</button>
+        </fieldset>
+        <p data-field="observation-required" class="def-muted" hidden>Select at least one register or Q1 time.</p>
+        <div class="def-toolbar">
+          <label class="def-checkbox"><input type="checkbox" data-field="observe-time">Q1 time</label>
+          <label>Interpretation <select data-field="mode"><option value="signed">Signed 32-bit</option><option value="unsigned">Unsigned 32-bit</option></select></label>
+          <label>Results <select data-field="sweep-output"><option value="cases">Plots and cases</option><option value="statistics">Statistics only</option></select></label>
+          <label>Sample count <input type="number" data-field="sample-count" value="1000" min="1" step="1" aria-describedby="q1lens-sweep-sample-help"></label>
+        </div>
+        <div class="def-toolbar">
+          <button data-action="sweep">Start sweep</button><button data-action="run">Run from start</button>
+          <button data-action="sample" aria-describedby="q1lens-sweep-sample-help">Random sample</button><button data-action="estimate">Estimate time</button>
+          <span data-field="setup-actions"><button data-action="cancel" hidden>Stop sweep</button></span>
+          <button data-action="reset" hidden>Reset all DEFs</button><span data-field="edited"></span>
+        </div>
+        <p id="q1lens-sweep-sample-help" class="def-muted" data-field="sample-help" aria-live="polite"></p>
+        <p data-field="estimate" role="status"></p>
+      </section>
       <p data-field="message" role="status"></p>
-      <section class="def-card" data-field="sweep" aria-labelledby="def-results-heading" hidden>
-        <div class="def-heading"><h3 id="def-results-heading" data-field="sweep-heading">Sweep results</h3><span data-field="progress-actions"></span></div>
-        <div data-field="progress" role="status"></div><progress data-field="bar" aria-label="Sweep progress"></progress>
+      <section class="def-card" data-field="sweep" aria-label="Sweep results" hidden>
+        <div class="def-heading"><div data-field="progress" role="status"></div><span data-field="progress-actions"></span></div>
+        <progress data-field="bar" aria-label="Sweep progress"></progress>
         <div data-field="register-summary"></div>
-        <div data-field="plot-controls" class="def-heading" hidden><h4>Plots</h4><label>Plot metric <select data-field="metric"></select></label></div>
+        <div data-field="plot-controls" class="def-toolbar" hidden><label>Plot metric <select data-field="metric"></select></label></div>
         <form data-field="formula-form" class="def-formula" hidden>
-          <label>Formula <input type="text" data-field="formula" maxlength="512" spellcheck="false" placeholder="R2" aria-describedby="q1lens-sweep-formula-help"></label>
-          <label>Reference formula <input type="text" data-field="reference-formula" maxlength="512" spellcheck="false" placeholder="Optional"></label>
-          <label>Absolute tolerance <input type="text" data-field="tolerance" maxlength="64" spellcheck="false" placeholder="Optional"></label>
+          <label>Formula <input type="text" data-field="formula" maxlength="512" spellcheck="false" placeholder="R2" title="Use observed final registers or DEF inputs. Trigonometric functions use radians."></label>
+          <label>Reference formula <input type="text" data-field="reference-formula" maxlength="512" spellcheck="false" placeholder="Optional" title="Expected value, written like the formula."></label>
+          <label>Absolute tolerance <input type="text" data-field="tolerance" maxlength="64" spellcheck="false" placeholder="Optional" title="With a tolerance, a case passes when |error| ≤ tolerance."></label>
           <button type="submit">Plot formula</button>
-          <p id="q1lens-sweep-formula-help" class="def-muted">Use observed final registers or DEF inputs. Trigonometric functions use radians. With a tolerance, a case passes when |error| ≤ tolerance.</p>
           <p data-field="formula-status" role="status"></p>
         </form>
         <div data-field="comparison" hidden></div>
@@ -357,6 +358,9 @@
     let edits = saved.edits || {}, selected = saved.sequencer, plan, planError, planTimer, token = 0, page = 0;
     let traceId, index, instructions = [], used = new Set(), pendingAt = [], position = saved.position || 0;
     let showAllRegisters = false;
+    // DEFs with a range, in the order their ranges were entered: the first is the horizontal plot axis.
+    let axisOrder = [], caseFilter;
+    sampleField.title = button("sample").title = "Draws from the selected ranges. The same combination can appear more than once.";
     let hasRegisterChoice = Array.isArray(saved.registers) || typeof saved.register === "string";
     const savedRegisters = new Set(saved.registers ?? (saved.register ? [saved.register] : []));
     for (const input of registerFields) input.checked = savedRegisters.has(input.dataset.register);
@@ -385,19 +389,21 @@
     const statisticsOnly = () => outputField.value === "statistics";
     const target = () => ({ revision: state.info.revision, sequencer: selected, uri: sequencer().uri });
     const inputNodes = () => [...field("defs").querySelectorAll("input[data-def]")];
+    const defRows = () => [...field("defs").querySelectorAll("tr[data-def-row]")];
+    const rangeInputs = (row) => [...row.querySelectorAll("input[data-range]")];
     const runInputs = () => ({ ...target(), registers: observedRegisters(), observe_time: timeField.checked,
       overrides: Object.fromEntries(inputNodes().map((input) => [input.dataset.def, input.value])) });
     const sweepInputs = () => ({ ...runInputs(), axes: readAxes(), statistics_only: statisticsOnly() });
 
     function renderControls() {
       const available = Boolean(sequencer()) && !unsaved && !state.busy;
+      button("verify").disabled = !available;
       const observedCount = observedRegisters().length;
       const hasObservations = observedCount > 0 || timeField.checked;
       const hiddenCount = registerFields.filter((input) => input.checked && input.parentElement.hidden).length;
       field("observed-count").textContent = `· ${observedCount} selected${hiddenCount ? ` · ${hiddenCount} hidden` : ""}`;
       field("observation-required").hidden = hasObservations;
       button("run").disabled = !available;
-      button("reset").disabled = !sequencer()?.defs.length;
       button("info").disabled = Boolean(unsaved || state.busy);
       const stop = button("cancel");
       const sweeping = state.busy === "sweep", estimating = state.busy === "estimate";
@@ -414,15 +420,20 @@
       const validSampleCount = Number.isSafeInteger(sampleField.valueAsNumber) && sampleField.validity.valid;
       button("sample").disabled = !available || !plan || !validSampleCount || !hasObservations;
       button("estimate").disabled = button("sample").disabled;
-      field("sample-help").textContent = validSampleCount ? "Draws from the selected ranges. The same combination can appear more than once." :
-        `Enter a whole sample count from 1 to ${sampleLimit.toLocaleString("en-US")}.`;
+      field("sample-help").textContent = validSampleCount ? "" : `Enter a whole sample count from 1 to ${sampleLimit.toLocaleString("en-US")}.`;
       const estimate = state.estimate;
       const matchingEstimate = plan && estimate && sequencer() && !unsaved &&
         JSON.stringify(estimate.inputs) === JSON.stringify(sweepInputs());
       field("estimate").textContent = estimating ? "Measuring sample time…" : matchingEstimate && validSampleCount ?
         `Estimated time: about ${estimatedDuration(estimate.setupMs + estimate.sampleMs * sampleField.valueAsNumber)} (measured on ${estimate.count} samples).` : "";
       const error = planError || (plan && !plan.allowed ? `Maximum ${(plan.limit ?? 4096).toLocaleString("en-US")} combinations.` : "");
-      field("plan").textContent = [plan && `${plan.axes.map((axis) => `${axis.name}: ${axis.count}`).join(" × ")} · ${plan.total} combinations`, error].filter(Boolean).join(" · ");
+      for (const row of defRows()) {
+        const position = plan ? plan.axes.findIndex((axis) => axis.name === row.dataset.defRow) : -1;
+        const cell = row.querySelector("[data-axis-count]");
+        cell.textContent = position < 0 ? "" : plan.axes[position].count;
+        cell.title = position < 0 ? "" : `${plan.axes[position].count} values · axis ${position + 1}`;
+      }
+      field("plan").textContent = [plan ? `${plan.total} combinations` : !axisOrder.length && sequencer()?.defs.length ? "Enter a Min or Max to sweep a DEF." : "", error].filter(Boolean).join(" · ");
       field("message").textContent = unsaved ? "Save the project and Q1ASM sources before calculating execution." :
         state.message || ({ info: "Reading project DEFs…", run: "Running from the start…", sweep: "Calculating sweep…", case: "Reproducing the selected case…" })[state.busy] || "";
     }
@@ -444,7 +455,8 @@
 
     function updateEdited() {
       const trace = state.trace && state.trace.sequencer === selected && !state.trace.stale ? state.trace : null;
-      let edited = false;
+      let edited = false, changed = false;
+      for (const cell of field("defs").querySelectorAll("[data-last-run]")) cell.hidden = !trace;
       for (const input of inputNodes()) {
         const name = input.dataset.def, declaration = input.dataset.default;
         const executed = trace && Object.hasOwn(trace.case.defs, name) ? trace.case.defs[name] : undefined;
@@ -452,15 +464,34 @@
           executed === sequencer()?.defs.find((def) => def.name === name)?.value ? declaration : executed;
         input.closest("tr").querySelector("[data-executed]").textContent = executed ?? "—";
         edited ||= input.value.trim() !== (lastLiteral ?? declaration).trim();
+        const differs = input.value !== declaration;
+        input.parentElement.querySelector("button[data-reset]").hidden = !differs;
+        changed ||= differs;
       }
+      button("reset").hidden = !changed;
       field("edited").textContent = edited ? "Changes have not been run" : "";
     }
 
+    function updateAxes() {
+      const rows = defRows();
+      const active = rows.filter((row) => rangeInputs(row).some((input) => input.value.trim())).map((row) => row.dataset.defRow);
+      axisOrder = [...axisOrder.filter((name) => active.includes(name)), ...active.filter((name) => !axisOrder.includes(name))].slice(0, 2);
+      for (const row of rows) {
+        const axis = axisOrder.includes(row.dataset.defRow), locked = axisOrder.length === 2 && !axis;
+        const literal = row.querySelector("input[data-def]").dataset.default;
+        for (const input of rangeInputs(row)) {
+          // An empty field of a swept DEF falls back to the value its placeholder shows.
+          input.placeholder = axis ? (input.name === "step" ? "1" : literal) : "";
+          input.disabled = locked;
+          input.title = locked ? "Two DEFs are already swept. Clear a range to sweep this one." : "";
+        }
+      }
+    }
+
     function readAxes() {
-      return [...field("axes").querySelectorAll("[data-axis]")].flatMap((row) => {
-        const name = row.querySelector("select").value;
-        return name ? [{ name, ...Object.fromEntries([...row.querySelectorAll("input")].map((input) => [input.name, input.value])) }] : [];
-      });
+      const rows = defRows();
+      return axisOrder.map((name) => ({ name, ...Object.fromEntries(rangeInputs(rows.find((row) => row.dataset.defRow === name))
+        .map((input) => [input.name, input.value.trim() ? input.value : input.placeholder])) }));
     }
 
     function requestPlan() {
@@ -469,7 +500,7 @@
       plan = undefined;
       planError = undefined;
       renderControls();
-      if (!sequencer()?.defs.length || unsaved || state.busy) return;
+      if (!sequencer()?.defs.length || !axisOrder.length || unsaved || state.busy) return;
       planTimer = setTimeout(() => send("plan", { ...target(), token: requestToken, axes: readAxes(), statistics_only: statisticsOnly() }), 120);
     }
 
@@ -484,15 +515,16 @@
       const source = field("source");
       source.title = seq?.file || "";
       source.textContent = source.title.split(/[\\/]/).at(-1);
-      field("defs").innerHTML = defs.length ? `<table aria-label="DEF inputs"><thead><tr><th scope="col">DEF</th><th scope="col">Default</th><th scope="col">Run input</th><th scope="col">Last run</th></tr></thead><tbody>
-        ${defs.map((def, i) => `<tr><th scope="row"><code>${esc(def.name)}</code><button data-location="${i}">Line ${def.line}</button></th><td><code>${esc(def.literal)}</code></td><td><div class="def-input-cell"><input type="text" aria-label="${esc(def.name)} DEF value" spellcheck="false" data-def="${esc(def.name)}" data-default="${esc(def.literal)}" value="${esc(Object.hasOwn(currentEdits(), def.name) ? currentEdits()[def.name] : def.literal)}"><button data-reset="${i}" aria-label="Reset ${esc(def.name)} DEF">Reset</button></div></td>
-        <td data-executed>—</td></tr>`).join("")}</tbody></table>` :
+      const ranges = [["min", "Min", "minimum"], ["max", "Max", "maximum"], ["step", "Step", "step"]];
+      field("defs").innerHTML = defs.length ? `<table aria-label="DEF inputs"><thead><tr><th scope="col">DEF</th><th scope="col">Default</th><th scope="col">Run input</th><th scope="col" data-last-run hidden>Last run</th>
+        ${ranges.map(([, label]) => `<th scope="col" title="Fill in to sweep this DEF. Up to two DEFs.">${label}</th>`).join("")}<th scope="col" aria-label="Values"></th></tr></thead><tbody>
+        ${defs.map((def, i) => `<tr data-def-row="${esc(def.name)}"><th scope="row"><code>${esc(def.name)}</code><button data-location="${i}" aria-label="Open ${esc(def.name)} at line ${def.line}" title="Open line ${def.line}">:${def.line}</button></th><td><code>${esc(def.literal)}</code></td><td><div class="def-input-cell"><input type="text" aria-label="${esc(def.name)} DEF value" spellcheck="false" data-def="${esc(def.name)}" data-default="${esc(def.literal)}" value="${esc(Object.hasOwn(currentEdits(), def.name) ? currentEdits()[def.name] : def.literal)}"><button data-reset="${i}" aria-label="Reset ${esc(def.name)} DEF" title="Reset to ${esc(def.literal)}" hidden>Reset</button></div></td>
+        <td data-last-run data-executed hidden>—</td>
+        ${ranges.map(([name, , spoken]) => `<td><input type="text" name="${name}" data-range="${esc(def.name)}" aria-label="${esc(def.name)} ${spoken}" spellcheck="false"></td>`).join("")}
+        <td data-axis-count class="def-muted"></td></tr>`).join("")}</tbody></table>` :
         `<p>${seq ? "No editable numeric DEFs." : "Load the project’s numeric DEFs to begin."}</p>`;
-      field("axes").innerHTML = defs.length ? [0, 1].map((i) => `<div class="def-axis" data-axis="${i}"><label>Axis ${i + 1} <select aria-label="Sweep axis ${i + 1}">
-        ${i ? '<option value="">None</option>' : ""}${defs.map((def) => `<option>${esc(def.name)}</option>`).join("")}</select></label>
-        ${[["min", "Min"], ["max", "Max"], ["step", "Step"]].map(([name, label]) => `<label>${label} <input type="text" name="${name}" aria-label="Axis ${i + 1} ${name}" value="${i ? "" : name === "step" ? 1 : esc(defs[0].literal)}" spellcheck="false" ${i ? "disabled" : ""}></label>`).join("")}</div>`).join("") : '<p class="def-muted">Select a sequencer with numeric DEFs to set sweep ranges.</p>';
-      const second = field("axes").querySelector('[data-axis="1"]');
-      if (second) second.hidden = defs.length < 2;
+      axisOrder = [];
+      updateAxes();
       updateEdited();
       requestPlan();
     }
@@ -594,52 +626,70 @@
       field("sweep").hidden = !sweep;
       if (!sweep) return;
       const random = sweep.plan.sampling === "random";
-      field("sweep-heading").textContent = random ? "Random sample results" : "Sweep results";
+      field("sweep").setAttribute("aria-label", random ? "Random sample results" : "Sweep results");
       const count = (status) => sweep.statisticsOnly ? sweep.summary?.statuses[status] ?? 0 : sweep.rows.filter((row) => row.status === status).length;
       const ended = sweep.summary?.count ?? sweep.rows.length, planned = Number(sweep.plan.total), remaining = planned - ended;
+      const running = sweep.status === "running";
       field("bar").max = planned;
       field("bar").value = ended;
-      field("bar").hidden = sweep.status === "completed";
+      field("bar").hidden = !running;
       const valid = count("completed"), completed = sweep.summary?.engine_completed ?? sweep.rows.filter((row) => row.engine_completed).length;
-      const counts = [
-        ["Failed", count("error")], ["Blocked", count("blocked")], ["Limit reached", count("step_limit")],
-        ["Output undetermined", count("undetermined")], [sweep.incompleteBatch ? "Unreported" : "Unexecuted", remaining],
-      ].filter(([, n]) => n > 0);
-      if (completed !== valid) counts.unshift(["Engine completed", completed]);
-      if (valid !== planned) counts.unshift(["Cases with readable output", valid]);
-      const observed = sweep.registers.length > 6 ? [`${sweep.registers.length} registers`] : sweep.registers;
-      field("progress").innerHTML = `<div class="def-toolbar">
-        <strong class="def-status" data-status="${esc(sweep.status)}">${esc(statusName(sweep.status))}</strong>
-        <span>${esc([sweep.sequencer, ...observed, ...(sweep.observeTime ? ["Q1 time"] : [])].join(" · "))}</span>
-        <span data-cases-reported><strong>${ended} / ${planned}</strong> ${random ? "samples" : "cases"} reported</span>
-        </div>${counts.length ? `<ul class="def-counts">${counts.map(([label, n]) => `<li>${label} <strong>${n}</strong></li>`).join("")}</ul>` : ""}
-        ${sweep.incompleteBatch ? '<p class="def-muted">Last batch interrupted.</p>' : ""}`;
+      // Segment order follows how much of the result is usable: readable, then partial, then missing.
+      const parts = [
+        ["readable", "def-readable", valid], ["undetermined", "undetermined", count("undetermined")],
+        ["blocked", "blocked", count("blocked")], ["failed", "error", count("error")],
+        [`limit reached · ${sweep.maxSteps} instructions`, "step_limit", count("step_limit")],
+        [sweep.incompleteBatch ? "unreported" : "unexecuted", "def-plot-unrun", remaining],
+      ].filter(([, , cases]) => cases > 0);
+      const breakdown = !running && parts.length > 0 && valid !== planned;
+      const swept = new Set(sweep.plan.axes.map((axis) => axis.name));
+      const fixed = assignments(Object.fromEntries(Object.entries(sweep.defs || {}).filter(([name]) => !swept.has(name))));
+      const settings = [sweep.sequencer, `Observed ${[...sweep.registers, ...(sweep.observeTime ? ["Q1 time"] : [])].join(", ")}`,
+        sweep.mode, `${sweep.maxSteps} instruction limit`, fixed && `Fixed DEFs ${fixed}`, sweep.statisticsOnly && "Statistics only",
+        `Engine completed ${completed}`].filter(Boolean).join(" · ");
+      const done = sweep.status === "completed";
+      field("progress").innerHTML = `<div class="def-summary" title="${esc(settings)}">
+        <strong class="def-status" data-status="${esc(sweep.status)}"${done ? ' role="img" aria-label="Completed"' : ""}>${done ? "✓" : esc(statusName(sweep.status))}</strong>
+        <span data-cases-reported><strong>${ended} / ${planned}</strong> ${random ? "samples" : "cases"}</span>
+        ${breakdown ? `<span class="def-bar" aria-hidden="true">${parts.map(([, style, cases]) => `<i class="${style}" style="flex-grow:${cases}"></i>`).join("")}</span>
+        <ul class="def-counts">${parts.map(([label, style, cases]) => `<li data-count="${style}"><i class="def-key ${style}"></i><strong>${cases}</strong> ${esc(label)}</li>`).join("")}</ul>` : ""}
+        ${sweep.incompleteBatch ? '<span class="def-muted">Last batch interrupted.</span>' : ""}</div>`;
     }
+
+    const needsAttention = (row) => row.status !== "completed" || row.diagnostics.length > 0 || Boolean(row.reason) ||
+      derived?.get(row.id)?.verdict === "fail";
 
     function renderTable() {
       const sweep = state.sweep;
       if (!sweep || sweep.status === "running" || sweep.statisticsOnly) { field("table").innerHTML = ""; return; }
-      const pages = Math.max(1, Math.ceil(sweep.rows.length / 50));
+      const flagged = sweep.rows.filter(needsAttention);
+      const filter = flagged.length ? caseFilter ?? "attention" : "all";
+      const rows = filter === "attention" ? flagged : sweep.rows;
+      const pages = Math.max(1, Math.ceil(rows.length / 50));
       page = Math.min(page, pages - 1);
       const disabled = sweep.status === "stale" || state.busy;
       const mode = modeField.value;
       const comparing = Boolean(activeReference && derived);
+      const showStatus = rows.some((row) => row.status !== "completed");
       field("table").innerHTML = `<div class="def-heading"><h4>Cases</h4><div class="def-toolbar">
-        <button data-page="-1" ${page ? "" : "disabled"}>Previous results</button><span>Page ${page + 1} of ${pages}</span>
-        <button data-page="1" ${page + 1 < pages ? "" : "disabled"}>Next results</button></div></div>
-        <div class="def-table-scroll def-case-table" tabindex="0" role="region" aria-label="Sweep case table"><table aria-label="Sweep cases"><thead><tr><th scope="col">Case</th><th scope="col">Effective DEFs</th><th scope="col">Status</th>
+        ${flagged.length ? `<span class="def-filter" role="group" aria-label="Case filter">
+          <button data-case-filter="attention" aria-pressed="${filter === "attention"}" title="Blocked, failed, undetermined or limited cases, and cases with diagnostics or a failed comparison">Needs attention ${flagged.length}</button>
+          <button data-case-filter="all" aria-pressed="${filter === "all"}">All ${sweep.rows.length}</button></span>` : ""}
+        ${pages > 1 ? `<button data-page="-1" aria-label="Previous results" title="Previous results" ${page ? "" : "disabled"}>‹</button><span>${page + 1} / ${pages}</span>
+        <button data-page="1" aria-label="Next results" title="Next results" ${page + 1 < pages ? "" : "disabled"}>›</button>` : ""}</div></div>
+        <div class="def-table-scroll def-case-table" tabindex="0" role="region" aria-label="Sweep case table"><table aria-label="Sweep cases"><thead><tr><th scope="col">Case</th><th scope="col">DEFs</th>${showStatus ? '<th scope="col">Status</th>' : ""}
         ${comparing ? '<th scope="col">Actual</th><th scope="col">Reference</th><th scope="col">Error</th><th scope="col">Verdict</th>' : ""}
         ${sweep.registers.map((name) => `<th scope="col">${esc(name)} · ${mode} / raw</th>`).join("")}
         ${sweep.observeTime ? '<th scope="col">Q1 time</th>' : ""}<th scope="col">Diagnostics</th></tr></thead><tbody>
-        ${sweep.rows.slice(page * 50, (page + 1) * 50).map((row) => `<tr><th scope="row"><button data-case="${row.id}" ${disabled ? "disabled" : ""}>Case ${row.id}</button></th>
-        <td><code>${esc(assignments(row.defs))}</code></td><td>${esc(statusName(row.status))}</td>
+        ${rows.slice(page * 50, (page + 1) * 50).map((row) => `<tr><th scope="row"><button data-case="${row.id}" aria-label="Case ${row.id}" ${disabled ? "disabled" : ""}>${row.id}</button></th>
+        <td><code>${esc(assignments(row.defs))}</code></td>${showStatus ? `<td>${row.status === "completed" ? "" : esc(statusName(row.status))}</td>` : ""}
         ${comparing ? comparisonCells(derived.get(row.id)) : ""}
         ${sweep.registers.map((name) => {
           const word = row.words[name];
           return `<td class="def-observed-value">${word == null ? "—" : `${interpret(word, mode)} <code class="def-muted">${hex(word)}</code>`}</td>`;
         }).join("")}
         ${sweep.observeTime ? `<td class="def-observed-value">${row.q1_ns == null ? "—" : `${row.q1_ns} ns`}</td>` : ""}
-        <td>${esc(diagnostics(row)) || "—"}</td></tr>`).join("")}</tbody></table></div>`;
+        <td>${esc(diagnostics(row))}</td></tr>`).join("")}</tbody></table></div>`;
     }
 
     function comparisonCells(result) {
@@ -671,12 +721,12 @@
     }
 
     function metricSummary(observations, mode) {
-      const metrics = [["count", "Valid samples"], ["min", "Min"], ["max", "Max"], ["mean", "Mean"], ["deviation", "Population SD"]];
-      return `<h4>Observation statistics</h4><div class="def-table-scroll def-statistics-table" role="region" aria-label="Observation statistics" tabindex="0">
-        <table><thead><tr><th scope="col">Metric</th>${metrics.map(([, label]) => `<th scope="col">${label}</th>`).join("")}</tr></thead><tbody>
+      const metrics = [["count", "n", "Valid samples"], ["min", "min"], ["max", "max"], ["mean", "mean"], ["deviation", "sd", "Population standard deviation"]];
+      return `<div class="def-table-scroll def-statistics-table" role="region" aria-label="Observation statistics" tabindex="0">
+        <table><thead><tr><th scope="col" aria-label="Metric"></th>${metrics.map(([, label, title]) => `<th scope="col"${title ? ` title="${title}"` : ""}>${label}</th>`).join("")}</tr></thead><tbody>
         ${[...observations].map(([name, stats]) => `<tr ${name === "time" ? "data-time-statistics" : `data-statistics="${esc(name)}"`}>
-          <th scope="row">${name === "time" ? "Q1 time (ns)" : `${esc(name)} <span class="def-muted">${mode} 32-bit</span>`}</th>
-          ${metrics.map(([key]) => `<td data-stat="${key}">${stats ? format(stats[key]) : key === "count" ? 0 : "—"}</td>`).join("")}</tr>`).join("")}
+          <th scope="row">${name === "time" ? 'Q1 time <span class="def-muted">ns</span>' : `${esc(name)} <span class="def-muted">${mode}</span>`}</th>
+          ${metrics.map(([key]) => `<td data-stat="${key}"${stats && !Number.isInteger(stats[key]) ? ` title="${format(stats[key])}"` : ""}>${stats ? short(stats[key]) : key === "count" ? 0 : "—"}</td>`).join("")}</tr>`).join("")}
         </tbody></table></div>`;
     }
 
@@ -693,10 +743,7 @@
       const metrics = [...sweep.registers, ...(sweep.observeTime ? ["time"] : [])];
       const observations = new Map(metrics.map((metric) => [metric, sweep.statisticsOnly ?
         (metric === "time" ? sweep.summary?.time : sweep.summary?.registers?.[metric]?.[mode]) : statistics(sweep.rows, mode, metric)]));
-      const swept = new Set(sweep.plan.axes.map((axis) => axis.name));
-      const fixed = assignments(Object.fromEntries(Object.entries(sweep.defs).filter(([name]) => !swept.has(name))));
-      summary.innerHTML = `<p class="def-muted">${sweep.statisticsOnly ? "Statistics only · " : ""}${esc(sweep.mode)} · ${sweep.maxSteps} instruction limit${fixed ? ` · Fixed DEFs ${esc(fixed)}` : ""}</p>
-        ${metricSummary(observations, mode)}`;
+      summary.innerHTML = metricSummary(observations, mode);
       if (sweep.statisticsOnly) { output.innerHTML = ""; renderTable(); return; }
       formulaStatus.textContent = "";
       if (activeFormula) {
@@ -795,11 +842,11 @@
         if (values[def] === declaration) delete values[def];
         edits = { ...edits, [editKey()]: values };
         updateEdited(); renderControls(); save();
-      } else if (event.target.closest("[data-axis]")) requestPlan();
+      } else if (event.target.matches("input[data-range]")) { updateAxes(); requestPlan(); }
       else if (event.target === sampleField) renderControls();
     });
     panel.addEventListener("change", (event) => {
-      if (event.target === seqField) { selected = seqField.value; showAllRegisters = false; renderInputs(); }
+      if (event.target === seqField) { selected = seqField.value; showAllRegisters = false; field("verification").replaceChildren(); renderInputs(); }
       if (event.target === outputField) requestPlan();
       if (event.target === modeField) { renderTrace(); renderSweep(); }
       if (event.target === metricField) {
@@ -809,22 +856,18 @@
       }
       if (event.target.matches("input[data-register]")) { hasRegisterChoice = true; renderControls(); }
       if (event.target === timeField) renderControls();
-      if (event.target.matches("[data-axis] select")) {
-        const row = event.target.closest("[data-axis]");
-        const def = sequencer().defs.find((item) => item.name === event.target.value);
-        for (const input of row.querySelectorAll("input")) {
-          input.disabled = !def;
-          input.value = input.name === "step" ? "1" : def?.literal ?? "";
-        }
-        requestPlan();
-      }
       save();
     });
     panel.addEventListener("click", (event) => {
       const node = event.target.closest("button, [data-case]");
       if (!node) return;
-      const { action, location, reset, step, case: id, page: offset } = node.dataset;
+      const { action, location, reset, step, case: id, page: offset, caseFilter: filter } = node.dataset;
       if (action === "info" || action === "cancel") send(action);
+      if (action === "verify" && sequencer()) {
+        field("verification").textContent = "Verifying saved inputs…";
+        send("verify", target());
+      }
+      if (node.dataset.witness) vscode.postMessage({ type: "openVerificationWitness", key: node.dataset.witness, index: Number(node.dataset.index) });
       if (action === "toggle-registers") {
         showAllRegisters = !showAllRegisters;
         renderRegisterChoices();
@@ -849,6 +892,7 @@
       if (action === "instruction-source") navigate(instructions[position]?.event.source);
       if (id !== undefined) openCase(id);
       if (offset !== undefined) { page += Number(offset); renderTable(); }
+      if (filter) { caseFilter = filter; page = 0; renderTable(); }
     });
     panel.addEventListener("keydown", (event) => {
       const point = event.target.closest(".def-plot-point");
@@ -861,13 +905,16 @@
       }
     });
     window.addEventListener("message", ({ data }) => {
-      if (data?.type === "setUnsavedChanges") { unsaved = data.hasUnsavedChanges; renderControls(); return; }
+      if (data?.type === "setUnsavedChanges") { unsaved = data.hasUnsavedChanges; if (unsaved) field("verification").replaceChildren(); renderControls(); return; }
       if (data?.project !== project) return;
-      if (data.type === "defRunState") {
+      if (data.type === "verificationResult" && data.sequencer === selected && data.revision === state.info?.revision && !unsaved) {
+        field("verification").innerHTML = (data.result?.checks || []).map((item, i) =>
+          `<p>${esc(item.text)} ${item.hasReplay ? `<button data-witness="${esc(data.result.key)}" data-index="${i}">Open counterexample timeline</button>` : ""}</p>`).join("");
+      } else if (data.type === "defRunState") {
         const oldInfo = state.info, wasBusy = state.busy, previousTrace = state.trace?.id;
-        if (data.patch.sweep?.id && state.sweep?.id !== data.patch.sweep.id) page = 0;
+        if (data.patch.sweep?.id && state.sweep?.id !== data.patch.sweep.id) { page = 0; caseFilter = undefined; }
         Object.assign(state, data.patch);
-        if (oldInfo !== state.info) renderInputs();
+        if (oldInfo !== state.info) { field("verification").replaceChildren(); renderInputs(); }
         else if (wasBusy && !state.busy && !plan) requestPlan();
         if (Object.hasOwn(data.patch, "trace")) renderTrace(["run", "case"].includes(wasBusy) && previousTrace !== state.trace?.id);
         if (Object.hasOwn(data.patch, "sweep")) renderSweep();

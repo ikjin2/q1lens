@@ -17,7 +17,7 @@ from q1timeline.render.html import render_html
     ("move 1,R64", "invalid_argument_type"),
     ("wait -1", "invalid_argument_value"),
     ("jmp @missing", "undefined_label"),
-    ("move $MISSING,R0", "unresolved_symbol"),
+    ("move $R7,R0", "unresolved_symbol"),
 ])
 def test_invalid_line_is_excluded_without_changing_remaining_timing(mode, bad_line, category):
     source = f"wait 1000\n{bad_line}\nwait 2000\nstop\n"

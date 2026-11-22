@@ -38,7 +38,9 @@ export function buildWebviewHtml(input: WebviewHtmlInput): string {
 <body>
   <header class="topbar">
     <h1>${title}</h1>
-    <button id="refresh-button" type="button" aria-label="Refresh timeline">Refresh</button>
+    <button id="refresh-button" class="icon-button" type="button" aria-label="Refresh timeline" title="Refresh timeline"><svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M12.5 8a4.5 4.5 0 1 1-1.3-3.2M12.5 2.3v2.8H9.7"/></svg></button>
+    <div id="qbs-tools" class="topbar-tools"></div>
+    <div id="qbs-status" class="topbar-status"></div>
   </header>
   <main id="qbs-root" class="timeline-shell" aria-live="polite"></main>
   <script nonce="${input.nonce}" src="${input.instructionColorsScriptUri}"></script>

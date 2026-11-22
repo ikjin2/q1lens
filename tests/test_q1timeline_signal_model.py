@@ -36,6 +36,27 @@ def test_play_replaces_waveform_and_zeroes_after_memory_end():
     assert samples(model, "waveform", "q", end=6) == [0, 0, 0.5, 0.25, -0.5, 0]
 
 
+def test_stationary_spans_match_single_grid_steps_across_wave_and_nco_changes():
+    config = {"sample_period_ns": 3, "sequencers": {"drive": {
+        "offset": [1.5, -0.0], "fir": [-1], "iir": {"a": [0.5], "b": [-1]},
+        "input": {"kind": "constant", "i": 1.25, "q": -0.0},
+    }}}
+    memory = {"drive": sequence([-0.0, 0.25, -0.5, 1.0], [0.0, -1.0])}
+    batched, stepped = (SignalModel(config, memory) for _ in range(2))
+    for model in (batched, stepped):
+        model.apply("drive", 7, "play", [0, 1, 4], {})
+        model.apply("drive", 23, "upd_param", [4], {"frequency": 50_000_000})
+        model.apply("drive", 49, "upd_param", [4], {"frequency": 0, "awg_offset": [-512, 0]})
+    for time in range(1, 70, 3):
+        stepped.export(time)
+    result = batched.export(70)["drive"]
+    assert result == stepped.export(70)["drive"]
+    assert result["clipping"]["adc_samples"] == 24
+    assert 0 < result["clipping"]["dac_samples"] < 24
+    for stage, paths in batched.signals["drive"].stages.items():
+        assert [p.tobytes() for p in paths] == [p.tobytes() for p in stepped.signals["drive"].stages[stage]]
+
+
 def test_nco_keeps_phase_continuous_when_frequency_changes():
     model = SignalModel({"sequencers": {"drive": {"offset": [0.5, 0], "nco_frequency_hz": 125e6}}}, {"drive": sequence()})
     model.apply("drive", 2, "upd_param", [4], {"frequency": 0, "_updated_fields": ["frequency"]})

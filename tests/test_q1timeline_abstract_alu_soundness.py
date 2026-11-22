@@ -244,3 +244,40 @@ def test_symbolic_status_branches_match_concrete_for_every_flag_combination():
             concrete = dict(zip(flags, values))
             bindings = [(flag, z3.BoolVal(concrete[name])) for name, flag in flags.items()]
             assert z3.is_true(z3.simplify(z3.substitute(decision, *bindings))) == core.branch_on_flags(op, concrete)
+
+
+@pytest.mark.parametrize("op", sorted(core_alu.ALU_OPS - {"not"}))
+def test_mixed_int_bitvector_operands_match_concrete_in_either_order(op):
+    z3 = pytest.importorskip("z3")
+    ctx = z3.Context()
+    x = z3.BitVec("word", 32, ctx=ctx)
+    item = instruction(op, "R0", "R1")
+    for left, right in [(0x80000001, 0), (0xFFFFFFFF, 3), (0x80000000, 32)]:
+        expected = core.issue(item, (left, right))
+        for inputs, binding in [((x, right), left), ((left, x), right)]:
+            words, flags = core_alu.evaluate(item, inputs)
+            replacement = (x, z3.BitVecVal(binding, 32, ctx=ctx))
+            assert tuple(z3.simplify(z3.substitute(word, replacement)).as_long() for word in words) == expected.words
+            for name, flag in flags.items():
+                assert flag.ctx == ctx
+                resolved = z3.simplify(z3.substitute(flag, replacement))
+                assert resolved.eq(z3.BoolVal(expected.flags.as_dict()[name], ctx=ctx))
+
+
+def test_mixed_and_partial_status_flags():
+    z3 = pytest.importorskip("z3")
+    ctx = z3.Context()
+    sign = z3.Bool("sign", ctx=ctx)
+    mixed = {"zf": False, "nf": sign, "cf": True, "of": False}
+    for op in core.STATUS_BRANCH_OPS | {"jge"}:
+        decision = core.branch_on_flags(op, mixed)
+        for value in (False, True):
+            expected = core.branch_on_flags(op, {**mixed, "nf": value})
+            if isinstance(decision, bool):
+                assert decision == expected
+            else:
+                resolved = z3.substitute(decision, (sign, z3.BoolVal(value, ctx=ctx)))
+                assert z3.simplify(resolved).eq(z3.BoolVal(expected, ctx=ctx))
+    assert core.branch_on_flags("js", {"nf": sign}).eq(sign)
+    assert core.branch_on_flags("jle", {"zf": True, "nf": sign}) is True
+    assert core.branch_on_flags("jg", {"nf": sign}) is None

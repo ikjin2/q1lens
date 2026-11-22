@@ -428,6 +428,27 @@ def test_acquisition_without_input_is_blocked_instead_of_inventing_zero() -> Non
     assert not events(state, "acquisition_result")
 
 
+@pytest.mark.parametrize("digital", [False, True])
+def test_scenario_acquisitions_preserve_per_bin_fifo_and_original_input_indices(digital) -> None:
+    op = "acquire_digital" if digital else "acquire"
+    program = {"a": f"{op} 0,0,20\n{op} 0,1,20\n{op} 0,0,20\nstop", "b": f"{op} 0,0,20\nstop"}
+    rows = []
+    for seq, acquisition, bin_index, value in [("b", 0, 0, 1), ("a", 1, 0, 0), ("a", 0, 1, 0),
+                                                ("a", 0, 0, 1), ("a", 0, 0, 0)]:
+        payload = {"kind": op, "level": value} if digital else {"i": value}
+        rows.append({"sequencer": seq, "acquisition_index": acquisition, "bin_index": bin_index, **payload})
+    if digital:
+        rows[1] = {"sequencer": "a", "acquisition_index": 0, "bin_index": 0, "kind": "acquire_ttl", "count": 9}
+    memory = {seq: {"acquisitions": {"bins": {"index": 0, "num_bins": 2}}} for seq in program}
+    a, b = run(program, sequences=memory, inputs={"digital_acquisitions" if digital else "acquisitions": rows})
+    assert status(a) == status(b) == "completed"
+    for state, expected in [(a, [3, 2, 4]), (b, [0])]:
+        results = [event.meta for event in events(state, "acquisition_result")]
+        assert [(result["source"] if digital else result)["input_index"] for result in results] == expected
+        field = "level" if digital else "i"
+        assert [result[field] for result in results] == [rows[i][field] for i in expected]
+
+
 def test_acquisition_completion_includes_drive_changes_during_the_window() -> None:
     drive, readout = run({
         "drive": "set_awg_offs 0,0\nupd_param 8\nset_awg_offs 16384,0\nupd_param 20\nstop",

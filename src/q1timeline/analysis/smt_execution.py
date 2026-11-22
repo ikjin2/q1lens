@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import operator
 from dataclasses import dataclass, field, replace
+from time import monotonic
 
 import z3
 
 from q1timeline.analysis.smt import Query, VerificationResult
-from q1timeline.analysis.smt_queue import FixedStartQueue
+from q1timeline.analysis.smt_queue import BufferedQueue, FixedStartQueue
 from q1timeline.q1asm import core, core_alu, core_rt
 from q1timeline.q1asm.ast import Instr
 from q1timeline.q1asm.compiled_addresses import next_compiled_pc
@@ -33,7 +34,9 @@ class _State:
     fifo: tuple = ()
     skip: bool | z3.BoolRef = False
     else_ns: int | z3.ArithRef = 0
-    queue: FixedStartQueue | None = None
+    queue: BufferedQueue | FixedStartQueue | None = None
+    prefill_delay: int | z3.ArithRef = 0
+    skipped_issues: int | z3.ArithRef = 0
 
 
 class _EndPath(Exception):
@@ -46,8 +49,8 @@ class _Witness(Exception):
 
 
 class Explorer:
-    def __init__(self, code: tuple[Instr, ...], symbolic_args, low: int, high: int,
-                 query: Query, max_steps: int, max_paths: int):
+    def __init__(self, code: tuple[Instr, ...], symbolic_args, domain,
+                 query: Query, max_steps: int, max_paths: int, deadline: float | None):
         self.code = code
         self.symbolic_args = symbolic_args
         self.query = query
@@ -55,20 +58,25 @@ class Explorer:
         self.max_paths = max_paths
         self.paths = 1
         self.incomplete = None
+        self.visited_observation = False
         # Both -1 and 4294967295 are legal DEF values. They become the same
         # 32-bit word only when the instruction reads its operand.
-        self.input = z3.BitVec("def_input", 33)
-        self.word = z3.Extract(31, 0, self.input)
+        self.inputs = {name: z3.BitVec(f"def_{name}", 33) for name in domain}
+        self.words = {name: z3.Extract(31, 0, word) for name, word in self.inputs.items()}
+        self.deadline = deadline
         self.solver = z3.Solver()
         self.solver.set(timeout=5000)
-        self.solver.add(low <= self.input, self.input <= high)
+        for name, (low, high) in domain.items():
+            self.solver.add(low <= self.inputs[name], self.inputs[name] <= high)
 
     def run(self):
         queue = None
         if self.query.kind == "underflow" and any(get_instruction_spec(i.op).emits_rt_packet for i in self.code):
-            queue = FixedStartQueue.start(self.query.value)
+            queue = BufferedQueue() if self.query.buffered_start else FixedStartQueue.start(self.query.value)
         frontier = [_State(z3.BoolVal(True), queue=queue)]
         while frontier:
+            if self.deadline is not None and monotonic() >= self.deadline:
+                return VerificationResult("unknown", "Verification timed out.")
             state = frontier.pop()
             try:
                 if state.steps >= self.max_steps:
@@ -90,9 +98,16 @@ class Explorer:
         if self.incomplete:
             return VerificationResult("unknown", self.incomplete)
         existential = self.query.kind in {"reachable", "path", "underflow"}
+        if not existential and self.query.pc is not None and not self.visited_observation:
+            return VerificationResult("proved", "The assertion label is unreachable for every input in the domain.")
         return VerificationResult("unreachable" if existential else "proved")
 
     def _model(self, condition, *, prune_unknown=False):
+        if self.deadline is not None:
+            remaining = self.deadline - monotonic()
+            if remaining <= 0:
+                raise _EndPath("Verification timed out.")
+            self.solver.set(timeout=max(1, min(5000, int(remaining * 1000))))
         status = self.solver.check(condition)
         if status == z3.sat:
             return self.solver.model()
@@ -130,16 +145,33 @@ class Explorer:
             return
         model = self._model(z3.And(state.condition, test), prune_unknown=True)
         if model is not None:
+            issue_count = state.steps + 1 + state.skipped_issues
+            if z3.is_expr(issue_count):
+                # Prefer an input whose independently replayed prefix fits the issue budget.
+                small = self._model(z3.And(state.condition, test, issue_count <= self.max_steps))
+                if small is not None:
+                    model = small
+                issue_count = model.eval(issue_count).as_long()
             observed = model.eval(value).as_long() if z3.is_expr(value) else value
-            raise _Witness(VerificationResult(status, def_value=model.eval(self.input).as_signed_long(),
-                                              register_value=observed, steps=state.steps + 1))
+            inputs = {name: model.eval(word, model_completion=True).as_signed_long()
+                      for name, word in self.inputs.items()}
+            raise _Witness(VerificationResult(status, def_value=next(iter(inputs.values()), None),
+                                              register_value=observed, steps=issue_count, inputs=inputs))
 
     def _step(self, state):
         item = self.code[state.pc]
         op = item.op
+        if self.query.kind in {"q1_time", "rt_time", "register"} and self.query.pc == state.pc:
+            self.visited_observation = True
+            if self.query.kind == "register" and self.query.register in state.busy:
+                self.incomplete = f"{self.query.register} is not ready at line {item.source.line}."
+            elif self.query.kind == "register" and self.query.register not in state.registers:
+                self.incomplete = f"{self.query.register} has no readable value at line {item.source.line}."
+            else:
+                self._finish(state, ())
         if op not in core.LOCAL_OPS or op == "illegal":
             raise _EndPath(f"Unsupported instruction {op} on line {item.source.line}.")
-        if self.query.kind == "underflow" and (op.startswith("acquire") or op in {"set_digital", "play"}):
+        if self.query.kind == "underflow" and (op.startswith("acquire") or op in {"set_digital", "wait_sync"}):
             raise _EndPath(f"Simulation side effects of {op} are outside the fixed-start FIFO model.")
         destinations = core.destination_indexes(op)
         inputs = []
@@ -157,7 +189,7 @@ class Explorer:
                 else:
                     raise _EndPath(f"{arg.value} is uninitialized on line {item.source.line}.")
             elif i in self.symbolic_args[state.pc]:
-                value = self.word
+                value = self.words[self.symbolic_args[state.pc][i]]
             else:
                 value = z3.BitVecVal(int(arg.value), 32)
             inputs.append(value)
@@ -180,6 +212,9 @@ class Explorer:
         elif op == "set_cond":
             state = self._condition(state, item, inputs)
         elif op in core_rt.RT_OPS:
+            for index, role, low, high in core_rt.OPERAND_RANGES.get(op, ()):
+                state = self._require(state, z3.And(z3.UGE(inputs[index], low), z3.ULE(inputs[index], high)),
+                                      f"Invalid {op} {role} on line {item.source.line}.")
             duration = inputs[-1]
             state = self._require(state, _valid_duration(duration), f"Invalid {op} duration on line {item.source.line}.")
             wait = z3.BV2Int(duration)
@@ -208,7 +243,8 @@ class Explorer:
             state = replace(state, sync=state.sync + sync_adjustment)
         self._observe_issue(state)
         if op == "stop":
-            self._finish(state, inputs)
+            if self.query.pc is None:
+                self._finish(state, inputs)
             return
         yield replace(state, steps=state.steps + 1, pc=state.pc + 1)
 
@@ -229,6 +265,25 @@ class Explorer:
         op = item.op
         target = inputs[-1]
         state = replace(state, busy=())
+        # Before the first enqueue there is no armed RT deadline. A counted
+        # delay containing only nops may be collapsed exactly, including the
+        # zero counter's full 32-bit wrap. Preserve its time for witness replay.
+        if op == "loop" and isinstance(state.queue, BufferedQueue) and not state.queue.dwells:
+            dest = z3.simplify(target)
+            if item.args[-1].raw.startswith("@") and z3.is_bv_value(dest) and dest.as_long() <= state.pc:
+                body = self.code[dest.as_long():state.pc]
+                if all(ins.op == "nop" for ins in body):
+                    repeats = z3.BV2Int(inputs[0] - 1)
+                    cost = get_instruction_spec(op).q1_time_model(item)
+                    extra = sum(get_instruction_spec(ins.op).q1_time_model(ins) for ins in body) + cost
+                    _, words, flags = core.branch_effect(item, (z3.BitVecVal(1, 32), target), state.flags)
+                    state = self._timing(state, branch_duration(cost, False), None)
+                    pc = next_compiled_pc(state.pc, item, taken=False, target=None, fault=False, code_size=len(self.code))
+                    yield replace(state, registers={**state.registers, item.args[0].value: words[0]}, flags=flags,
+                                  prefill_delay=state.prefill_delay + repeats * extra,
+                                  skipped_issues=state.skipped_issues + repeats * (len(body) + 1),
+                                  pc=pc, steps=state.steps + 1)
+                    return
         if not item.args[-1].raw.startswith("@"):
             state = self._require(state, z3.ULE(target, 16383), f"Branch target outside the address range at PC {state.pc}.")
         condition, words, flags = core.branch_effect(item, tuple(inputs), state.flags)
@@ -275,8 +330,11 @@ class Explorer:
 
     def _timing(self, state, cost, dwell, *, stop=False):
         if state.queue is not None:
-            queue, failed = state.queue.issue(cost, dwell=dwell, stop=stop)
-            self._witness(state, failed, "reachable", state.queue.next_dequeue)
+            if z3.is_int_value(dwell):
+                dwell = dwell.as_long()
+            queue, failed, when = state.queue.issue(cost, dwell=dwell, stop=stop)
+            if when is not None:
+                self._witness(state, failed, "reachable", when + state.prefill_delay)
             state = replace(state, queue=queue)
         if self.query.kind not in {"q1_time", "rt_time"}:
             return state

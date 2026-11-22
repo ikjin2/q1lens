@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.11
+
+- Compare a routed port across two compiled projects with `q1lens compare-output`. Fixed-input `no_clip` and `peak` checks now cover FIR-filtered samples and the filter tail.
+
+- Inspect symbolic waveform intervals, repeated gain ramps and routed baseband port output in Hardware. Check clipping, signed area and peak bounds and open the Concrete waveform counterexample from the editor.
+
+- Show verified RT queue boundaries and source assertions in the editor and Sweep. Open a counterexample at its recorded timeline event and inspect the register history.
+- Automatic Z3 verification is off by default. Enable it from the Q1ASM status bar or run **Verify Program** on demand.
+- Explain unreachable branches when a program tests the same feedback word again.
+- Show less text in every panel. Group diagnostics by kind with line links ordered by consequence, show the selected event on one line under the timeline, group the timeline toolbar with an issue count, and omit panels that have nothing to show.
+- Merge DEF run inputs and sweep ranges into one table, summarize sweep results on one line and list cases that need attention first. Round displayed statistics to four significant digits and keep exact values in tooltips.
+- Shorten Hardware, QBS timeline, sidebar, Python setup and counterexample text, and show each file link and status once.
+- Check sequencer alignment across measurement outcomes and compare the RT traces of two programs. The `q1lens verify` and `q1lens equiv` commands return the same verdicts for CI.
+- Pair with Python package 0.2.11.
+
 ## 0.2.10
 
 - Model more Q1ASM and QTM behavior, including zero-duration RT packets, trigger counters and forwarding, digital acquisition, scope capture, and NetZero compensation.

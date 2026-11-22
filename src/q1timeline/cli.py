@@ -676,6 +676,9 @@ def _analyze_command(args: argparse.Namespace) -> int:
         )
         if sequence_names is not None:
             state.metadata["weight_lengths"] = sequence_names.weight_lengths
+        sequence = config.output_sequence(sequencer, sequence_names.data if sequence_names else None)
+        if sequence:
+            state.metadata["output_sequence"] = sequence
         states.append(state)
     if execution_mode == "simulation":
         from q1timeline.simulation.runtime import simulate_programs
@@ -695,6 +698,10 @@ def _analyze_command(args: argparse.Namespace) -> int:
                 print(f"q1timeline analyze: {exc}", file=sys.stderr)
             return 2
     for state, sequencer in zip(states, config.sequencers):
+        if execution_mode == "simulation":
+            sequence = config.output_sequence(sequencer, simulation_sequences.get(sequencer.id))
+            if sequence:
+                state.metadata["output_sequence"] = sequence
         state.metadata["module"] = sequencer.module
         state.metadata["hardware_parameters"] = dict(sequencer.hardware_parameters)
         state.metadata["sequencer_index"] = sequencer.sequencer_index
@@ -716,6 +723,7 @@ def _analyze_command(args: argparse.Namespace) -> int:
         },
         diagnostics=diagnostics,
         feedback_routes=config.simulation.get("routes", ()),
+        modules=config.modules,
     )
     output_target: Path | None = None
     try:
@@ -796,7 +804,8 @@ def build_parser() -> argparse.ArgumentParser:
     queries.add_argument("--assert", dest="assertion", metavar="EXPR", help="compare R0..R63, stop_code, q1_time or rt_time")
     queries.add_argument("--reach", metavar="LABEL_OR_PC", help="reach an instruction at a label or compiled PC")
     queries.add_argument("--path", metavar="BRANCH=OUTCOME,...", help="reach ordered taken/fallthrough branch outcomes")
-    queries.add_argument("--underflow-at", type=int, metavar="STARTUP_NS", help="reach an RT queue underflow at fixed startup")
+    queries.add_argument("--underflow-at", type=int, metavar="STARTUP_NS",
+                         help="check for RT queue underflow at fixed startup (exit 0 if safe, 1 on underflow, 2 if unknown)")
     prove.add_argument("--max-steps", type=int, default=10000, help="maximum Q1 issues per path (default 10000)")
     prove.add_argument("--max-paths", type=int, default=256, help="maximum number of paths to explore (default 256)")
     prove.add_argument("--replay-ir", type=Path, help="write the verified witness timeline")

@@ -37,9 +37,10 @@ async function open(page, html) {
   await analysisDetails(page);
 }
 
+// Rejections of one kind share a diagnostic row; each source location keeps its own links.
 function row(page, location) {
-  return page.locator('[data-diagnostic-category="feedback_write_combine"]')
-    .filter({has: page.getByText(location, {exact: true})});
+  return page.locator('[data-diagnostic-category="feedback_write_combine"]' +
+    ` .diagnostic-occurrence[data-diagnostic-location="${location}"]`);
 }
 
 test("standalone TB rejection links open each retained contributor and local cutoff", async ({page}) => {
@@ -67,8 +68,12 @@ test("standalone TB rejection links open each retained contributor and local cut
 test("standalone TB rejection actions keep only distinct retained evidence", async ({page}) => {
   const {partial, success} = fixtures();
   await open(page, partial);
-  await expect(row(page, "rx.q1asm:1").getByRole("link")).toHaveText(["Show event", "Show b contribution", "Show rx RT cutoff"]);
-  await expect(row(page, "a.q1asm:3").getByRole("link")).toHaveText(["Show event"]);
+  // The first link is the line chip (named "Show event"); the others name their evidence.
+  await expect(row(page, "rx.q1asm:1").getByRole("link")).toHaveText(["1", "Show b contribution", "Show rx RT cutoff"]);
+  await expect(row(page, "rx.q1asm:1").getByRole("link", {name: "Show event", exact: true})).toHaveText("1");
+  await expect(row(page, "a.q1asm:3").getByRole("link")).toHaveText(["3"]);
+  await expect(row(page, "a.q1asm:3").getByRole("link", {name: "Show event", exact: true})).toHaveCount(1);
+  await expect(page.locator('.diagnostic[data-diagnostic-category="feedback_write_combine"]')).toHaveCount(1);
   await open(page, success);
   await expect(page.locator("a[data-tb-evidence]")).toHaveCount(0);
 });

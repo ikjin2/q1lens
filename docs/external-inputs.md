@@ -25,7 +25,8 @@ events. Sources must have unique, nonempty IDs. Each occurrence has one stable
 ID shared by every recipient. An occurrence can release one `wait_trigger` per
 recipient and also increment its enabled trigger counter once.
 
-The Scenario input summary beside Play opens Configure. Apply & rerun validates
+The inputs button beside Refresh (tooltip: Configure external inputs) opens Configure;
+its badge counts the configured sources and its tooltip lists them. Apply & rerun validates
 the entire configuration before replacing the active scenario and recomputes the
 trace from the start. Branch and feedback choices are retained. Unsaved changes
 are marked explicitly. Save to project persists the applied configuration; Reset

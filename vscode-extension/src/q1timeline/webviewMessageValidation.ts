@@ -17,6 +17,7 @@ function parseDefRunMessage(message) {
   if (action === "case" && typeof sweepId === "string" && Number.isSafeInteger(caseId) && caseId > 0 &&
       hasOnlyKeys(message, [...base, "sweepId", "caseId"])) return { ...message, valid: true };
   if (![revision, sequencer, uri].every((value) => typeof value === "string" && value.length > 0)) return { valid: false };
+  if (action === "verify" && hasOnlyKeys(message, [...base, ...target])) return { ...message, valid: true };
   const validAxes = Array.isArray(axes) && axes.length >= 1 && axes.length <= 2 && axes.every((axis) =>
     axis && typeof axis === "object" && hasOnlyKeys(axis, ["name", "min", "max", "step"]) &&
     [axis.name, axis.min, axis.max, axis.step].every(literal));
@@ -45,6 +46,9 @@ function parseWebviewMessage(message) {
   }
 
   if (message.type === "defRun") return parseDefRunMessage(message);
+  if (message.type === "verifyAlignment" && hasOnlyKeys(message, ["type"])) return { valid: true, type: message.type };
+  if (message.type === "openVerificationWitness" && typeof message.key === "string" && message.key.length === 36 &&
+      Number.isSafeInteger(message.index) && message.index >= 0 && hasOnlyKeys(message, ["type", "key", "index"])) return { ...message, valid: true };
 
   if (
     message.type === "eventClick" &&

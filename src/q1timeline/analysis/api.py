@@ -11,9 +11,9 @@ from q1timeline.analysis.hardware_readiness import analyze_hardware_readiness
 from q1timeline.analysis.underflow import analyze_underflows
 from q1timeline.execution.state import AnalysisState
 from q1timeline.external_inputs import concrete_receiver_inputs, validate_external_inputs
-from q1timeline.project import is_valid_alignment_mode, is_valid_branch_policy, validate_params_json_mapping
-from q1timeline.q1asm.parser import parse_q1asm
-from q1timeline.sequence import sequence_weight_lengths
+from q1timeline.project import ProjectConfig, is_valid_alignment_mode, is_valid_branch_policy, validate_params_json_mapping
+from q1timeline.q1asm.parser import parse_q1asm, parse_q1asm_file
+from q1timeline.sequence import load_sequence_data, load_sequence_names, sequence_weight_lengths
 from q1timeline.simulation.config import validate_simulation
 
 
@@ -137,6 +137,53 @@ def analyze_documents(
     )
 
 
+def analyze_project_states(config: ProjectConfig) -> list[AnalysisState]:
+    if config.analysis.execution_mode == "simulation":
+        from q1timeline.simulation.runtime import simulate_programs
+
+        sequences = {seq.id: load_sequence_data(seq.sequence_json) for seq in config.sequencers if seq.sequence_json}
+        states = simulate_programs(
+            {seq.id: parse_q1asm_file(seq.file) for seq in config.sequencers},
+            params=config.params, max_steps=config.analysis.max_steps,
+            simulation=config.simulation,
+            sequences=sequences,
+            hardware_parameters={seq.id: seq.hardware_parameters for seq in config.sequencers},
+            sequencer_metadata=config.sequencer_metadata(),
+        )
+        for state, seq in zip(states, config.sequencers):
+            sequence = config.output_sequence(seq, sequences.get(seq.id))
+            if sequence:
+                state.metadata["output_sequence"] = sequence
+        return states
+    from q1timeline.analysis.interpreter import interpret_program
+
+    states = []
+    for sequencer in config.sequencers:
+        sequence_names = load_sequence_names(sequencer.sequence_json) if sequencer.sequence_json else None
+        config.diagnostics.extend(sequence_names.diagnostics if sequence_names else [])
+        program = parse_q1asm_file(sequencer.file)
+        state = interpret_program(
+            program,
+            sequencer_id=sequencer.id,
+            params=config.params,
+            waveform_names=sequence_names.waveforms if sequence_names else None,
+            acquisition_names=sequence_names.acquisitions if sequence_names else None,
+            branch_policy=config.analysis.branch_policy,
+            execution_mode=config.analysis.execution_mode,
+            external=config.concrete_inputs(sequencer, config.params) if config.analysis.execution_mode == "concrete" else None,
+            max_steps=config.analysis.max_steps,
+        )
+        state.metadata["hardware_parameters"] = dict(sequencer.hardware_parameters)
+        if sequence_names is not None:
+            state.metadata["weight_lengths"] = sequence_names.weight_lengths
+        sequence = config.output_sequence(sequencer, sequence_names.data if sequence_names else None)
+        if sequence:
+            state.metadata["output_sequence"] = sequence
+        states.append(state)
+    analyze_underflows(states)
+    return states
+
+
 def _analyze_program_text(
     text: str,
     *,
@@ -174,6 +221,8 @@ def _analyze_program_text(
                   if execution_mode == "concrete" and external_inputs is not None else None),
     )
     state.metadata["weight_lengths"] = sequence_weight_lengths(sequence)
+    if sequence is not None:
+        state.metadata["output_sequence"] = sequence
     return state
 
 

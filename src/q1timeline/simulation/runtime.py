@@ -10,6 +10,7 @@ from collections import deque
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 import heapq
+from time import monotonic
 from typing import Any
 
 from q1timeline.execution import issue as q1_issue, operands as operand_binding, registers as register_writes
@@ -284,6 +285,7 @@ def simulate_programs(
     branch_assumptions: Mapping[str, str] | None = None,
     hardware_parameters: Mapping[str, Mapping[str, int | str | bool]] | None = None,
     sequencer_metadata: Mapping[str, Mapping[str, int | str | None]] | None = None,
+    deadline: float | None = None,
 ) -> list[execution_state.AnalysisState]:
     """Run a scenario, optionally selecting a conditional branch occurrence.
 
@@ -344,7 +346,7 @@ def simulate_programs(
         signals = SignalModel(config["physical"], memories) if config["physical"] else None
         engine = _Runtime(programs, params or {}, max_steps, config, signals, strict_q1asm, choices,
                           prepared_programs or {}, paths, memories, hardware_parameters or {}, sequencer_metadata or {})
-        states = engine.run()
+        states = engine.run(deadline)
         unused = set(choices) - engine.applied_branch_choices
         # A comparison can end before a Q1 choice reached by the recorded run.
         if unused and not comparison:
@@ -528,8 +530,14 @@ class _Runtime:
         self.qtm_truth_pending: dict[tuple[str, int], dict] = {}
         self.qrm_scope_latest: dict[tuple[str, str], tuple[_Sequencer, dict]] = {}
         self.qrm_scope_buffers: dict[tuple[str, str], dict] = {}
-        self.used_acquisition_inputs: set[int] = set()
-        self.used_digital_inputs: set[int] = set()
+        self.acquisition_inputs: dict[tuple[str, int, int, str | None], list[tuple[int, dict]]] = {}
+        for field in ("acquisitions", "digital_acquisitions"):
+            rows = config["inputs"].get(field, [])
+            # Store each bin's first scenario row at the end for FIFO consumption via pop().
+            for index in reversed(range(len(rows))):
+                row = rows[index]
+                key = row["sequencer"], row["acquisition_index"], row["bin_index"], row.get("kind")
+                self.acquisition_inputs.setdefault(key, []).append((index, row))
         self.tb_groups: dict[tuple, list[dict]] = {}
         for name, program in programs.items():
             prepared = prepared_programs.get(name)
@@ -772,8 +780,10 @@ class _Runtime:
             self.sync_waiters.pop(seq.state.sequencer_id, None)
         return pending_rt_wait
 
-    def run(self) -> list[execution_state.AnalysisState]:
+    def run(self, deadline: float | None = None) -> list[execution_state.AnalysisState]:
         while self.events:
+            if deadline is not None and monotonic() >= deadline:
+                raise TimeoutError("Verification timed out.")
             ticks, phase, _serial, name, action, data = heapq.heappop(self.events)
             time = ticks // 128 if ticks % 128 == 0 else ticks / 128
             seq = self.sequencers[name]
@@ -1782,7 +1792,7 @@ class _Runtime:
                 return hardware["integration_length_acq"], "hardware_parameters"
         else:
             weights = command.args[2:4]
-            if "input" in physical and self.find_acquisition_input(name, *command.args[:2]) is None:
+            if "input" in physical and self.acquisition_input(name, *command.args[:2], consume=False) is None:
                 return self.signals.acquisition_duration(name, command.duration, weights), "weight_memory"
             entries = self.memories[name].get("weights", {})
             if isinstance(entries, Mapping):
@@ -1793,12 +1803,12 @@ class _Runtime:
                     return max(lengths[index] for index in weights), "weight_memory"
         return command.duration, "instruction_duration_fallback"
 
-    def find_acquisition_input(self, name: str, acquisition: int, bin_index: int) -> tuple[int, dict] | None:
-        for index, item in enumerate(self.config.get("inputs", {}).get("acquisitions", [])):
-            if (index not in self.used_acquisition_inputs and item["sequencer"] == name
-                    and item["acquisition_index"] == acquisition and item["bin_index"] == bin_index):
-                return index, item
-        return None
+    def acquisition_input(self, name: str, acquisition: int, bin_index: int, kind: str | None = None,
+                          *, consume: bool) -> tuple[int, dict] | None:
+        rows = self.acquisition_inputs.get((name, acquisition, bin_index, kind))
+        if not rows:
+            return None
+        return rows.pop() if consume else rows[-1]
 
     def start_qrm_scope(self, seq: _Sequencer, event: execution_state.TimelineEvent) -> None:
         if seq.state.metadata.get("module_type") not in QRM_MODULE_TYPES:
@@ -1927,19 +1937,11 @@ class _Runtime:
                 event.meta["bin_aggregate"] = result["bin_aggregate"] = aggregate
         return result, event
 
-    def find_digital_input(self, seq: _Sequencer, command: _Command, acquisition: int, bin_index: int) -> tuple[int, dict] | None:
-        for index, item in enumerate(self.config["inputs"].get("digital_acquisitions", [])):
-            if (index not in self.used_digital_inputs and item["sequencer"] == seq.state.sequencer_id
-                    and item["kind"] == command.instruction.op and item["acquisition_index"] == acquisition and item["bin_index"] == bin_index):
-                return index, item
-        return None
-
     def supplied_digital(self, seq: _Sequencer, command: _Command, acquisition: int, bin_index: int) -> dict | None:
-        supplied = self.find_digital_input(seq, command, acquisition, bin_index)
+        supplied = self.acquisition_input(seq.state.sequencer_id, acquisition, bin_index, command.instruction.op, consume=True)
         if supplied is None:
             return None
         index, item = supplied
-        self.used_digital_inputs.add(index)
         return {key: item[key] for key in ("count", "count_valid", "level", "timetag_ticks") if key in item} | {
             "status": "supplied", "source": {"kind": "digital_scenario", "input_index": index}}
 
@@ -2045,7 +2047,8 @@ class _Runtime:
             routes = self.qtm_trigger_routes(seq, settings["forward_trigger_address"])
         if not routes:
             return
-        supplied = self.find_digital_input(seq, command, *command.args[:2]) if command.op == "acquire_ttl" else None
+        supplied = (self.acquisition_input(seq.state.sequencer_id, *command.args[:2], command.op, consume=False)
+                    if command.op == "acquire_ttl" else None)
         count_limit = supplied[1]["count"] if supplied is not None else None
         if count_limit == 0:
             return
@@ -3131,10 +3134,9 @@ class _Runtime:
             measurement["window"]["interrupted_by_event_id"] = interrupted_by.id
         seq.acquisition = None
         result = None
-        supplied = self.find_acquisition_input(seq.state.sequencer_id, *args[:2])
+        supplied = self.acquisition_input(seq.state.sequencer_id, *args[:2], consume=True)
         if supplied is not None:
             index, item = supplied
-            self.used_acquisition_inputs.add(index)
             result = {key: item[key] for key in ("i", "q", "thresholded") if key in item}
             result.update(input_index=index, source={"kind": "scenario", "label": f"acquisition input {index}"})
         if result is None:

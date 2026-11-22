@@ -1593,9 +1593,11 @@
       end: maxTime,
     };
     return {
-      title: "Q1ASM Timeline",
+      // No caption in the time layout: the panel title and the ruler already say what this is.
+      // The instruction layout keeps one line because its columns are not simultaneous.
+      title: "",
       layout: instruction ? "instruction" : "time",
-      subtitle: instruction ? "Independent instruction order per lane; columns do not show simultaneous time" : `${lanes.filter((lane) => !lane.hidden).length} lanes / ${events.length} events`,
+      subtitle: instruction ? "Per-lane order, not time" : "",
       totalTime: maxTime,
       viewport,
       ticks: instruction ? [...new Set([0, 0.25, 0.5, 0.75, 1].map((ratio) => Math.round(maxTime * ratio)))].map((index) => ({

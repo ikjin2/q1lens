@@ -122,6 +122,10 @@ def test_concrete_rt_loop_from_backward_conditional_branch(max_steps: int, count
     assert loop["meta"]["count"] == count
     assert loop["meta"]["complete"] is complete
     assert loop["t1"]["value"] == (300 if complete else 200)
+    # The loop starts on its own source line and is also linked from its closing branch.
+    for line in (3, 6):
+        expected = [e["id"] for e in ir["events"] if e is loop or e["source"]["line"] == line]
+        assert ir["source_map"]["by_source"][f"<untitled>:{line}"] == expected
 
 
 def test_concrete_does_not_group_identical_commands_at_distinct_source_locations() -> None:

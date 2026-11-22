@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "q1lens"
-version = "0.2.10"
+version = "0.2.11"
 description = "Visualize Q1ASM."
 readme = "README.md"
 authors = [
@@ -23,6 +23,7 @@ classifiers = [
 ]
 dependencies = [
   "PyYAML>=6.0",
+  "z3-solver>=4.12.4",
 ]
 
 [project.urls]
@@ -31,7 +32,7 @@ Repository = "https://github.com/ikjin2/q1lens.git"
 Issues = "https://github.com/ikjin2/q1lens/issues"
 
 [project.optional-dependencies]
-smt = ["z3-solver>=4.12"]
+smt = []  # Compatibility with earlier installations using q1lens[smt].
 dev = [
   "build>=1.2",
   "pytest>=8.0",

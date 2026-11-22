@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import inspect
+import json
 import re
 import sys
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field, fields, is_dataclass
+from enum import Enum
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -33,6 +36,10 @@ class Q1ASMProgram:
     relative_file: Path
     program: str
     path: tuple[str, ...]
+    sequence: dict | None = None
+    settings: dict = field(default_factory=dict)
+    module_settings: dict = field(default_factory=dict)
+    module_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -152,7 +159,7 @@ def _analyze_project(config: ProjectConfig) -> AnalysisResult:
     if config.low_level_q1timeline and q1asm_programs:
         from qbstimeline.adapters.q1timeline import write_q1timeline_project
 
-        write_q1timeline_project(config.output_dir, q1asm_programs)
+        write_q1timeline_project(config.output_dir, q1asm_programs, module_types=config.module_types)
     else:
         (config.output_dir / "q1timeline.yml").unlink(missing_ok=True)
 
@@ -430,9 +437,13 @@ def _collect_q1asm_programs(value: Any, *, path: tuple[str, ...], programs: list
 
     sequencers = value.get("sequencers")
     if isinstance(sequencers, dict):
+        module_settings = _settings_dict(value.get("settings"))
+        module_type = (value.get("instrument_type") or value.get("module_type")
+                       or module_settings.get("instrument_type") or module_settings.get("module_type"))
         for seq_name, settings in sequencers.items():
-            program = _program_from_sequencer_settings(settings)
-            if program is None:
+            settings = _settings_dict(settings)
+            sequence = _unwrap_user_dict(settings.get("sequence"))
+            if not isinstance(sequence, dict) or not isinstance(sequence.get("program"), str):
                 continue
             sequencer_path = (*path, str(seq_name))
             sequencer_id = _unique_sequencer_id(
@@ -443,8 +454,12 @@ def _collect_q1asm_programs(value: Any, *, path: tuple[str, ...], programs: list
                 Q1ASMProgram(
                     sequencer_id=sequencer_id,
                     relative_file=Path("q1asm") / f"{sequencer_id}.q1asm",
-                    program=program,
+                    program=sequence["program"],
                     path=sequencer_path,
+                    sequence=sequence,
+                    settings={key: val for key, val in settings.items() if key != "sequence"},
+                    module_settings=module_settings,
+                    module_type=module_type,
                 )
             )
 
@@ -455,25 +470,64 @@ def _collect_q1asm_programs(value: Any, *, path: tuple[str, ...], programs: list
             _collect_q1asm_programs(child, path=(*path, str(key)), programs=programs)
 
 
-def _program_from_sequencer_settings(settings: Any) -> str | None:
-    settings = _unwrap_user_dict(settings)
-    sequence = settings.get("sequence") if isinstance(settings, dict) else getattr(settings, "sequence", None)
-    sequence = _unwrap_user_dict(sequence)
-    if not isinstance(sequence, dict):
-        return None
-    program = sequence.get("program")
-    return program if isinstance(program, str) else None
+def _settings_dict(settings):
+    value = _unwrap_user_dict(settings)
+    if isinstance(value, Mapping):
+        return dict(value)
+    if is_dataclass(value):
+        result = {item.name: getattr(value, item.name) for item in fields(value)}
+    else:
+        result = {key: val for key, val in getattr(value, "__dict__", {}).items() if not key.startswith("_")}
+    # An inherited slot can be absent from both the dataclass fields and the instance dictionary.
+    for name, _ in inspect.getmembers(type(value), inspect.ismemberdescriptor):
+        if name not in result and not name.startswith("_") and hasattr(value, name):
+            result[name] = getattr(value, name)
+    if "sequence" not in result and hasattr(value, "sequence"):
+        result["sequence"] = value.sequence
+    return result
+
+
+def _compiled_json(value):
+    if isinstance(value, Enum):
+        return value.value
+    if is_dataclass(value):
+        return _settings_dict(value)
+    if hasattr(value, "tolist"):
+        return value.tolist()
+    if callable(getattr(value, "to_dict", None)):
+        return value.to_dict()
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(f"Unsupported compiled setting {type(value).__name__}")
 
 
 def _write_q1asm_files(output_dir: Path, programs: list[Q1ASMProgram]) -> None:
     q1asm_dir = output_dir / "q1asm"
     if q1asm_dir.exists():
         for stale_file in q1asm_dir.glob("*.q1asm"):
+            stale_file.with_suffix(".sequence.json").unlink(missing_ok=True)
             stale_file.unlink(missing_ok=True)
     for program in programs:
         path = output_dir / program.relative_file
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(program.program, encoding="utf-8")
+        if program.sequence is not None:
+            sequence = dict(program.sequence)
+            sequence["compiled_settings"] = program.settings
+            sequence["compiled_module_settings"] = program.module_settings
+            static = {}
+            for field_name, prefix, default in (("static_gain", "init_gain_awg_path_", 1),
+                                                ("static_offset", "init_offset_awg_path_", 0)):
+                if any(prefix + path in program.settings for path in "IQ"):
+                    static[field_name] = [program.settings.get(prefix + path, default) for path in "IQ"]
+            if "nco_en" in program.settings:
+                static["nco_enabled"] = program.settings["nco_en"]
+            if program.settings.get("modulation_freq") is not None:
+                static["nco_frequency_hz"] = program.settings["modulation_freq"]
+            if static:
+                sequence["output_settings"] = static
+            path.with_suffix(".sequence.json").write_text(
+                json.dumps(sequence, default=_compiled_json, allow_nan=False), encoding="utf-8")
 
 
 def _valid_q1asm_provenance_rows(

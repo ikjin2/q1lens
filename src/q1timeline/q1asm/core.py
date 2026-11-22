@@ -77,25 +77,35 @@ def possible_flags(flags: dict[str, bool] | None) -> frozenset[FlagCase]:
     return frozenset(product(*[(known[name],) if name in known else (False, True) for name in FLAG_NAMES]))
 
 
+_STATUS_PREDICATES = {
+    "jz": lambda flags: flags["zf"],
+    "jnz": lambda flags: core_alu.flag_not(flags["zf"]),
+    "jo": lambda flags: flags["of"],
+    "jno": lambda flags: core_alu.flag_not(flags["of"]),
+    "js": lambda flags: flags["nf"],
+    "jns": lambda flags: core_alu.flag_not(flags["nf"]),
+    "jg": lambda flags: core_alu.flag_and(core_alu.flag_not(flags["zf"]), flags["nf"] == flags["of"]),
+    "jl": lambda flags: flags["nf"] != flags["of"],
+    "jle": lambda flags: core_alu.flag_or(flags["zf"], flags["nf"] != flags["of"]),
+    # Qblox's Core actions text for jge appears to repeat jg.
+    "jge": lambda flags: flags["nf"] == flags["of"],
+    "ja": lambda flags: core_alu.flag_not(core_alu.flag_or(flags["cf"], flags["zf"])),
+    "jae": lambda flags: core_alu.flag_not(flags["cf"]),
+    "jb": lambda flags: flags["cf"],
+    "jbe": lambda flags: core_alu.flag_or(flags["cf"], flags["zf"]),
+}
+
+
 def branch_on_flags(
     op: str, flags: dict[str, core_alu.Flag] | None, cases: frozenset[FlagCase] | None = None,
 ) -> core_alu.Flag | None:
-    """Evaluate a status jump, enumerating completions only for partial concrete flags."""
+    """Evaluate a status jump, enumerating both values for each absent flag."""
     if cases is not None or (flags is not None and len(flags) < len(FLAG_NAMES)):
         possibilities = cases if cases is not None else possible_flags(flags)
         decisions = {branch_on_flags(op, dict(zip(FLAG_NAMES, values))) for values in possibilities}
         return decisions.pop() if len(decisions) == 1 else None
-    if flags is None:
-        return None
-    zf, nf, cf, of = (flags[name] for name in FLAG_NAMES)
-    # XOR with True negates Python bools and Z3 predicates alike.
-    nz, nc = zf ^ True, cf ^ True
-    return {
-        "jz": zf, "jnz": nz, "jo": of, "jno": of ^ True, "js": nf, "jns": nf ^ True,
-        "jg": nz & (nf == of), "jl": nf != of, "jle": zf | (nf != of),
-        # Qblox's Core actions text for jge appears to repeat jg.
-        "jge": nf == of, "ja": nc & nz, "jae": nc, "jb": cf, "jbe": cf | zf,
-    }.get(op)
+    predicate = _STATUS_PREDICATES.get(op)
+    return predicate(flags) if flags is not None and predicate is not None else None
 
 
 def destination_indexes(op: str) -> tuple[int, ...]:
@@ -116,12 +126,12 @@ def branch_effect(
     """Return the branch decision, loop counter write and resulting flags."""
     if instruction.op == "loop":
         bits = core_alu.sub_flags(inputs[0], 1)
-        return bits["zf"] ^ True, ((inputs[0] - 1) & _WORD_MASK,), bits
+        return core_alu.flag_not(bits["zf"]), ((inputs[0] - 1) & _WORD_MASK,), bits
     if instruction.op == "jmp":
         return True, (), None
     if len(instruction.args) == 3:
         bits = core_alu.sub_flags(inputs[0], inputs[1])
-        return (bits["cf"] if instruction.op == "jlt" else bits["cf"] ^ True), (), bits
+        return (bits["cf"] if instruction.op == "jlt" else core_alu.flag_not(bits["cf"])), (), bits
     return branch_on_flags(instruction.op, flags), (), None
 
 
@@ -253,7 +263,8 @@ def _register_index(arg: Arg) -> int:
 
 def _bind_operand(arg: Arg, bindings: dict[str, Arg], labels: dict[str, int]) -> Arg:
     if arg.kind in {"symbol", "placeholder"}:
-        arg = bindings.get(str(arg.value), arg)
+        name = str(arg.value)
+        arg = bindings.get(name, bindings.get(name.removeprefix("$"), arg))
     if arg.kind == "label":
         name = str(arg.value)
         if name not in labels:
@@ -289,7 +300,8 @@ def prepare_program(program: Program, *, params: dict[str, object] | None = None
             bindings[name] = Arg("imm", word, str(raw))
     for name, arg in program.defs.items():
         if arg.kind in {"symbol", "placeholder"}:
-            arg = bindings.get(str(arg.value), arg)
+            reference = str(arg.value)
+            arg = bindings.get(reference, bindings.get(reference.removeprefix("$"), arg))
         bindings[f"${name}"] = arg
         if arg.kind != "reg":
             bindings[name] = arg

@@ -125,6 +125,8 @@ def test_resolved_labels_supply_valid_scope_enable_and_condition_enable_values()
     ("move 0,R0\nnop\nmove 7,R1\nset_cond R0,R1,R1,4\nstop", "error"),
     ("set_cond 0,0,0,3\nstop", "error"),
     ("play 1024,1,4\nstop", "error"),
+    ("move 1024,R0\nnop\nplay R0,R0,4\nstop", "error"),
+    ("move 16777216,R0\nnop\nacquire 0,R0,4\nstop", "error"),
 ])
 def test_unsupported_or_invalid_rt_inputs_refuse_execution(source, status):
     program = parse_q1asm(source)

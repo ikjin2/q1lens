@@ -14,6 +14,7 @@ from q1timeline.q1asm.instruction_table import InstructionSpec
 
 Confidence = Literal["exact", "symbolic", "assumed", "unknown", "runtime_dependent"]
 BranchAssumptionPath = Literal["collapsed", "taken", "fallthrough", "both"]
+FlagExpression = tuple[str, tuple[str, bool], tuple[str, bool]]
 
 VALID_BRANCH_ASSUMPTION_PATHS = {"collapsed", "taken", "fallthrough", "both"}
 CLASSICAL_REGISTER_MASK = 0xFFFFFFFF
@@ -156,6 +157,8 @@ class AnalysisState:
     alu_flags: dict[str, bool] | None = None
     alu_flags_source: SourceLocation | None = None
     alu_flag_cases: frozenset[_AluFlagCase] | None = None
+    flag_expression: FlagExpression | None = None
+    path_flag_facts: dict[FlagExpression, tuple[frozenset[_AluFlagCase], int]] = field(default_factory=dict)
     alu_flags_read_hazard: bool = False
     loop_counter: int = 0
     q1_issue_index: int = 0
@@ -190,6 +193,8 @@ class AnalysisState:
     event_serial: int = 0
     observed_loop_events: list[TimelineEvent] = field(default_factory=list)
     playback_devices: core.DeviceState | None = None
+    unresolved_diagnostic_by_line: dict[int, int] = field(default_factory=dict, compare=False, repr=False)
+    _label_bindings: tuple[dict[str, int], SymbolTable] | None = field(default=None, init=False, repr=False, compare=False)
 
 
 @dataclass(frozen=True)

@@ -62,7 +62,10 @@ body.vscode-high-contrast {
 .shared-timeline-stage .stage-title {
   font-size: 12px;
   font-weight: 600;
-  text-transform: uppercase;
+}
+
+.shared-timeline-stage:not(:has(> .stage-header)) .ruler {
+  top: 0;
 }
 
 .shared-timeline-stage .stage-total {

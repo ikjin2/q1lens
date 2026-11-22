@@ -99,6 +99,7 @@
     }
     const attributes = className ? ` class="${className}"` : "";
     fields.push(`<dt>${escapeHtml(label)}</dt><dd${attributes}>${escapeHtml(displayed)}</dd>`);
+    (fields.inspectorEntries ||= []).push({ label, value: displayed });
   }
 
   function appendDiffInspectorFields(fields, event) {
@@ -459,6 +460,7 @@
     const event = timelineEventsById.get(String(eventId));
     if (!event) {
       inspectorFields.innerHTML = "<dt>Selected event</dt><dd>None</dd>";
+      renderSelectionStrip(null);
       return;
     }
     const meta = event.meta || {};
@@ -491,6 +493,7 @@
       appendRecordedConditionFields(fields, event);
       addInspectorField(fields, "Loop context", meta.loop_context || meta.loop_id);
       inspectorFields.innerHTML = fields.join("");
+      renderSelectionStrip(event, fields.inspectorEntries);
   }
 
   function selectEventNode(eventNode, options = {}) {
@@ -537,7 +540,6 @@
     renderSharedEventInspector(applied[0] || eventId, eventNode?.dataset.diagnosticMessage);
     syncTimelineZoomActionState();
     if (options.notify !== false) {
-      openAnalysisDetails();
       window.dispatchEvent(new CustomEvent("q1timeline:eventClick", { detail: { eventId,
         ...(options.preserveFocus ? { preserveFocus: true } : {}) } }));
     }
@@ -1191,6 +1193,24 @@
     popover.style.visibility = "";
   }
 
+  function rtBlockDetailsScope(event) {
+    const meta = event?.meta || {};
+    const scope = [];
+    if (meta.loop_iteration_index !== undefined) scope.push(`Iteration ${Number(meta.loop_iteration_index) + 1}`);
+    if (meta.branch_comparison_path) scope.push(window.q1timelineTimelineAdapter.branchComparisonLabel(meta.branch_comparison_path, meta.branch_comparison_kind));
+    if (meta.rt_trigger_epoch || timelineTimeBasis === "aligned" && meta.aligned_time_nominal) scope.push("Nominal RT position");
+    if (event?.confidence === "assumed" || meta.assumed_branch_path || meta.feedback_assumptions?.length) scope.push("Assumed execution");
+    return scope;
+  }
+
+  // True when the popover would show more than the instruction text.
+  function rtBlockDetailsHaveContent(event) {
+    const details = event && rtDetailsByEvent.get(String(event.id));
+    if (!details) return false;
+    return Boolean((details.parameters || []).length || (details.registers || []).length ||
+      details.parameterNote || details.registerNote || rtBlockDetailsScope(event).length);
+  }
+
   function renderRtBlockDetails(popover, event) {
     const details = rtDetailsByEvent.get(String(event.id));
     if (!details) return;
@@ -1209,22 +1229,19 @@
     close.addEventListener("click", () => closeTimelineControlPopover(true));
     heading.append(close);
     popover.append(heading);
-    const meta = event.meta || {};
-    const scope = [];
-    if (meta.loop_iteration_index !== undefined) scope.push(`Iteration ${Number(meta.loop_iteration_index) + 1}`);
-    if (meta.branch_comparison_path) scope.push(window.q1timelineTimelineAdapter.branchComparisonLabel(meta.branch_comparison_path, meta.branch_comparison_kind));
-    if (meta.rt_trigger_epoch || timelineTimeBasis === "aligned" && meta.aligned_time_nominal) scope.push("Nominal RT position");
-    if (event.confidence === "assumed" || meta.assumed_branch_path || meta.feedback_assumptions?.length) scope.push("Assumed execution");
+    const scope = rtBlockDetailsScope(event);
     if (scope.length) {
       const context = document.createElement("p");
       context.className = "q1timeline-rt-details-note";
       context.textContent = scope.join(" · ");
       popover.append(context);
     }
-    for (const [key, title, empty] of [
-      ["parameters", "Latched parameters", "No latched parameters used."],
-      ["registers", "Registers used", "No registers read by this command."],
+    for (const [key, title] of [
+      ["parameters", "Latched parameters"],
+      ["registers", "Registers used"],
     ]) {
+      // A section with no values and no note says nothing; leave it out.
+      if (!(details[key] || []).length && !details[key === "registers" ? "registerNote" : "parameterNote"]) continue;
       const section = document.createElement("details");
       section.open = true;
       const summary = document.createElement("summary");
@@ -1255,7 +1272,7 @@
       } else {
         const note = document.createElement("p");
         note.className = "q1timeline-rt-details-note";
-        note.textContent = details[key === "registers" ? "registerNote" : "parameterNote"] || empty;
+        note.textContent = details[key === "registers" ? "registerNote" : "parameterNote"];
         section.append(note);
       }
       const sectionNote = details[key === "registers" ? "registerNote" : "parameterNote"];
@@ -1731,6 +1748,7 @@
       const intervals = timelineIr.playback ? "wait intervals" : "unchanged intervals";
       setIconOnlyToolbarButton(button, "foldWaits", unavailable ? `No ${intervals} shared by all sequencers` : `${collapsed ? "Expand" : "Fold"} all ${intervals}`);
       button.disabled = unavailable;
+      button.hidden = unavailable;
       button.setAttribute("aria-pressed", String(collapsed));
     }
     if (!candidates) return;
@@ -1999,7 +2017,7 @@
           return;
         }
         selectEventNode(node, { preserveFocus: Boolean(block.rtDetails || node.dataset.diagnosticMessage) });
-        if (block.rtDetails) {
+        if (block.rtDetails && rtBlockDetailsHaveContent(timelineEventsById.get(String(block.eventId)))) {
           const target = findVisibleEventNodeByIds([String(block.eventId)]);
           if (target) openTimelineControlPopover(target, timelineEventsById.get(String(block.eventId)), "rt-details");
         } else closeTimelineControlPopover();
@@ -2057,13 +2075,14 @@
       if (node.dataset.blockId?.endsWith(":acquisition-window")) continue;
       if (node.dataset.diagnosticPlacement) continue;
       if (!rtDetailsByEvent.has(node.dataset.eventId)) continue;
+      if (!rtBlockDetailsHaveContent(timelineEventsById.get(node.dataset.eventId))) continue;
       node.dataset.rtDetailEventId = node.dataset.eventId;
       node.dataset.controlChipId = `rt-details:${node.dataset.eventId}`;
       node.setAttribute("aria-haspopup", "dialog");
       node.setAttribute("aria-expanded", "false");
       node.title = `${node.title || ""}\nClick or press Enter to expand latched parameters and registers used.`;
     }
-    if (expandedDetailsId && rtDetailsByEvent.has(expandedDetailsId)) {
+    if (expandedDetailsId && rtBlockDetailsHaveContent(timelineEventsById.get(expandedDetailsId))) {
       const node = findVisibleEventNodeByIds([expandedDetailsId]);
       if (node) openTimelineControlPopover(node, timelineEventsById.get(expandedDetailsId), "rt-details");
     }
@@ -2421,6 +2440,23 @@
       if (button) revealRelatedEvent(button);
     });
 
+    for (const chip of document.querySelectorAll(".diagnostic-location[data-source-file]")) {
+      // The renderer emits a label; here it can open the editor, so it becomes a button.
+      const open = () => vscode.postMessage({
+        type: "sourceClick", file: chip.dataset.sourceFile,
+        line: Number(chip.dataset.sourceLine) || 1, column: Number(chip.dataset.sourceColumn) || 1,
+      });
+      chip.setAttribute("role", "button");
+      chip.setAttribute("tabindex", "0");
+      chip.setAttribute("aria-label", `Open ${chip.title}`);
+      chip.addEventListener("click", open);
+      chip.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        open();
+      });
+    }
+
     for (const link of document.querySelectorAll("[data-semantic-event-id]")) {
       link.addEventListener("click", (event) => {
         event.preventDefault();
@@ -2508,7 +2544,7 @@
       node.className = "analysis-details";
       node.open = false;
       const summary = document.createElement("summary");
-      summary.textContent = "Analysis details";
+      summary.textContent = "Details";
       node.append(summary);
       const timelineRoot = document.getElementById("timeline-root");
       if (timelineRoot && typeof timelineRoot.insertAdjacentElement === "function") {
@@ -2830,6 +2866,11 @@
       panLeft: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 6 8 12l6 6"/><path d="M9 12h11"/></svg>',
       panRight: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m10 6 6 6-6 6"/><path d="M4 12h11"/></svg>',
       axis: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 18h16"/><path d="M6 18V8"/><path d="M10 18v-4"/><path d="M14 18V6"/><path d="M18 18v-7"/></svg>',
+      inputs: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3v5"/><path d="M15 3v5"/><path d="M6 8h12v3a6 6 0 0 1-12 0z"/><path d="M12 17v4"/></svg>',
+      more: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h.01"/><path d="M12 12h.01"/><path d="M19 12h.01"/></svg>',
+      issueError: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="m9 9 6 6"/><path d="m15 9-6 6"/></svg>',
+      issueWarning: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4 21 19H3z"/><path d="M12 10v4"/><path d="M12 16.5v.5"/></svg>',
+      issueClear: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 13 4 4 10-11"/></svg>',
     };
     return icons[name] || icons.axis;
   }
@@ -2952,17 +2993,37 @@
     for (const receiver of externalInputsState.feedback || []) {
       descriptions.push(`LINQ · ${receiver.target} · ${receiver.arrivals.length ? `${receiver.arrivals.length} arrivals` : "no arrivals"}`);
     }
-    summary.textContent = descriptions.length ? `≈ Scenario input · ${descriptions[0]}${descriptions.length > 1 ? ` · +${descriptions.length - 1} sources` : ""}` : "External inputs · not configured";
-    if (externalInputsState.overridden) summary.textContent += " · Unsaved changes";
+    let text = descriptions.length ? `≈ Scenario input · ${descriptions[0]}${descriptions.length > 1 ? ` · +${descriptions.length - 1} sources` : ""}` : "External inputs · not configured";
+    if (externalInputsState.overridden) text += " · Unsaved changes";
     summary.title = descriptions.length ? `${[...descriptions, ...parameters].join("\n")}\nTriggers use the shared RT clock. LINQ uses the receiver's Q1 clock.` : "Configure shared triggers and LINQ inputs for this project.";
+    // The toolbar shows a count; the full description stays available to assistive technology and the tooltip.
+    summary.replaceChildren();
+    if (descriptions.length || externalInputsState.overridden) {
+      const badge = document.createElement("span");
+      badge.className = "q1timeline-toolbar-badge";
+      badge.setAttribute("aria-hidden", "true");
+      badge.textContent = `≈ ${descriptions.length}${externalInputsState.overridden ? " •" : ""}`;
+      summary.append(badge);
+    }
+    const full = document.createElement("span");
+    full.className = "q1timeline-visually-hidden";
+    full.textContent = text;
+    summary.append(full);
+    const configure = document.querySelector('[aria-controls="q1timeline-external-inputs-form"]');
+    if (configure) configure.title = `External inputs\n${summary.title}`;
   }
 
   function syncExternalInputsActions(error = "") {
     const form = document.getElementById("q1timeline-external-inputs-form");
     if (!form) return;
     for (const control of form.querySelectorAll("input, textarea, select, button")) control.disabled = externalInputsPending;
-    form.querySelector('[data-trigger-action="save"]').disabled = externalInputsPending || externalInputsDirty || !externalInputsState.overridden || !externalInputsState.canSave;
-    form.querySelector('[data-trigger-action="reset"]').disabled = externalInputsPending || !externalInputsDirty && !externalInputsState.overridden;
+    const save = form.querySelector('[data-trigger-action="save"]');
+    const reset = form.querySelector('[data-trigger-action="reset"]');
+    save.disabled = externalInputsPending || externalInputsDirty || !externalInputsState.overridden || !externalInputsState.canSave;
+    reset.disabled = externalInputsPending || !externalInputsDirty && !externalInputsState.overridden;
+    // Save and Reset appear only once there is something to save or reset.
+    save.hidden = !externalInputsState.overridden;
+    reset.hidden = !externalInputsDirty && !externalInputsState.overridden;
     const status = form.querySelector('[role="status"]');
     status.textContent = error || (externalInputsPending ? "Applying…" : externalInputsDirty ? "Unapplied changes" : externalInputsState.overridden ? "Unsaved changes" : "");
     status.classList.toggle("has-error", Boolean(error));
@@ -2973,7 +3034,9 @@
     if (!form) return;
     const triggers = externalInputsState.triggers || [];
     const sequencers = (timelineIr.sequencers || []).map((item) => String(item.id));
-    form.innerHTML = '<p class="q1timeline-input-help">Trigger arrivals use the shared RT clock. LINQ arrivals use each receiver’s Q1 clock. Both are in ns before display alignment.</p><div class="q1timeline-trigger-sources"></div><div class="q1timeline-feedback-sources"></div>';
+    // The clock each value uses is named in its field label; the full sentence is the form's tooltip.
+    form.title = "Trigger arrivals use the shared RT clock. LINQ arrivals use each receiver’s Q1 clock. Both are in ns before display alignment.";
+    form.innerHTML = '<div class="q1timeline-trigger-sources"></div><div class="q1timeline-feedback-sources"></div>';
     const sources = form.querySelector(".q1timeline-trigger-sources");
     let nextSourceIndex = 1;
     const addSource = (trigger) => {
@@ -2984,7 +3047,7 @@
       card.innerHTML = `<legend>Trigger ${index}</legend><div class="q1timeline-trigger-fields">
         <label>Name<input data-trigger-field="id" aria-label="Trigger ${index} name" value="${escapeHtml(trigger.id)}" required></label>
         <label>Address / parameter<input data-trigger-field="address" aria-label="Trigger ${index} address" value="${escapeHtml(trigger.address)}" required></label>
-        <label>Times (ns, comma separated)<input data-trigger-field="times" aria-label="Trigger ${index} times (ns)" value="${escapeHtml(trigger.times_ns.join(", "))}"></label>
+        <label>Times (RT clock ns, comma separated)<input data-trigger-field="times" aria-label="Trigger ${index} times (ns)" value="${escapeHtml(trigger.times_ns.join(", "))}"></label>
         <button type="button" data-trigger-action="remove" aria-label="Remove trigger ${index}">Remove</button></div>
         <details class="q1timeline-trigger-targets"><summary>Targets (${trigger.targets.length})</summary><div>${targets.map((id) => `<label><input type="checkbox" data-trigger-target="${escapeHtml(id)}"${trigger.targets.includes(id) ? " checked" : ""}>${escapeHtml(id)}</label>`).join("")}</div></details>`;
       card.querySelector('[data-trigger-action="remove"]').addEventListener("click", () => {
@@ -3002,9 +3065,8 @@
       const targets = [...new Set([...sequencers, receiver.target])];
       card.innerHTML = `<legend>LINQ receiver ${index}</legend><div class="q1timeline-trigger-fields">
         <label>Sequencer<select data-feedback-target aria-label="LINQ receiver ${index} sequencer" required>${targets.map((target) => `<option value="${escapeHtml(target)}"${target === receiver.target ? " selected" : ""}>${escapeHtml(target)}</option>`).join("")}</select></label>
-        <label>Arrivals (Q1 ns, ID, word per line)<textarea data-feedback-arrivals aria-label="LINQ receiver ${index} arrivals" rows="3" placeholder="1000, 9, 123">${escapeHtml(receiver.arrivals.map((entry) => `${entry.time_ns}, ${entry.id}, ${entry.value}`).join("\n"))}</textarea></label>
-        <button type="button" data-feedback-remove aria-label="Remove LINQ receiver ${index}">Remove</button></div>
-        <p class="q1timeline-input-help">Leave arrivals empty to model an empty FIFO.</p>`;
+        <label>Arrivals (Q1 clock ns, ID, word per line)<textarea data-feedback-arrivals aria-label="LINQ receiver ${index} arrivals" rows="3" placeholder="1000, 9, 123" title="Leave empty to model an empty FIFO.">${escapeHtml(receiver.arrivals.map((entry) => `${entry.time_ns}, ${entry.id}, ${entry.value}`).join("\n"))}</textarea></label>
+        <button type="button" data-feedback-remove aria-label="Remove LINQ receiver ${index}">Remove</button></div>`;
       card.querySelector("[data-feedback-remove]").addEventListener("click", () => {
         card.remove(); externalInputsDirty = true; syncExternalInputsActions();
       });
@@ -3013,7 +3075,7 @@
     (externalInputsState.feedback || []).forEach(addReceiver);
     const actions = document.createElement("div");
     actions.className = "q1timeline-input-actions";
-    actions.innerHTML = '<button type="button" data-trigger-action="add">Add trigger</button><button type="button" data-feedback-add>Add LINQ receiver</button><button type="submit">Apply &amp; rerun</button><button type="button" data-trigger-action="save">Save to project</button><button type="button" data-trigger-action="reset">Reset changes</button><span role="status" aria-live="polite"></span>';
+    actions.innerHTML = '<button type="button" data-trigger-action="add">Add trigger</button><button type="button" data-feedback-add>Add LINQ receiver</button><button type="submit" class="q1timeline-primary-button">Apply &amp; rerun</button><button type="button" data-trigger-action="save">Save to project</button><button type="button" data-trigger-action="reset">Reset changes</button><span role="status" aria-live="polite"></span>';
     actions.querySelector('[data-trigger-action="add"]').addEventListener("click", () => {
       addSource({id: `trigger_${nextSourceIndex}`, address: 1, targets: sequencers, times_ns: [1000]});
       externalInputsDirty = true; syncExternalInputsActions();
@@ -3041,8 +3103,8 @@
     const toolbar = ensureToolbarNode();
     const group = document.createElement("span");
     group.className = "q1timeline-external-inputs-summary";
-    group.innerHTML = '<span id="q1timeline-external-inputs-summary"></span><button type="button" aria-label="Configure external inputs" aria-controls="q1timeline-external-inputs-form" aria-expanded="false">Configure</button>';
-    toolbar.insertBefore(group, document.getElementById("q1timeline-refresh-button"));
+    group.innerHTML = `<button type="button" class="q1timeline-toolbar-button" aria-label="Configure external inputs" aria-controls="q1timeline-external-inputs-form" aria-expanded="false">${toolbarSvgIcon("inputs")}</button><span id="q1timeline-external-inputs-summary"></span>`;
+    document.getElementById("q1timeline-refresh-button").after(group);
     const form = document.createElement("form");
     form.id = "q1timeline-external-inputs-form";
     form.className = "q1timeline-external-inputs-form";
@@ -3099,12 +3161,37 @@
     renderExternalInputsEditor();
   }
 
+  function toolbarSeparator() {
+    const separator = document.createElement("span");
+    separator.className = "q1timeline-toolbar-separator";
+    separator.setAttribute("aria-hidden", "true");
+    return separator;
+  }
+
+  function setTextToolbarButton(button, text, label) {
+    button.classList.add("q1timeline-toolbar-text-button");
+    button.textContent = text;
+    button.setAttribute("aria-label", label);
+    button.title = label;
+  }
+
+  function closeToolbarMoreMenu(restoreFocus) {
+    const menu = document.getElementById("q1timeline-toolbar-more");
+    if (!menu || !menu.open) return;
+    menu.open = false;
+    if (restoreFocus) menu.querySelector("summary")?.focus();
+  }
+
+  // Toolbar order: run, view, zoom, tools, status. Status items are the only coloured ones.
   function ensureToolbarNode() {
     let node = document.getElementById("q1timeline-toolbar");
     if (!node) {
       node = document.createElement("div");
       node.id = "q1timeline-toolbar";
       node.className = "q1timeline-toolbar";
+      node.setAttribute("role", "toolbar");
+      node.setAttribute("aria-label", "Timeline");
+
       const executionButton = document.createElement("button");
       executionButton.id = "q1timeline-execution-button";
       executionButton.type = "button";
@@ -3119,56 +3206,65 @@
       refreshButton.id = "q1timeline-refresh-button";
       refreshButton.type = "button";
       setIconOnlyToolbarButton(refreshButton, "refresh", "Refresh");
+      refreshButton.title = `Refresh · auto-update: ${initialUpdateMode}`;
       refreshButton.addEventListener("click", () => vscode.postMessage({ type: "requestRefresh" }));
       node.append(refreshButton);
 
+      // Shown only when it differs from the default; the Refresh tooltip always carries it.
       const autoUpdateIndicator = document.createElement("span");
       autoUpdateIndicator.id = "q1timeline-auto-update-indicator";
       setToolbarStatusIcon(autoUpdateIndicator, "sync", `Auto-update: ${initialUpdateMode}`);
+      autoUpdateIndicator.hidden = initialUpdateMode === "onSave";
       node.append(autoUpdateIndicator);
 
       const alignmentPolicy = document.createElement("span");
       alignmentPolicy.id = "q1timeline-alignment-policy";
       node.append(alignmentPolicy);
 
-      const timeBasisGroup = document.createElement("span");
-      timeBasisGroup.id = "q1timeline-time-basis-toggle";
-      timeBasisGroup.className = "q1timeline-toolbar-group";
-      for (const basis of ["aligned", "local"]) {
-        const basisButton = document.createElement("button");
-        basisButton.type = "button";
-        basisButton.setAttribute("data-time-basis", basis);
-        setIconOnlyToolbarButton(basisButton, basis === "aligned" ? "aligned" : "local", basis === "aligned" ? "Aligned time basis" : "Local time basis");
-        basisButton.addEventListener("click", () => setTimelineTimeBasis(basis));
-        timeBasisGroup.append(basisButton);
-      }
-      node.append(timeBasisGroup);
+      node.append(toolbarSeparator());
 
       const layoutGroup = document.createElement("span");
       layoutGroup.id = "q1timeline-layout-toggle";
       layoutGroup.className = "q1timeline-toolbar-group";
       layoutGroup.setAttribute("role", "group");
       layoutGroup.setAttribute("aria-label", "Timeline layout");
-      for (const [layout, label] of [["time", "Time scale"], ["instruction", "Instruction"]]) {
+      for (const [layout, text, label] of [["time", "Time", "Time scale"], ["instruction", "Instruction", "Instruction"]]) {
         const button = document.createElement("button");
         button.type = "button";
         button.className = "q1timeline-layout-button";
         button.dataset.timelineLayout = layout;
-        button.textContent = label;
+        setTextToolbarButton(button, text, label);
         button.addEventListener("click", () => setTimelineLayout(layout));
         layoutGroup.append(button);
       }
       node.append(layoutGroup);
 
+      const timeBasisGroup = document.createElement("span");
+      timeBasisGroup.id = "q1timeline-time-basis-toggle";
+      timeBasisGroup.className = "q1timeline-toolbar-group";
+      timeBasisGroup.setAttribute("role", "group");
+      timeBasisGroup.setAttribute("aria-label", "Time basis");
+      for (const basis of ["aligned", "local"]) {
+        const basisButton = document.createElement("button");
+        basisButton.type = "button";
+        basisButton.setAttribute("data-time-basis", basis);
+        setTextToolbarButton(basisButton, basis === "aligned" ? "Aligned" : "Local", basis === "aligned" ? "Aligned time basis" : "Local time basis");
+        basisButton.addEventListener("click", () => setTimelineTimeBasis(basis));
+        timeBasisGroup.append(basisButton);
+      }
+      node.append(timeBasisGroup);
+
       const modeGroup = document.createElement("span");
       modeGroup.id = "q1timeline-mode-toggle";
       modeGroup.className = "q1timeline-toolbar-group";
+      modeGroup.setAttribute("role", "group");
+      modeGroup.setAttribute("aria-label", "View mode");
       const normalButton = document.createElement("button");
       normalButton.id = "q1timeline-mode-normal";
       normalButton.type = "button";
       normalButton.dataset.mode = "normal";
       normalButton.setAttribute("data-mode", "normal");
-      setIconOnlyToolbarButton(normalButton, "normal", "Normal view");
+      setTextToolbarButton(normalButton, "Normal", "Normal view");
       normalButton.addEventListener("click", () => requestViewMode("normal"));
       modeGroup.append(normalButton);
       const debugButton = document.createElement("button");
@@ -3176,10 +3272,12 @@
       debugButton.type = "button";
       debugButton.dataset.mode = "debug";
       debugButton.setAttribute("data-mode", "debug");
-      setIconOnlyToolbarButton(debugButton, "debug", "Debug view");
+      setTextToolbarButton(debugButton, "Debug", "Debug view");
       debugButton.addEventListener("click", () => requestViewMode("debug"));
       modeGroup.append(debugButton);
       node.append(modeGroup);
+
+      node.append(toolbarSeparator());
 
       const fitButton = document.createElement("button");
       fitButton.id = "q1timeline-fit-button";
@@ -3187,21 +3285,6 @@
       setIconOnlyToolbarButton(fitButton, "fit", "Fit timeline");
       fitButton.addEventListener("click", fitTimelineToWindow);
       node.append(fitButton);
-
-      const resetZoomButton = document.createElement("button");
-      resetZoomButton.id = "q1timeline-reset-zoom-button";
-      resetZoomButton.type = "button";
-      setIconOnlyToolbarButton(resetZoomButton, "reset", "Reset zoom");
-      resetZoomButton.addEventListener("click", resetTimelineZoom);
-      node.append(resetZoomButton);
-
-      const waitFoldButton = document.createElement("button");
-      waitFoldButton.id = "q1timeline-wait-fold-button";
-      waitFoldButton.type = "button";
-      setIconOnlyToolbarButton(waitFoldButton, "foldWaits", timelineWaitsCollapsed ? "Expand all unchanged intervals" : "Fold all unchanged intervals");
-      waitFoldButton.setAttribute("aria-pressed", String(timelineWaitsCollapsed));
-      waitFoldButton.addEventListener("click", toggleTimelineFolds);
-      node.append(waitFoldButton);
 
       const zoomOutButton = document.createElement("button");
       zoomOutButton.id = "q1timeline-zoom-out-button";
@@ -3217,6 +3300,7 @@
       zoomInButton.addEventListener("click", zoomTimelineIn);
       node.append(zoomInButton);
 
+      // Contextual: present only while a range is selected (see syncTimelineZoomActionState).
       const zoomSelectionButton = document.createElement("button");
       zoomSelectionButton.id = "q1timeline-zoom-selection-button";
       zoomSelectionButton.type = "button";
@@ -3224,30 +3308,81 @@
       zoomSelectionButton.addEventListener("click", zoomTimelineSelection);
       node.append(zoomSelectionButton);
 
-      const zoomEventButton = document.createElement("button");
-      zoomEventButton.id = "q1timeline-zoom-event-button";
-      zoomEventButton.type = "button";
-      setIconOnlyToolbarButton(zoomEventButton, "zoomEvent", "Zoom selected event");
-      zoomEventButton.addEventListener("click", zoomTimelineToSelectedEvent);
-      node.append(zoomEventButton);
+      // Contextual: present only when there are intervals to fold (see renderWaitFolds).
+      const waitFoldButton = document.createElement("button");
+      waitFoldButton.id = "q1timeline-wait-fold-button";
+      waitFoldButton.type = "button";
+      setIconOnlyToolbarButton(waitFoldButton, "foldWaits", timelineWaitsCollapsed ? "Expand all unchanged intervals" : "Fold all unchanged intervals");
+      waitFoldButton.setAttribute("aria-pressed", String(timelineWaitsCollapsed));
+      waitFoldButton.addEventListener("click", toggleTimelineFolds);
+      node.append(waitFoldButton);
 
-      const panLeftButton = document.createElement("button");
-      panLeftButton.id = "q1timeline-pan-left-button";
-      panLeftButton.type = "button";
-      setIconOnlyToolbarButton(panLeftButton, "panLeft", "Pan left");
-      panLeftButton.addEventListener("click", () => panTimeline(-1));
-      node.append(panLeftButton);
+      const spacer = document.createElement("span");
+      spacer.className = "q1timeline-toolbar-spacer";
+      spacer.setAttribute("aria-hidden", "true");
+      node.append(spacer);
 
-      const panRightButton = document.createElement("button");
-      panRightButton.id = "q1timeline-pan-right-button";
-      panRightButton.type = "button";
-      setIconOnlyToolbarButton(panRightButton, "panRight", "Pan right");
-      panRightButton.addEventListener("click", () => panTimeline(1));
-      node.append(panRightButton);
+      // Sweep and Verify are inserted after this anchor.
+      const tools = document.createElement("span");
+      tools.id = "q1timeline-toolbar-tools";
+      tools.hidden = true;
+      node.append(tools);
 
+      const more = document.createElement("details");
+      more.id = "q1timeline-toolbar-more";
+      more.className = "q1timeline-toolbar-more";
+      const moreSummary = document.createElement("summary");
+      moreSummary.className = "q1timeline-toolbar-button";
+      moreSummary.setAttribute("aria-label", "More timeline actions");
+      moreSummary.title = "More timeline actions";
+      moreSummary.innerHTML = toolbarSvgIcon("more");
+      const moreMenu = document.createElement("div");
+      moreMenu.className = "q1timeline-toolbar-menu";
+      moreMenu.setAttribute("role", "group");
+      moreMenu.setAttribute("aria-label", "More timeline actions");
+      for (const [id, text, action] of [
+        ["q1timeline-reset-zoom-button", "Reset zoom", resetTimelineZoom],
+        ["q1timeline-pan-left-button", "Pan left", () => panTimeline(-1)],
+        ["q1timeline-pan-right-button", "Pan right", () => panTimeline(1)],
+      ]) {
+        const button = document.createElement("button");
+        button.id = id;
+        button.type = "button";
+        button.className = "q1timeline-toolbar-menu-item";
+        button.textContent = text;
+        button.addEventListener("click", () => {
+          action();
+          // Panning is repeated, so the menu stays open for it; a reset is a single action.
+          if (action === resetTimelineZoom) closeToolbarMoreMenu(true);
+        });
+        moreMenu.append(button);
+      }
+      more.append(moreSummary, moreMenu);
+      more.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") closeToolbarMoreMenu(true);
+      });
+      document.addEventListener("click", (event) => {
+        if (!more.contains(event.target)) closeToolbarMoreMenu(false);
+      });
+      node.append(more);
+
+      node.append(toolbarSeparator());
+
+      const issueStatus = document.createElement("button");
+      issueStatus.id = "q1timeline-issue-status";
+      issueStatus.type = "button";
+      issueStatus.className = "q1timeline-issue-status";
+      issueStatus.addEventListener("click", () => {
+        const panel = document.querySelector(".diagnostics");
+        if (panel && typeof panel.scrollIntoView === "function") panel.scrollIntoView({ block: "nearest" });
+      });
+      node.append(issueStatus);
+
+      // The ruler shows the visible range; this node keeps the exact window for assistive technology.
       const timeWindow = document.createElement("span");
       timeWindow.id = "q1timeline-time-window";
-      setToolbarStatusIcon(timeWindow, "axis", "Timeline window");
+      timeWindow.className = "q1timeline-visually-hidden";
+      timeWindow.setAttribute("aria-label", "Timeline window");
       node.append(timeWindow);
 
       const timelineRoot = document.getElementById("timeline-root");
@@ -3256,8 +3391,159 @@
       } else {
         analysisDetailsBody().append(node);
       }
+      const filter = document.getElementById("event-filter");
+      if (filter) {
+        // One filter, next to the zoom controls it works with.
+        filter.placeholder = "Filter";
+        filter.classList.add("q1timeline-toolbar-filter");
+        spacer.before(filter);
+      }
+      renderIssueStatus();
     }
     return node;
+  }
+
+  function renderIssueStatus() {
+    const node = document.getElementById("q1timeline-issue-status");
+    if (!node) return;
+    const counts = { error: 0, warning: 0, note: 0 };
+    for (const diagnostic of timelineIr.diagnostics || []) {
+      const severity = diagnostic && diagnostic.severity;
+      counts[severity === "error" || severity === "warning" ? severity : "note"] += 1;
+    }
+    const plural = (count, word) => `${count} ${word}${count === 1 ? "" : "s"}`;
+    const parts = [];
+    if (counts.error) parts.push(`<span class="q1timeline-issue-count is-error" data-issue-severity="error">${toolbarSvgIcon("issueError")}${counts.error}</span>`);
+    if (counts.warning) parts.push(`<span class="q1timeline-issue-count is-warning" data-issue-severity="warning">${toolbarSvgIcon("issueWarning")}${counts.warning}</span>`);
+    const clear = !counts.error && !counts.warning;
+    if (clear) parts.push(`<span class="q1timeline-issue-count is-clear" data-issue-severity="none">${toolbarSvgIcon("issueClear")}</span>`);
+    const label = [counts.error ? plural(counts.error, "error") : "", counts.warning ? plural(counts.warning, "warning") : "",
+      counts.note ? plural(counts.note, "note") : ""].filter(Boolean).join(" · ") || "No issues";
+    node.innerHTML = parts.join("");
+    node.title = clear && counts.note ? `No errors or warnings · ${plural(counts.note, "note")}` : label;
+    node.setAttribute("aria-label", node.title);
+    node.disabled = !document.querySelector(".diagnostics");
+  }
+
+  // One line under the timeline with the facts needed to read the selected block.
+  // The complete field list stays in the details section ("More").
+  const selectionFactLabels = new Map([
+    ["Error", "error"], ["Time range", "t"], ["RT preview range", "t"], ["Comparison", "compare"],
+    ["Integration window", "window"], ["Acquisition target", "target"], ["Trigger status", "trigger"],
+    ["LINQ status", "LINQ"], ["Execution status", "status"], ["Reason", "reason"], ["Late by", "late"],
+    ["Stop code", "stop"], ["Fault flag", "fault"], ["Branch condition", "if"], ["Branch assumption", "assume"],
+    ["Latched state", "latched"],
+  ]);
+  const selectionFactLimit = 6;
+
+  function ensureSelectionNode() {
+    let node = document.getElementById("q1timeline-selection");
+    if (!node) {
+      node = document.createElement("div");
+      node.id = "q1timeline-selection";
+      node.className = "q1timeline-selection";
+      node.setAttribute("role", "region");
+      node.setAttribute("aria-label", "Selected event");
+      node.hidden = true;
+      const facts = document.createElement("span");
+      facts.className = "q1timeline-selection-facts";
+      facts.dataset.selectionFacts = "";
+      const spacer = document.createElement("span");
+      spacer.className = "q1timeline-toolbar-spacer";
+      spacer.setAttribute("aria-hidden", "true");
+      const zoomEventButton = document.createElement("button");
+      zoomEventButton.id = "q1timeline-zoom-event-button";
+      zoomEventButton.type = "button";
+      setIconOnlyToolbarButton(zoomEventButton, "zoomEvent", "Zoom selected event");
+      zoomEventButton.disabled = true;
+      zoomEventButton.addEventListener("click", zoomTimelineToSelectedEvent);
+      const more = document.createElement("button");
+      more.id = "q1timeline-selection-more";
+      more.type = "button";
+      more.className = "q1timeline-toolbar-text-button";
+      more.textContent = "More";
+      more.title = "Show every field of the selected event";
+      more.addEventListener("click", () => {
+        openAnalysisDetails();
+        const inspector = document.getElementById("event-inspector");
+        if (inspector && typeof inspector.scrollIntoView === "function") inspector.scrollIntoView({ block: "nearest" });
+      });
+      node.append(facts, spacer, zoomEventButton, more);
+      const timelineRoot = document.getElementById("timeline-root");
+      if (timelineRoot && typeof timelineRoot.insertAdjacentElement === "function") {
+        timelineRoot.insertAdjacentElement("afterend", node);
+      } else {
+        analysisDetailsBody().append(node);
+      }
+    }
+    return node;
+  }
+
+  function selectionFactEntries(entries) {
+    const facts = [];
+    for (const entry of entries) {
+      const exceptional = entry.label === "Confidence" && entry.value !== "exact" ||
+        entry.label === "Integration status" && entry.value !== "completed";
+      if (selectionFactLabels.has(entry.label) || exceptional) {
+        facts.push({ ...entry, short: selectionFactLabels.get(entry.label) || entry.label.toLowerCase(), exceptional });
+      }
+    }
+    // Keep the ranked order of selectionFactLabels; exceptional values always stay.
+    const order = [...selectionFactLabels.keys()];
+    const rank = (fact) => fact.label === "Error" ? -1 : fact.exceptional ? 0 : 1 + order.indexOf(fact.label);
+    return facts.map((fact, index) => ({ fact, index })).sort((a, b) => rank(a.fact) - rank(b.fact) || a.index - b.index)
+      .slice(0, selectionFactLimit).map((item) => item.fact);
+  }
+
+  function renderSelectionStrip(event, entries = []) {
+    const node = ensureSelectionNode();
+    const facts = node.querySelector("[data-selection-facts]");
+    node.hidden = !event;
+    facts.replaceChildren();
+    if (!event) return;
+    // Not data-event-id: delegated timeline handlers treat that attribute as a block.
+    node.dataset.selectionEventId = String(event.id);
+    const source = event.source || {};
+    const raw = event.kind === "trigger_receive" ? "" : source.raw || "";
+    const codeEnd = window.q1asmInstructionColors?.sourceCodeEnd ? window.q1asmInstructionColors.sourceCodeEnd(raw) : raw.length;
+    const code = document.createElement("code");
+    code.className = "q1timeline-selection-code";
+    code.textContent = raw.slice(0, codeEnd).trim() || event.label || event.kind;
+    facts.append(code);
+    if (event.sequencer_id) {
+      const sequencer = document.createElement("span");
+      sequencer.className = "q1timeline-selection-muted";
+      sequencer.textContent = event.sequencer_id;
+      facts.append(sequencer);
+    }
+    if (source.file) {
+      const link = document.createElement("button");
+      link.type = "button";
+      link.className = "q1timeline-selection-source";
+      link.textContent = `${String(source.file).replace(/\\/g, "/").split("/").pop()}:${source.line || 1}`;
+      link.title = "Open source";
+      link.setAttribute("aria-label", `Open ${link.textContent}`);
+      link.addEventListener("click", () => vscode.postMessage({
+        type: "sourceClick", file: source.file, line: source.line || 1, column: source.column || 1,
+      }));
+      facts.append(link);
+    }
+    for (const fact of selectionFactEntries(entries)) {
+      const item = document.createElement("span");
+      item.className = "q1timeline-selection-fact";
+      item.dataset.selectionFact = fact.label;
+      if (fact.label === "Error") item.classList.add("is-error");
+      else if (fact.exceptional) item.classList.add("is-exceptional");
+      item.title = fact.label;
+      const label = document.createElement("span");
+      label.className = "q1timeline-selection-muted";
+      label.textContent = fact.short;
+      const value = document.createElement("span");
+      // The inspector keeps its "a -> b" form; the strip adds the unit for a bare pair of numbers.
+      value.textContent = fact.short === "t" ? fact.value.replace(/^(-?[\d.]+) -> (-?[\d.]+)$/, "$1 → $2 ns") : fact.value;
+      item.append(label, value);
+      facts.append(item);
+    }
   }
 
   function ensureRelatedBlockSummaryNode() {
@@ -3276,8 +3562,11 @@
     if (!node) {
       node = document.createElement("div");
       node.id = "q1timeline-unsaved-banner";
-      node.style.cssText = "padding:4px 8px;font:12px sans-serif;background:var(--vscode-inputValidation-warningBackground);color:var(--vscode-inputValidation-warningForeground);border-bottom:1px solid var(--vscode-inputValidation-warningBorder);";
-      analysisDetailsBody().append(node);
+      node.className = "q1timeline-unsaved-status";
+      node.setAttribute("role", "status");
+      const issueStatus = document.getElementById("q1timeline-issue-status");
+      if (issueStatus) issueStatus.before(node);
+      else ensureToolbarNode().append(node);
     }
     return node;
   }
@@ -3400,6 +3689,9 @@
       return;
     }
     setToolbarStatusIcon(node, "alignment", "Alignment: " + (policy || "unknown"));
+    node.hidden = true;
+    const aligned = document.querySelector('[data-time-basis="aligned"]');
+    if (aligned) aligned.title = `Aligned time basis · alignment: ${policy || "unknown"}`;
   }
 
   function renderTimeBasisToggle() {
@@ -4204,7 +4496,9 @@
   function renderTimelineWindowStatus(window) {
     const node = document.getElementById("q1timeline-time-window");
     if (node) {
-      setToolbarStatusIcon(node, "axis", `X (${timelineTimeBasis}): ${formatWindowValue(window.min)}..${formatWindowValue(window.max)} ns`);
+      const label = `X (${timelineTimeBasis}): ${formatWindowValue(window.min)}..${formatWindowValue(window.max)} ns`;
+      node.setAttribute("aria-label", label);
+      node.title = label;
     }
     syncTimelineZoomActionState();
   }
@@ -4214,6 +4508,7 @@
     if (selectionButton) {
       const range = normalizedTimelineSelectionRange();
       selectionButton.disabled = !range || range.end <= range.start;
+      selectionButton.hidden = selectionButton.disabled;
       selectionButton.title = range && range.end > range.start
         ? `Zoom ${formatWindowValue(range.start)}..${formatWindowValue(range.end)} ns`
         : "Shift-drag a timeline range to enable";
@@ -5281,7 +5576,8 @@
   function renderUnsavedChanges(hasUnsavedChanges) {
     const node = ensureUnsavedChangesNode();
     node.hidden = !hasUnsavedChanges;
-    node.textContent = "Unsaved changes are not reflected in the current analysis.";
+    node.textContent = "Unsaved";
+    node.title = "Unsaved changes are not reflected in the current analysis.";
   }
 
   function renderHardwareCursor(state = hardwareView && hardwareView.getState()) {
@@ -5382,18 +5678,86 @@
     }
     const mode = comparison && comparison.mode;
     const labels = { saved: "saved baseline", previous: "previous analysis", none: "none" };
-    let text = `Current comparison: ${labels[mode] || labels.none}.`;
-    if (comparison && comparison.pending) {
-      text += ` Next analysis: ${labels[comparison.nextMode]}. Reanalyze to update highlights.`;
+    const active = Boolean(mode && mode !== "none");
+    const pending = Boolean(comparison && comparison.pending);
+    node.hidden = !active && !pending;
+    let text = active ? `vs ${labels[mode]}` : "";
+    if (pending) {
+      text += `${text ? " · " : ""}next: ${labels[comparison.nextMode]} · reanalyze to update`;
     }
     node.textContent = text;
+    if (active) {
+      // The four border styles are only meaningful while blocks carry them.
+      const legend = document.createElement("span");
+      legend.className = "timeline-comparison-legend";
+      legend.setAttribute("aria-hidden", "true");
+      for (const status of ["added", "changed", "shifted", "removed"]) {
+        const item = document.createElement("span");
+        item.className = `timeline-comparison-key is-${status}`;
+        item.textContent = status;
+        legend.append(item);
+      }
+      node.append(legend);
+    }
     node.title = "Added: green solid border; changed: amber solid border; shifted: blue dashed border; removed: red dotted border. Select a block for before/after values.";
   }
 
   ensureToolbarNode();
+  if (state.parameterProjectFile && timelineIr.sequencers?.length > 1) {
+    const alignmentButton = document.createElement("button");
+    alignmentButton.type = "button";
+    alignmentButton.className = "q1timeline-toolbar-text-button";
+    alignmentButton.textContent = "Verify";
+    alignmentButton.setAttribute("aria-label", "Verify alignment");
+    alignmentButton.title = "Verify alignment across measurement outcomes for the saved project";
+    const report = document.createElement("div");
+    report.id = "q1timeline-verified-alignment";
+    report.setAttribute("role", "status");
+    ensureToolbarNode().after(report);
+    alignmentButton.addEventListener("click", () => {
+      report.textContent = "Checking alignment…";
+      vscode.postMessage({ type: "verifyAlignment" });
+    });
+    window.addEventListener("message", ({ data }) => {
+      if (data?.type === "setUnsavedChanges" && data.hasUnsavedChanges) report.replaceChildren();
+      if (data?.type !== "alignmentVerification") return;
+      report.replaceChildren();
+      // Failures and unknowns are listed; passing checks collapse to one count.
+      const checks = data.result?.checks || [];
+      const passed = checks.filter((check) => !check.hasReplay && /^\u2713/.test(check.text));
+      checks.forEach((check, index) => {
+        if (passed.length > 1 && passed.includes(check)) return;
+        const row = document.createElement("p");
+        row.className = "q1timeline-verified-row";
+        if (check.hasReplay) row.classList.add("is-counterexample");
+        const text = document.createElement("span");
+        text.textContent = check.text;
+        row.append(text);
+        if (check.hasReplay) {
+          const replay = document.createElement("button");
+          replay.type = "button";
+          replay.className = "q1timeline-toolbar-text-button";
+          replay.textContent = "Open";
+          replay.setAttribute("aria-label", "Open counterexample timeline");
+          replay.title = "Open counterexample timeline";
+          replay.addEventListener("click", () => vscode.postMessage({ type: "openVerificationWitness", key: data.result.key, index }));
+          row.append(replay);
+        }
+        report.append(row);
+      });
+      if (passed.length > 1) {
+        const row = document.createElement("p");
+        row.className = "q1timeline-verified-row is-passed";
+        row.textContent = `\u2713 ${passed.length} checks proved`;
+        row.title = passed.map((check) => check.text).join("\n");
+        report.append(row);
+      }
+    });
+    document.getElementById("q1timeline-toolbar-tools").after(alignmentButton);
+  }
   if (state.parameterProjectFile && window.q1lensDefRuns) {
     const saved = readPersistedWebviewState().defRuns;
-    window.q1lensDefRuns.mount(document.getElementById("q1timeline-layout-toggle"), vscode, state.parameterProjectFile,
+    window.q1lensDefRuns.mount(document.getElementById("q1timeline-toolbar-tools"), vscode, state.parameterProjectFile,
       saved?.project === state.parameterProjectFile ? saved.view : {},
       (view) => writePersistedWebviewState({ defRuns: { project: state.parameterProjectFile, view } }), initialUnsavedChanges);
   }

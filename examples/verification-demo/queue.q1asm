@@ -1,0 +1,8 @@
+# The pulse train drains the prefilled RT queue faster than Q1 replenishes it.
+.DEF N 20
+move $N,R0
+wait 56
+pulse: sub R0,1,R0
+       play 0,1,4
+       jnz @pulse
+stop

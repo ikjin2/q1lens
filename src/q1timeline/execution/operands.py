@@ -52,9 +52,11 @@ def resolved_args_for_instruction(
     scope: SymbolTable,
     state: AnalysisState,
 ) -> list[dict[str, Any]]:
+    chains = [_resolution_chain_for_arg(arg, state.symbol_origins) for arg in instruction.args]
+    if not any(chains):
+        return []
     resolved_args: list[dict[str, Any]] = []
-    has_resolution_chain = False
-    for index, arg in enumerate(instruction.args):
+    for index, (arg, chain) in enumerate(zip(instruction.args, chains)):
         value = resolve_arg_value(arg, scope)
         entry: dict[str, Any] = {
             "index": index,
@@ -62,12 +64,10 @@ def resolved_args_for_instruction(
             "kind": arg.kind,
             "value": value_to_json(value),
         }
-        chain = _resolution_chain_for_arg(arg, state.symbol_origins)
         if chain:
             entry["chain"] = chain
-            has_resolution_chain = True
         resolved_args.append(entry)
-    return resolved_args if has_resolution_chain else []
+    return resolved_args
 
 
 def _resolution_chain_for_arg(arg: Arg, symbol_origins: dict[str, Any]) -> list[dict[str, Any]]:
@@ -100,9 +100,10 @@ def set_cond_is_disabled(state: AnalysisState, instruction: Instr, symbols: Symb
 
 
 def is_valid_register_arg(arg: Arg) -> bool:
-    if arg.kind != "reg" or not isinstance(arg.value, str):
-        return False
-    raw = arg.raw
+    return arg.kind == "reg" and isinstance(arg.value, str) and _valid_register_spelling(arg.raw)
+
+
+def _valid_register_spelling(raw: str) -> bool:
     if not raw.startswith("R"):
         return False
     index = _register_index_from_raw(raw)
@@ -141,7 +142,7 @@ def physical_read_register(arg: Arg, state: AnalysisState) -> str | None:
     index = _register_index_from_raw(name) if name.startswith("R") else None
     if index is not None and 0 <= index <= REGISTER_MAX_INDEX and name == f"R{index}":
         return name
-    if not is_valid_register_arg(Arg("reg", name, name)):
+    if not _valid_register_spelling(name):
         return state.register_aliases.get(name)
     return None
 
@@ -316,19 +317,25 @@ def operand_known_bits(arg: Arg, value: Value, state: AnalysisState) -> tuple[in
 
 
 def operand_scope(symbols: SymbolTable, state: AnalysisState) -> SymbolTable:
-    label_symbols = {f"@{label}": Concrete(pc) for label, pc in address_labels(state).items()}
-    scope = {**symbols, **label_symbols, **state.registers}
+    labels = address_labels(state)
+    scope = symbols.copy()
+    if labels:
+        # Source recovery can renumber labels. Reuse their immutable values only for the same layout.
+        if state._label_bindings is None or state._label_bindings[0] != labels:
+            state._label_bindings = labels.copy(), {f"@{name}": Concrete(pc) for name, pc in labels.items()}
+        scope.update(state._label_bindings[1])
+    scope.update(state.registers)
     for name, value in symbols.items():
         if not name.startswith("$"):
             scope.setdefault(f"${name}", value)
     if state.execution_mode == "concrete":
         for name in symbols:
-            if is_valid_register_arg(Arg("reg", name, name)):
-                scope[name] = state.registers.get(name, Unknown(name))
+            if _valid_register_spelling(name):
+                scope[name] = state.registers[name] if name in state.registers else Unknown(name)
     for alias, register in state.register_aliases.items():
         value = scope.get(register, Unknown(register))
         scope[f"${alias}"] = value
-        if not is_valid_register_arg(Arg("reg", alias, alias)):
+        if not _valid_register_spelling(alias):
             scope[alias] = value
     return scope
 

@@ -189,7 +189,7 @@ test("bin paging resets consistently when choosing a different sequencer", async
   await tab(page, "Bins");
   await page.locator('[data-action="bins-next"]').click();
   await expect(value(page, "bin-count")).toHaveText("17–17 of 17 targets");
-  await page.getByRole("button", { name: "Zoom out one hardware level", exact: true }).click();
+  await page.getByRole("navigation", { name: "Hardware hierarchy" }).getByRole("button", { name: "QRM0", exact: true }).click();
   await page.getByRole("button", { name: "Inspect sequencer second", exact: true }).click();
   await expect(value(page, "bin-count")).toHaveText("1–16 of 17 targets");
   await page.locator('[data-action="bins-next"]').click();
@@ -281,7 +281,10 @@ test("fixtures are fresh CLI outputs and browser assets match current production
 
 test("digital register readiness, occurrence navigation, queue, latched values and responsive controls", async ({ page }) => {
   await open(page, "01-digital", "QCM0", "counter");
-  await expect(page.getByRole("combobox", { name: "Hardware sequencer" })).toHaveValue("counter");
+  await expect(page.locator('[data-level="detail"]')).toHaveText("counter");
+  await expect(page.locator('[data-control="sequencer"]')).toHaveValue("counter");
+  await expect(page.getByRole("combobox", { name: "Hardware sequencer" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Zoom out one hardware level" })).toHaveCount(0);
   await tab(page, "Registers");
   await at(page, 31);
   await expect(register(page, "R1")).toHaveText("0");
@@ -352,7 +355,8 @@ test("communication input provenance, cross-sequencer navigation and trigger bou
   await expect(page.getByRole("spinbutton")).toHaveValue("228");
   await tab(page, "Simulation");
   await page.getByRole("button", { name: "Show sending event", exact: true }).click();
-  await expect(page.getByRole("combobox", { name: "Hardware sequencer" })).toHaveValue("sender");
+  await expect(page.locator('[data-level="detail"]')).toHaveText("sender");
+  await expect(page.locator('[data-control="sequencer"]')).toHaveValue("sender");
   await expect(page.getByRole("spinbutton")).toHaveValue("204");
   await page.getByRole("combobox", { name: "Hardware module" }).selectOption("QRM0");
   await page.getByRole("button", { name: "Inspect sequencer receiver", exact: true }).click();
@@ -389,9 +393,9 @@ test("physical stage values, finite SVG and acquisition visibility while rewindi
   await expect(value(page, "bins")).toContainText("unknown");
   await expect(value(page, "bins")).not.toContainText("31.953125");
   await at(page, 272);
-  await expect(value(page, "bins")).toContainText("I 31.953125 · Q 0");
-  await expect(value(page, "bins")).toContainText("threshold 1");
-  await expect(value(page, "bins").getByRole("button", {name: /^I 31\.953125/})).toHaveAttribute("title", /^Ready at 272 ns/);
+  await expect(value(page, "bins")).toContainText("I 31.95 · Q 0 · thr 1");
+  await expect(value(page, "bins-units")).toHaveText("(normalized full scale * ns)");
+  await expect(value(page, "bins").getByRole("button", {name: /^I 31\.95 /})).toHaveAttribute("title", /^Ready at 272 ns.* · I 31\.953125 · Q 0 \(normalized full scale \* ns\) · threshold 1$/);
   await page.locator('[data-bin="0:0"]').click();
   await expect(value(page, "bin-history")).toContainText("Simulated loopback");
   await at(page, 271);
@@ -461,7 +465,7 @@ test("underflow remains a visible error with the partial queue trace", async ({ 
   await page.getByRole("button", { name: "Open QCM0: 1 sequencer", exact: true }).click();
   await page.getByRole("button", { name: "Inspect sequencer starved", exact: true }).click();
   await at(page, 24);
-  await expect(value(page, "execution")).toContainText("error");
+  await expect(value(page, "execution")).toContainText("Error");
   await expect(value(page, "execution")).toContainText("24 ns");
   await tab(page, "Simulation");
   await expect(value(page, "communications")).toContainText("8 ns · q1 stall");
@@ -480,8 +484,7 @@ test("supplied synthetic input retains provenance and hides future bins", async 
   await tab(page, "Bins");
   await expect(value(page, "bins")).toContainText("unknown");
   await at(page, 212);
-  await expect(value(page, "bins")).toContainText("I 1 · Q -2");
-  await expect(value(page, "bins")).toContainText("threshold 1");
+  await expect(value(page, "bins")).toContainText("I 1 · Q -2 · thr 1");
   await page.locator('[data-bin="0:0"]').click();
   await expect(value(page, "bin-history")).toContainText("Supplied trace · synthetic verification fixture");
 });
@@ -717,7 +720,9 @@ test("Hardware shows the blocked Play Q1 edge while RT remains active", async ({
   await expect(page.getByRole("spinbutton")).toHaveValue("24");
 
   await mountHardwareTrace(page, ir, {level: "detail", sequencerId: "peer", basis: "aligned", time: 20});
-  await expect(value(page, "execution")).toContainText("Path execution · partial · 3 instructions");
+  await expect(value(page, "trace-kind")).toHaveText("Path execution");
+  await expect(value(page, "execution")).toHaveText("Partial · 3 instr");
+  await expect(value(page, "execution")).toHaveAttribute("title", "Path execution · partial · 3 instructions");
   await expect(value(page, "execution")).not.toContainText("observation end");
   await expect(value(page, "rt-event")).toContainText("active · wait");
 });
@@ -1075,23 +1080,27 @@ test("Hardware shows modeled I/Q bin averages at each accepted result", async ({
   await mountHardwareTrace(page, datasets.plain, initialState);
   await expect(aggregate).toHaveCount(0);
   await at(page, 108);
-  await expect(aggregate).toHaveText("I/Q bin aggregate · 1 accepted window · Mean I 2 · Mean Q 1 · Threshold count 0 (normalized full scale * ns)");
+  await expect(aggregate).toHaveText("I/Q bin aggregate · 1 accepted window · Mean I 2 · Mean Q 1 · Threshold count 0");
+  await expect(aggregate).toHaveAttribute("title", "I/Q bin aggregate · 1 accepted window · Mean I 2 · Mean Q 1 · Threshold count 0 (normalized full scale * ns)");
+  await expect(value(page, "bins-units")).toHaveText("(normalized full scale * ns)");
   await at(page, 115);
   await expect(aggregate).toContainText("1 accepted window");
   await at(page, 116);
-  await expect(row.getByRole("button", {name: "I 4 · Q -2 (normalized full scale * ns) · threshold 1"})).toBeVisible();
-  await expect(aggregate).toHaveText("I/Q bin aggregate · 2 accepted windows · Mean I 3 · Mean Q -0.5 · Threshold count 1 (normalized full scale * ns)");
+  await expect(row.getByRole("button", {name: "I 4 · Q -2 · thr 1", exact: true})).toHaveAttribute("title", / · I 4 · Q -2 \(normalized full scale \* ns\) · threshold 1$/);
+  await expect(aggregate).toHaveText("I/Q bin aggregate · 2 accepted windows · Mean I 3 · Mean Q -0.5 · Threshold count 1");
+  await expect(aggregate).toHaveAttribute("title", "I/Q bin aggregate · 2 accepted windows · Mean I 3 · Mean Q -0.5 · Threshold count 1 (normalized full scale * ns)");
   await page.evaluate(() => window.hardwarePreview.setTimeBasis("aligned"));
   await expect(page.getByRole("spinbutton")).toHaveValue("16");
   await expect(aggregate).toContainText("Mean I 3");
 
   await mountHardwareTrace(page, datasets.weighted, {...initialState, time: 116});
   await expect(value(page, "bins").locator("[data-bin]")).toHaveCount(1);
-  await expect(row.getByRole("button", {name: "I 2 · Q -2 (normalized full scale * ns) · threshold 0"})).toBeVisible();
+  await expect(row.getByRole("button", {name: "I 2 · Q -2 · thr 0", exact: true})).toHaveAttribute("title", / · I 2 · Q -2 \(normalized full scale \* ns\) · threshold 0$/);
   await expect(aggregate).toContainText("2 accepted windows · Mean I 2 · Mean Q -0.5 · Threshold count 0");
 
   await mountHardwareTrace(page, datasets.scenario, {...initialState, time: 108});
-  await expect(row.getByRole("button", {name: "I 17 · Q -9 (scenario values) · threshold 0"})).toBeVisible();
+  await expect(row.getByRole("button", {name: "I 17 · Q -9 · thr 0", exact: true})).toHaveAttribute("title", / · I 17 · Q -9 \(scenario values\) · threshold 0$/);
+  await expect(value(page, "bins-units")).toHaveText("(scenario values)");
   await expect(aggregate).toHaveCount(0);
   await at(page, 116);
   await expect(aggregate).toContainText("1 accepted window · Mean I 4 · Mean Q -2 · Threshold count 1");
@@ -1111,7 +1120,7 @@ test("Hardware selects recorded unavailable I/Q evidence at its observation time
   ].join("\n")], {cwd: repo, encoding: "utf8", timeout: 10000, env: {...process.env, PYTHONPATH: path.join(repo, "src")}}));
   const initialState = {level: "detail", sequencerId: "iq", basis: "aligned", time: 7, selectedBlock: "bins", selectedBin: "0:0"};
   const row = value(page, "bins").locator("tr").filter({has: page.locator('[data-bin="0:0"]')});
-  const success = row.getByRole("button", {name: "I 17 · Q -9 (scenario values) · threshold 0"});
+  const success = row.getByRole("button", {name: "I 17 · Q -9 · thr 0", exact: true});
   const unavailable = row.getByRole("button", {name: /unavailable · Acquisition requires a scenario result/});
   const communications = value(page, "communications");
   for (const ir of [datasets.routed, datasets.noRoute]) {
@@ -1280,4 +1289,70 @@ test("Hardware cursor commits preserve focus, validation and the first subsequen
     node.dispatchEvent(new Event("input", {bubbles: true}));
   });
   await expect(spin).toHaveValue("20");
+});
+
+test("Hardware states each fact once and keeps explanations and exact values in tooltips", async ({ page }) => {
+  await page.goto("/?case=03-signals");
+  const hardware = page.locator("#hardware");
+  await expect(hardware.locator(".hardware-title")).toHaveText("Hardware Simulated");
+  await expect(value(page, "trace-kind")).toHaveAttribute("title", /Timing uses an event-driven model of queues and configured inputs\./);
+  const card = page.getByRole("button", { name: "Open QRM_RF0: 1 sequencer", exact: true });
+  await expect(card.locator(".hardware-card-name")).toHaveText("QRM_RF0");
+  await expect(card.locator(".hardware-card-count")).toHaveText("1 sequencer");
+  await expect(card.locator("[data-preview-sequencer]")).toHaveText("readout");
+  await expect(card.locator("[data-module-status]")).toContainText("at 0 ns");
+  await expect(hardware).not.toContainText(/MODULE|Explore sequencers|Select a module/);
+  await expect(page.getByRole("button", { name: "Zoom out one hardware level" })).toHaveCount(0);
+  await card.click();
+  await expect(hardware).not.toContainText(/SEQUENCER|Inspect internal state|Select a sequencer/);
+  await page.getByRole("button", { name: "Inspect sequencer readout", exact: true }).click();
+  await at(page, 420);
+
+  const crumbs = page.getByRole("navigation", { name: "Hardware hierarchy" });
+  await expect(crumbs.getByRole("button")).toHaveText(["Modules", "QRM_RF0", "readout"]);
+  await expect(crumbs.getByRole("combobox", { name: "Hardware module" })).toHaveValue("QRM_RF0");
+  await expect(crumbs.getByRole("combobox", { name: "Hardware sequencer" })).toHaveCount(0);
+  await expect(hardware.locator(".hardware-flow-label")).toHaveText(["Command execution", "Acquisition targets"]);
+  await expect(value(page, "execution")).toHaveText("Completed · 5 instr · stop 0");
+  await expect(value(page, "execution")).toHaveAttribute("title", "Event-driven simulation · completed · 5 / 10000 instructions · Stop code 0");
+  await expect(value(page, "instruction-detail")).not.toContainText("Flags before");
+  await expect(value(page, "timing-note")).toBeHidden();
+
+  await tab(page, "Registers");
+  await expect(value(page, "register-detail")).toHaveText("R0 ? · no writes");
+  await expect(hardware.locator('[data-view="register-pager"]')).toBeHidden();
+  await expect(value(page, "register-history")).toBeHidden();
+  await expect(value(page, "selection-detail")).toHaveText("");
+  const source = page.getByRole("button", { name: "Open source", exact: true });
+  await expect(source).toBeDisabled();
+  await expect(source).toHaveAttribute("title", "Select a register or active block to inspect its source instruction.");
+
+  await tab(page, "Parameters");
+  await expect(value(page, "parameters")).toHaveText("No settings yet");
+  await expect(hardware.locator('[data-table="parameters"] thead')).toBeHidden();
+  await expect(value(page, "queue-note")).toBeHidden();
+
+  await tab(page, "Simulation");
+  await expect(value(page, "signal-values").locator("strong")).toHaveText(["I: 0", "Q: 0"]);
+  await expect(value(page, "signal-values").locator("[data-signal-source]")).toHaveText("Numerical model · Calculated signal");
+  await expect(value(page, "signal-values")).toContainText("Numerical model", { useInnerText: true });
+  expect((await value(page, "signal-values").innerText()).match(/Numerical model/g)).toHaveLength(1);
+  await expect(value(page, "communications").locator('[title="I 31.953125 · Q 0 (normalized full scale * ns) · threshold 1"]')).toHaveText("I 31.95 · Q 0 · thr 1 (normalized full scale * ns)");
+
+  await tab(page, "Bins");
+  await expect(value(page, "bins-note")).toBeHidden();
+  await expect(hardware.locator('[data-head="targets"]')).toHaveAttribute("title", /^Targets count executed commands that specify a bin destination\./);
+  await page.locator('[data-bin="0:0"]').click();
+  await expect(value(page, "selection-detail")).toHaveText("readout.q1asm:3");
+  await expect(value(page, "selection-detail")).toHaveAttribute("title", /[\\/]03-signals[\\/]readout\.q1asm:3$/);
+  await expect(source).toBeEnabled();
+  await expect(source).toHaveAttribute("title", "");
+
+  await crumbs.getByRole("combobox", { name: "Hardware module" }).selectOption("QCM0");
+  await expect(crumbs.getByRole("button")).toHaveText(["Modules", "QCM0"]);
+  await page.getByRole("button", { name: "Inspect sequencer controller", exact: true }).click();
+  await crumbs.getByRole("button", { name: "QCM0", exact: true }).click();
+  await expect(value(page, "overview-title")).toHaveText("QCM0 · Sequencers");
+  await crumbs.getByRole("button", { name: "Modules", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Open QCM0: 1 sequencer", exact: true })).toBeVisible();
 });

@@ -10,10 +10,11 @@ Q1Lens의 acquisition 버퍼 검사, 종료 시 미적용 설정 경고, 진단 
 
 1. 아래 사례의 `.q1asm` 파일을 엽니다. **Ctrl+Shift+P → Q1Lens: Open Timeline
    Preview**를 실행합니다. 각 폴더의 `q1timeline.yml`을 자동으로 선택합니다.
-2. **Diagnostics**는 **Analysis details** 밖에 표시됩니다. 제목 옆에 진단 코드가
-   중복되지 않고, 출처는 `파일명:줄`로 표시되며 일반적인 `Fix:` 문장은 없습니다.
-3. **Show event** 또는 타임라인 이벤트를 누르면 **Analysis details**가 열리고
-   **Selected event**, **Hardware state**를 함께 확인할 수 있습니다.
+2. **Diagnostics**는 **Details** 밖에 표시됩니다. 같은 종류의 진단은 한 행으로 묶이고,
+   파일명 뒤의 줄 번호를 누르면 그 줄이 열립니다. 일반적인 `Fix:` 문장은 없습니다.
+3. 밑줄이 있는 줄 번호나 타임라인 이벤트를 누르면 타임라인 바로 아래에 선택한 이벤트가
+   한 줄로 표시됩니다. **More**를 누르면 **Details**가 열려 전체 항목과 **Hardware**를
+   함께 확인할 수 있습니다.
 4. **Ctrl+Shift+M**으로 Problems를 열어 편집기의 경고/오류와 비교합니다.
 
 | 사례 | 예상 결과 | 직접 바꿔볼 항목 |

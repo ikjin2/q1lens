@@ -18,7 +18,6 @@ const invalidInstructions = [
   { name: "gain out of range", source: "set_awg_gain 32768,0", category: "invalid_argument_value" },
   { name: "integer overflow", source: "move 4294967296,R0", category: "invalid_argument_value" },
   { name: "undefined branch label", source: "jmp @missing", category: "undefined_label" },
-  { name: "undefined alias", source: "move $MISSING,R0", category: "unresolved_symbol" },
   { name: "floating point literal", source: "move 1.5,R0", category: "syntax_error" },
   { name: "unclosed placeholder", source: "wait {DURATION", category: "syntax_error" },
   { name: "semicolon separator", source: "move 1,R0; stop", category: "syntax_error" },
@@ -138,6 +137,9 @@ describe("Q1ASM editor diagnostic coverage", function () {
   }
 
   for (const source of [
+    "move $GAIN,R0\nstop\n",
+    "stop\nmove $GAIN,R0\n",
+    "jmp @done\nmove $GAIN,R0\ndone: stop\n",
     "move 1,R0,\nstop\n",
     "stop 0\n",
     "stop 1\n",

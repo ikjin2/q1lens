@@ -23,6 +23,8 @@ UnderflowStatus = Literal[
     "possibly_safe_with_initial_buffer",
 ]
 
+_ZERO = Concrete(0)
+
 
 @dataclass(frozen=True)
 class UnderflowResult:
@@ -73,8 +75,13 @@ def analyze_underflows(
     })
     earliest = replay_queues(streams, queue_depth_limit=queue_depth_limit, initial_buffer_ns=ASSUMED_INITIAL_BUFFER_NS,
                              sync_participants=participants)
-    prefetched = replay_queues(streams, queue_depth_limit=queue_depth_limit, prefill_sync=True,
-                              initial_buffer_ns=POSSIBLE_INITIAL_BUFFER_NS, sync_participants=participants)
+    # With no barrier and no exhausted reserve, both scenarios follow the same dequeues.
+    prefetched = earliest
+    if any(result.failure is not None for result in earliest.values()) or any(
+        packet.op == "wait_sync" for name in participants for packet in streams[name]
+    ):
+        prefetched = replay_queues(streams, queue_depth_limit=queue_depth_limit, prefill_sync=True,
+                                  initial_buffer_ns=POSSIBLE_INITIAL_BUFFER_NS, sync_participants=participants)
     results = []
     assumptions = {
         "queue_depth_limit": queue_depth_limit,
@@ -184,14 +191,11 @@ def _all_path_queue_safety(state: AnalysisState, queue_depth_limit: int):
         if (not alternative.stopped or reason is not None
                 or any(packet.op in {"wait_sync", "wait_trigger"} for packet in packets)):
             return None
-        amounts = []
-        for initial in (ASSUMED_INITIAL_BUFFER_NS, POSSIBLE_INITIAL_BUFFER_NS):
-            replay = replay_queues({state.sequencer_id: packets}, queue_depth_limit=queue_depth_limit,
-                                   initial_buffer_ns=initial)[state.sequencer_id]
-            if replay.failure is not None or replay.incomplete_reason is not None:
-                return None
-            amounts.append(replay.required_buffer_ns)
-        required[path] = max(amounts)
+        replay = replay_queues({state.sequencer_id: packets}, queue_depth_limit=queue_depth_limit,
+                               initial_buffer_ns=ASSUMED_INITIAL_BUFFER_NS)[state.sequencer_id]
+        if replay.failure is not None or replay.incomplete_reason is not None:
+            return None
+        required[path] = replay.required_buffer_ns
     return required
 
 
@@ -355,14 +359,15 @@ def _queue_packets(state: AnalysisState):
             if cutoff is None or hidden_start < cutoff:
                 cutoff, reason, boundary = hidden_start, "compact_loop_timing_unexpanded", None
             continue
+        if not loop_packets:
+            continue
         q1_period = max(event.t1.value for event in q1)-start + meta.get("loop_q1_jump_runtime_ns", 24)
         evaluated_elapsed = periods[0] if evaluated else 0
         for iteration in range(1, count):
             prefix_slope = 0
             evaluated_prefix = 0
             for packet in loop_packets:
-                if not all(isinstance(value, Concrete) for value in
-                           (packet.q1_issue_t0, packet.q1_issue_t1, packet.rt_t0, packet.rt_t1)):
+                if not _concrete_packet_times(packet):
                     cutoff, reason, boundary = start, "unknown_rt_timing", None
                     break
                 duration = packet.duration
@@ -381,7 +386,7 @@ def _queue_packets(state: AnalysisState):
                 else:
                     rt_t0 = Concrete(packet.rt_t0.value + offset)
                 packet_meta = dict(packet.meta)
-                if duration == Concrete(0):
+                if duration == _ZERO:
                     packet_meta.update(queue_duration_ns=0,
                                        next_dequeue_not_before_ns=rt_t0.value + rt_dequeue_spacing_ns(0))
                 else:
@@ -402,12 +407,11 @@ def _queue_packets(state: AnalysisState):
             return known, reason, boundary or packet
         if packet.op == "wait_trigger" and packet.meta.get("conditional_skipped") is not True:
             return known, "trigger_arrival_unknown", packet
-        if _packet_has_unknown_rt_timing(packet) or not all(isinstance(value, Concrete) for value in
-                (packet.q1_issue_t0, packet.q1_issue_t1, packet.rt_t0, packet.rt_t1)):
+        if _packet_has_unknown_rt_timing(packet) or not _concrete_packet_times(packet):
             return known, "unknown_rt_timing", packet
         if known:
             previous = known[-1]
-            gap = rt_dequeue_spacing_ns(0) if previous.duration == Concrete(0) else 0
+            gap = rt_dequeue_spacing_ns(0) if previous.duration == _ZERO else 0
             if packet.rt_t0.value != previous.rt_t1.value + gap:
                 return known, "unrepresented_rt_commands", packet
         known.append(packet)
@@ -416,6 +420,11 @@ def _queue_packets(state: AnalysisState):
 
 def _packet_has_unknown_rt_timing(packet) -> bool:
     return packet.confidence == "unknown" or isinstance(packet.duration, Unknown)
+
+
+def _concrete_packet_times(packet: RtPacket) -> bool:
+    return (isinstance(packet.q1_issue_t0, Concrete) and isinstance(packet.q1_issue_t1, Concrete)
+            and isinstance(packet.rt_t0, Concrete) and isinstance(packet.rt_t1, Concrete))
 
 
 def _emit_queue_depth(state: AnalysisState, *, packet_id: str, t0: Concrete, source, depth: int) -> None:
@@ -639,7 +648,7 @@ def _event_like(state: AnalysisState, *, lane: str, kind: str, t0: Concrete | Un
         kind=kind,
         t0=t0,
         t1=t0,
-        duration=subtract_values(t0, t0),
+        duration=_ZERO if isinstance(t0, Concrete) and type(t0.value) is int else subtract_values(t0, t0),
         label=label,
         confidence="exact" if kind != "analysis_incomplete" else "unknown",
         source=source,

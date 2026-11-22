@@ -4,6 +4,8 @@ import pytest
 
 from q1timeline.analysis.interpreter import interpret_program, prepare_def_program
 from q1timeline.analysis.values import Concrete
+from q1timeline.execution.operands import operand_scope
+from q1timeline.execution.state import AnalysisState
 from q1timeline.ir.control_flow_graph import control_flow_graph_from_states
 from q1timeline.playback import PlaybackSession
 from q1timeline.q1asm.compiled_addresses import compile_addresses
@@ -42,6 +44,15 @@ def issues(state):
 def graph_edge(state, op):
     graph = control_flow_graph_from_states([state])["sequencers"][0]
     return next(edge for edge in graph["edges"] if edge["op"] == op)
+
+
+def test_operand_scopes_follow_label_edits_and_current_registers():
+    state = AnalysisState("seq", labels={"done": 3}, registers={"R0": Concrete(7)})
+    first = operand_scope({}, state)
+    state.labels["done"] = 1
+    state.registers["R0"] = Concrete(9)
+    assert operand_scope({}, state) == {"@done": Concrete(1), "R0": Concrete(9)}
+    assert first == {"@done": Concrete(3), "R0": Concrete(7)}
 
 
 def test_qblox_1_4_1_assembler_address_golden_vector():

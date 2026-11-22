@@ -20,7 +20,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ['3.10', '3.12']
+        include:
+          - python: '3.10'
+            solver: 'z3-solver==4.12.4'
+          - python: '3.12'
+            solver: 'z3-solver'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -29,7 +33,9 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Install declared development dependencies
-        run: python -m pip install '.[dev,smt]'
+        run: python -m pip install '.[dev,smt]' '${{ matrix.solver }}'
+      - name: Verify the installed SMT solver can run
+        run: python -c "import z3; print(z3.get_version_string()); assert z3.Solver().check() == z3.sat"
       - name: Compare the complete Q1ASM example and tutorial corpus
         shell: pwsh
         run: |
@@ -178,6 +184,14 @@ jobs:
           New-Item -ItemType Directory -Force ../output/ci/extension-host | Out-Null
           npm run test:extension 2>&1 | Tee-Object ../output/ci/extension-host/host.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify the packaged extension and wheel together
+        if: matrix.vscode == 'stable'
+        run: |
+          python -m build --wheel --outdir output/ci/packages
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm --prefix vscode-extension run package -- --out ../output/ci/packages/q1lens.vsix
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tools/verify_simulation_wheel.py --wheel 'output/ci/packages/*.whl' --vsix output/ci/packages/q1lens.vsix --out output/ci/extension-host/installed
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:

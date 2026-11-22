@@ -95,7 +95,8 @@ def concrete_instruction_ready(
     if has_invalid_arguments:
         end_concrete_execution(state, "error", "Invalid instruction operands.", instruction)
         return False
-    if spec.category == "latched":
+    # Playback can retain symbolic operands and bypass the fully resolved RT issue.
+    if spec.category == "latched" or (allow_symbolic_operands and instruction.op in core_rt.RT_OPS):
         unsupported = unsupported_register_operand(state, instruction, scope, condition_disabled=condition_disabled)
         if unsupported is not None:
             end_concrete_execution(state, "blocked", unsupported.message, instruction)
@@ -131,8 +132,9 @@ def diagnose_program(
         compiled_addresses=state.compiled_addresses,
     )
     if prepared is not None and prepared.revalidate is not None:
+        scope = operand_scope(symbols, probe)
         for instruction in prepared.revalidate:
-            validate_instruction(probe, instruction, symbols, prepared.bindings[instruction.pc], source_check=True)
+            validate_instruction(probe, instruction, symbols, prepared.bindings[instruction.pc], source_check=True, scope=scope)
         if not any(item.severity == "error" for item in probe.diagnostics):
             state.diagnostics.extend(prepared.lints)
             return
@@ -143,8 +145,9 @@ def diagnose_program(
         probe.instructions_by_pc = state.instructions_by_pc
         probe.compiled_addresses = state.compiled_addresses
         probe.diagnostics = []
+        scope = operand_scope(symbols, probe)
         for instruction in state.instructions_by_pc.values():
-            validate_instruction(probe, instruction, symbols)
+            validate_instruction(probe, instruction, symbols, symbolic_params=state.execution_mode == "analysis", scope=scope)
         errors = [item for item in probe.diagnostics
                   if item.severity == "error" and item not in state.static_diagnostics]
         state.static_diagnostics.extend(errors)
@@ -159,10 +162,10 @@ def diagnose_program(
             state.symbol_origins["defs"][name]["value"] = value_to_json(value)
         state.immutable_value_origins = build_immutable_value_origins(symbols, defs, state)
     if not state.strict_q1asm:
-        scope = operand_scope(symbols, probe)
         for instruction in state.instructions_by_pc.values():
             for arg in instruction.args:
-                if (arg.kind == "symbol" and not str(arg.value).startswith("$")
+                if (arg.kind == "symbol" and (not str(arg.value).startswith("$") or state.execution_mode == "analysis"
+                                             and not any(name in symbols for name in arg_symbol_lookup_names(arg)))
                         and not _is_bare_defined_symbol(arg, probe)):
                     diagnostics = []
                     resolve_arg_value(arg, scope, diagnostics, required=True, source=instruction.source)
@@ -214,7 +217,9 @@ def validate_instruction(
     symbols: SymbolTable,
     binding: BoundInstruction | None = None,
     *,
+    scope: SymbolTable | None = None,
     source_check: bool = False,
+    symbolic_params: bool = False,
 ) -> tuple[InstructionSpec, bool, int]:
     spec = binding.spec if binding is not None else get_instruction_spec(instruction.op)
     diagnostic_start = len(state.diagnostics)
@@ -223,6 +228,8 @@ def validate_instruction(
         # register writes still depend on the instruction's execution occurrence.
         _diagnose_register_read_hazards(state, instruction, binding.reads)
         return spec, False, diagnostic_start
+    if scope is None:
+        scope = operand_scope(symbols, state)
     validation_diagnostics = binding.raw_diagnostics if binding is not None else spec.validate(instruction)
     state.diagnostics.extend(validation_diagnostics)
     has_raw_invalid_arguments = any(
@@ -231,11 +238,13 @@ def validate_instruction(
     )
     has_invalid_register_operands = _diagnose_invalid_register_operands(state, instruction)
     has_invalid_bare_def_operands = _diagnose_bare_def_symbol_operands(state, instruction)
-    has_unresolved_dollar_symbols = _diagnose_unresolved_dollar_symbol_operands(state, instruction)
-    has_unresolved_strict_symbols = _diagnose_strict_q1asm_unresolved_operands(state, instruction, symbols)
-    has_undefined_labels = _diagnose_undefined_label_operands(state, instruction, symbols, spec)
+    has_unresolved_dollar_symbols = _diagnose_unresolved_dollar_symbol_operands(
+        state, instruction, symbolic_params=symbolic_params or state.execution_mode == "analysis",
+    )
+    has_unresolved_strict_symbols = _diagnose_strict_q1asm_unresolved_operands(state, instruction, scope)
+    has_undefined_labels = _diagnose_undefined_label_operands(state, instruction, symbols, spec, scope)
     if not has_raw_invalid_arguments:
-        _diagnose_resolved_argument_types(state, instruction, spec, symbols)
+        _diagnose_resolved_argument_types(state, instruction, spec, symbols, scope)
     _diagnose_unresolved_register_operands(state, instruction, spec)
     _diagnose_register_read_hazards(state, instruction, binding.reads if binding is not None else None)
     has_invalid_arguments = any(
@@ -248,23 +257,24 @@ def validate_instruction(
         state,
         instruction,
         spec,
-        symbols,
+        scope,
     ) or has_invalid_arguments
     has_invalid_arguments = _diagnose_official_rt_duration_range(
         state,
         instruction,
         spec,
-        symbols,
+        scope,
     ) or has_invalid_arguments
     has_invalid_arguments = _diagnose_invalid_rt_index_operands(
         state,
         instruction,
-        symbols,
+        scope,
     ) or has_invalid_arguments
     has_invalid_arguments = _diagnose_official_operand_ranges(
         state,
         instruction,
         symbols,
+        scope,
     ) or has_invalid_arguments
 
     if state.static_diagnostics:
@@ -276,7 +286,7 @@ def validate_instruction(
 
 
 def _diagnose_undefined_label_operands(
-    state: AnalysisState, instruction: Instr, symbols: SymbolTable, spec: InstructionSpec,
+    state: AnalysisState, instruction: Instr, symbols: SymbolTable, spec: InstructionSpec, scope: SymbolTable,
 ) -> bool:
     missing_labels: set[str] = set()
     target_index = None
@@ -285,7 +295,7 @@ def _diagnose_undefined_label_operands(
     for index, arg in enumerate(instruction.args):
         if resolve_register_name(arg, state) is not None:
             continue
-        resolved = branch_target_arg(arg, state, symbols)
+        resolved = branch_target_arg(arg, state, symbols, scope=scope)
         if resolved.kind == "label" and str(resolved.value) not in state.labels:
             missing_labels.add(str(resolved.value))
         elif (resolved.kind == "label" and index == target_index
@@ -378,7 +388,7 @@ def _diagnose_bare_def_symbol_operands(state: AnalysisState, instruction: Instr)
     return emitted
 
 
-def _diagnose_unresolved_dollar_symbol_operands(state: AnalysisState, instruction: Instr) -> bool:
+def _diagnose_unresolved_dollar_symbol_operands(state: AnalysisState, instruction: Instr, *, symbolic_params: bool) -> bool:
     emitted = False
     defined_symbols = (
         set(state.symbol_origins.get("defs", {}))
@@ -393,6 +403,9 @@ def _diagnose_unresolved_dollar_symbol_operands(state: AnalysisState, instructio
             continue
         name = raw_name[1:]
         if name in defined_symbols or raw_name in defined_symbols:
+            continue
+        if (symbolic_params and not state.strict_q1asm
+                and not is_valid_register_arg(Arg("reg", name, name))):
             continue
         state.diagnostics.append(
             Diagnostic(
@@ -415,12 +428,11 @@ def _diagnose_unresolved_dollar_symbol_operands(state: AnalysisState, instructio
 def _diagnose_strict_q1asm_unresolved_operands(
     state: AnalysisState,
     instruction: Instr,
-    symbols: SymbolTable,
+    scope: SymbolTable,
 ) -> bool:
     if not state.strict_q1asm:
         return False
     emitted = False
-    scope = operand_scope(symbols, state)
     for index, arg in enumerate(instruction.args):
         if arg.kind not in {"symbol", "placeholder"}:
             continue
@@ -483,6 +495,7 @@ def _diagnose_resolved_argument_types(
     instruction: Instr,
     spec: InstructionSpec,
     symbols: SymbolTable,
+    scope: SymbolTable,
 ) -> None:
     if not instruction.args:
         return
@@ -490,7 +503,7 @@ def _diagnose_resolved_argument_types(
     if not candidates:
         return
 
-    resolved_instruction = instruction_for_q1_timing(instruction, state, symbols)
+    resolved_instruction = instruction_for_q1_timing(instruction, state, symbols, scope=scope)
     if resolved_instruction.args == instruction.args:
         return
     actual_types = [_resolved_arg_type(arg) for arg in resolved_instruction.args]
@@ -599,13 +612,13 @@ def _diagnose_negative_rt_duration_operand(
     state: AnalysisState,
     instruction: Instr,
     spec: InstructionSpec,
-    symbols: SymbolTable,
+    scope: SymbolTable,
 ) -> bool:
     duration_arg_index = rt_duration_arg_for_instruction(spec, instruction)
     if duration_arg_index is None or duration_arg_index >= len(instruction.args):
         return False
     duration_arg = instruction.args[duration_arg_index]
-    duration = resolve_arg_value(duration_arg, operand_scope(symbols, state))
+    duration = resolve_arg_value(duration_arg, scope)
     if not isinstance(duration, Concrete) or duration.value >= 0:
         return False
     state.diagnostics.append(
@@ -630,7 +643,7 @@ def _diagnose_official_rt_duration_range(
     state: AnalysisState,
     instruction: Instr,
     spec: InstructionSpec,
-    symbols: SymbolTable,
+    scope: SymbolTable,
 ) -> bool:
     duration_arg_index = rt_duration_arg_for_instruction(spec, instruction)
     if duration_arg_index is None or duration_arg_index >= len(instruction.args):
@@ -638,7 +651,7 @@ def _diagnose_official_rt_duration_range(
     duration_arg = instruction.args[duration_arg_index]
     if resolve_register_name(duration_arg, state) is not None:
         return False
-    duration = resolve_arg_value(duration_arg, operand_scope(symbols, state))
+    duration = resolve_arg_value(duration_arg, scope)
     if not isinstance(duration, Concrete) or duration.value <= RT_DURATION_MAX:
         return False
     state.diagnostics.append(
@@ -690,14 +703,14 @@ def invalid_rt_duration(instruction: Instr, spec: InstructionSpec, scope: Symbol
 def _diagnose_invalid_rt_index_operands(
     state: AnalysisState,
     instruction: Instr,
-    symbols: SymbolTable,
+    scope: SymbolTable,
 ) -> bool:
     emitted = False
     for argument_index, operand_role in _non_negative_operand_roles(instruction.op):
         if argument_index >= len(instruction.args):
             continue
         arg = instruction.args[argument_index]
-        value = resolve_arg_value(arg, operand_scope(symbols, state))
+        value = resolve_arg_value(arg, scope)
         if isinstance(value, Concrete):
             if _has_official_operand_range(instruction.op, argument_index, operand_role):
                 continue
@@ -745,18 +758,18 @@ def _diagnose_official_operand_ranges(
     state: AnalysisState,
     instruction: Instr,
     symbols: SymbolTable,
+    scope: SymbolTable,
 ) -> bool:
     if is_packed_feedback_register_form(instruction, state):
         return False
     emitted = False
-    scope = operand_scope(symbols, state)
     for argument_index, operand_role, lower, upper in official_operand_ranges(instruction.op, len(instruction.args)):
         if argument_index >= len(instruction.args):
             continue
         arg = instruction.args[argument_index]
         value: Value
         if operand_role == "branch_target":
-            target_arg = branch_target_arg(arg, state, symbols)
+            target_arg = branch_target_arg(arg, state, symbols, scope=scope)
             if target_arg.kind != "imm":
                 continue
             value = Concrete(int(target_arg.value))
@@ -910,7 +923,7 @@ def _resolved_branch_target_arg(arg: Arg, value: Value) -> Arg | None:
     return None
 
 
-def branch_target_arg(arg: Arg, state: AnalysisState, symbols: SymbolTable) -> Arg:
+def branch_target_arg(arg: Arg, state: AnalysisState, symbols: SymbolTable, *, scope: SymbolTable | None = None) -> Arg:
     if arg.kind in {"label", "imm"}:
         return arg
     if arg.kind == "symbol" and str(arg.value).startswith("$"):
@@ -918,7 +931,8 @@ def branch_target_arg(arg: Arg, state: AnalysisState, symbols: SymbolTable) -> A
         raw = origin.get("raw", "")
         if raw.startswith("@"):
             return Arg(kind="label", value=raw[1:], raw=arg.raw)
-    scope = operand_scope(symbols, state)
+    if scope is None:
+        scope = operand_scope(symbols, state)
     if arg.kind == "reg":
         return _resolved_branch_target_arg(arg, resolve_arg_value(arg, scope)) or arg
     register = resolve_register_name(arg, state)
@@ -983,6 +997,14 @@ def emit_undefined_label(state: AnalysisState, instruction: Instr, target_label:
 def latched_operand_value(op: str, arg: Arg, scope: SymbolTable, state: AnalysisState) -> Value:
     value = resolve_arg_value(arg, scope)
     register = resolve_register_name(arg, state)
+    if isinstance(value, Symbolic) and value.tree is not None and op in {
+        "set_awg_gain", "set_awg_offs", "set_freq", "set_ph", "set_ph_delta",
+    }:
+        tree = value.tree
+        if register is not None and op in {"set_awg_gain", "set_awg_offs", "set_freq"}:
+            tree = tree.signed()
+        _, _, low, high = core_rt.OPERAND_RANGES[op][0]
+        return value.with_tree(tree.in_range(low, high))
     if register is None:
         return value
     # Decode only the value sent to the latch. Register traces keep the raw word.

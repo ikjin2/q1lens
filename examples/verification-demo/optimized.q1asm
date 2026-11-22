@@ -1,0 +1,9 @@
+.DEF N 4
+;@assume 1 <= N <= 8
+move $N,R0
+wait 100
+cmp R0,7
+jnz @pulse
+wait 12
+pulse: play 0,1,8
+stop

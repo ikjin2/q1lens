@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import math
 import re
-from dataclasses import dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,7 @@ from q1timeline.analysis.trigger_counters import TRIGGER_COUNTER_PARAMETERS, tri
 from q1timeline.diagnostics import Diagnostic
 from q1timeline.external_inputs import concrete_receiver_inputs, validate_external_inputs
 from q1timeline.feedback_fifo import DEFAULT_FEEDBACK_QUEUE_CAPACITY
+from q1timeline.output.modules import ModuleConfig
 from q1timeline.q1asm.core_devices import ExternalInputs
 from q1timeline.q1asm.ast import SourceLocation
 from q1timeline.simulation.config import validate_simulation
@@ -77,6 +79,8 @@ class ProjectConfig:
     simulation: dict[str, Any] = field(default_factory=dict)
     external_inputs: dict[str, Any] = field(default_factory=dict)
     alignment_mode_explicit: bool = False
+    modules: dict[str, ModuleConfig] = field(default_factory=dict)
+    module_snapshot_files: tuple[Path, ...] = ()
 
     def concrete_inputs(self, seq: SequencerConfig, params: dict) -> ExternalInputs:
         return concrete_receiver_inputs(
@@ -87,6 +91,19 @@ class ProjectConfig:
     def sequencer_metadata(self) -> dict[str, dict[str, str | int | None]]:
         return {seq.id: {"module": seq.module, "module_type": seq.module_type, "sequencer_index": seq.sequencer_index}
                 for seq in self.sequencers}
+
+    def output_sequence(self, seq: SequencerConfig, sequence: dict | None) -> dict:
+        sequence = sequence or {}
+        physical = self.simulation.get("physical", {}).get("sequencers", {}).get(seq.id, {})
+        module = self.modules.get(seq.module)
+        snapshot = module.sequencer_settings.get(seq.id, {}) if module else {}
+        if not (physical or snapshot):
+            return sequence
+        stored = sequence.get("output_settings", sequence.get("settings", {}))
+        if not isinstance(stored, Mapping):
+            raise ValueError(f"{seq.id}: Sequencer output settings must be a mapping.")
+        settings = {**stored, **physical, **snapshot}
+        return {**sequence, "output_settings": settings}
 
     def alignment_for_execution(self, execution_mode: str) -> str:
         if execution_mode == "simulation" and self.alignment_mode == "first_wait_sync" and not self.alignment_mode_explicit:
@@ -289,6 +306,18 @@ def load_project_config(project_file: str | Path) -> ProjectConfig:
             source=_source_for_yaml_key(project_path, "external_inputs"),
         ))
 
+    modules = {}
+    try:
+        modules = _load_output_modules(data.get("modules", {}), root, sequencers)
+        routed_modules = {seq: module for module in modules.values() for seq in module.channel_map}
+        sequencers = [
+            replace(seq, module=routed_modules[seq.id].name, module_type=routed_modules[seq.id].module_type)
+            if seq.id in routed_modules else seq for seq in sequencers
+        ]
+    except (OSError, ValueError) as exc:
+        errors.append(Diagnostic(severity="error", category="invalid_argument_value", message=str(exc),
+                                 source=_source_for_yaml_key(project_path, "modules")))
+
     if errors:
         raise ConfigLoadError("Project configuration contains errors", errors)
 
@@ -307,7 +336,46 @@ def load_project_config(project_file: str | Path) -> ProjectConfig:
         diagnostics=diagnostics,
         simulation=simulation,
         external_inputs=external_inputs,
+        modules=modules,
+        module_snapshot_files=tuple((root / spec["snapshot"]).resolve()
+                                    for spec in data.get("modules", {}).values() if "snapshot" in spec),
     )
+
+
+def _load_output_modules(specs, root, sequencers):
+    if not isinstance(specs, dict):
+        raise ValueError("modules must map module names to baseband output settings")
+    modules = {}
+    owners = {}
+    by_id = {seq.id: seq for seq in sequencers}
+    for name, spec in specs.items():
+        if not isinstance(spec, dict) or not isinstance(spec.get("type"), str):
+            raise ValueError(f"modules.{name} requires a baseband type")
+        kind = spec["type"].upper()
+        if "snapshot" in spec:
+            if set(spec) - {"type", "snapshot", "snapshot_path"} or not isinstance(spec["snapshot"], str):
+                raise ValueError(f"Invalid snapshot settings for modules.{name}")
+            snapshot = json.loads((root / spec["snapshot"]).read_text(encoding="utf-8-sig"))
+            path = spec.get("snapshot_path", [])
+            if not isinstance(path, list) or not all(isinstance(key, str) for key in path):
+                raise ValueError("snapshot_path must be a list of object keys")
+            for key in path:
+                if not isinstance(snapshot, dict) or key not in snapshot:
+                    raise ValueError(f"Missing snapshot_path key {key!r} for {name}")
+                snapshot = snapshot[key]
+            indices = {seq.id: seq.sequencer_index for seq in sequencers if seq.module == name}
+            module = ModuleConfig.from_snapshot(name, kind, snapshot, indices)
+        else:
+            if set(spec) - {"type", "channel_map", "output_offsets"}:
+                raise ValueError(f"Unknown output settings for modules.{name}")
+            module = ModuleConfig(name, kind, spec.get("channel_map", {}), spec.get("output_offsets", {}))
+        for seq in module.channel_map:
+            if (seq not in by_id or seq in owners or by_id[seq].module not in (None, name)
+                    or by_id[seq].module_type not in (None, kind)):
+                raise ValueError(f"Unknown or conflicting sequencer {seq!r} in modules.{name}")
+            owners[seq] = name
+        modules[name] = module
+    return modules
 
 
 def load_single_file_config(q1asm_file: str | Path) -> ProjectConfig:

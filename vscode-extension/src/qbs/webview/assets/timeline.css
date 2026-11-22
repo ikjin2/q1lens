@@ -13,8 +13,7 @@ body {
 .topbar {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
+  gap: 8px;
   height: 42px;
   padding: 0 12px;
   border-bottom: 1px solid var(--vscode-panel-border);
@@ -22,6 +21,7 @@ body {
 }
 
 .topbar h1 {
+  min-width: 0;
   margin: 0;
   overflow: hidden;
   font-size: 14px;
@@ -30,13 +30,39 @@ body {
   white-space: nowrap;
 }
 
+.topbar-tools {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+  padding-left: 8px;
+  border-left: 1px solid var(--vscode-panel-border);
+}
+
+.topbar-status {
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+
+/* Controls are neutral; colour is reserved for state and the one primary action. */
 button {
   border: 0;
   border-radius: 4px;
-  color: var(--vscode-button-foreground);
-  background: var(--vscode-button-background);
+  color: var(--vscode-foreground);
+  background: transparent;
   font: inherit;
   cursor: pointer;
+}
+
+.icon {
+  display: block;
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 button:focus-visible {
@@ -58,54 +84,66 @@ button:focus-visible {
   border-right: 1px solid var(--vscode-panel-border);
 }
 
-.stage-header {
-  position: sticky;
-  top: 0;
-  z-index: 3;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  height: 36px;
-  padding: 0 12px;
-  border-bottom: 1px solid var(--vscode-panel-border);
-  background: var(--vscode-editor-background);
-}
-
-.stage-heading {
-  display: grid;
-  min-width: 0;
-  gap: 1px;
-}
-
-.stage-title {
-  font-size: 12px;
-  font-weight: 600;
-  text-transform: uppercase;
-}
-
-.stage-total {
+.stage-window,
+.stage-selection {
   color: var(--vscode-descriptionForeground);
   font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .zoom-controls {
   display: flex;
   flex: 0 0 auto;
   align-items: center;
-  gap: 6px;
+  gap: 2px;
 }
 
 .icon-button,
 .tool-button {
   min-height: 26px;
-  padding: 4px 8px;
-  border-radius: 3px;
+  padding: 3px 8px;
+  border-radius: 4px;
 }
 
 .icon-button {
-  width: 28px;
+  display: inline-grid;
+  width: 26px;
+  flex: 0 0 auto;
+  place-items: center;
   padding: 0;
-  font-weight: 700;
+}
+
+.tool-button {
+  margin-left: 6px;
+  color: var(--vscode-button-secondaryForeground);
+  background: var(--vscode-button-secondaryBackground);
+  white-space: nowrap;
+}
+
+.icon-button:hover,
+.tool-button:hover {
+  background: var(--vscode-button-secondaryHoverBackground);
+}
+
+.status-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 24px;
+  padding: 2px 8px;
+  color: var(--vscode-descriptionForeground);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.status-chip[data-provenance="unmapped"] {
+  color: var(--vscode-errorForeground, var(--vscode-charts-red));
+  font-weight: 600;
+}
+
+.status-chip:hover {
+  background: var(--vscode-button-secondaryHoverBackground);
 }
 
 button:disabled {
@@ -115,7 +153,7 @@ button:disabled {
 
 .ruler {
   position: sticky;
-  top: 36px;
+  top: 0;
   z-index: 2;
   height: 34px;
   margin-left: 168px;
@@ -447,18 +485,25 @@ button:disabled {
   background: var(--vscode-sideBar-background);
 }
 
-.inspector-kicker {
-  color: var(--vscode-descriptionForeground);
-  font-size: 11px;
-  font-weight: 600;
-  text-transform: uppercase;
-}
-
 .inspector h2 {
-  margin: 5px 0 14px;
+  margin: 0 0 12px;
   font-size: 16px;
   font-weight: 600;
   line-height: 1.25;
+}
+
+.inspector-time {
+  margin: -8px 0 12px;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.inspector-time-meta {
+  color: var(--vscode-descriptionForeground);
+}
+
+.inspector-hint {
+  margin: -8px 0 12px;
 }
 
 .inspector-rows {
@@ -536,12 +581,6 @@ button:disabled {
   gap: 6px;
 }
 
-.q1asm-drilldown-title {
-  font-size: 12px;
-  font-weight: 600;
-  text-transform: uppercase;
-}
-
 .q1asm-drilldown-meta {
   display: flex;
   min-width: 0;
@@ -611,14 +650,20 @@ button:disabled {
 
 .inspector-actions {
   display: flex;
-  flex-direction: column;
-  gap: 8px;
-  margin-top: 18px;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 16px;
 }
 
 .action-button {
-  min-height: 30px;
-  padding: 6px 10px;
+  min-height: 26px;
+  padding: 3px 10px;
+  color: var(--vscode-button-foreground);
+  background: var(--vscode-button-background);
+}
+
+.action-button:hover {
+  background: var(--vscode-button-hoverBackground, var(--vscode-button-background));
 }
 
 .action-button.secondary {
@@ -626,49 +671,60 @@ button:disabled {
   background: var(--vscode-button-secondaryBackground);
 }
 
+.action-button.secondary:hover {
+  background: var(--vscode-button-secondaryHoverBackground);
+}
+
+/* One quiet footer line: counts, provenance legend, project files. */
 .summary-strip {
   grid-column: 1 / 3;
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 20px;
   min-width: 0;
+  padding: 5px 12px;
   border-top: 1px solid var(--vscode-panel-border);
+  color: var(--vscode-descriptionForeground);
   background: var(--vscode-editor-background);
+  font-size: 12px;
+}
+
+.summary-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
 }
 
 .provenance-legend {
-  flex: 1.25 1 280px;
-  display: grid;
-  gap: 6px;
-  align-content: center;
-  padding: 9px 12px;
-  border-right: 1px solid var(--vscode-panel-border);
-}
-
-.provenance-legend-title {
-  color: var(--vscode-descriptionForeground);
-  font-size: 11px;
-  font-weight: 600;
-  text-transform: uppercase;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
 }
 
 .provenance-legend-items {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px 10px;
+  gap: 4px;
 }
 
 .provenance-legend-item {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  font-size: 11px;
+  font-size: 12px;
   white-space: nowrap;
-  color: var(--vscode-foreground);
+  color: var(--vscode-descriptionForeground);
   background: transparent;
-  border: 1px solid var(--vscode-panel-border);
   border-radius: 3px;
-  padding: 3px 5px;
+  padding: 1px 5px;
   cursor: pointer;
+}
+
+.provenance-legend-item:hover:not(:disabled) {
+  color: var(--vscode-foreground);
+  background: var(--vscode-button-secondaryHoverBackground);
 }
 
 .provenance-legend-item:disabled { opacity: 0.55; cursor: default; }
@@ -691,68 +747,41 @@ button:disabled {
   border-bottom-color: var(--vscode-errorForeground, var(--vscode-charts-red));
 }
 
-.source-card {
-  flex: 1.5 1 320px;
-  min-width: 0;
-  display: grid;
-  grid-template-columns: 72px minmax(0, 1fr);
-  gap: 10px;
-  align-items: center;
-  padding: 10px 12px;
-  border-right: 1px solid var(--vscode-panel-border);
-}
-
-.source-title {
-  color: var(--vscode-descriptionForeground);
-  font-size: 11px;
-  font-weight: 600;
-  text-transform: uppercase;
-}
-
 .source-files {
   display: flex;
   min-width: 0;
   flex-wrap: wrap;
-  gap: 6px;
+  align-items: center;
+  gap: 4px 14px;
+  margin-left: auto;
 }
 
-.source-files span {
-  max-width: 180px;
+.source-link,
+.source-output {
+  max-width: 220px;
   overflow: hidden;
-  padding: 2px 6px;
-  border-radius: 4px;
-  background: var(--vscode-editor-inactiveSelectionBackground);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.source-actions {
-  grid-column: 1 / -1;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
+.source-link {
+  padding: 0;
+  border-radius: 2px;
+  color: var(--vscode-textLink-foreground);
 }
 
-.source-button {
-  padding: 4px 8px;
+.source-link:hover {
+  text-decoration: underline;
 }
 
 .summary-item {
-  flex: 1 1 120px;
-  padding: 10px 12px;
-  border-right: 1px solid var(--vscode-panel-border);
+  white-space: nowrap;
 }
 
 .summary-value {
-  display: block;
-  font-size: 18px;
+  color: var(--vscode-foreground);
+  font-variant-numeric: tabular-nums;
   font-weight: 600;
-}
-
-.summary-label {
-  color: var(--vscode-descriptionForeground);
-  font-size: 11px;
-  text-transform: uppercase;
 }
 
 @media (max-width: 920px) {
@@ -772,17 +801,10 @@ button:disabled {
   }
 
   .summary-strip {
-    display: grid;
     grid-column: 1;
-    grid-template-columns: repeat(2, minmax(120px, 1fr));
   }
 
-  .source-card {
-    grid-column: 1 / 3;
-    grid-template-columns: 1fr;
-  }
-
-  .provenance-legend {
-    grid-column: 1 / 3;
+  .source-files {
+    margin-left: 0;
   }
 }

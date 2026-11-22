@@ -9,15 +9,12 @@ from typing import Any
 import yaml
 
 from q1timeline.analysis.alignment import align_timelines
+from q1timeline.analysis.api import analyze_project_states
 from q1timeline.analysis.hardware_readiness import analyze_project_hardware_readiness
-from q1timeline.analysis.underflow import analyze_underflows
 from q1timeline.diagnostics import Diagnostic, has_fatal_diagnostics
-from q1timeline.execution.state import AnalysisState
 from q1timeline.ir.serialize import diagnostics_to_json, timeline_ir_from_states, write_timeline_ir
-from q1timeline.project import ConfigLoadError, ProjectConfig, load_project_config
-from q1timeline.q1asm.parser import parse_q1asm_file
+from q1timeline.project import ConfigLoadError, load_project_config
 from q1timeline.render.html import render_html
-from q1timeline.sequence import load_sequence_data, load_sequence_names
 
 
 @dataclass(frozen=True)
@@ -71,7 +68,7 @@ def collect_watch_paths(project_file: str | Path) -> set[Path]:
     except ConfigLoadError:
         return _collect_project_reference_paths(project_path)
 
-    paths = {project_path}
+    paths = {project_path, *config.module_snapshot_files}
     for sequencer in config.sequencers:
         paths.add(sequencer.file.resolve())
         if sequencer.sequence_json is not None:
@@ -101,6 +98,12 @@ def _collect_project_reference_paths(project_path: Path) -> set[Path]:
                 value = sequencer.get(key)
                 if isinstance(value, str) and value.strip():
                     paths.add(_resolve_project_reference(project_path, value))
+
+    modules = loaded.get("modules")
+    if isinstance(modules, dict):
+        for module in modules.values():
+            if isinstance(module, dict) and isinstance(module.get("snapshot"), str):
+                paths.add(_resolve_project_reference(project_path, module["snapshot"]))
 
     for section_name in ("params", "display"):
         section = loaded.get(section_name)
@@ -173,7 +176,7 @@ def run_watch_once(project_file: str | Path, out_dir: str | Path) -> WatchRunRes
 
     try:
         config = load_project_config(project_path)
-        states = _analyze_config(config)
+        states = analyze_project_states(config)
         analyze_project_hardware_readiness(states, config.sequencers)
         alignment_mode = config.alignment_for_execution(config.analysis.execution_mode)
         align_timelines(
@@ -193,6 +196,7 @@ def run_watch_once(project_file: str | Path, out_dir: str | Path) -> WatchRunRes
             },
             diagnostics=diagnostics,
             feedback_routes=config.simulation.get("routes", ()),
+            modules=config.modules,
         )
         for entry, sequencer in zip(ir["sequencers"], config.sequencers):
             if sequencer.module:
@@ -263,45 +267,6 @@ def watch_project(
         if tracker.update(snapshot, now=time.monotonic()):
             result = run_watch_once(project_file, out_dir)
             print(_status_line(result))
-
-
-def _analyze_config(config: ProjectConfig) -> list[AnalysisState]:
-    if config.analysis.execution_mode == "simulation":
-        from q1timeline.simulation.runtime import simulate_programs
-
-        return simulate_programs(
-            {seq.id: parse_q1asm_file(seq.file) for seq in config.sequencers},
-            params=config.params, max_steps=config.analysis.max_steps,
-            simulation=config.simulation,
-            sequences={seq.id: load_sequence_data(seq.sequence_json)
-                       for seq in config.sequencers if seq.sequence_json},
-            hardware_parameters={seq.id: seq.hardware_parameters for seq in config.sequencers},
-            sequencer_metadata=config.sequencer_metadata(),
-        )
-    from q1timeline.analysis.interpreter import interpret_program
-
-    states = []
-    for sequencer in config.sequencers:
-        sequence_names = load_sequence_names(sequencer.sequence_json) if sequencer.sequence_json else None
-        config.diagnostics.extend(sequence_names.diagnostics if sequence_names else [])
-        program = parse_q1asm_file(sequencer.file)
-        state = interpret_program(
-            program,
-            sequencer_id=sequencer.id,
-            params=config.params,
-            waveform_names=sequence_names.waveforms if sequence_names else None,
-            acquisition_names=sequence_names.acquisitions if sequence_names else None,
-            branch_policy=config.analysis.branch_policy,
-            execution_mode=config.analysis.execution_mode,
-            external=config.concrete_inputs(sequencer, config.params) if config.analysis.execution_mode == "concrete" else None,
-            max_steps=config.analysis.max_steps,
-        )
-        state.metadata["hardware_parameters"] = dict(sequencer.hardware_parameters)
-        if sequence_names is not None:
-            state.metadata["weight_lengths"] = sequence_names.weight_lengths
-        states.append(state)
-    analyze_underflows(states)
-    return states
 
 
 def _snapshot_paths(paths: set[Path]) -> dict[str, int | None]:

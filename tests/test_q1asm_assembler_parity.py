@@ -412,14 +412,14 @@ def test_fb_com_data_accepts_full_feedback_id_range() -> None:
     assert _error_categories("fb_cmd 255,0,4\nstop\n") == []
 
 
-def test_fb_cmd_undefined_alias_reports_the_excluded_source_operand() -> None:
-    state = _state("fb_cmd $CH,0,4\nstop\n")
+def test_strict_fb_cmd_undefined_alias_reports_the_source_operand() -> None:
+    state = _state("fb_cmd $CH,0,4\nstop\n", strict_q1asm=True)
 
     assert any(
         diagnostic.category == "unresolved_symbol"
         and diagnostic.details.get("op") == "fb_cmd"
         and diagnostic.details.get("operand") == "$CH"
-        and diagnostic.details.get("source_line_skipped")
+        and diagnostic.severity == "error"
         for diagnostic in state.diagnostics
     )
 

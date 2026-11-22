@@ -12,10 +12,13 @@ import math
 import random
 from array import array
 from collections import deque
+from operator import mul
 from typing import Any
 
 
+_OUTPUT_STAGES = ("waveform", "gain_offset", "nco", "fir", "filtered", "dac")
 MODEL = "q1lens-sampled-envelope-v1"
+PHASE_TICKS_PER_TURN = 4_000_000_000  # quarter-Hz frequency word × elapsed ns
 MAX_TOTAL_SAMPLES = 1_000_000
 SOURCES = [
     "https://docs.qblox.com/en/main/products/qblox_instruments/q1/index.html",
@@ -179,20 +182,49 @@ def validate_physical_config(config: dict, sequencer_ids=None) -> dict:
     return result
 
 
+def _quantize_with_clipping(value: float, scale: int) -> tuple[float, bool]:
+    if -1 <= value < 1:
+        code = round(value * scale)
+        if code < scale:
+            return code / scale, False
+    # A value below +1 can still round to the first unrepresentable code.
+    return ((scale - 1) / scale if value >= 0 else -1.0), True
+
+
 def _quantize(value: float, bits: int) -> float:
-    scale = 2 ** (bits - 1)
-    return min(scale - 1, max(-scale, round(min(1, max(-1, value)) * scale))) / scale
+    return _quantize_with_clipping(value, 1 << (bits - 1))[0]
 
 
-def _clips(value: float, bits: int) -> bool:
-    if value < -1 or value >= 1:
-        return True
-    scale = 2 ** (bits - 1)
-    return not -scale <= round(value * scale) < scale
+def _convert_iq(i: float, q: float, bits: int) -> tuple[complex, bool]:
+    scale = 1 << (bits - 1)
+    i, clipped_i = _quantize_with_clipping(i, scale)
+    q, clipped_q = _quantize_with_clipping(q, scale)
+    return complex(i, q), clipped_i or clipped_q
+
+
+def _phase_turns(ticks: int | float) -> float:
+    return (ticks % PHASE_TICKS_PER_TURN) / PHASE_TICKS_PER_TURN
+
+
+def _scaled_ticks(value: float, scale: int) -> int | float:
+    ticks = value * scale
+    return int(ticks) if ticks.is_integer() else ticks
+
+
+# Common binary phases reuse the same libm values. Exact quadrants keep a zero on the orthogonal axis.
+_GRID_ROTATIONS = tuple(
+    (1 + 0j, 1j, -1 + 0j, -1j)[k // 8] if k % 8 == 0
+    else complex(math.cos(math.tau * (k / 32)), math.sin(math.tau * (k / 32)))
+    for k in range(32)
+)
 
 
 def _rotation(turns: float) -> complex:
-    angle = math.tau * (turns % 1)
+    fraction = turns % 1
+    slot = fraction * 32
+    if slot.is_integer():
+        return _GRID_ROTATIONS[int(slot) % 32]
+    angle = math.tau * fraction
     return complex(math.cos(angle), math.sin(angle))
 
 
@@ -201,14 +233,16 @@ class _Signal:
         self.config = config
         self.events: list[tuple[int, str, list[int], dict]] = []
         self.event_index = 0
-        self.stages = {stage: (array("d"), array("d")) for stage in ("waveform", "gain_offset", "nco", "fir", "filtered", "dac", "adc", "demodulated")}
+        self.stages = {stage: (array("d"), array("d")) for stage in (*_OUTPUT_STAGES, "adc", "demodulated")}
+        self.output_paths = tuple(self.stages[stage] for stage in _OUTPUT_STAGES)
         self.phases = array("d")
         self.gain = config["gain"]
         self.offset = config["offset"]
-        self.frequency = config["nco_frequency_hz"]
-        self.phase_offset = config["nco_phase_turns"]
+        self.frequency_word = _scaled_ticks(config["nco_frequency_hz"], 4)
+        turns = config["nco_phase_turns"]
+        self.phase_offset_ticks = 0 if turns.is_integer() else _scaled_ticks(turns, PHASE_TICKS_PER_TURN) % PHASE_TICKS_PER_TURN
         self.phase_time = 0
-        self.accumulated_phase = 0.0
+        self.accumulated_ticks = 0
         self.play: tuple[int, list[float], list[float]] | None = None
         self.fir_history = deque(maxlen=len(config["fir"]))
         self.iir_inputs = deque(maxlen=len(config["iir"]["b"]))
@@ -371,47 +405,106 @@ class SignalModel:
             raise ValueError("Physical signal sample limit exceeded; shorten the run or increase sample_period_ns")
         # All outputs first: zero-delay loopbacks remain independent of dict order.
         for seq, signal in self.signals.items():
-            while len(signal.phases) < count:
-                self._sample_output(seq, signal, len(signal.phases) * self.dt)
-        for seq, signal in self.signals.items():
-            while len(signal.stages["adc"][0]) < count:
-                index = len(signal.stages["adc"][0])
-                sample = self._input_sample(seq, signal, index * self.dt)
-                if sample is None:
-                    signal.adc_missing.add(index)
-                    sample = complex(float("nan"), float("nan"))
-                else:
-                    noise = signal.config.get("input", {}).get("noise_std", 0)
-                    if noise:
-                        sample += complex(signal.random.gauss(0, noise), signal.random.gauss(0, noise))
-                    if not math.isfinite(sample.real) or not math.isfinite(sample.imag):
-                        raise ValueError("Input model produced a non-finite sample")
-                    bits = signal.config["adc_bits"]
-                    signal.adc_clipped += int(_clips(sample.real, bits) or _clips(sample.imag, bits))
-                    sample = complex(_quantize(sample.real, bits), _quantize(sample.imag, bits))
-                self._append(signal, "adc", sample)
-                demodulated = sample * _rotation(-signal.phases[index]) if signal.config["demodulate"] else sample
-                self._append(signal, "demodulated", demodulated)
+            self._render_output(seq, signal, count)
+        for signal in self.signals.values():
+            self._render_input(signal, count)
         self._rendered_end_ns = max(self._rendered_end_ns, end_ns)
+
+    def _render_output(self, seq: str, signal: _Signal, count: int) -> None:
+        index = len(signal.phases)
+        iir = signal.config["iir"]
+        can_hold = (not signal.netzero and len(signal.config["fir"]) == len(iir["a"]) == len(iir["b"]) == 1
+                    and signal.fir_history.maxlen == signal.iir_inputs.maxlen == signal.iir_outputs.maxlen == 1)
+        while index < count:
+            time_ns = index * self.dt
+            previous_clipped = signal.dac_clipped
+            self._sample_output(seq, signal, time_ns)
+            index += 1
+            stop = count
+            if signal.event_index < len(signal.events):
+                next_event_ns = signal.events[signal.event_index][0]
+                stop = min(stop, (next_event_ns + self.dt - 1) // self.dt)
+            if index < stop and can_hold and signal.frequency_word == 0:
+                wave_end = 0
+                if signal.play is not None:
+                    start, wave_i, wave_q = signal.play
+                    wave_end = start + max(len(wave_i), len(wave_q))
+                if time_ns < wave_end:
+                    stop = min(stop, (wave_end + self.dt - 1) // self.dt)
+                else:
+                    # The first post-waveform sample has established the entire one-tap filter state.
+                    remaining = stop - index
+                    for paths in signal.output_paths:
+                        for path in paths:
+                            path.extend(path[-1:] * remaining)
+                    signal.phases.extend(signal.phases[-1:] * remaining)
+                    signal.dac_clipped += (signal.dac_clipped - previous_clipped) * remaining
+                    index = stop
+            for tick in range(index, stop):
+                self._sample_output(seq, signal, tick * self.dt)
+            index = stop
+
+    def _render_input(self, signal: _Signal, count: int) -> None:
+        adc_i, adc_q = signal.stages["adc"]
+        demod_i, demod_q = signal.stages["demodulated"]
+        first = len(adc_i)
+        if first >= count:
+            return
+        inp = signal.config.get("input")
+        noise = inp.get("noise_std", 0) if inp else 0
+        if not signal.config["demodulate"] and (inp is None or inp["kind"] == "constant" and not noise):
+            remaining = count - first
+            if inp is None:
+                i = q = math.nan
+                signal.adc_missing.update(range(first, count))
+            else:
+                if not math.isfinite(inp["i"]) or not math.isfinite(inp["q"]):
+                    raise ValueError("Input model produced a non-finite sample")
+                value, clipped = _convert_iq(inp["i"], inp["q"], signal.config["adc_bits"])
+                i, q = value.real, value.imag
+                signal.adc_clipped += remaining * clipped
+            for value, adc, demod in ((i, adc_i, demod_i), (q, adc_q, demod_q)):
+                samples = array("d", [value]) * remaining
+                adc.extend(samples)
+                demod.extend(samples)
+            return
+        rotation = _rotation(inp["phase_turns"]) if inp and inp["kind"] == "loopback" else 1 + 0j
+        for index in range(first, count):
+            sample = self._input_sample(inp, index * self.dt, rotation)
+            if sample is None:
+                signal.adc_missing.add(index)
+                sample = complex(float("nan"), float("nan"))
+            else:
+                if noise:
+                    sample += complex(signal.random.gauss(0, noise), signal.random.gauss(0, noise))
+                if not math.isfinite(sample.real) or not math.isfinite(sample.imag):
+                    raise ValueError("Input model produced a non-finite sample")
+                sample, clipped = _convert_iq(sample.real, sample.imag, signal.config["adc_bits"])
+                signal.adc_clipped += clipped
+            adc_i.append(sample.real)
+            adc_q.append(sample.imag)
+            demodulated = sample * _rotation(-signal.phases[index]) if signal.config["demodulate"] else sample
+            demod_i.append(demodulated.real)
+            demod_q.append(demodulated.imag)
 
     def _sample_output(self, seq: str, signal: _Signal, time_ns: int) -> None:
         while signal.event_index < len(signal.events) and signal.events[signal.event_index][0] <= time_ns:
             event_time, op, args, settings = signal.events[signal.event_index]
             signal.event_index += 1
-            signal.accumulated_phase += signal.frequency * (event_time - signal.phase_time) * 1e-9
+            signal.accumulated_ticks += signal.frequency_word * (event_time - signal.phase_time)
             signal.phase_time = event_time
             updated = settings.get("_updated_fields", list(settings))
             if settings.get("_phase_reset"):
-                signal.accumulated_phase = 0
-                signal.phase_offset = 0
+                signal.accumulated_ticks = 0
+                signal.phase_offset_ticks = 0
             if "frequency" in updated and settings.get("frequency") is not None:
-                signal.frequency = settings["frequency"] / 4
-                if abs(signal.frequency) >= 0.5e9 / self.dt:
+                signal.frequency_word = settings["frequency"]
+                if abs(signal.frequency_word) >= 2e9 / self.dt:
                     raise ValueError("NCO frequency reaches the configured sample-grid Nyquist limit")
             if "phase" in updated and settings.get("phase") is not None:
-                signal.phase_offset = settings["phase"] / 1e9
+                signal.phase_offset_ticks = settings["phase"] * 4
             if "phase_delta" in updated and settings.get("phase_delta") is not None:
-                signal.accumulated_phase += settings["phase_delta"] / 1e9
+                signal.accumulated_ticks += settings["phase_delta"] * 4
             for field, attribute in (("awg_gain", "gain"), ("awg_offset", "offset")):
                 if field in updated and settings.get(field) is not None:
                     setattr(signal, attribute, [value / 32768 for value in settings[field]])
@@ -423,42 +516,46 @@ class SignalModel:
             index = time_ns - start
             raw = complex(wave_i[index] if index < len(wave_i) else 0, wave_q[index] if index < len(wave_q) else 0)
         gained = complex(raw.real * signal.gain[0] + signal.offset[0], raw.imag * signal.gain[1] + signal.offset[1])
-        phase = signal.accumulated_phase + signal.frequency * (time_ns - signal.phase_time) * 1e-9 + signal.phase_offset
+        phase = _phase_turns(signal.accumulated_ticks + signal.frequency_word * (time_ns - signal.phase_time)
+                             + signal.phase_offset_ticks)
         modulated = gained * _rotation(phase)
         signal.fir_history.appendleft(modulated)
-        filtered = sum(coefficient * sample for coefficient, sample in zip(signal.config["fir"], signal.fir_history))
-        fir = filtered
-        signal.iir_inputs.appendleft(filtered)
+        weights = signal.config["fir"]
+        # Keep the same sum operation even for one tap, including its signed-zero behavior.
+        fir = sum((weights[0] * modulated,)) if len(weights) == 1 else sum(map(mul, weights, signal.fir_history))
+        signal.iir_inputs.appendleft(fir)
         coefficients = signal.config["iir"]
-        filtered = (sum(coefficient * sample for coefficient, sample in zip(coefficients["b"], signal.iir_inputs))
-                    - sum(coefficient * sample for coefficient, sample in zip(coefficients["a"][1:], signal.iir_outputs))) / coefficients["a"][0]
+        a, b = coefficients["a"], coefficients["b"]
+        feedforward = sum((b[0] * fir,)) if len(b) == 1 else sum(map(mul, b, signal.iir_inputs))
+        feedback = sum(map(mul, a[1:], signal.iir_outputs)) if len(a) > 1 else 0
+        filtered = (feedforward - feedback) / a[0]
         if not math.isfinite(filtered.real) or not math.isfinite(filtered.imag):
             raise ValueError("IIR/FIR output is non-finite; verify the configured filter stability")
         signal.iir_outputs.appendleft(filtered)
-        compensated = [filtered.real, filtered.imag]
-        for output in signal.netzero.values():
-            cfg, pulse = output["config"], output["pulse"]
-            path = cfg["path"]
-            if pulse is not None and pulse[0] <= time_ns < pulse[0] + len(pulse[1]) * self.dt:
-                compensated[path] = pulse[1][(time_ns - pulse[0]) // self.dt]
-            output["area"] += compensated[path] * self.dt
-            if cfg["ihp_enabled"]:
-                output["ihp_area"] += compensated[path] * self.dt
-        signal.dac_clipped += int(any(_clips(value, signal.config["dac_bits"]) for value in compensated))
-        dac = complex(*(_quantize(value, signal.config["dac_bits"]) for value in compensated))
+        dac_input = filtered
         if signal.netzero:
-            self._append(signal, "netzero", complex(*compensated))
-        for stage, sample in (("waveform", raw), ("gain_offset", gained), ("nco", modulated), ("fir", fir), ("filtered", filtered), ("dac", dac)):
-            self._append(signal, stage, sample)
+            compensated = [filtered.real, filtered.imag]
+            for output in signal.netzero.values():
+                cfg, pulse = output["config"], output["pulse"]
+                path = cfg["path"]
+                if pulse is not None and pulse[0] <= time_ns < pulse[0] + len(pulse[1]) * self.dt:
+                    compensated[path] = pulse[1][(time_ns - pulse[0]) // self.dt]
+                output["area"] += compensated[path] * self.dt
+                if cfg["ihp_enabled"]:
+                    output["ihp_area"] += compensated[path] * self.dt
+            dac_input = complex(*compensated)
+        dac, clipped = _convert_iq(dac_input.real, dac_input.imag, signal.config["dac_bits"])
+        signal.dac_clipped += clipped
+        if signal.netzero:
+            i_path, q_path = signal.stages["netzero"]
+            i_path.append(dac_input.real)
+            q_path.append(dac_input.imag)
+        for (i_path, q_path), sample in zip(signal.output_paths, (raw, gained, modulated, fir, filtered, dac)):
+            i_path.append(sample.real)
+            q_path.append(sample.imag)
         signal.phases.append(phase % 1)
 
-    @staticmethod
-    def _append(signal: _Signal, stage: str, value: complex) -> None:
-        signal.stages[stage][0].append(value.real)
-        signal.stages[stage][1].append(value.imag)
-
-    def _input_sample(self, seq: str, signal: _Signal, time_ns: int) -> complex | None:
-        inp = signal.config.get("input")
+    def _input_sample(self, inp: dict | None, time_ns: int, rotation: complex) -> complex | None:
         if inp is None:
             return None
         if inp["kind"] == "constant":
@@ -473,7 +570,7 @@ class SignalModel:
             return 0j  # Declared loopback starts from zero initial conditions.
         source = self.signals[inp["sequencer"]].stages["dac"]
         index = delayed_time // self.dt
-        return complex(source[0][index], source[1][index]) * inp["gain"] * _rotation(inp["phase_turns"])
+        return complex(source[0][index], source[1][index]) * inp["gain"] * rotation
 
     def acquire(self, seq: str, start_ns: int, duration_ns: int, acquisition_index: int, bin_index: int, weights=None,
                 *, integration_length_source: str | None = None) -> dict | None:
@@ -490,20 +587,28 @@ class SignalModel:
         end = start_ns + duration_ns
         self._render(end)
         first, last = start_ns // self.dt, math.ceil(end / self.dt)
-        if any(index in signal.adc_missing for index in range(first, last)):
+        if signal.adc_missing and any(index in signal.adc_missing for index in range(first, last)):
             return None
         total_i = total_q = 0.0
         paths = signal.stages["demodulated"]
-        for index in range(first, last):
-            t0, t1 = max(start_ns, index * self.dt), min(end, (index + 1) * self.dt)
-            weight_i = weight_q = t1 - t0
-            if weights is not None:
-                relative_start, relative_end = t0 - start_ns, t1 - start_ns
-                wi, wq = (self.weights[seq][weight] for weight in weights)
-                weight_i = sum(wi[relative_start:relative_end])
-                weight_q = sum(wq[relative_start:relative_end])
-            total_i += paths[0][index] * weight_i
-            total_q += paths[1][index] * weight_q
+        if self.dt == 1 and weights is None:
+            i_path, q_path = paths
+            for index in range(first, last):
+                total_i += i_path[index]
+                total_q += q_path[index]
+        else:
+            wi, wq = (self.weights[seq][key] for key in weights) if weights is not None else (None, None)
+            left = 0
+            right = self.dt - start_ns % self.dt
+            for index in range(first, last):
+                right = min(right, duration_ns)
+                weight_i = weight_q = right - left
+                if weights is not None:
+                    weight_i = sum(wi[left:right])
+                    weight_q = sum(wq[left:right])
+                total_i += paths[0][index] * weight_i
+                total_q += paths[1][index] * weight_q
+                left, right = right, right + self.dt
         rotated = complex(total_i, total_q) * _rotation(signal.config["threshold_rotation_deg"] / 360)
         if integration_length_source is None:
             integration_length_source = ("weight_memory" if weights is not None else "configured"
@@ -589,12 +694,15 @@ class SignalModel:
                 if stage in {"adc", "demodulated"} and "input" not in signal.config:
                     continue
                 for path, samples in zip(("i", "q"), paths):
+                    values = samples[::stride].tolist()
+                    if not all(map(math.isfinite, values)):
+                        values = [value if math.isfinite(value) else None for value in values]
                     traces.append({"stage": stage, "path": path, "t0": 0, "dt_ns": self.dt * stride,
-                                   "samples": [value if math.isfinite(value) else None for value in samples[::stride]],
+                                   "samples": values,
                                    "source": self._source(signal) if stage in {"adc", "demodulated"} else {"kind": "numerical_model", "label": "Calculated signal"}})
             for path, samples in zip(("i", "q"), signal.stages["dac"]):
                 traces.append({"stage": "rf", "path": path, "t0": 0, "dt_ns": self.dt * stride,
-                               "samples": list(samples[::stride]), "representation": "complex_envelope",
+                               "samples": samples[::stride].tolist(), "representation": "complex_envelope",
                                "lo_frequency_hz": signal.config["lo_frequency_hz"],
                                "source": {"kind": "numerical_model", "label": "Ideal RF complex envelope; LO carrier not sampled"}})
             parameters = {key: copy.deepcopy(value) for key, value in signal.config.items() if key != "input"}

@@ -926,12 +926,16 @@
     const root = rootNode;
     const section = element("section", "shared-timeline-stage timeline-stage");
     if (Number.isFinite(model.plotWidth)) section.style.setProperty("--timeline-time-width", `${model.plotWidth}px`);
-    const header = element("div", "stage-header");
-    const heading = element("div", "stage-heading");
-    heading.appendChild(element("div", "stage-title", model.title || "Timeline"));
-    heading.appendChild(element("div", "stage-total", model.subtitle || ""));
-    header.appendChild(heading);
-    section.appendChild(header);
+    // The caption is optional: a model that passes neither a title nor a subtitle gets no header row.
+    const title = model.title === undefined ? "Timeline" : model.title;
+    if (title || model.subtitle) {
+      const header = element("div", "stage-header");
+      const heading = element("div", "stage-heading");
+      if (title) heading.appendChild(element("div", "stage-title", title));
+      if (model.subtitle) heading.appendChild(element("div", "stage-total", model.subtitle));
+      header.appendChild(heading);
+      section.appendChild(header);
+    }
     section.appendChild(renderRuler(model));
 
     const lanes = element("div", "timeline-lanes");

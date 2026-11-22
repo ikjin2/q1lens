@@ -53,9 +53,10 @@ def admit_q1_issue(
     supported_ops: set[str] | None = None, allow_symbolic_operands: bool = False,
 ) -> _Q1Admission | None:
     binding = state.bound_instructions.get(instruction.pc) if state.interior_pc is None else None
-    spec, invalid, diagnostic_start = validate_instruction(state, instruction, symbols, binding)
-    needs_scope = state.execution_mode == "concrete" or state.record_trace or spec.emits_rt_packet or instruction.op in core.LOCAL_OPS
-    scope = operand_scope(symbols, state) if needs_scope else {}
+    scope = operand_scope(symbols, state) if state.execution_mode == "concrete" or state.record_trace else None
+    spec, invalid, diagnostic_start = validate_instruction(state, instruction, symbols, binding, scope=scope)
+    if scope is None:
+        scope = operand_scope(symbols, state) if spec.emits_rt_packet or instruction.op in core.LOCAL_OPS else {}
     duration_error = None if invalid else invalid_rt_duration(instruction, spec, scope)
     if state.execution_mode == "concrete" and not concrete_instruction_ready(
         state, instruction, symbols, spec, invalid, diagnostic_start,

@@ -90,6 +90,8 @@ async function inspect(page, issue, viewer) {
     while (!await target.count() && await collapsed.count()) await collapsed.first().press("Enter");
   }
   await target.press("Enter");
+  // Selecting a block fills the selection strip; the full field list is read from the details section.
+  if (viewer === "extension") await analysisDetails(page);
   return inspectorField(page, "Recorded RT decisions");
 }
 

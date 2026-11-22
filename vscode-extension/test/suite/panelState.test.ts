@@ -47,7 +47,7 @@ window.addEventListener("message", ({data}) => {
   vscode.postMessage({type:"testQbsState",id:data.id,state:{
     selected:[...document.querySelectorAll('.timeline-block[aria-selected="true"]')].map(node=>node.dataset.blockId),
     inspector:document.querySelector(".inspector h2").textContent,
-    viewport:document.querySelector(".stage-total").textContent
+    viewport:document.querySelector(".timeline-stage").dataset.viewport
   }});
 });
 </script></body>`);
@@ -67,7 +67,7 @@ window.addEventListener("message", ({data}) => {
       const selected = await state(true);
       assert.deepEqual(selected.selected, ["second"]);
       assert.equal(selected.inspector, "Second(q0)");
-      assert.ok(!selected.viewport.includes("view 0 ns - 90 ns"), "The test must actually zoom the production timeline");
+      assert.notEqual(selected.viewport, "0 ns - 90 ns", "The test must actually zoom the production timeline");
       const other = vscode.Uri.joinPath(workspaceRoot, `hidden-qbs-state-${Date.now()}.txt`);
       await vscode.workspace.fs.writeFile(other, Buffer.from("Another editor\n"));
       await vscode.window.showTextDocument(other, { viewColumn: panel.viewColumn, preview: false });

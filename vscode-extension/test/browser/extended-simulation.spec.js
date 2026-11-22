@@ -15,7 +15,7 @@ for (const profile of ["01-feedback-missing", "06-feedback-too-late"]) {
     expect(source.line).toBe(2);
     expect(source.file.replaceAll("\\", "/")).toContain(`/faults/${profile}/program.q1asm`);
     await at(page, 1200);
-    await expect(value(page, "execution")).toContainText("error");
+    await expect(value(page, "execution")).toContainText("Error");
     await expect(value(page, "execution")).toContainText("RT queue underflow · Observation end 1200 ns");
     await expect(value(page, "q1-event")).toContainText("observation ended");
     await tab(page, "Simulation");
@@ -49,7 +49,7 @@ test("delayed feedback becomes readable only after arrival and register latency"
   await expect(page.getByRole("spinbutton")).toHaveValue("400");
   await expect(value(page, "communications")).toContainText("Scenario input 0");
   await expect(page.getByRole("button", { name: "Show sending event", exact: true })).toHaveCount(0);
-  await expect(value(page, "execution")).toContainText("completed");
+  await expect(value(page, "execution")).toContainText("Completed");
 });
 
 test("duplicate feedback preserves FIFO occurrences even when two payloads are equal", async ({ page }) => {
@@ -89,7 +89,7 @@ test("missing trigger ends observation and retains its pending wait without fabr
   await at(page, 199);
   await expect(value(page, "rt-event")).toContainText("not started");
   await at(page, 200);
-  await expect(value(page, "execution")).toContainText("blocked");
+  await expect(value(page, "execution")).toContainText("Blocked");
   await expect(value(page, "execution")).toContainText("No scheduled input can resume trigger_wait. · Observation end 200 ns");
   await expect(value(page, "rt-event")).toContainText("observation ended");
   await tab(page, "Simulation");
@@ -111,7 +111,7 @@ test("feedback queue overflow exposes accepted inputs and no uncommitted registe
   await at(page, 399);
   await expect(value(page, "communications")).not.toContainText("feedback receive");
   await at(page, 400);
-  await expect(value(page, "execution")).toContainText("error");
+  await expect(value(page, "execution")).toContainText("Error");
   await expect(value(page, "execution")).toContainText("LINQ feedback queue overflow (capacity 2). · Observation end 400 ns");
   const receives = page.locator(".hardware-communication").filter({ has: page.getByRole("button", { name: "400 ns · feedback receive", exact: true }) });
   await expect(receives).toHaveCount(2);
@@ -149,7 +149,7 @@ test("full RT queue displays stall and resumes exactly when the first packet sta
   await at(page, 440);
   await tab(page, "Simulation");
   await expect(value(page, "simulation-queue")).toContainText("RT queue 0 / 2 packets");
-  await expect(value(page, "execution")).toContainText("completed");
+  await expect(value(page, "execution")).toContainText("Completed");
 });
 
 test("four-bin preview retains the previous result until wrapped acquisition completes, and rewinds", async ({ page }) => {

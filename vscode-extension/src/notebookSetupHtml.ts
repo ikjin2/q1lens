@@ -13,6 +13,7 @@ export function notebookSetupHtml(input: {
   const nonce = randomUUID();
   const shell = process.platform === "win32" ? "PowerShell" : "POSIX shell (sh / bash / zsh)";
   const error = input.report.qbsError || input.report.q1asmError || "";
+  const checkTitle = `After installing, check ${input.fileEnvironment ? "the original file's Python environment" : "the original notebook's current kernel"}. Q1Lens continues your analysis when it is ready.`;
   return `<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -20,52 +21,56 @@ export function notebookSetupHtml(input: {
 <title>Q1Lens Python Setup</title>
 <style nonce="${nonce}">
 body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); padding: 18px 24px; line-height: 1.5; }
-main { max-width: 760px; margin: auto; }
-h1 { font-size: 23px; font-weight: 600; margin: 8px 0; }
-h2 { font-size: 16px; margin: 20px 0 8px; }
-p { margin: 8px 0; }
-.eyebrow, .muted { color: var(--vscode-descriptionForeground); }
-.eyebrow { font-size: 12px; letter-spacing: 1px; }
-.diagnosis { border-left: 3px solid var(--vscode-editorWarning-foreground); padding: 8px 14px; background: var(--vscode-textBlockQuote-background); }
-dl { display: grid; grid-template-columns: auto 1fr; gap: 6px 16px; }
+main { max-width: 760px; margin: auto; display: flex; flex-direction: column; gap: 10px; }
+h1 { font-size: 16px; font-weight: 600; margin: 0; display: flex; gap: 8px; align-items: baseline; overflow-wrap: anywhere; }
+h1 .mark { color: var(--vscode-editorWarning-foreground); }
+p { margin: 0; }
+.muted { color: var(--vscode-descriptionForeground); }
+.environment { overflow-wrap: anywhere; }
+dl { display: grid; grid-template-columns: auto 1fr; gap: 6px 16px; margin: 8px 0; }
 dt { color: var(--vscode-descriptionForeground); } dd { margin: 0; overflow-wrap: anywhere; }
 pre, code { font-family: var(--vscode-editor-font-family); }
-pre { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--vscode-textCodeBlock-background); margin: 8px 0; padding: 12px; border: 1px solid var(--vscode-panel-border); border-radius: 4px; }
-select { background: var(--vscode-dropdown-background); color: var(--vscode-dropdown-foreground); border: 1px solid var(--vscode-dropdown-border); padding: 7px; margin-left: 8px; }
-button { font: inherit; padding: 7px 12px; border: 1px solid transparent; cursor: pointer; background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; }
+.command-row { display: flex; align-items: center; gap: 8px; padding: 6px 8px; background: var(--vscode-textCodeBlock-background); border: 1px solid var(--vscode-panel-border); border-radius: 4px; }
+.command-row pre { flex: 1; min-width: 0; }
+details pre { background: var(--vscode-textCodeBlock-background); margin: 8px 0; padding: 12px; border: 1px solid var(--vscode-panel-border); border-radius: 4px; }
+details p { margin: 8px 0; }
+summary { cursor: pointer; color: var(--vscode-descriptionForeground); }
+select { background: var(--vscode-dropdown-background); color: var(--vscode-dropdown-foreground); border: 1px solid var(--vscode-dropdown-border); padding: 4px 6px; font: inherit; }
+button { font: inherit; padding: 4px 11px; border: 1px solid transparent; border-radius: 2px; cursor: pointer; white-space: nowrap; background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
 button:hover { background: var(--vscode-button-hoverBackground); }
 button.secondary { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
-button:focus-visible, select:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 2px; }
+button.secondary:hover { background: var(--vscode-button-secondaryHoverBackground); }
+button:focus-visible, select:focus-visible, summary:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 2px; }
 button:disabled { opacity: .5; cursor: default; }
-.actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
-#status { min-height: 24px; color: var(--vscode-descriptionForeground); }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; }
+#status { min-height: 20px; color: var(--vscode-descriptionForeground); }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 [hidden] { display: none !important; }
+@media (max-width: 520px) { .command-row { flex-wrap: wrap; } .command-row pre { flex-basis: 100%; order: -1; } }
 </style></head><body><main>
-<div class="eyebrow">Q1LENS · ${input.fileEnvironment ? "PYTHON" : "NOTEBOOK"} SETUP</div>
-<h1>${input.fileEnvironment ? "Use your project's Python environment" : "Use your notebook's Python environment"}</h1>
-<p class="diagnosis">${escape(input.issue)}</p>
-<dl><dt>${input.fileEnvironment ? "File" : "Notebook"}</dt><dd>${escape(input.notebook)}</dd>
-<dt>Selected by</dt><dd>${escape(input.sourceLabel ?? "Notebook kernel")}</dd>
-<dt>Python</dt><dd>${escape(input.report.version)}</dd>
-<dt>Executable</dt><dd><code>${escape(input.pythonPath)}</code></dd></dl>
-<details${input.report.q1lensInstalled === false ? "" : " open"}><summary>Diagnostic details</summary><pre>${escape(error)}</pre></details>
-<h2>1. Choose how to install</h2>
-<label for="installer">Package manager</label>
+<h1><span class="mark" aria-hidden="true">⚠</span><span>${escape(input.issue)}</span></h1>
+<p class="muted environment">Python ${escape(input.report.version)} · <code>${escape(input.pythonPath)}</code> · ${escape(input.sourceLabel ?? "Notebook kernel")}</p>
+<div class="command-row">
+<label class="sr-only" for="installer">Package manager</label>
 <select id="installer"><option value="pip"${input.installer === "pip" ? " selected" : ""}>pip</option><option value="uv"${input.installer === "uv" ? " selected" : ""}>uv pip</option></select>
-<p class="muted">Suggested package: <code>q1lens==${escape(input.version)}</code>, matching this extension. You can edit the command before running it.</p>
-<p id="pipMissing" hidden>pip is not available in this environment. Choose uv pip, or prepare pip using your own workflow.</p>
-<p id="uvHint" hidden>Requires uv on your PATH. This command targets the selected environment directly.</p>
-<h2>2. Review and run the command</h2>
-<p class="muted">Shell: ${shell}. The Python path explicitly selects the environment shown above.</p>
 <pre id="pipCommand"${input.installer !== "pip" ? " hidden" : ""}>${escape(notebookInstallCommand(input.pythonPath, input.version, "pip"))}</pre>
 <pre id="uvCommand"${input.installer !== "uv" ? " hidden" : ""}>${escape(notebookInstallCommand(input.pythonPath, input.version, "uv"))}</pre>
-<div class="actions"><button class="secondary command" data-action="copyCommand">Copy Command</button><button class="secondary command" data-action="insertCommand">Insert into Terminal</button></div>
-<p class="muted">Terminal insertion only fills in the command. Review it and press Enter to run it yourself.</p>
-<details><summary>I manage project dependencies myself</summary><p>Add Q1Lens through your existing requirements or project dependency workflow, then check again here. The commands above do not update your project's dependency or lock files.</p></details>
-<h2>3. Check and continue</h2>
-<p>After installing, check ${input.fileEnvironment ? "the original file's Python environment" : "the original notebook's current kernel"}. Q1Lens will continue your analysis when it is ready.</p>
-<div class="actions"><button data-action="checkAgain">Check Again</button><button class="secondary" data-action="openNotebook">${input.fileEnvironment ? "Open File" : "Open Notebook"}</button></div>
+<button class="secondary command" data-action="copyCommand">Copy</button>
+<button class="secondary command" data-action="insertCommand" title="Fills in the terminal only. Review the command and press Enter to run it yourself.">Insert in terminal</button>
+</div>
+<p id="pipMissing" hidden>pip is not available in this environment. Choose uv pip, or prepare pip using your own workflow.</p>
+<p id="uvHint" class="muted" hidden>Requires uv on your PATH. This command targets the selected environment directly.</p>
+<div class="actions"><button data-action="checkAgain" title="${checkTitle}">Check again</button><button class="secondary" data-action="openNotebook">${input.fileEnvironment ? "Open file" : "Open notebook"}</button></div>
 <p id="status" role="status" aria-live="polite">${escape(input.notice)}</p>
+<details${error && input.report.q1lensInstalled !== false ? " open" : ""}><summary>Details</summary>
+<dl><dt>${input.fileEnvironment ? "File" : "Notebook"}</dt><dd>${escape(input.notebook)}</dd>
+<dt>Package</dt><dd><code>q1lens==${escape(input.version)}</code>, matching this extension. You can edit the command before running it.</dd>
+<dt>Shell</dt><dd>${shell}. The Python path selects the environment shown above.</dd></dl>
+${error ? `<pre>${escape(error)}</pre>` : ""}
+<p>${checkTitle}</p>
+<p>Managing dependencies yourself? Add Q1Lens through your existing requirements or project dependency workflow, then check again here. The commands above do not update your project's dependency or lock files.</p>
+</details>
 <script nonce="${nonce}">
 const vscode = acquireVsCodeApi();
 const installer = document.getElementById("installer");

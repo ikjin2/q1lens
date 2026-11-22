@@ -81,7 +81,8 @@ describe("notebook installation commands", () => {
         const command = prefix + notebookInstallCommand(pythonPath, version, installer);
         const result = spawnSync(
           windows ? "powershell.exe" : "/bin/sh",
-          windows ? ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command] : ["-c", command],
+          windows ? ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+            "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n" + command] : ["-c", command],
           { encoding: "utf8", timeout: 10000 }
         );
         assert.equal(result.status, 0, result.stderr || result.error?.message);

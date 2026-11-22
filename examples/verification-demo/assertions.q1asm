@@ -1,0 +1,11 @@
+.DEF N 20
+;@assume 1 <= N <= 513
+;@assert rt_time == 20000 at @readout
+;@assert R2 < 1024
+wait 20000
+move $N,R0
+nop
+add R0,511,R2
+nop
+readout: wait 16
+stop

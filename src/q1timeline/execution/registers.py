@@ -238,6 +238,7 @@ def concrete_write_provenance(
 def set_alu_flags(state: AnalysisState, instruction: Instr, flags: dict[str, bool] | None) -> None:
     state.alu_flags = flags
     state.alu_flag_cases = None
+    state.flag_expression = None
     state.alu_flags_source = instruction.source if flags is not None else None
     state.alu_flags_read_hazard = state.analysis_back_edge_limit is not None and bool(state.pending_register_writes) and any(
         pending_register_write(state, register) is not None for _, register in register_read_operands(instruction, state)

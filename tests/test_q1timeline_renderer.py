@@ -516,7 +516,8 @@ def test_parameters_panel_is_collapsed_between_timeline_and_analysis_details() -
     ]}})
 
     assert '<details id="q1timeline-parameters" class="analysis-parameters">' in html
-    assert '<span class="parameters-title">Parameters · 2 · 1 overridden</span>' in html
+    assert re.search(r'<span class="parameters-title" title="[^"]+">Parameters · 2 · 1 overridden</span>', html)
+    assert '<p class="parameters-help">' not in html
     assert html.index('id="timeline-root"') < html.index('id="q1timeline-parameters"')
     assert html.index('id="q1timeline-parameters"') < html.index('id="q1timeline-analysis-details"')
     assert '<code>DRIVE_DURATION</code>' in html
@@ -540,7 +541,8 @@ def test_parameters_panel_has_accessible_search_controls() -> None:
 
     assert re.search(
         r'<summary>.*<button class="parameters-search-toggle" type="button" aria-label="Search parameters" '
-        r'aria-controls="q1timeline-parameter-search" aria-expanded="false" hidden>.*</button></summary>', html,
+        r'title="Search parameters" aria-controls="q1timeline-parameter-search" aria-expanded="false" hidden>'
+        r'<svg[^>]*>.*</svg></button></summary>', html,
     )
     assert '<div id="q1timeline-parameter-search" class="parameters-search" hidden>' in html
     assert re.search(r'<input class="parameters-search-input" type="search"[^>]+aria-label="Search parameters by name">', html)
@@ -572,17 +574,27 @@ def test_parameters_panel_marks_added_and_equal_value_overrides() -> None:
         {"name": "SAME", "value_json": "64", "overridden": True, "base_value_json": "64"},
     ]}})
 
-    assert '<span class="parameters-title">Parameters · 2 · 2 overridden</span>' in html
+    assert '>Parameters · 2 · 2 overridden</span>' in html
     assert 'added for this analysis' in html
     assert '<code>null</code>' in html
     assert '← base 64' in html
 
 
-def test_parameters_panel_distinguishes_empty_snapshot_from_older_ir() -> None:
-    html = render_html({"version": "0.1.0", "events": [], "analysis": {"parameters": []}})
-    assert '<span class="parameters-title">Parameters · 0</span>' in html
-    assert 'No parameters configured for this analysis.' in html
+def test_parameters_panel_is_omitted_when_there_is_nothing_to_list() -> None:
+    # An empty snapshot and an older IR without one both leave the panel out.
+    assert 'id="q1timeline-parameters"' not in render_html(
+        {"version": "0.1.0", "events": [], "analysis": {"parameters": []}})
     assert 'id="q1timeline-parameters"' not in render_html({"version": "0.1.0", "events": []})
+
+
+def test_parameters_panel_lists_overridden_values_first() -> None:
+    html = render_html({"version": "0.1.0", "events": [], "analysis": {"parameters": [
+        {"name": "PLAIN", "value_json": "1", "overridden": False},
+        {"name": "CHANGED", "value_json": "2", "overridden": True, "base_value_json": "1"},
+    ]}})
+    # Rows keep the index of the analysis parameter they edit.
+    assert html.index('data-parameter-index="1"><dt><code>CHANGED</code>') < html.index(
+        'data-parameter-index="0"><dt><code>PLAIN</code>')
 
 
 def test_branch_region_renders_marker_without_block_in_debug_mode() -> None:
@@ -1417,3 +1429,96 @@ def test_flow_and_branch_labels_use_compact_visible_text_with_full_tooltips() ->
     assert not re.search(r'<text class="branch-marker-condition"', html)
     assert "feedback ch 1: acq#0/bin0 -&gt; $LEFT" in html
     assert "unresolved branch $CURSOR_GAIN &gt;= $MAX_GAIN" in html
+
+
+def _warning(category: str, message: str, file: str, line: int, **extra) -> dict:
+    return {"severity": "warning", "category": category, "message": message,
+            "source": {"file": file, "line": line}, **extra}
+
+
+def test_diagnostics_share_one_row_per_kind_ordered_by_consequence() -> None:
+    unreachable = "Instructions in this region cannot be reached from program entry."
+    html = render_html({"version": "0.1.0", "events": [], "diagnostics": [
+        _warning("unreachable_code", unreachable, r"C:\project\a.q1asm", 130),
+        _warning("unreachable_code", unreachable, r"C:\project\a.q1asm", 162),
+        _warning("unreachable_code", unreachable, r"C:\project\b.q1asm", 7),
+        _warning("overwritten_register", "The value written to R1 is overwritten on every path before it is read.",
+                 r"C:\project\b.q1asm", 50, details={"register": "R1"}),
+        _warning("overwritten_register", "The value written to R2 is overwritten on every path before it is read.",
+                 r"C:\project\b.q1asm", 51, details={"register": "R2"}),
+        _warning("analysis_incomplete", "Underflow analysis incomplete: trigger arrival unknown.",
+                 r"C:\project\a.q1asm", 47),
+        {"severity": "info", "category": "loop_truncated", "message": "Loop L0 shown as compact block.",
+         "source": {"file": r"C:\project\a.q1asm", "line": 129}},
+    ]})
+    panel = re.search(r'<section class="diagnostics"[\s\S]*?</section>', html).group()
+    assert '<p class="diagnostic-summary">6 warnings · 1 info</p>' in panel
+    rows = re.findall(r'<li class="diagnostic severity-(\w+)" data-diagnostic-category="(\w+)" data-diagnostic-count="(\d+)">',
+                      panel)
+    # What limits the analysis comes first, then defects, then cleanup; notes stay in their own list.
+    assert rows == [("warning", "analysis_incomplete", "1"), ("warning", "overwritten_register", "2"),
+                    ("warning", "unreachable_code", "3"), ("info", "loop_truncated", "1")]
+    assert panel.count(unreachable) == 1
+    row = re.search(r'data-diagnostic-category="unreachable_code"[\s\S]*?</li>', panel).group()
+    assert '<span class="diagnostic-count">3</span>' in row
+    assert re.sub(r"<[^>]+>", " ", row).split()[-5:] == ["a.q1asm:", "130", "162", "b.q1asm:", "7"]
+    assert re.findall(r'data-diagnostic-location="([^"]+)"', row) == ["a.q1asm:130", "a.q1asm:162", "b.q1asm:7"]
+    assert row.count('<span class="diagnostic-source">a.q1asm:</span>') == 1
+    # Messages that differ in one word share a line; the word labels each location.
+    merged = re.search(r'data-diagnostic-category="overwritten_register"[\s\S]*?</li>', panel).group()
+    assert "The value written to … is overwritten on every path before it is read." in merged
+    assert re.findall(r'<span class="diagnostic-qualifier">(\w+)</span>', merged) == ["R1", "R2"]
+    assert merged.count('class="diagnostic-message"') == 1
+
+
+def test_diagnostic_locations_link_to_the_event_or_name_the_source_line() -> None:
+    event = {"id": "seq:e1", "sequencer_id": "seq", "lane": "rt.control", "kind": "wait", "label": "wait",
+             "t0": _ns(0), "t1": _ns(4), "duration": _ns(4), "confidence": "exact",
+             "source": {"file": "seq.q1asm", "line": 2, "column": 1}, "meta": {}}
+    html = render_html({"version": "0.1.0", "events": [event], "diagnostics": [
+        _warning("analysis_incomplete", "Underflow analysis incomplete: runtime input is missing.",
+                 r"C:\project\seq.q1asm", 2, related_events=["seq:e1"]),
+        _warning("unreachable_code", "Unreachable.", r"C:\project\seq.q1asm", 9),
+    ]})
+    panel = re.search(r'<section class="diagnostics"[\s\S]*?</section>', html).group()
+    link = re.search(r'<a class="diagnostic-location"[^>]*>2</a>', panel).group()
+    assert 'data-related-event-id="seq:e1"' in link and 'aria-label="Show event"' in link
+    assert 'title="seq.q1asm:2 · show in timeline"' in link
+    # Without an editor to open, a source-only location is a label; it carries what a host needs to act on it.
+    label = re.search(r'<span class="diagnostic-location"[^>]*>9</span>', panel).group()
+    assert 'data-source-file="C:\\project\\seq.q1asm"' in label
+    assert 'data-source-line="9"' in label and 'title="seq.q1asm:9"' in label
+    assert "<button" not in panel
+
+
+def test_diagnostics_panel_is_omitted_without_diagnostics_and_errors_keep_every_message() -> None:
+    assert 'class="diagnostics"' not in render_html({"version": "0.1.0", "events": [], "diagnostics": []})
+    html = render_html({"version": "0.1.0", "events": [], "diagnostics": [
+        {"severity": "error", "category": "invalid_argument_value", "message": "Value 70000 is out of range.",
+         "source": {"file": "a.q1asm", "line": 3}},
+        {"severity": "error", "category": "invalid_argument_value", "message": "Value 80000 is out of range.",
+         "source": {"file": "a.q1asm", "line": 4}},
+    ]})
+    row = re.search(r'<li class="diagnostic severity-error"[\s\S]*?</li>', html).group()
+    assert "Value 70000 is out of range." in row and "Value 80000 is out of range." in row
+    assert "…" not in row
+
+
+def test_a_large_diagnostic_group_folds_its_locations_by_file() -> None:
+    diagnostics = [_warning("unreachable_code", "Unreachable.", f"{name}.q1asm", line)
+                   for name in ("a", "b") for line in range(1, 17)]
+    row = re.search(r'<li class="diagnostic severity-warning"[\s\S]*?</li>',
+                    render_html({"version": "0.1.0", "events": [], "diagnostics": diagnostics})).group()
+    assert 'data-diagnostic-count="32"' in row
+    assert re.findall(r'<details class="diagnostic-file"><summary><span class="diagnostic-source">(\w)\.q1asm:</span>'
+                      r'<span class="diagnostic-count">(\d+)</span>', row) == [("a", "16"), ("b", "16")]
+    small = render_html({"version": "0.1.0", "events": [], "diagnostics": diagnostics[:30]})
+    assert '<details class="diagnostic-file">' not in small
+
+
+def test_diagnostic_priority_ranks_analysis_limits_before_lint_and_cleanup() -> None:
+    from q1timeline.diagnostic_catalog import diagnostic_priority
+
+    assert [diagnostic_priority(category) for category in (
+        "analysis_incomplete", "definite_underflow", "syntax_error", "overwritten_register",
+        "unreachable_code", "loop_truncated", "not_in_the_catalog")] == [1, 1, 2, 3, 4, 4, 2]

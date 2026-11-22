@@ -85,8 +85,8 @@ describe("Q1 timeline instruction layout", () => {
     assert.equal(lane(model).label, "Control · RT");
     assert.deepEqual(model.viewport, { start: 0, end: 3 });
     assert.equal(model.totalTime, 3);
-    assert.match(model.subtitle, /Independent instruction order per lane/);
-    assert.match(model.subtitle, /do not show simultaneous time/);
+    assert.equal(model.title, "");
+    assert.equal(model.subtitle, "Per-lane order, not time");
     assert.deepEqual(model.ticks.map((tick: any) => tick.label), ["#0", "#1", "#2", "#3"]);
     model.ticks.forEach((tick: any, index: number) => assert.ok(Math.abs(tick.leftPercent - index * 100 / 3) < 0.000001));
     assert.equal(JSON.stringify({ ir, options }), before);

@@ -328,7 +328,7 @@ class PlaybackSession:
         if invalid:
             state.diagnostics.extend(validation)
             return self._block(runner, instruction, invalid[0].message, error=True)
-        if (spec.category == "unknown"
+        if (spec.category == "unknown" or instruction.op == "sw_req"
                 or (spec.timing_effect_status == "analysis_incomplete" and not spec.emits_rt_packet
                     and instruction.op != "set_cond")):
             return self._block(runner, instruction, f"{instruction.op} requires unavailable execution or external timing semantics.")

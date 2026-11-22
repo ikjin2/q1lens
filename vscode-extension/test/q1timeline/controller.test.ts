@@ -2919,10 +2919,11 @@ describe("q1timeline controller", () => {
       const controller = new TimelineController(createContext());
       controller.showIncompatibleCoreVersionWarning({ core_version: "0.1.1" });
       controller.showIncompatibleCoreVersionWarning({ core_version: "0.2.0" });
-      assert.deepEqual(warnings, []);
       controller.showIncompatibleCoreVersionWarning({ core_version: "0.3.0" });
+      assert.deepEqual(warnings, []);
+      controller.showIncompatibleCoreVersionWarning({ core_version: "0.4.0" });
       assert.equal(warnings.length, 1);
-      assert.match(warnings[0], /Supported range: 0\.1\.x or 0\.2\.x/);
+      assert.match(warnings[0], /Supported range: 0\.1\.x, 0\.2\.x, or 0\.3\.x/);
       controller.dispose();
     });
   });

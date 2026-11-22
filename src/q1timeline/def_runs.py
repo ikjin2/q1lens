@@ -7,6 +7,7 @@ import itertools
 import json
 import sys
 from collections import Counter
+from collections.abc import Collection
 from dataclasses import asdict, dataclass
 from decimal import Decimal
 from math import sqrt
@@ -21,11 +22,12 @@ from q1timeline.analysis.interpreter import (
     diagnose_program_source, interpret_program, prepare_def_program,
 )
 from q1timeline.analysis.underflow import analyze_underflows
-from q1timeline.analysis.values import Concrete, value_to_json
+from q1timeline.analysis.values import Concrete, Symbolic, resolve_def_values, symbol_table_from_params, value_to_json
 from q1timeline.cli import _load_json_override, _parse_param_overrides
 from q1timeline.ir.serialize import _diagnostic_to_dict, timeline_ir_from_states
 from q1timeline.project import ConfigLoadError, load_project_config
-from q1timeline.q1asm.ast import Arg, Program, numeric_defs, with_def_values
+from q1timeline.q1asm.ast import Program, duplicate_def_names, numeric_defs, with_def_values
+from q1timeline.q1asm.compiled_addresses import compile_addresses
 from q1timeline.q1asm.parser import parse_integer_literal, parse_q1asm
 from q1timeline.sequence import load_sequence_data, load_sequence_names
 from q1timeline.simulation.runtime import simulate_programs
@@ -44,6 +46,33 @@ def _referenced_registers(program: Program, params: dict) -> list[str]:
     return sorted(registers & REGISTERS, key=lambda name: int(name[1:]))
 
 
+def _def_rows(program: Program, params: dict, strict: bool) -> list[dict]:
+    layout = compile_addresses({item.pc: item for item in program.instructions}, program.labels)
+    resolved = resolve_def_values({name: arg for name, arg in program.defs.items() if arg.kind != "reg"},
+                                  symbol_table_from_params(params), labels=layout.labels if layout else program.labels)
+    duplicates = duplicate_def_names(program)
+    rows = []
+    for name, arg in program.defs.items():
+        source = program.def_sources[name]
+        row = {"name": name, "literal": arg.raw, "value": None, "line": source.line, "column": source.column}
+        if name in duplicates:
+            row["reason"] = "Duplicate DEF declaration."
+        elif arg.kind == "reg":
+            row["reason"] = "Register alias."
+        elif arg.kind == "label":
+            row["reason"] = "Label address."
+        elif arg.kind == "placeholder" and strict:
+            row["reason"] = "Strict Q1ASM disallows template DEFs."
+        elif isinstance(resolved[name], Concrete):
+            row["value"] = str(resolved[name].value)
+        elif arg.kind == "placeholder" and isinstance(resolved[name], Symbolic) and resolved[name].unresolved_symbols:
+            row["needs_input"] = True
+        else:
+            row["reason"] = "The template does not resolve to an integer with the current parameters."
+        rows.append(row)
+    return rows
+
+
 def _literal(raw, label: str) -> int:
     if isinstance(raw, str):
         try:
@@ -53,7 +82,7 @@ def _literal(raw, label: str) -> int:
     raise ValueError(f"{label} must be a Q1ASM integer literal (decimal or hexadecimal).")
 
 
-def sweep_plan(axes: list, defs: dict[str, Arg], *, statistics_only: bool = False) -> dict:
+def sweep_plan(axes: list, defs: Collection[str], *, statistics_only: bool = False) -> dict:
     if not isinstance(axes, list) or not 1 <= len(axes) <= 2:
         raise ValueError("Select one or two DEFs to sweep.")
     ranges = []
@@ -143,7 +172,7 @@ class _SweepStatistics:
 
 
 class RunSnapshot:
-    def __init__(self, args):
+    def __init__(self, args, *, include_all_defs: bool = True):
         project = Path(args.project).resolve()
         project_bytes = project.read_bytes()
         self.config = config = load_project_config(project)
@@ -157,11 +186,14 @@ class RunSnapshot:
         params = _load_json_override(Path(args.params)) if args.params else config.params
         self.params = {**params, **_parse_param_overrides(args.set_param)}
         self.programs = {}
+        self.def_rows = {}
+        self.def_values = {}
         self.sources = {}
         self.names = {}
         self.memories = {}
         self.external = {seq.id: config.concrete_inputs(seq, self.params) for seq in config.sequencers} if self.mode == "concrete" else {}
         self.diagnostics = list(config.diagnostics)
+        self.include_all_defs = include_all_defs
         source_bytes = {}
         for seq in config.sequencers:
             file = seq.file.resolve()
@@ -169,6 +201,10 @@ class RunSnapshot:
                 source_bytes[file] = file.read_bytes()
             source = source_bytes[file]
             self.programs[seq.id] = parse_q1asm(source.decode("utf-8"), file=str(file))
+            rows = self._rows_for(self.programs[seq.id])
+            self.def_rows[seq.id] = rows
+            self.def_values[seq.id] = {row["name"]: int(row["value"]) if row["value"] is not None else None
+                                       for row in rows if row["value"] is not None or row.get("needs_input")}
             self.sources[seq.id] = {"file": str(file), "uri": file.as_uri(), "sha256": hashlib.sha256(source).hexdigest()}
             if seq.sequence_json:
                 self.names[seq.id] = load_sequence_names(seq.sequence_json)
@@ -182,14 +218,30 @@ class RunSnapshot:
                     self.mode, self.max_steps, self.strict, self.hardware_readiness]
         self.revision = hashlib.sha256(json.dumps(identity, default=str).encode()).hexdigest()
 
-    def info(self) -> dict:
-        return {"revision": self.revision, "mode": self.mode, "max_steps": self.max_steps,
-                "sequencers": [{"id": name, **self.sources[name],
-                                "registers": _referenced_registers(program, self.params), "defs": [
-                    {"name": key, "literal": arg.raw, "value": str(arg.value),
-                     "line": program.def_sources[key].line, "column": program.def_sources[key].column}
-                    for key, arg in numeric_defs(program).items()]}
-                    for name, program in self.programs.items()]}
+    def _rows_for(self, program: Program) -> list[dict]:
+        rows = _def_rows(program, self.params, self.strict)
+        if self.include_all_defs:
+            return rows
+        literals = numeric_defs(program)
+        return [row for row in rows if row["name"] in literals]
+
+    def info(self, source_drafts: dict[str, str] | None = None) -> dict:
+        if source_drafts is not None and (
+            not isinstance(source_drafts, dict) or not all(isinstance(source, str) for source in source_drafts.values())
+        ):
+            raise ValueError("Source drafts must map file paths to text.")
+        drafts = {str(Path(file).resolve()): source for file, source in (source_drafts or {}).items()}
+        sequencers = []
+        for name, program in self.programs.items():
+            source = self.sources[name]
+            file = source["file"]
+            rows = self.def_rows[name]
+            if file in drafts:
+                program = parse_q1asm(drafts[file], file=file)
+                rows = self._rows_for(program)
+            sequencers.append({"id": name, **source, "registers": _referenced_registers(program, self.params),
+                               "defs": rows})
+        return {"revision": self.revision, "mode": self.mode, "max_steps": self.max_steps, "sequencers": sequencers}
 
     def target(self, request: dict) -> tuple[str, Program]:
         target = request.get("sequencer")
@@ -198,7 +250,7 @@ class RunSnapshot:
         return target, self.programs[target]
 
     def inputs(self, request: dict) -> tuple[str, str | _Observation, dict[str, int]]:
-        target, program = self.target(request)
+        target, _ = self.target(request)
         if "registers" in request or "observe_time" in request:
             registers, time = request.get("registers"), request.get("observe_time")
             if ("register" in request or not isinstance(registers, list) or len(registers) > 64
@@ -213,14 +265,18 @@ class RunSnapshot:
             selection = request.get("register")
             if not isinstance(selection, str) or selection not in REGISTERS:
                 raise ValueError("Select an observation register R0 through R63.")
-        defs = {name: int(arg.value) for name, arg in numeric_defs(program).items()}
+        defs = self.def_values[target]
         overrides = request.get("overrides", {})
         if not isinstance(overrides, dict) or overrides.keys() - defs.keys():
             raise ValueError("Only editable numeric DEFs in the selected sequencer can be overridden.")
-        return target, selection, {**defs, **{name: _literal(raw, name) for name, raw in overrides.items()}}
+        values = {name: value for name, value in defs.items() if value is not None}
+        values.update({name: _literal(raw, name) for name, raw in overrides.items()})
+        return target, selection, values
 
-    def validate_sweep_source(self):
-        for program in self.programs.values():
+    def validate_sweep_source(self, target: str, values: dict[str, int]):
+        for name, program in self.programs.items():
+            if name == target:
+                program = self._case_program(target, values)
             literal_operands = {(instruction.source.line, arg.raw) for instruction in program.instructions
                                 for arg in instruction.args if arg.kind in {"imm", "label"}}
             for item in diagnose_program_source(program, params=self.params, strict_q1asm=self.strict):
@@ -236,15 +292,23 @@ class RunSnapshot:
                     continue
                 raise ValueError(f"Fix the source before sweeping. {item.message}")
 
+    def _case_program(self, target: str, values: dict[str, int]) -> Program:
+        program = self.programs[target]
+        if all(self.def_values[target].get(name) == value for name, value in values.items()):
+            return program
+        # Other selected inputs keep their fixed values, even if a template
+        # references a DEF that changed for this case.
+        return with_def_values(program, values)
+
     def prepare_statistics(self, target: str, values: dict[str, int], axes: set[str]) -> dict[str, PreparedDefProgram]:
-        programs = {**self.programs, target: with_def_values(self.programs[target], values)}
+        programs = {**self.programs, target: self._case_program(target, values)}
         return {name: prepare_def_program(program, params=self.params, strict_q1asm=self.strict,
                                           varying=axes if name == target else set())
                 for name, program in programs.items()}
 
     def run(self, target: str, selection: str | _Observation, values: dict[str, int], *, detail: bool = False, case_id: int = 1,
             prepared: dict[str, PreparedDefProgram] | None = None) -> dict:
-        programs = {**self.programs, target: with_def_values(self.programs[target], values)}
+        programs = {**self.programs, target: self._case_program(target, values)}
         config = self.config
         if self.mode == "simulation":
             states = simulate_programs(programs, params=self.params, max_steps=self.max_steps,
@@ -338,6 +402,7 @@ def main(argv: list[str] | None = None) -> int:
     sys.stdin.reconfigure(encoding="utf-8")
     snapshot = None
     sweep = None
+    include_all_defs = True
     for line in sys.stdin:
         request = json.loads(line)
         try:
@@ -345,22 +410,24 @@ def main(argv: list[str] | None = None) -> int:
             statistics_only = request.get("statistics_only", False)
             if not isinstance(statistics_only, bool):
                 raise ValueError("statistics_only must be a boolean.")
+            if command == "info":
+                include_all_defs = request.get("include_all_defs") is True
             if command in {"info", "run", "sweep"}:
-                snapshot = RunSnapshot(args)
+                snapshot = RunSnapshot(args, include_all_defs=include_all_defs)
                 sweep = None
                 if command != "info" and snapshot.revision != request.get("revision"):
                     raise ValueError("The project, source, or execution settings changed. Reload DEFs and start a new run.")
             if command == "info":
-                result = {"info": snapshot.info()}
+                result = {"info": snapshot.info(request.get("source_drafts"))}
             elif command == "plan":
-                _, program = snapshot.target(request)
-                result = {"plan": sweep_plan(request["axes"], numeric_defs(program), statistics_only=statistics_only)}
+                target, _ = snapshot.target(request)
+                result = {"plan": sweep_plan(request["axes"], snapshot.def_values[target], statistics_only=statistics_only)}
             elif command == "run":
                 target, selection, values = snapshot.inputs(request)
                 result = snapshot.run(target, selection, values, detail=True, case_id=request.get("case_id", 1))
             elif command == "sweep":
                 target, selection, values = snapshot.inputs(request)
-                plan = sweep_plan(request["axes"], numeric_defs(snapshot.programs[target]), statistics_only=statistics_only)
+                plan = sweep_plan(request["axes"], snapshot.def_values[target], statistics_only=statistics_only)
                 sample_count = request.get("sample_count")
                 if "sample_count" in request:
                     if type(sample_count) is not int or not 1 <= sample_count <= plan["sample_limit"]:
@@ -368,7 +435,9 @@ def main(argv: list[str] | None = None) -> int:
                     plan.update(sampling="random", total=str(sample_count), allowed=True)
                 elif not plan["allowed"]:
                     raise ValueError(f"This sweep mode supports up to {plan['limit']:,} combinations.")
-                snapshot.validate_sweep_source()
+                for axis in plan["axes"]:
+                    values[axis["name"]] = int(axis["min"])
+                snapshot.validate_sweep_source(target, values)
                 names = [axis["name"] for axis in plan["axes"]]
                 ranges = [range(int(axis["min"]), int(axis["last"]) + 1, int(axis["step"])) for axis in plan["axes"]]
                 if sample_count is not None:

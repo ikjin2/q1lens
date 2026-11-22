@@ -1641,7 +1641,7 @@
           const id = `command-group:${first.id}`;
           const expanded = expandedGroups.has(id);
           const duration = last.start + last.duration - first.start;
-          const label = q1 ? `Q1 × ${run.length}` : `wait × ${run.length}`;
+          const label = q1 ? `Q1 × ${run.length}` : "wait";
           const action = `${expanded ? "Collapse" : "Expand"} ${run.length} ${q1 ? "Q1 instructions" : "wait commands"}`;
           const span = instruction ? `instructions ${first.start + 1}–${first.start + duration}` :
             `${first.start}–${first.start + duration} ns${waits ? ` (${duration} ns)` : ""}`;
@@ -1651,9 +1651,10 @@
           }
           const summary = {
             id, kind: "command_group", label: expanded ? "−" : label,
+            detail: waits && !expanded ? String(duration) : "",
             start: first.start, duration, title: `${action} · ${span}`, eventIds: [],
             accentColor: waits ? first.accentColor : undefined,
-            foldGroup: {expanded, waits, action, count: run.length},
+            foldGroup: {expanded, waits, action},
             search: run.map((block) => block.search).join(" "),
             classNames: expanded ? "timeline-command-group timeline-command-group-open" : "timeline-command-group",
           };

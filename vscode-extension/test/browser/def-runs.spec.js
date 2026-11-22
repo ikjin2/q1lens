@@ -17,8 +17,13 @@ test("DEF webview changes heatmap and histogram metrics using saved results", as
       if (message.action === "info") report({ info: { revision: "sha256", mode: "concrete", max_steps: 10000, sequencers: [{ id: "s", uri,
         file: "fixture.q1asm", registers: ["R0", "R2"], defs: [{ name: "X", value: "0", literal: "0", line: 1 }, { name: "Y", value: "10", literal: "10", line: 2 }] },
       { id: "t", uri: "file:///other.q1asm", file: "other.q1asm", registers: ["R8"], defs: [] }] } });
-      if (message.action === "plan") window.postMessage({ type: "defSweepPlan", project, token: message.token,
-        plan: message.axes[0].max === "4096" ? { ...plan, total: "8194", allowed: false, limit: 4096 } : plan }, "*");
+      if (message.action === "plan") {
+        const axes = message.axes.map(({ name, min, max, step }) => ({ name, min, last: max, step,
+          count: String(Math.floor((Number(max) - Number(min)) / Number(step)) + 1) }));
+        const total = axes.reduce((n, axis) => n * Number(axis.count), 1);
+        window.postMessage({ type: "defSweepPlan", project, token: message.token,
+          plan: { ...plan, axes, total: String(total), limit: 4096, allowed: total <= 4096 } }, "*");
+      }
       if (message.action === "estimate") {
         const { type, project, action, ...inputs } = message;
         report({ estimate: { inputs, setupMs: 10, sampleMs: 10, count: 16 } });
@@ -83,9 +88,11 @@ test("DEF webview changes heatmap and histogram metrics using saved results", as
   await expect(time).not.toBeChecked();
   const start = page.getByRole("button", { name: "Start sweep" });
   const range = (name) => page.getByRole("textbox", { name, exact: true });
-  await expect(page.locator('[data-field="plan"]')).toHaveText("Enter a Min or Max to sweep a DEF.");
-  await expect(start).toBeDisabled();
+  await expect(page.locator('[data-field="plan"]')).toHaveText("10 combinations");
+  await expect(start).toBeEnabled();
   await range("X maximum").fill("1");
+  await expect(range("X minimum")).toHaveValue("0");
+  await range("X minimum").fill("");
   await expect(range("X minimum")).toHaveAttribute("placeholder", "0");
   await range("Y maximum").fill("11");
   await expect(page.locator('[data-field="plan"]')).toHaveText("4 combinations");
@@ -241,12 +248,35 @@ test("DEF sweep keeps one input table, a one-line result and exceptions first", 
     const bridge = { postMessage(message) {
       window.requests.push(message);
       if (message.action === "info") report({ info: { revision: "sha256", mode: "concrete", max_steps: 10000, sequencers: [{ id: "s", uri,
-        file: "fixture.q1asm", registers: ["R0"], defs: [{ name: "N", value: "4", literal: "4", line: 1 },
-          { name: "GAIN", value: "2", literal: "2", line: 2 }, { name: "OFFSET", value: "10", literal: "10", line: 3 }] }] } });
+        file: "fixture.q1asm", registers: ["R0"], defs: [{ name: "N", value: "4", literal: "0x4", line: 1 },
+          { name: "DEST", value: null, literal: "R0", line: 2, reason: "Register alias." },
+          { name: "GAIN", value: "2", literal: "{gain}", line: 3 }, { name: "OFFSET", value: "10", literal: "10", line: 4 }] },
+        { id: "unresolved", uri: "file:///unresolved.q1asm", file: "unresolved.q1asm", registers: ["R1"],
+          defs: [{ name: "SIZE", value: null, literal: "{size}", line: 1, needs_input: true }] },
+        { id: "large", uri: "file:///large.q1asm", file: "large.q1asm", registers: [],
+          defs: [{ name: "ADDR", value: null, literal: "@done", line: 1, reason: "Label address." },
+            { name: "LIMIT", value: "2147483647", literal: "0x7fffffff", line: 2 },
+            { name: "MIXED", value: "12", literal: "1٢", line: 3 }] },
+        { id: "aliases", uri: "file:///aliases.q1asm", file: "aliases.q1asm", registers: ["R1"],
+          defs: [{ name: "REG", value: null, literal: "R1", line: 1, reason: "Register alias." }] }] } });
       const axes = (message.axes || []).map(({ name, min, max, step }) => ({ name, min, last: max, step,
         count: String((Number(max) - Number(min)) / Number(step) + 1) }));
       const plan = { axes, total: String(axes.reduce((total, axis) => total * Number(axis.count), 1)), allowed: true, sample_limit: 25_000 };
       if (message.action === "plan") window.postMessage({ type: "defSweepPlan", project, token: message.token, plan }, "*");
+      if (message.sequencer === "unresolved" && message.action === "sweep") {
+        const rows = [2, 3, 4].map((value, i) => ({ id: i + 1, status: "completed", engine_completed: true,
+          defs: { SIZE: String(value) }, words: { R1: value }, diagnostics: [] }));
+        report({ sweep: { id: "manual", status: "completed", plan, sequencer: "unresolved", mode: "concrete", maxSteps: 10000,
+          registers: message.registers, observeTime: false, defs: { SIZE: message.axes[0].min }, rows } });
+        return;
+      }
+      if (message.sweepId === "manual" && message.action === "case") {
+        const value = message.caseId + 1;
+        report({ trace: { id: "manual-case", sweepId: "manual", sequencer: "unresolved", registers: ["R1"], mode: "concrete", maxSteps: 10000,
+          ir: { sequencers: [{ id: "unresolved" }], events: [] }, literals: { SIZE: String(value) },
+          case: { id: message.caseId, status: "completed", engine_completed: true, defs: { SIZE: String(value) }, words: { R1: value }, diagnostics: [] } } });
+        return;
+      }
       if (message.action === "run") report({ trace: { id: "run", sequencer: "s", registers: ["R0"], observeTime: false, mode: "concrete", maxSteps: 10000,
         ir: { sequencers: [{ id: "s" }], events: [] }, literals: message.overrides,
         case: { id: 0, status: "completed", engine_completed: true, defs: message.overrides, words: { R0: 1 }, diagnostics: [] } } });
@@ -265,8 +295,28 @@ test("DEF sweep keeps one input table, a one-line result and exceptions first", 
   });
   const panel = page.locator("#q1timeline-def-runs");
   const input = (name) => panel.getByRole("textbox", { name, exact: true });
+  const axis = (name) => panel.getByRole("checkbox", { name: `Sweep ${name}`, exact: true });
   await expect(panel.getByRole("heading")).toHaveText(["Sweep"]);
-  await expect(panel.getByRole("table", { name: "DEF inputs" }).locator("thead th:visible")).toHaveText(["DEF", "Default", "Run input", "Min", "Max", "Step", ""]);
+  await expect(panel.getByRole("table", { name: "DEF inputs" }).locator("thead th:visible")).toHaveText(["Sweep DEF", "Declaration", "Run input", "Min", "Max", "Step", ""]);
+  await expect(input("N DEF value")).toHaveValue("0x4");
+  await expect(axis("N")).toBeChecked();
+  await expect(axis("GAIN")).not.toBeChecked();
+  await expect(input("N minimum")).toHaveValue("4");
+  await expect(input("N maximum")).toHaveValue("13");
+  await expect(input("N step")).toHaveValue("1");
+  await expect(panel.locator('[data-field="plan"]')).toHaveText("10 combinations");
+  await axis("GAIN").check();
+  await expect(panel.locator('[data-field="plan"]')).toHaveText("100 combinations");
+  await expect(axis("OFFSET")).toBeDisabled();
+  await axis("N").uncheck();
+  await expect(panel.locator('[data-field="plan"]')).toHaveText("10 combinations");
+  await expect(panel.locator('[data-def-row="GAIN"] td').first()).toHaveText("{gain}");
+  await expect(input("GAIN DEF value")).toHaveValue("2");
+  const alias = panel.locator('[data-def-row="DEST"]');
+  await expect(alias).toContainText("Register alias.");
+  await expect(alias.locator("input")).toHaveCount(0);
+  await alias.getByRole("button", { name: "Open DEST at line 2" }).click();
+  expect(await page.evaluate(() => window.requests.at(-1))).toMatchObject({ type: "sourceClick", line: 2 });
 
   // Reset controls and the last-run column appear only when they have something to act on or show.
   const reset = panel.getByRole("button", { name: "Reset OFFSET DEF" }), resetAll = panel.getByRole("button", { name: "Reset all DEFs" });
@@ -276,22 +326,26 @@ test("DEF sweep keeps one input table, a one-line result and exceptions first", 
   await expect(reset).toBeVisible();
   await expect(resetAll).toBeVisible();
   await panel.getByRole("button", { name: "Run from start" }).click();
+  expect(await page.evaluate(() => window.requests.find((request) => request.action === "run").overrides))
+    .toEqual({ N: "0x4", GAIN: "2", OFFSET: "11" });
   await expect(panel.locator('[data-def-row="OFFSET"] [data-executed]')).toHaveText("11");
   await expect(panel.getByRole("columnheader", { name: "Last run" })).toBeVisible();
   await reset.click();
   await expect(input("OFFSET DEF value")).toHaveValue("10");
   await expect(reset).toBeHidden();
 
-  // A DEF becomes an axis when a range is entered. The first range entered is the first axis, and two is the limit.
+  // Editing a range selects it. The first selected row is the horizontal axis.
   await input("GAIN maximum").fill("3");
+  await expect(input("GAIN minimum")).toHaveValue("2");
   await input("N minimum").fill("1");
   await input("N maximum").fill("5");
   await expect(input("OFFSET minimum")).toBeDisabled();
-  await expect(input("OFFSET step")).toHaveAttribute("title", /Two DEFs are already swept/);
+  await expect(axis("OFFSET")).toBeDisabled();
   await expect(panel.locator('[data-field="plan"]')).toHaveText("10 combinations");
   await expect.poll(() => page.evaluate(() => window.requests.filter((request) => request.action === "plan").at(-1).axes)).toEqual([
     { name: "GAIN", min: "2", max: "3", step: "1" }, { name: "N", min: "1", max: "5", step: "1" }]);
-  await input("GAIN maximum").fill("");
+  await axis("GAIN").uncheck();
+  await expect(input("GAIN maximum")).toHaveValue("3");
   await expect(input("OFFSET minimum")).toBeEnabled();
   await expect(panel.locator('[data-def-row="GAIN"] [data-axis-count]')).toBeEmpty();
   await expect(panel.locator('[data-def-row="N"] [data-axis-count]')).toHaveText("5");
@@ -303,7 +357,7 @@ test("DEF sweep keeps one input table, a one-line result and exceptions first", 
   await panel.getByRole("checkbox", { name: "Q1 time", exact: true }).check();
   await panel.getByRole("button", { name: "Start sweep" }).click();
   expect(await page.evaluate(() => window.requests.at(-1))).toMatchObject({ action: "sweep", statistics_only: false,
-    axes: [{ name: "N", min: "1", max: "5", step: "1" }], overrides: { N: "4", GAIN: "2", OFFSET: "10" } });
+    axes: [{ name: "N", min: "1", max: "5", step: "1" }], overrides: { N: "0x4", GAIN: "2", OFFSET: "10" } });
 
   // One result line: completion mark, reported cases, proportions and non-zero counts. Settings stay in its tooltip.
   const summary = panel.locator(".def-summary");
@@ -340,4 +394,59 @@ test("DEF sweep keeps one input table, a one-line result and exceptions first", 
   // Plot text is drawn at its own size instead of growing with the panel.
   const plot = panel.locator('svg[aria-label="DEF input versus R0"]');
   expect(await plot.evaluate((svg) => svg.getBoundingClientRect().width <= svg.viewBox.baseVal.width)).toBe(true);
+  const seq = panel.getByRole("combobox", { name: "Sequencer" }), start = panel.getByRole("button", { name: "Start sweep" });
+  await seq.selectOption("aliases");
+  await expect(panel.locator('[data-def-row="REG"]')).toContainText("Register alias.");
+  await expect(panel.locator('[data-field="plan"]')).toBeEmpty();
+  await expect(start).toBeDisabled();
+
+  await seq.selectOption("large");
+  await expect(axis("LIMIT")).toBeChecked();
+  await expect(input("LIMIT maximum")).toHaveValue("2147483647");
+  const min = BigInt(await input("LIMIT minimum").inputValue());
+  const step = BigInt(await input("LIMIT step").inputValue());
+  expect(step).toBeGreaterThan(1n);
+  expect(min + 9n * step).toBe(2147483647n);
+  await expect(panel.locator('[data-field="plan"]')).toHaveText("10 combinations");
+  await expect(panel.getByRole("checkbox", { name: "Q1 time", exact: true })).toBeChecked();
+  await expect(start).toBeEnabled();
+  await axis("LIMIT").uncheck();
+  await expect(start).toBeDisabled();
+  await axis("MIXED").check();
+  await expect(input("MIXED minimum")).toHaveValue("12");
+  await expect(input("MIXED maximum")).toHaveValue("21");
+  await expect(panel.locator('[data-field="plan"]')).toHaveText("10 combinations");
+
+  await seq.selectOption("unresolved");
+  await expect(input("SIZE DEF value")).toHaveValue("");
+  await expect(axis("SIZE")).toBeChecked();
+  await expect(input("SIZE minimum")).toHaveValue("0");
+  await expect(input("SIZE maximum")).toHaveValue("9");
+  await expect(panel.locator('[data-field="plan"]')).toHaveText("10 combinations");
+  await input("SIZE maximum").fill("");
+  await expect(start).toBeDisabled();
+  await input("SIZE minimum").fill("2");
+  await input("SIZE maximum").fill("2");
+  await expect(panel.locator('[data-def-row="SIZE"] [data-axis-count]')).toHaveText("1");
+  await input("SIZE maximum").fill("4");
+  await expect(panel.locator('[data-field="plan"]')).toHaveText("3 combinations");
+  await start.click();
+  expect(await page.evaluate(() => window.requests.at(-1))).toMatchObject({ action: "sweep", sequencer: "unresolved",
+    axes: [{ name: "SIZE", min: "2", max: "4", step: "1" }] });
+  expect(await page.evaluate(() => window.requests.at(-1).overrides)).toEqual({});
+  await expect(panel.getByRole("table", { name: "Sweep cases" }).locator("tbody tr td:nth-child(2)")).toHaveText(["SIZE=2", "SIZE=3", "SIZE=4"]);
+  await input("Formula").fill("$SIZE * 2");
+  await panel.getByRole("button", { name: "Plot formula" }).click();
+  await expect(panel.locator('svg[aria-label="DEF input versus Formula"] [data-case="2"]')).toHaveAccessibleName(/Formula 6/);
+  await panel.getByRole("button", { name: "Case 2", exact: true }).click();
+  await expect(panel.locator('[data-def-row="SIZE"] [data-executed]')).toHaveText("3");
+  await expect(input("SIZE DEF value")).toHaveValue("");
+  await input("SIZE DEF value").fill("8");
+  await expect(input("SIZE minimum")).toHaveValue("2");
+  await expect(input("SIZE maximum")).toHaveValue("4");
+  await axis("SIZE").uncheck();
+  await axis("SIZE").check();
+  await expect(panel.locator('[data-field="plan"]')).toHaveText("3 combinations");
+  await panel.getByRole("button", { name: "Run from start" }).click();
+  expect(await page.evaluate(() => window.requests.at(-1).overrides)).toEqual({ SIZE: "8" });
 });

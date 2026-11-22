@@ -33,7 +33,6 @@ In the Command Palette, run **Q1Lens: Select Python Environment** → **Enter Py
 
 Run **Q1Lens: Show Python Environment** to confirm the selection.
 
-## Quick start
+## User guide
 
-Open the [verification demo workspace](examples/verification-demo/verification.code-workspace) from your Q1Lens checkout. In that workspace, run **Q1Lens: Select Python Environment** and choose the interpreter where you installed `q1lens`.
-Open `queue.q1asm`, run **Q1Lens: Verify Program**, then choose **Open counterexample timeline**. The queue stays supplied for `N=1..37`. At `N=38`, the timeline selects the first underflow at **1188 ns**.
+Read the [Q1Lens user guide](https://github.com/ikjin2/q1lens/blob/main/docs/index.md).

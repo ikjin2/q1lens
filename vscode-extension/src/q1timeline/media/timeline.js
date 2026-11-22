@@ -1966,12 +1966,11 @@
       for (const lane of model.lanes.filter((lane) => ["runtime", "branch-runtime", "runtime-path"].includes(lane.kind))) {
         for (const block of lane.blocks.filter((block) => !block.diagnosticPlacement && !["underflow_warning", "analysis_incomplete", "unknown_region"].includes(block.kind))) {
           if (block.pointMarker || block.foldGroup?.expanded) continue;
-          block.commandLabel = block.foldGroup?.waits
-            ? `wait ${formatFoldDuration(block.duration)} × ${block.foldGroup.count}`
-            : block.commandToken || block.label;
+          block.commandLabel = block.commandToken || block.label;
           block.classNames += " q1timeline-command-name";
           if (!block.duration) block.classNames += " q1timeline-command-point";
-          const label = block.diagnosticErrors?.length ? `! ${block.commandLabel}` : block.commandLabel;
+          let label = block.diagnosticErrors?.length ? `! ${block.commandLabel}` : block.commandLabel;
+          if (block.foldGroup?.waits) label += ` ${block.detail}`;
           timelineCommandWidths.push({ start: block.start, end: block.start + block.duration, label });
         }
       }

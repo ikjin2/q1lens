@@ -1,0 +1,72 @@
+site_name: Q1Lens
+site_description: User guide for Q1Lens, a Q1ASM timeline and verification tool for VS Code.
+site_url: https://ikjin2.github.io/q1lens/
+repo_url: https://github.com/ikjin2/q1lens
+repo_name: ikjin2/q1lens
+edit_uri: edit/main/docs/
+
+docs_dir: docs
+exclude_docs: |
+  requirements.txt
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+markdown_extensions:
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight
+  - pymdownx.superfences
+
+# Rewrites links that leave docs/ (examples, tests) to the repository on GitHub.
+hooks:
+  - tools/mkdocs_repo_links.py
+
+validation:
+  links:
+    not_found: warn
+    anchors: warn
+    unrecognized_links: warn
+
+nav:
+  - Home: index.md
+  - Guide:
+      - Install: guide/install.md
+      - Quick start: guide/quick-start.md
+      - Write Q1ASM: guide/editing.md
+      - Read the timeline: guide/timeline.md
+      - Set up a project: guide/projects.md
+      - Execution modes: guide/execution-modes.md
+      - Feedback and external inputs: guide/feedback-and-inputs.md
+      - Hardware view: guide/hardware.md
+      - DEF runs and sweeps: guide/def-sweep.md
+      - Verify a program: guide/verification.md
+      - Qblox Scheduler and notebooks: guide/scheduler-notebook.md
+      - Command line and CI: guide/cli.md
+  - Reference:
+      - Commands: reference/commands.md
+      - Settings: reference/settings.md
+      - Troubleshooting: reference/troubleshooting.md
+  - Model:
+      - Program verification: verification.md
+      - Run with DEF values: def-register-sweep.md
+      - Event-driven simulation: simulation.md
+      - External inputs: external-inputs.md
+      - Symbolic waveform output: symbolic-output.md
+      - Acquisition buffer checks: acquisition-buffer.md

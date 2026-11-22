@@ -1,6 +1,6 @@
 /// <reference lib="dom" />
 import assert from "node:assert/strict";
-import { chromium, type Browser, type Frame } from "@playwright/test";
+import { chromium, expect, type Browser, type Frame } from "@playwright/test";
 import * as vscode from "vscode";
 
 async function webview(browser: Browser, source?: string): Promise<Frame> {
@@ -25,6 +25,55 @@ async function webview(browser: Browser, source?: string): Promise<Frame> {
 
 describe("DEF execution and sweep in VS Code", function () {
   this.timeout(90000);
+
+  it("lists and updates DEFs from unsaved Q1ASM while execution waits for save", async () => {
+    const workspace = vscode.workspace.workspaceFolders?.[0]?.uri;
+    assert.ok(workspace);
+    const folder = vscode.Uri.joinPath(workspace, "draft-defs");
+    const source = vscode.Uri.joinPath(folder, "draft.q1asm");
+    const saved = Buffer.from("wait 20\nstop\n");
+    await vscode.workspace.fs.createDirectory(folder);
+    await vscode.workspace.fs.writeFile(source, saved);
+    const doc = await vscode.workspace.openTextDocument(source);
+    const port = process.env.Q1LENS_DEF_WEBVIEW_CDP_PORT;
+    assert.ok(port, "Run this suite through npm run test:extension");
+    const browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
+    try {
+      await vscode.commands.executeCommand("q1timeline.openPreview", source);
+      const frame = await webview(browser, "draft-defs");
+      const add = new vscode.WorkspaceEdit();
+      add.insert(source, new vscode.Position(0, 0), ".DEF N 20\n");
+      assert.equal(await vscode.workspace.applyEdit(add), true);
+      await frame.getByRole("button", { name: "Sweep", exact: true }).click();
+      const input = frame.getByRole("textbox", { name: "N DEF value", exact: true });
+      await expect(input).toHaveValue("20", { timeout: 15000 });
+
+      const change = new vscode.WorkspaceEdit();
+      change.replace(source, new vscode.Range(0, 7, 0, 9), "21");
+      assert.equal(await vscode.workspace.applyEdit(change), true);
+      await expect(input).toHaveValue("21", { timeout: 15000 });
+      await expect(frame.getByRole("button", { name: "Reload DEFs" })).toBeEnabled();
+      await expect(frame.getByRole("button", { name: "Run from start" })).toBeDisabled();
+      await expect(frame.getByRole("button", { name: "Start sweep" })).toBeDisabled();
+      await expect(frame.getByRole("button", { name: "Verify saved program" })).toBeDisabled();
+      assert.equal(doc.isDirty, true);
+      assert.deepEqual(Buffer.from(await vscode.workspace.fs.readFile(source)), saved);
+      assert.equal(await doc.save(), true);
+      await expect.poll(async () => {
+        const current = await webview(browser, "draft-defs");
+        try {
+          return await current.getByRole("button", { name: "Run from start" }).isEnabled({ timeout: 500 });
+        } catch {
+          // Saving can replace the webview before the execution controls are ready.
+          return false;
+        }
+      }, { timeout: 15000 }).toBe(true);
+    } finally {
+      if (doc.isDirty) await doc.save();
+      await browser.close();
+      await vscode.commands.executeCommand("workbench.action.closeAllEditors");
+    }
+  });
 
   it("runs the real Python worker from the timeline, cancels a sweep and follows a result", async () => {
     const workspace = vscode.workspace.workspaceFolders?.[0]?.uri;
@@ -52,7 +101,21 @@ describe("DEF execution and sweep in VS Code", function () {
       const r2Stats = '[data-statistics="R2"]';
       const registerChoices = frame.locator(".def-register-choices");
       const range = (name: string) => frame.getByRole("textbox", { name, exact: true });
+      const axis = (name: string) => frame.getByRole("checkbox", { name: `Sweep ${name}`, exact: true });
       const stat = (row: string, name: string) => frame.locator(`${row} [data-stat="${name}"]`);
+      await waitText('[data-field="plan"]', "10 combinations");
+      assert.equal(await axis("X").isChecked(), true);
+      assert.equal(await axis("Y").isChecked(), false);
+      const start = frame.getByRole("button", { name: "Start sweep" });
+      await start.click();
+      await waitText('[data-cases-reported]', "10 / 10 cases");
+      assert.equal(await stat('[data-statistics="R0"]', "mean").textContent(), "4.5");
+      await axis("Y").check();
+      await waitText('[data-field="plan"]', "100 combinations");
+      await start.click();
+      await waitText('[data-cases-reported]', "100 / 100 cases");
+      await axis("Y").uncheck();
+      await waitText('[data-field="plan"]', "10 combinations");
       assert.deepEqual(await registerChoices.locator("label:visible").allTextContents(), ["R0", "R1", "R2"]);
       await frame.getByRole("button", { name: "Show all registers" }).click();
       assert.equal(await registerChoices.getByRole("checkbox").count(), 64);
@@ -148,8 +211,7 @@ describe("DEF execution and sweep in VS Code", function () {
       await errorPoint.click();
       await waitText('[data-field="trace-heading"]', "sweep case 5");
 
-      await range("Y maximum").fill("");
-      await range("Y step").fill("");
+      await axis("Y").uncheck();
       await r1.uncheck();
       const output = frame.getByRole("combobox", { name: "Results", exact: true });
       await output.selectOption("statistics");

@@ -43,10 +43,14 @@ class Program:
     def_sources: dict[str, SourceLocation] = field(default_factory=dict)
 
 
+def duplicate_def_names(program: Program) -> set[str]:
+    return {item.details["name"] for item in program.diagnostics
+            if item.message.startswith("Duplicate .DEF name:") and "name" in item.details}
+
+
 def numeric_defs(program: Program) -> dict[str, Arg]:
-    """Return the unambiguous numeric DEFs that a run can override."""
-    duplicates = {item.details.get("name") for item in program.diagnostics
-                  if item.message.startswith("Duplicate .DEF name:")}
+    """Return the unambiguous integer literal declarations."""
+    duplicates = duplicate_def_names(program)
     return {name: arg for name, arg in program.defs.items()
             if arg.kind == "imm" and name in program.def_sources and name not in duplicates}
 

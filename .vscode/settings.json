@@ -1,5 +1,6 @@
 {
   "python.analysis.extraPaths": [
     "./src"
-  ]
+  ],
+  "q1lens.q1timeline.verification.autoRun": true
 }

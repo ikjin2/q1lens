@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.1
+
+- List all DEF declarations in Sweep. Enter Min and Max to sweep a template DEF even when its project parameter has no value.
+- Open Sweep with a 10-point range on the first editable DEF. Select a second axis for a 100-case grid or edit the ranges directly.
+- Show the total duration below grouped wait commands in the Normal timeline.
+- Add a user guide covering installation, execution modes, verification, and troubleshooting.
+
 ## 0.3.0
 
 - Pair with Python package 0.3.0, which installs Z3 by default for program verification.

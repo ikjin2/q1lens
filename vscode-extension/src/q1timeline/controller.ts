@@ -1437,8 +1437,17 @@ export class TimelineController {
   }
 
   hasUnsavedProjectChanges() {
-    const documents = vscode.workspace.textDocuments || [];
-    return documents.some((document) => document.isDirty && this.isProjectRelated(document.uri));
+    return this.unsavedProjectDocuments().length > 0;
+  }
+
+  unsavedProjectDocuments() {
+    return (vscode.workspace.textDocuments || []).filter((document) => document.isDirty && this.isProjectRelated(document.uri));
+  }
+
+  defSourceDrafts() {
+    return Object.fromEntries(this.unsavedProjectDocuments()
+      .filter((document) => document.uri.scheme === "file" && isQ1asmPath(document.uri.fsPath))
+      .map((document) => [document.uri.fsPath, document.getText()]));
   }
 
   checkAnalyzerInstallation() {
@@ -3197,7 +3206,8 @@ export class TimelineController {
         const { project, revision, sequencer, uri } = parsedMessage;
         const info = this.defRuns.state.info;
         const seq = info?.sequencers.find((item) => item.id === sequencer && item.uri === uri);
-        if (this.panel && this.webviewReady && project === this.projectUri?.fsPath && seq && revision === info.revision) {
+        if (this.panel && this.webviewReady && project === this.projectUri?.fsPath && seq && revision === info.revision &&
+            !info.draft && !this.hasUnsavedProjectChanges()) {
           const explicitProject = this.singleFileMode ? undefined : this.projectUri;
           const result = await vscode.commands.executeCommand("q1timeline.verify", vscode.Uri.file(seq.file),
             explicitProject, explicitProject && seq.id, true);

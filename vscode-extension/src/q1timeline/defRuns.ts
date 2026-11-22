@@ -66,10 +66,13 @@ export class DefRuns {
       return;
     }
     if (this.job) return;
-    if (owner.hasUnsavedProjectChanges()) {
-      this.publish({ message: "Save the project and Q1ASM sources before calculating execution." });
+    const unsaved = owner.hasUnsavedProjectChanges();
+    if (message.action !== "info" && (unsaved || this.state.info?.draft)) {
+      this.publish({ message: unsaved ? "Save the project and Q1ASM sources before calculating execution."
+        : "Reload DEFs before starting a new run." });
       return;
     }
+    const sourceDrafts = message.action === "info" && unsaved ? owner.defSourceDrafts() : undefined;
     const options = this.options();
     const key = JSON.stringify(options);
     if (this.optionsKey && this.optionsKey !== key) this.invalidate();
@@ -122,13 +125,13 @@ export class DefRuns {
       }
       const request = (payload) => this.client.request(payload, options.timeout);
       if (job.action === "info") {
-        const { info } = await request({ command: "info" });
+        const { info } = await request({ command: "info", include_all_defs: true, source_drafts: sourceDrafts });
         if (!current()) return;
         if ((sweep && sweep.revision !== info.revision) || (this.state.trace && this.state.trace.revision !== info.revision)) {
           this.publish({ sweep: sweep && { ...sweep, status: "stale" },
             trace: this.state.trace && { ...this.state.trace, stale: true } });
         }
-        this.publish({ info });
+        this.publish({ info: { ...info, draft: unsaved } });
         return;
       }
       const inputs = expected ? { ...sweep.inputs, overrides: expected.defs, case_id: expected.id } : {

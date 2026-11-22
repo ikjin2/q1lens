@@ -73,4 +73,3 @@ underflow를 검출해야 검증 PASS**입니다.
 
 검증 스크립트는 실행마다 새 IR을 검사하며 필수 예제 누락과 다른 원인의 실패를
 거부합니다. `python -O`/`PYTHONOPTIMIZE`에서는 검사를 생략하지 않고 즉시 실패합니다.
-자동화 환경과 실행 방법은 [continuous validation](../../docs/ci-validation.md)을 참고하세요.

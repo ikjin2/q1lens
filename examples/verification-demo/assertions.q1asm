@@ -1,4 +1,4 @@
-.DEF N 20
+.DEF N 10
 ;@assume 1 <= N <= 513
 ;@assert rt_time == 20000 at @readout
 ;@assert R2 < 1024

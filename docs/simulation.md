@@ -1010,6 +1010,5 @@ the corresponding model assumption before treating it as hardware evidence.
 | Firmware-specific command effects | Record Q1/RT progress and observable output for `sw_req` and `play_pulse` on a supporting module. For `upd_thres`, Concrete records writes at indices 0–3 and Simulation models the low/high count thresholds at 0/1. Compare classification results before and after writing each index. For `play_netzero` and `reset_netzero`, capture the output waveform and residual area across a reset and retrigger. |
 
 Use the [verification workspace](../examples/simulation-verification/README.md)
-for runnable examples and expected values, and [continuous validation](ci-validation.md)
-for the automated checks. Passing these checks validates the software model, not
-equivalence to a physical instrument.
+for runnable examples and expected values. Passing these checks validates the
+software model, not equivalence to a physical instrument.

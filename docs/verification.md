@@ -11,7 +11,7 @@ Standalone queue checks use the simulator’s buffered RT startup. Pass `--start
 An automatic boundary search varies one numeric DEF at a time. Its default interval starts at 1 or the declared value, whichever is smaller, and ends at 4294967295. Use an assumption to select another interval, including zero or negative values. Other explicitly ranged inputs vary jointly. Other DEFs retain their source values. A first failure means the entire stated prefix was checked. A later value can become safe again.
 
 ```asm
-.DEF N 20
+.DEF N 10
 ;@assume 1 <= N <= 513
 ;@assert rt_time == 20000 at @readout
 ;@assert R2 < 1024

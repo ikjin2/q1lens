@@ -62,12 +62,25 @@ test("Normal time scale groups adjacent waits while preserving separate RT actio
     event("w0", "wait", 0, 100, {op: "wait"}), event("w1", "wait", 100, 300, {op: "wait"}),
     event("p0", "play", 300, 400), event("p1", "play", 400, 500),
     event("trigger", "wait_trigger", 500, 600),
-    event("w2", "wait", 600, 700), event("w3", "wait", 704, 800),
+    event("w2", "wait", 600, 700, {op: "wait"}), event("w3", "wait", 704, 800, {op: "wait"}),
+    event("w4", "wait", 804, 1804, {op: "wait"}), event("w5", "wait", 1804, 2004, {op: "wait"}),
+    event("w6", "wait", 2004, 2080, {op: "wait"}), event("p2", "play", 2080, 40000, {op: "play"}),
   ]};
   await mount(page, "idle", ir, {analysisDetailsOpen: false, timelineWaitsCollapsed: false}, {viewMode: "normal"});
   const group = page.getByRole("button", {name: "Expand 2 wait commands", exact: true});
   const block = (id) => page.locator(`.timeline-block[data-event-id="${id}"]`);
-  await expect(group).toHaveText("wait 300 ns × 2");
+  const longGroup = page.getByRole("button", {name: "Expand 3 wait commands", exact: true});
+  await expect(group).toHaveClass(/is-compact/);
+  const detailColor = await block("w2").locator(".block-detail").evaluate((node) => getComputedStyle(node).color);
+  for (const [waits, total] of [[group, "300"], [longGroup, "1276"]]) {
+    await expect(waits.locator(".block-label")).toHaveText("wait");
+    const detail = waits.locator(".block-detail");
+    await expect(detail).toBeVisible();
+    await expect(detail).toHaveText(total);
+    await expect(detail).toHaveCSS("color", detailColor);
+    const [blockBounds, detailBounds] = await Promise.all([waits.boundingBox(), detail.boundingBox()]);
+    expect(detailBounds.x + detailBounds.width).toBeLessThanOrEqual(blockBounds.x + blockBounds.width);
+  }
   for (const id of ["p0", "p1", "trigger", "w2", "w3"]) await expect(block(id)).toBeVisible();
   await expect(block("w0")).toBeHidden();
   await group.press("Enter");

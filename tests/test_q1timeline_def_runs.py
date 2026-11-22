@@ -100,6 +100,67 @@ R43: stop
     }
 
 
+def test_info_keeps_def_literals_and_explains_unavailable_values(tmp_path):
+    project = program(tmp_path, """.DEF FIXED 0x10
+    .DEF INPUT {seed}
+.DEF OUT R6
+.DEF DEST @end
+.DEF MISSING {absent}
+.DEF TEXT {word}
+.DEF REPEATED 1
+.DEF REPEATED 2
+end: stop
+""", config="params:\n  file: params.json\n")
+    (tmp_path / "params.json").write_text('{"seed": "0b101", "word": "abc"}', encoding="utf-8")
+    run = snapshot(project)
+    entries = {entry["name"]: entry for entry in run.info()["sequencers"][0]["defs"]}
+    assert {name: (entry["literal"], entry["value"]) for name, entry in entries.items()} == {
+        "FIXED": ("0x10", "16"), "INPUT": ("{seed}", "5"), "OUT": ("R6", None),
+        "DEST": ("@end", None), "MISSING": ("{absent}", None), "TEXT": ("{word}", None),
+        "REPEATED": ("1", None),
+    }
+    assert (entries["INPUT"]["line"], entries["INPUT"]["column"]) == (2, 5)
+    assert entries["MISSING"]["needs_input"] is True
+    assert run.inputs(request(run, MISSING="1"))[2]["MISSING"] == 1
+    for name in ("OUT", "DEST", "TEXT", "REPEATED"):
+        assert entries[name]["reason"]
+        assert not entries[name].get("needs_input")
+        with pytest.raises(ValueError):
+            run.inputs(request(run, **{name: "1"}))
+    assert run.inputs(request(run))[2] == {"FIXED": 16, "INPUT": 5}
+
+
+def test_strict_mode_reports_template_as_unavailable_even_with_integer_parameter(tmp_path):
+    run = snapshot(program(tmp_path, ".DEF X {seed}\nmove $X,R0\nnop\nstop\n"),
+                   set_param=["seed=4"], q1asm_strict=True)
+    entry, = run.info()["sequencers"][0]["defs"]
+    assert entry["literal"] == "{seed}" and entry["value"] is None
+    assert "strict" in entry["reason"].lower()
+    assert not entry.get("needs_input")
+    with pytest.raises(ValueError):
+        run.inputs(request(run, X="4"))
+
+
+def test_parameter_def_override_is_local_to_one_alias_and_sequencer(tmp_path):
+    source = (".DEF X {seed}\n.DEF Y {seed}\nmove $X,R0\nmove $Y,R1\n"
+              "move {seed},R2\nnop\nstop\n")
+    project = program(tmp_path, source, config="params:\n  file: params.json\n", sequencers=(
+        "sequencers:\n  - id: sum\n    file: sum.q1asm\n  - id: other\n    file: sum.q1asm\n"))
+    params = tmp_path / "params.json"
+    params.write_text('{"seed": 3}', encoding="utf-8")
+    run = snapshot(project, set_param=["seed=10"])
+    assert run.inputs(request(run))[2] == {"X": 10, "Y": 10}
+    detail = run.run(*run.inputs(request(run, register="R0", X="11")), detail=True)
+    assert detail["case"]["defs"] == {"X": "11", "Y": "10"}
+    writes = {(write["sequencer_id"], write["register"]): write["value"]["value"]
+              for write in detail["ir"]["register_history"]}
+    assert writes == {("sum", "R0"): 11, ("other", "R0"): 10,
+                      ("sum", "R1"): 10, ("other", "R1"): 10,
+                      ("sum", "R2"): 10, ("other", "R2"): 10}
+    assert (tmp_path / "sum.q1asm").read_text(encoding="utf-8") == source
+    assert params.read_text(encoding="utf-8") == '{"seed": 3}'
+
+
 def test_literal_overrides_win_over_params_and_trace_has_real_readiness():
     paths = [FIXTURE / name for name in ("sum.q1asm", "params.json", "q1timeline.yml")]
     original = [path.read_bytes() for path in paths]
@@ -344,18 +405,64 @@ def test_worker_aggregates_statistics_without_case_rows(tmp_path):
     assert summary["time"]["count"] == 2 and summary["time"]["deviation"] == 0
 
 
+@pytest.mark.parametrize("mode", ["concrete", "simulation"])
+def test_worker_sweeps_missing_parameter_from_bounds_alone(tmp_path, mode):
+    project = program(tmp_path, ".DEF X {missing}\n.DEF UNUSED {outside}\n"
+                      "wait $X\nmove $X,R2\nnop\nstop\n")
+    run = snapshot(project, execution_mode=mode)
+    common = request(run)
+    grid = {"command": "sweep", **common, "axes": [axis(lower="8", upper="12", step="4")]}
+    commands = [
+        {"command": "info", "include_all_defs": True},
+        {"command": "plan", **common, "axes": grid["axes"]},
+        grid, {"command": "batch"}, {"command": "batch"},
+        {"command": "run", **common, "overrides": {"X": "12"}, "case_id": 2},
+        {**grid, "statistics_only": True}, {"command": "batch"}, {"command": "batch"},
+    ]
+    response = subprocess.run(
+        [sys.executable, "-m", "q1timeline.def_runs", "--project", str(project), "--execution-mode", mode],
+        input="".join(json.dumps({"id": i, **payload}) + "\n" for i, payload in enumerate(commands)),
+        capture_output=True, encoding="utf-8", timeout=10, check=True,
+    )
+    info, plan, started, first, second, replay, _, _, statistics = map(json.loads, response.stdout.splitlines())
+    defs = info["info"]["sequencers"][0]["defs"]
+    assert [(d["name"], d["value"], d["needs_input"]) for d in defs] == [("X", None, True), ("UNUSED", None, True)]
+    assert plan["plan"]["total"] == started["plan"]["total"] == "2"
+    rows = first["rows"] + second["rows"]
+    assert [(r["defs"], r["word"], r["status"]) for r in rows] == [
+        ({"X": "8"}, 8, "completed"), ({"X": "12"}, 12, "completed"),
+    ]
+    assert replay["case"] == rows[1]
+    assert statistics["summary"]["signed"] == {"count": 2, "min": 8, "max": 12, "mean": 10, "deviation": 2}
+
+
 def test_worker_batches_and_reproduces_selected_case(tmp_path):
-    project = program(tmp_path, (FIXTURE / "sum.q1asm").read_text(encoding="utf-8"))
-    run = snapshot(project)
-    cmd = [sys.executable, "-m", "q1timeline.def_runs", "--project", str(project)]
+    source = (FIXTURE / "sum.q1asm").read_text(encoding="utf-8").replace(".DEF X 0", ".DEF X {input_x}")
+    project = program(tmp_path, source)
+    params = tmp_path / "params.json"
+    params.write_text('{"input_x": 7}', encoding="utf-8")
+    run = snapshot(project, params=str(params))
+    cmd = [sys.executable, "-m", "q1timeline.def_runs", "--project", str(project), "--params", str(params)]
     with subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, encoding="utf-8") as worker:
         def call(command, **payload):
             worker.stdin.write(json.dumps({"id": 1, "command": command, **payload}, ensure_ascii=False) + "\n")
             worker.stdin.flush()
             return json.loads(worker.stdout.readline())
 
-        assert call("info")["info"]["revision"] == run.revision
+        legacy_info = call("info")["info"]
+        assert [entry["name"] for entry in legacy_info["sequencers"][0]["defs"]] == ["Y"]
+        info = call("info", include_all_defs=True)["info"]
+        assert info["revision"] == run.revision == legacy_info["revision"]
+        assert [(entry["name"], entry["value"]) for entry in info["sequencers"][0]["defs"]] == [("X", "7"), ("Y", "10")]
+        draft = source.replace(".DEF Y 10", ".DEF Y 12\n.DEF DRAFT 3")
+        draft_info = call("info", include_all_defs=True,
+                          source_drafts={info["sequencers"][0]["file"]: draft})["info"]
+        assert [(entry["name"], entry["value"]) for entry in draft_info["sequencers"][0]["defs"]] == [
+            ("X", "7"), ("Y", "12"), ("DRAFT", "3"),
+        ]
         base = request(run)
+        assert call("run", **base)["case"]["word"] == 17
+        assert call("plan", **base, axes=[axis()])["plan"]["total"] == "3"
         assert call("run", **{**base, "overrides": {"X": "1٢"}})["case"]["word"] == 22
         assert "error" in call("sweep", **base, axes=[axis(upper="4096")])
         assert "error" in call("batch")

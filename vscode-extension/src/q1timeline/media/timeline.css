@@ -51,6 +51,10 @@ body:not(.instruction-view) #timeline-root .timeline-connector-layer {
   border-style: dashed;
 }
 
+.shared-timeline-stage .timeline-command-group.q1timeline-command-name .block-detail {
+  display: block;
+}
+
 .shared-timeline-stage .timeline-block.timeline-command-group-open {
   top: auto;
   bottom: 0;

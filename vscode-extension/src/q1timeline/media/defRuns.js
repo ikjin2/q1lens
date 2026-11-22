@@ -355,13 +355,14 @@
     const registerFields = [...panel.querySelectorAll("input[data-register]")];
     const observedRegisters = () => registerFields.filter((input) => input.checked).map((input) => input.dataset.register);
     const outputField = field("sweep-output"), sampleField = field("sample-count");
-    let edits = saved.edits || {}, selected = saved.sequencer, plan, planError, planTimer, token = 0, page = 0;
+    let edits = saved.edits || {}, selected = saved.sequencer, plan, planError, planTimer, infoTimer, token = 0, page = 0;
     let traceId, index, instructions = [], used = new Set(), pendingAt = [], position = saved.position || 0;
     let showAllRegisters = false;
-    // DEFs with a range, in the order their ranges were entered: the first is the horizontal plot axis.
+    // The first selected DEF is the horizontal plot axis.
     let axisOrder = [], caseFilter;
     sampleField.title = button("sample").title = "Draws from the selected ranges. The same combination can appear more than once.";
     let hasRegisterChoice = Array.isArray(saved.registers) || typeof saved.register === "string";
+    let hasTimeChoice = typeof saved.observeTime === "boolean";
     const savedRegisters = new Set(saved.registers ?? (saved.register ? [saved.register] : []));
     for (const input of registerFields) input.checked = savedRegisters.has(input.dataset.register);
     timeField.checked = saved.observeTime === true;
@@ -383,20 +384,22 @@
     const editKey = () => JSON.stringify([selected, sequencer()?.uri]);
     const currentEdits = () => edits[editKey()] || {};
     const save = () => persist({ open: !panel.hidden, sequencer: selected,
-      ...(hasRegisterChoice ? { registers: observedRegisters() } : {}), observeTime: timeField.checked,
+      ...(hasRegisterChoice ? { registers: observedRegisters() } : {}),
+      ...(hasTimeChoice || hasRegisterChoice ? { observeTime: timeField.checked } : {}),
       mode: modeField.value, metric: selectedMetric, formula: activeFormula, referenceFormula: activeReference,
       tolerance: activeTolerance, sweepOutput: outputField.value, edits, traceId, position });
     const statisticsOnly = () => outputField.value === "statistics";
     const target = () => ({ revision: state.info.revision, sequencer: selected, uri: sequencer().uri });
     const inputNodes = () => [...field("defs").querySelectorAll("input[data-def]")];
-    const defRows = () => [...field("defs").querySelectorAll("tr[data-def-row]")];
+    const defRows = () => [...field("defs").querySelectorAll("tr[data-def-row]:has(input[data-def])")];
     const rangeInputs = (row) => [...row.querySelectorAll("input[data-range]")];
     const runInputs = () => ({ ...target(), registers: observedRegisters(), observe_time: timeField.checked,
-      overrides: Object.fromEntries(inputNodes().map((input) => [input.dataset.def, input.value])) });
+      overrides: Object.fromEntries(inputNodes().filter((input) => input.dataset.default || input.value.trim())
+        .map((input) => [input.dataset.def, input.value])) });
     const sweepInputs = () => ({ ...runInputs(), axes: readAxes(), statistics_only: statisticsOnly() });
 
     function renderControls() {
-      const available = Boolean(sequencer()) && !unsaved && !state.busy;
+      const available = Boolean(sequencer()) && !unsaved && !state.info?.draft && !state.busy;
       button("verify").disabled = !available;
       const observedCount = observedRegisters().length;
       const hasObservations = observedCount > 0 || timeField.checked;
@@ -404,7 +407,7 @@
       field("observed-count").textContent = `· ${observedCount} selected${hiddenCount ? ` · ${hiddenCount} hidden` : ""}`;
       field("observation-required").hidden = hasObservations;
       button("run").disabled = !available;
-      button("info").disabled = Boolean(unsaved || state.busy);
+      button("info").disabled = Boolean(state.busy);
       const stop = button("cancel");
       const sweeping = state.busy === "sweep", estimating = state.busy === "estimate";
       const stopSlot = field(sweeping && state.sweep?.status === "running" ? "progress-actions" : "setup-actions");
@@ -433,7 +436,8 @@
         cell.textContent = position < 0 ? "" : plan.axes[position].count;
         cell.title = position < 0 ? "" : `${plan.axes[position].count} values · axis ${position + 1}`;
       }
-      field("plan").textContent = [plan ? `${plan.total} combinations` : !axisOrder.length && sequencer()?.defs.length ? "Enter a Min or Max to sweep a DEF." : "", error].filter(Boolean).join(" · ");
+      const hint = !axisOrder.length && inputNodes().length ? "Select a DEF to sweep." : "";
+      field("plan").textContent = [plan ? `${plan.total} combinations` : hint, error].filter(Boolean).join(" · ");
       field("message").textContent = unsaved ? "Save the project and Q1ASM sources before calculating execution." :
         state.message || ({ info: "Reading project DEFs…", run: "Running from the start…", sweep: "Calculating sweep…", case: "Reproducing the selected case…" })[state.busy] || "";
     }
@@ -441,6 +445,7 @@
     function renderRegisterChoices() {
       const seq = sequencer();
       const related = new Set(seq?.registers);
+      if (!hasTimeChoice && !hasRegisterChoice) timeField.checked = Boolean(seq && !related.size);
       for (const input of registerFields) {
         const name = input.dataset.register;
         if (!hasRegisterChoice) input.checked = name === seq?.registers?.[0];
@@ -472,18 +477,35 @@
       field("edited").textContent = edited ? "Changes have not been run" : "";
     }
 
+    function suggestRange(row) {
+      const run = row.querySelector("input[data-def]");
+      const draft = run.value.trim();
+      const literal = /^-?(?:0[xX][0-9a-fA-F]+|0|[1-9]\d*)$/.test(draft) ? draft : run.dataset.resolved || "0";
+      const anchor = literal.startsWith("-") ? -BigInt(literal.slice(1)) : BigInt(literal);
+      const percent = (anchor < 0n ? -anchor : anchor) / 100n || 1n;
+      const decade = 10n ** BigInt(percent.toString().length - 1);
+      const digit = percent / decade;
+      const step = (digit >= 5n ? 5n : digit >= 2n ? 2n : 1n) * decade;
+      const upper = anchor <= 0x7fffffffn ? 0x7fffffffn : 0xffffffffn;
+      const span = 9n * step;
+      const min = anchor <= upper && anchor + span > upper ? anchor - span : anchor;
+      const suggested = { min, max: min + span, step };
+      for (const input of rangeInputs(row)) {
+        input.value = String(suggested[input.name]);
+        if (run.dataset.resolved || input.name === "step") input.placeholder = input.value;
+      }
+    }
+
     function updateAxes() {
       const rows = defRows();
-      const active = rows.filter((row) => rangeInputs(row).some((input) => input.value.trim())).map((row) => row.dataset.defRow);
-      axisOrder = [...axisOrder.filter((name) => active.includes(name)), ...active.filter((name) => !axisOrder.includes(name))].slice(0, 2);
+      const active = rows.filter((row) => row.querySelector("[data-axis]").checked).map((row) => row.dataset.defRow);
+      axisOrder = [...axisOrder.filter((name) => active.includes(name)), ...active.filter((name) => !axisOrder.includes(name))];
       for (const row of rows) {
-        const axis = axisOrder.includes(row.dataset.defRow), locked = axisOrder.length === 2 && !axis;
-        const literal = row.querySelector("input[data-def]").dataset.default;
-        for (const input of rangeInputs(row)) {
-          // An empty field of a swept DEF falls back to the value its placeholder shows.
-          input.placeholder = axis ? (input.name === "step" ? "1" : literal) : "";
+        const checkbox = row.querySelector("[data-axis]");
+        const locked = axisOrder.length === 2 && !checkbox.checked;
+        for (const input of [checkbox, ...rangeInputs(row)]) {
           input.disabled = locked;
-          input.title = locked ? "Two DEFs are already swept. Clear a range to sweep this one." : "";
+          input.title = locked ? "Two DEFs are already swept. Uncheck one to sweep this DEF." : "";
         }
       }
     }
@@ -497,11 +519,13 @@
     function requestPlan() {
       clearTimeout(planTimer);
       const requestToken = ++token;
+      const axes = readAxes();
+      const incomplete = axes.find((axis) => !axis.min || !axis.max);
       plan = undefined;
-      planError = undefined;
+      planError = incomplete ? `Set ${[!incomplete.min && "Min", !incomplete.max && "Max"].filter(Boolean).join(" and ")} for ${incomplete.name}.` : undefined;
       renderControls();
-      if (!sequencer()?.defs.length || !axisOrder.length || unsaved || state.busy) return;
-      planTimer = setTimeout(() => send("plan", { ...target(), token: requestToken, axes: readAxes(), statistics_only: statisticsOnly() }), 120);
+      if (!axes.length || incomplete || unsaved || state.info?.draft || state.busy) return;
+      planTimer = setTimeout(() => send("plan", { ...target(), token: requestToken, axes, statistics_only: statisticsOnly() }), 120);
     }
 
     function renderInputs() {
@@ -516,14 +540,26 @@
       source.title = seq?.file || "";
       source.textContent = source.title.split(/[\\/]/).at(-1);
       const ranges = [["min", "Min", "minimum"], ["max", "Max", "maximum"], ["step", "Step", "step"]];
-      field("defs").innerHTML = defs.length ? `<table aria-label="DEF inputs"><thead><tr><th scope="col">DEF</th><th scope="col">Default</th><th scope="col">Run input</th><th scope="col" data-last-run hidden>Last run</th>
-        ${ranges.map(([, label]) => `<th scope="col" title="Fill in to sweep this DEF. Up to two DEFs.">${label}</th>`).join("")}<th scope="col" aria-label="Values"></th></tr></thead><tbody>
-        ${defs.map((def, i) => `<tr data-def-row="${esc(def.name)}"><th scope="row"><code>${esc(def.name)}</code><button data-location="${i}" aria-label="Open ${esc(def.name)} at line ${def.line}" title="Open line ${def.line}">:${def.line}</button></th><td><code>${esc(def.literal)}</code></td><td><div class="def-input-cell"><input type="text" aria-label="${esc(def.name)} DEF value" spellcheck="false" data-def="${esc(def.name)}" data-default="${esc(def.literal)}" value="${esc(Object.hasOwn(currentEdits(), def.name) ? currentEdits()[def.name] : def.literal)}"><button data-reset="${i}" aria-label="Reset ${esc(def.name)} DEF" title="Reset to ${esc(def.literal)}" hidden>Reset</button></div></td>
-        <td data-last-run data-executed hidden>—</td>
-        ${ranges.map(([name, , spoken]) => `<td><input type="text" name="${name}" data-range="${esc(def.name)}" aria-label="${esc(def.name)} ${spoken}" spellcheck="false"></td>`).join("")}
-        <td data-axis-count class="def-muted"></td></tr>`).join("")}</tbody></table>` :
+      field("defs").innerHTML = defs.length ? `<table aria-label="DEF inputs"><thead><tr><th scope="col">Sweep DEF</th><th scope="col">Declaration</th><th scope="col">Run input</th><th scope="col" data-last-run hidden>Last run</th>
+        ${ranges.map(([, label]) => `<th scope="col">${label}</th>`).join("")}<th scope="col" aria-label="Values"></th></tr></thead><tbody>
+        ${defs.map((def, i) => {
+          const editable = def.value !== null || def.needs_input;
+          const name = `<code>${esc(def.name)}</code>`;
+          const axis = editable ? `<label><input type="checkbox" data-axis aria-label="Sweep ${esc(def.name)}"> ${name}</label>` : name;
+          const declaration = `<th scope="row">${axis}<button data-location="${i}" aria-label="Open ${esc(def.name)} at line ${def.line}" title="Open line ${def.line}">:${def.line}</button></th><td><code>${esc(def.literal)}</code></td>`;
+          if (!editable) return `<tr data-def-row="${esc(def.name)}">${declaration}<td colspan="5" class="def-muted">${esc(def.reason)}</td><td data-last-run hidden></td></tr>`;
+          const initial = def.literal.startsWith("{") ? def.value ?? "" : def.literal;
+          const inputHint = def.needs_input ? 'placeholder="Optional" title="Enter an integer for a run or set Min and Max for a sweep."' : "";
+          return `<tr data-def-row="${esc(def.name)}">${declaration}<td><div class="def-input-cell"><input type="text" aria-label="${esc(def.name)} DEF value" spellcheck="false" data-def="${esc(def.name)}" data-default="${esc(initial)}" data-resolved="${esc(def.value)}" ${inputHint} value="${esc(Object.hasOwn(currentEdits(), def.name) ? currentEdits()[def.name] : initial)}"><button data-reset aria-label="Reset ${esc(def.name)} DEF" title="${initial ? `Reset to ${esc(initial)}` : "Clear run input"}" hidden>Reset</button></div></td>
+          <td data-last-run data-executed hidden>—</td>
+          ${ranges.map(([name, , spoken]) => `<td><input type="text" name="${name}" data-range="${esc(def.name)}" aria-label="${esc(def.name)} ${spoken}" spellcheck="false"></td>`).join("")}
+          <td data-axis-count class="def-muted"></td></tr>`;
+        }).join("")}</tbody></table>` :
         `<p>${seq ? "No editable numeric DEFs." : "Load the project’s numeric DEFs to begin."}</p>`;
       axisOrder = [];
+      const rows = defRows();
+      for (const row of rows) suggestRange(row);
+      if (rows.length) rows[0].querySelector("[data-axis]").checked = true;
       updateAxes();
       updateEdited();
       requestPlan();
@@ -827,7 +863,11 @@
     }
 
     function loadInfo() {
-      if (!panel.hidden && !state.info && !state.busy && !unsaved && !state.message) send("info");
+      clearTimeout(infoTimer);
+      if (panel.hidden) return;
+      infoTimer = setTimeout(() => {
+        if (!panel.hidden && !state.busy && (!state.info || (state.info.draft && !unsaved))) send("info");
+      }, 150);
     }
     toggle.addEventListener("click", () => {
       panel.hidden = !panel.hidden;
@@ -841,13 +881,24 @@
         const values = { ...currentEdits(), [def]: event.target.value };
         if (values[def] === declaration) delete values[def];
         edits = { ...edits, [editKey()]: values };
+        const row = event.target.closest("tr");
+        if (!row.dataset.customRange) {
+          suggestRange(row);
+          if (row.querySelector("[data-axis]").checked) requestPlan();
+        }
         updateEdited(); renderControls(); save();
-      } else if (event.target.matches("input[data-range]")) { updateAxes(); requestPlan(); }
+      } else if (event.target.matches("input[data-range]")) {
+        const row = event.target.closest("tr");
+        row.dataset.customRange = "true";
+        row.querySelector("[data-axis]").checked = true;
+        updateAxes(); requestPlan();
+      }
       else if (event.target === sampleField) renderControls();
     });
     panel.addEventListener("change", (event) => {
       if (event.target === seqField) { selected = seqField.value; showAllRegisters = false; field("verification").replaceChildren(); renderInputs(); }
       if (event.target === outputField) requestPlan();
+      if (event.target.matches("input[data-axis]")) { updateAxes(); requestPlan(); }
       if (event.target === modeField) { renderTrace(); renderSweep(); }
       if (event.target === metricField) {
         selectedMetric = metricField.value;
@@ -855,7 +906,7 @@
         renderPlots(state.sweep, stats);
       }
       if (event.target.matches("input[data-register]")) { hasRegisterChoice = true; renderControls(); }
-      if (event.target === timeField) renderControls();
+      if (event.target === timeField) { hasTimeChoice = true; renderControls(); }
       save();
     });
     panel.addEventListener("click", (event) => {
@@ -878,8 +929,7 @@
           ...(action === "sample" ? { sample_count: sampleField.valueAsNumber } : {}) });
       }
       if (action === "reset" || reset !== undefined) {
-        const inputs = inputNodes();
-        for (const input of action === "reset" ? inputs : [inputs[Number(reset)]]) {
+        for (const input of action === "reset" ? inputNodes() : [node.closest("tr").querySelector("input[data-def]")]) {
           input.value = input.dataset.default;
           input.dispatchEvent(new Event("input", { bubbles: true }));
         }
@@ -905,7 +955,13 @@
       }
     });
     window.addEventListener("message", ({ data }) => {
-      if (data?.type === "setUnsavedChanges") { unsaved = data.hasUnsavedChanges; if (unsaved) field("verification").replaceChildren(); renderControls(); return; }
+      if (data?.type === "setUnsavedChanges") {
+        unsaved = data.hasUnsavedChanges;
+        if (unsaved) field("verification").replaceChildren();
+        else loadInfo();
+        renderControls();
+        return;
+      }
       if (data?.project !== project) return;
       if (data.type === "verificationResult" && data.sequencer === selected && data.revision === state.info?.revision && !unsaved) {
         field("verification").innerHTML = (data.result?.checks || []).map((item, i) =>
@@ -920,6 +976,7 @@
         if (Object.hasOwn(data.patch, "sweep")) renderSweep();
         else if (wasBusy !== state.busy && state.sweep?.status !== "running") renderTable();
         renderControls();
+        if (data.patch.info === null || (!unsaved && data.patch.info?.draft)) loadInfo();
       } else if (data.type === "defSweepRows" && state.sweep?.id === data.sweepId) {
         const lastId = state.sweep.rows.at(-1)?.id || 0;
         state.sweep.rows.push(...data.rows.filter((row) => row.id > lastId));
@@ -933,7 +990,7 @@
     });
     renderInputs();
     renderControls();
-    if (!panel.hidden) setTimeout(loadInfo, 0);
+    loadInfo();
   }
 
   const api = { mount, statistics, interpret, compileFormula, summarize, parseTolerance, compareValues };

@@ -1,9 +1,6 @@
 # Execution Flow demo
 
-This is the retained design reference. See the [accepted interactions and
-extension integration sequence](../docs/execution-exploration.md).
-
-The current web demo opens in **Instruction** mode with Q1 in one horizontal
+This is the retained design reference. The current web demo opens in **Instruction** mode with Q1 in one horizontal
 lane. It loads the extension's shared timeline CSS and instruction colors,
 including its 22px command blocks. Thin loop bands show Q1ASM labels and the
 selected iteration; the chevron folds a loop without wrapping the command lane.

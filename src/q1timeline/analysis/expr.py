@@ -24,10 +24,6 @@ class Expr:
     _text: str | None = field(default=None, init=False, repr=False, compare=False)
     _display: str | None = field(default=None, init=False, repr=False, compare=False)
 
-    def __setstate__(self, state):
-        # Older frozen-slot pickles contain fewer formatting caches.
-        Expr.__init__(self, *state[:3])
-
     @classmethod
     def const(cls, value: int) -> Expr:
         if type(value) is not int:
@@ -293,6 +289,15 @@ class Expr:
         if self.op == "-" and a == _ZERO:
             return f"-{group(b, True)}"
         return f"{group(a, False)} {self.op} {group(b, True)}"
+
+
+def _restore_pickle_state(expr: Expr, state: list[Any]) -> None:
+    # Older frozen-slot pickles contain fewer formatting caches.
+    Expr.__init__(expr, *state[:3])
+
+
+# Python 3.10 overwrites __setstate__ when it creates the slotted dataclass.
+Expr.__setstate__ = _restore_pickle_state
 
 
 _ZERO = Expr.const(0)

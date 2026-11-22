@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.0
+
+- Pair with Python package 0.3.0, which installs Z3 by default for program verification.
+- Restore symbolic expressions serialized by earlier development builds on Python 3.10.
+- See [0.2.11](#0211) for the verification, waveform analysis, and timeline changes included in this release.
+
 ## 0.2.11
 
 - Compare a routed port across two compiled projects with `q1lens compare-output`. Fixed-input `no_clip` and `peak` checks now cover FIR-filtered samples and the filter tail.

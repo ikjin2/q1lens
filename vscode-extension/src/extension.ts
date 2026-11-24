@@ -5,6 +5,7 @@ import { parseProjectConfigLite } from "./qbs/projectDiscovery";
 import { registerSidebar } from "./qbs/sidebar";
 import { registerQ1Timeline } from "./q1timeline/register";
 import { registerVerification } from "./q1timeline/verification";
+import { registerDecisionLanes } from "./q1timeline/decisionLanes";
 import { registerEnvironmentCommands } from "./environment";
 import { registerPythonEnvironmentStatus } from "./pythonEnvironmentStatus";
 
@@ -13,6 +14,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const environment = registerEnvironmentCommands(context);
   const q1timeline = registerQ1Timeline(context);
   registerVerification(context);
+  registerDecisionLanes(context);
   registerCommands(context, { openQ1TimelineTarget: q1timeline.openTarget });
   registerSidebar(context);
   context.subscriptions.push(

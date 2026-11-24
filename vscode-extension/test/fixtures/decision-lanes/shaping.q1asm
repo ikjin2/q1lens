@@ -1,0 +1,17 @@
+        move 3, R0
+        nop
+body:   wait 100
+        fb_pop_data 16, R1
+        nop
+        jlt R1, 2147483648, @positive
+        not R1, R1
+        nop
+        add R1, 1, R1
+        nop
+positive:
+        jlt R1, 100, @small
+        wait 40
+        jmp @next
+small:  wait 20
+next:   loop R0, @body
+        stop

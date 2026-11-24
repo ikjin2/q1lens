@@ -1,0 +1,184 @@
+/* Decision lanes. Chrome follows the VS Code theme; colour only ever means Jump, Continue, or an
+   assumed (forced or unknown) choice. The direction pair is a validated blue / aqua, one step per theme kind. */
+#decision-lanes{--surface:var(--vscode-editor-background,#fff);--ink:var(--vscode-foreground,#19282c);--muted:var(--vscode-descriptionForeground,#5d6b68);--faint:rgba(128,128,128,.95);--line:var(--vscode-panel-border,rgba(128,128,128,.35));--grid:rgba(128,128,128,.16);--axis:rgba(128,128,128,.45);--band:rgba(128,128,128,.08);--band2:rgba(128,128,128,.17);--block:rgba(128,128,128,.24);--block-ink:var(--vscode-foreground,#19282c);--wash:rgba(128,128,128,.10);--jump:#2a78d6;--cont:#1baf7a;--amber:var(--vscode-editorWarning-foreground,#8a5d0c);--amber-bg:rgba(211,154,44,.16);--amber-line:var(--vscode-editorWarning-foreground,#d39a2c);--mono:var(--vscode-editor-font-family,Consolas,monospace);--sans:var(--vscode-font-family,'Segoe UI',sans-serif)}
+body:is(.vscode-dark,.vscode-high-contrast) #decision-lanes{--jump:#3987e5;--cont:#199e70}
+body{margin:0;padding:0;background:var(--vscode-editor-background)}
+#decision-lanes{color:var(--ink);font:13px/1.55 var(--sans);padding:14px 18px 22px;max-width:1560px;margin:0 auto}
+#decision-lanes *{box-sizing:border-box}
+#decision-lanes [hidden]{display:none !important}
+#decision-lanes.busy #dl-content,#decision-lanes.outdated #dl-content{opacity:.55;pointer-events:none}
+#decision-lanes button,#decision-lanes input,#decision-lanes select{font:inherit;color:inherit}
+#decision-lanes button{cursor:pointer;border:1px solid var(--line);background:var(--vscode-button-secondaryBackground,transparent);color:var(--vscode-button-secondaryForeground,inherit);border-radius:4px;padding:3px 9px;font-size:12px}
+#decision-lanes button:hover:not(:disabled){background:var(--vscode-button-secondaryHoverBackground,var(--band2))}
+#decision-lanes button:disabled{cursor:default;opacity:.5}
+#decision-lanes button.on{border-color:var(--ink);box-shadow:inset 0 0 0 1px var(--ink)}
+#decision-lanes button.link{border:0;background:none;padding:0;color:var(--vscode-textLink-foreground,inherit);font:inherit}
+#decision-lanes button.link:hover{text-decoration:underline;background:none}
+#decision-lanes select,#decision-lanes input[type=text]{background:var(--vscode-input-background,transparent);color:var(--vscode-input-foreground,inherit);border:1px solid var(--vscode-input-border,var(--line));border-radius:4px;padding:3px 7px;font-size:12px;max-width:100%}
+#decision-lanes :focus-visible{outline:1px solid var(--vscode-focusBorder,var(--ink));outline-offset:2px}
+#decision-lanes .mono,#decision-lanes code{font-family:var(--mono)}
+#decision-lanes .controls{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:end;border:1px solid var(--line);border-radius:8px;padding:10px 14px}
+#decision-lanes .controls label{display:grid;gap:3px;font-size:11px;color:var(--muted)}
+#decision-lanes .controls .hint{font-weight:400}
+#decision-lanes .controls .words{min-width:min(360px,100%);flex:1 1 360px;max-width:560px}
+#decision-lanes .controls .field{display:flex;gap:6px}
+#decision-lanes .controls .field input{flex:1;min-width:0;font-family:var(--mono)}
+#decision-lanes .controls input[aria-invalid=true]{border-color:var(--vscode-inputValidation-errorBorder,var(--vscode-errorForeground,#c33))}
+#decision-lanes .input-error{color:var(--vscode-errorForeground,#c33)}
+#decision-lanes .controls .grow{flex:1}
+#decision-lanes .status{display:flex;gap:6px 8px;align-items:center;flex-wrap:wrap;font-size:12px;color:var(--muted)}
+#decision-lanes .status .progress{font-style:italic}
+#decision-lanes .boundary{font-size:11px;color:var(--muted);margin:6px 2px 12px}
+#decision-lanes .boundary strong{color:var(--ink);font-weight:600;margin-right:6px}
+#decision-lanes .banner{border:1px solid var(--line);border-left-width:3px;border-radius:4px;padding:8px 12px;margin:0 0 12px;font-size:12px;white-space:pre-wrap}
+#decision-lanes .banner.error{border-left-color:var(--vscode-errorForeground,#c33)}
+#decision-lanes .banner.warn{border-left-color:var(--amber-line)}
+#decision-lanes .banner.info{border-left-color:var(--vscode-focusBorder,var(--axis))}
+#decision-lanes .card{border:1px solid var(--line);border-radius:8px;margin-bottom:14px;min-width:0}
+#decision-lanes .card-top{display:flex;justify-content:space-between;align-items:center;gap:8px 16px;flex-wrap:wrap;padding:8px 14px;border-bottom:1px solid var(--line);font-size:12px;color:var(--muted)}
+#decision-lanes .card-top strong{color:var(--ink);font-size:13px;font-weight:600}
+#decision-lanes .toolbar{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+#decision-lanes .lanes-wrap{position:relative;padding:10px 14px 4px;overflow-x:auto;overflow-y:hidden}
+#dl-lanes,#dl-stack{min-height:40px}
+#dl-lanes svg,#dl-stack svg{display:block;touch-action:pan-y;user-select:none}
+#dl-lanes svg{cursor:grab}
+#dl-lanes svg.dragging{cursor:grabbing}
+#decision-lanes svg text{font-family:var(--sans);font-size:11px;fill:var(--muted)}
+#decision-lanes svg .tick{fill:var(--muted);font-family:var(--mono);font-variant-numeric:tabular-nums}
+#decision-lanes svg .lane-label{fill:var(--muted)}
+#decision-lanes svg .lane-strong{fill:var(--ink)}
+#decision-lanes svg .lane-text{fill:var(--block-ink)}
+#decision-lanes svg .grid{stroke:var(--grid);stroke-width:1}
+#decision-lanes svg .rail{stroke:var(--axis);stroke-width:1}
+#decision-lanes svg .cap{stroke:var(--faint);stroke-width:1}
+#decision-lanes svg .pass{fill:var(--band)}
+#decision-lanes svg .pass.odd{fill:var(--band2)}
+#decision-lanes svg .hyp{fill:var(--amber-line)}
+#decision-lanes svg .block{fill:var(--block)}
+#decision-lanes svg .block.other{fill:none;stroke:var(--block-ink);stroke-width:1.2;stroke-dasharray:4 3}
+#decision-lanes svg .rowband{fill:var(--band)}
+#decision-lanes svg .acq{fill:var(--faint)}
+#decision-lanes svg .acq.on{fill:var(--ink)}
+#decision-lanes svg .src{stroke:var(--ink);stroke-width:2}
+#decision-lanes svg .arc{fill:none;stroke:var(--ink);stroke-width:1}
+#decision-lanes svg .conn{fill:none;stroke:var(--axis);stroke-width:1}
+#decision-lanes svg .cell{stroke:var(--surface);stroke-width:2}
+#decision-lanes svg .jump{fill:var(--jump)}
+#decision-lanes svg .cont{fill:var(--cont)}
+#decision-lanes svg .cell.unknown{stroke:var(--amber-line);stroke-dasharray:2 2}
+#decision-lanes svg .same{fill-opacity:.34}
+#decision-lanes svg .forced{fill:none;stroke:var(--amber-line);stroke-width:1.6}
+#decision-lanes svg .selring{fill:none;stroke:var(--ink);stroke-width:2}
+#decision-lanes svg .selline{stroke:var(--ink);stroke-width:1;stroke-opacity:.55}
+#decision-lanes svg .xhair{stroke:var(--faint);stroke-width:1;pointer-events:none}
+#decision-lanes svg .minor{fill:var(--surface);stroke:var(--faint);stroke-width:1.2}
+#decision-lanes svg .minor.on{fill:var(--muted);stroke:var(--muted)}
+#decision-lanes svg .wash{fill:var(--wash)}
+#decision-lanes svg .series{fill:none;stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
+#decision-lanes svg .ghost{fill:none;stroke-width:1.5;stroke-dasharray:5 4}
+#decision-lanes svg .dot{stroke:var(--surface);stroke-width:2}
+#decision-lanes svg .leader{stroke:var(--axis);stroke-width:1;fill:none}
+#decision-lanes svg .end{fill:var(--ink);font-family:var(--mono)}
+#decision-lanes svg .end.alt{fill:var(--muted)}
+#decision-lanes svg .head{fill:var(--ink);font-weight:600}
+#decision-lanes svg .rowbg{fill:var(--band)}
+#decision-lanes svg .rowhit{fill:transparent;cursor:pointer}
+#decision-lanes svg .rowhit:hover{fill:var(--wash)}
+#decision-lanes svg .outcome{fill:var(--ink)}
+#decision-lanes svg [data-action]{cursor:pointer}
+#decision-lanes svg [data-action]:focus-visible{outline:none}
+#decision-lanes svg [data-action]:focus-visible .cell{stroke:var(--ink)}
+#decision-lanes .tip{position:absolute;pointer-events:none;background:var(--vscode-editorHoverWidget-background,var(--surface));border:1px solid var(--vscode-editorHoverWidget-border,var(--line));border-radius:6px;padding:7px 10px;font-size:11px;line-height:1.55;box-shadow:0 4px 14px rgba(0,0,0,.2);min-width:170px;max-width:300px;z-index:3}
+#decision-lanes .tip .t-head{font-family:var(--mono);color:var(--ink);font-weight:600}
+#decision-lanes .tip .t-row{display:flex;justify-content:space-between;gap:14px;color:var(--muted)}
+#decision-lanes .tip .t-row b{font-family:var(--mono);font-weight:600;color:var(--ink)}
+#decision-lanes .tip .t-row .key{display:inline-block;width:12px;height:2px;margin-right:5px;vertical-align:middle}
+#decision-lanes .chips{display:flex;flex-wrap:wrap;gap:8px 18px;align-items:center;padding:8px 14px 10px;font-size:11px;color:var(--muted)}
+#decision-lanes .chips .group{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+#decision-lanes .chips button{padding:1px 8px;font:11px var(--mono)}
+#decision-lanes .legend{display:flex;flex-wrap:wrap;gap:6px 16px;padding:0 14px 10px;font-size:11px;color:var(--muted)}
+#decision-lanes .sw{display:inline-block;vertical-align:-1px;margin-right:5px;width:10px;height:10px;border-radius:2.5px}
+#decision-lanes .sw.jump{background:var(--jump)}
+#decision-lanes .sw.cont{background:var(--cont)}
+#decision-lanes .sw.forced{border:1.6px solid var(--amber-line);border-radius:3.5px}
+#decision-lanes .sw.hyp{width:16px;height:3px;background:var(--amber-line);border-radius:0;vertical-align:3px}
+#decision-lanes .sw.dash{width:16px;height:0;border-top:1.5px dashed var(--ink);border-radius:0;vertical-align:3px}
+#decision-lanes .sw.tri{width:0;height:0;border-left:4px solid transparent;border-right:4px solid transparent;border-top:6px solid var(--ink);border-radius:0}
+#decision-lanes .pill{display:inline-block;border-radius:4px;padding:0 7px;font-size:11px;font-weight:600;background:var(--band2);color:var(--muted);white-space:nowrap}
+#decision-lanes .pill.warn{color:var(--amber);background:var(--amber-bg)}
+#decision-lanes .pill.dir{background:transparent;border:1px solid var(--line);color:var(--ink);font-weight:500}
+#decision-lanes .pill.dir i{margin-right:5px;vertical-align:-1px}
+#decision-lanes .dhead{display:flex;flex-wrap:wrap;gap:6px 12px;align-items:center;margin:2px 2px 10px}
+#decision-lanes .dhead h2{font-size:16px;margin:0;font-weight:600}
+#decision-lanes .dhead .where{font:12px var(--mono);color:var(--muted)}
+#decision-lanes .dhead .toolbar{margin-left:auto}
+#decision-lanes .detail{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
+#decision-lanes .dcard{padding:12px 14px;margin:0}
+#decision-lanes .dcard.empty{margin-bottom:14px}
+#decision-lanes .dcard h3{font-size:13px;margin:0 0 10px;display:flex;justify-content:space-between;gap:10px;align-items:baseline;flex-wrap:wrap}
+#decision-lanes .dcard h3 small{font-weight:400;color:var(--muted);font-size:11px}
+#decision-lanes .dcard h4{font-size:11px;font-weight:600;color:var(--muted);margin:14px 0 6px}
+#decision-lanes .note{font-size:11px;color:var(--muted);margin:6px 0 0}
+#decision-lanes .pred{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:5px 10px;align-items:center;font:12px var(--mono)}
+#decision-lanes .pred .bar{height:8px;background:var(--band2);border-radius:0 4px 4px 0}
+#decision-lanes .pred .bar i{display:block;height:8px;background:var(--ink);border-radius:0 4px 4px 0}
+#decision-lanes .pred .val{text-align:right;font-variant-numeric:tabular-nums}
+#decision-lanes .verdict{font:13px var(--mono);margin:10px 0 0}
+#decision-lanes .prov{border-top:1px solid var(--line);padding:8px 0 2px}
+#decision-lanes .prov:first-of-type{border-top:0;padding-top:0}
+#decision-lanes .prov-head{font:12px var(--mono);margin-bottom:5px}
+#decision-lanes .chain{display:flex;flex-wrap:wrap;gap:4px;align-items:center}
+#decision-lanes .chain button{font:11px var(--mono);padding:0 6px;border-radius:4px;text-align:left}
+#decision-lanes .chain button.input{border-style:dashed}
+#decision-lanes .chain .arrow{color:var(--muted);font-size:11px}
+#decision-lanes .acq-line{font-size:11px;color:var(--muted);margin-top:6px;display:flex;flex-wrap:wrap;gap:4px 8px;align-items:center}
+#decision-lanes .acq-line .mono{color:var(--ink)}
+#decision-lanes .acq-line button{padding:0 7px;font-size:11px}
+#decision-lanes .tag{font-size:10.5px;border:1px dashed var(--axis);border-radius:4px;padding:0 5px;color:var(--muted)}
+#decision-lanes .badge{display:inline-block;font-size:12px;font-weight:600;border:1px solid var(--ink);border-radius:5px;padding:0 9px}
+#decision-lanes .cmp{width:100%;border-collapse:collapse;font-size:12px;margin-top:10px;table-layout:fixed}
+#decision-lanes .cmp th,#decision-lanes .cmp td{padding:5px 6px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top;overflow-wrap:anywhere}
+#decision-lanes .cmp thead th{font-weight:600;font-size:11px}
+#decision-lanes .cmp tbody th{font-weight:400;color:var(--muted);font-size:11px;width:27%}
+#decision-lanes .cmp td{font-family:var(--mono);font-variant-numeric:tabular-nums}
+#decision-lanes .cmp tr.differs td{font-weight:600}
+#decision-lanes .who{display:block;font:10.5px var(--sans);color:var(--muted);font-weight:400}
+#decision-lanes .facts{display:grid;grid-template-columns:auto minmax(0,1fr);gap:6px 12px;margin:0;font-size:12px}
+#decision-lanes .facts dt{color:var(--muted);font-size:11px;max-width:130px}
+#decision-lanes .facts dd{margin:0;font-family:var(--mono);overflow-wrap:anywhere}
+#decision-lanes .facts dd span{display:block;font:10.5px var(--sans);color:var(--muted)}
+#decision-lanes .row-actions{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;margin-top:12px;font-size:12px}
+#decision-lanes .two{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(0,1fr);gap:14px;margin-top:14px}
+#decision-lanes table.sites,#decision-lanes table.dtable{width:100%;border-collapse:collapse;font-size:12px}
+#decision-lanes .sites th,#decision-lanes .sites td,#decision-lanes .dtable th,#decision-lanes .dtable td{padding:6px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}
+#decision-lanes .sites thead th,#decision-lanes .dtable thead th{font-size:11px;font-weight:600;color:var(--muted);background:var(--band)}
+#decision-lanes .sites td.mono,#decision-lanes .dtable td{font-family:var(--mono);font-variant-numeric:tabular-nums}
+#decision-lanes .sites tr:last-child td,#decision-lanes .dtable tr:last-child td{border-bottom:0}
+#decision-lanes .kind{display:inline-block;font-size:11px;border-radius:4px;padding:0 7px;border:1px solid var(--line);color:var(--muted);white-space:nowrap}
+#decision-lanes .kind.input{border-color:var(--ink);color:var(--ink);font-weight:600}
+#decision-lanes .bc{display:flex;flex-wrap:wrap;gap:2px}
+#decision-lanes .bc button{width:12px;height:18px;padding:0;border:0;border-radius:2.5px;background:transparent;position:relative}
+#decision-lanes .bc button i{position:absolute;left:1px;width:10px;height:10px;border-radius:2.5px}
+#decision-lanes .bc button.jump i{top:0;background:var(--jump)}
+#decision-lanes .bc button.cont i{top:8px;background:var(--cont)}
+#decision-lanes .bc button.forced{box-shadow:0 0 0 1.5px var(--amber-line)}
+#decision-lanes .bc button.sel{box-shadow:0 0 0 2px var(--ink)}
+#decision-lanes .bc.quiet button.jump i,#decision-lanes .bc.quiet button.cont i{background:var(--faint)}
+#decision-lanes .source{font:11.5px/1.9 var(--mono);padding:8px 0;overflow:auto}
+#decision-lanes .code-line{white-space:pre;padding:0 12px;border-left:3px solid transparent;color:var(--muted);cursor:pointer}
+#decision-lanes .code-line:hover{background:var(--band)}
+#decision-lanes .code-line.active{background:var(--band2);border-color:var(--ink);color:var(--ink)}
+#decision-lanes .code-line .ln{display:inline-block;width:34px;color:var(--muted);opacity:.75}
+#decision-lanes .code-line .kind{font-family:var(--sans);margin-left:10px}
+#decision-lanes .position{padding:8px 14px 10px;border-top:1px solid var(--line);font-size:11px;color:var(--muted)}
+#decision-lanes .position b{color:var(--ink);font-weight:600}
+#decision-lanes details.card>summary{list-style:none;cursor:pointer;padding:8px 14px;font-size:12px;color:var(--muted);display:flex;justify-content:space-between;gap:12px}
+#decision-lanes details.card>summary::-webkit-details-marker{display:none}
+#decision-lanes details.card>summary strong{color:var(--ink);font-size:13px}
+#decision-lanes details.card[open]>summary{border-bottom:1px solid var(--line)}
+#decision-lanes .dtable tr.sel td{background:var(--band2)}
+#decision-lanes .dtable tbody tr{cursor:pointer}
+#decision-lanes .table-scroll{overflow-x:auto}
+#decision-lanes .foot{margin-top:6px;border-top:1px solid var(--line);padding-top:10px;font-size:11px;color:var(--muted);display:grid;gap:3px}
+#decision-lanes .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
+@media(max-width:1100px){#decision-lanes .detail{grid-template-columns:1fr}#decision-lanes .two{grid-template-columns:1fr}}

@@ -53,6 +53,14 @@ Unknown means Q1Lens could not conclude either way. Common causes:
 
 Execution stops where the model has nothing to go on. The diagnostic at that point says why: a missing trigger or feedback word, an unsupported instruction, or the step or time limit. Supply the [external input](../guide/feedback-and-inputs.md#external-inputs), or raise the limit.
 
+## Decision lanes does not open or stops early
+
+- **"The Q1Lens Python package in the selected environment does not include Decision lanes."** The extension is newer than the package in that interpreter. Update the package there, then select **Refresh**.
+- **The panel says Partial.** The run stopped where the model had nothing to go on, and the panel shows why. A missing trigger needs an [external input](../guide/feedback-and-inputs.md#external-inputs). A long run that reads many feedback words reaches the limit on recorded events.
+- **No input decision.** No branch in the run compares a value that came from a feedback word. Check that the run reaches the `fb_pop_data` you expect.
+- The panel shows the saved file. Save your edits, or select **Refresh** after changing a file outside VS Code.
+- Messages from the Python worker are in the **Q1Lens Decision Lanes** output.
+
 ## Report a problem
 
 Open an issue at [github.com/ikjin2/q1lens/issues](https://github.com/ikjin2/q1lens/issues). Include the Q1Lens version, the output from **Q1Lens: Check Python Environment** and a small Q1ASM file that shows the problem.

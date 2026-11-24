@@ -1,0 +1,17 @@
+        wait 100
+        fb_pop_data 16, R1
+        nop
+        test R1, 1
+        jnz @odd
+        wait 8
+odd:    cmp R1, 5
+        jb @below
+        wait 8
+below:  sub R1, 6, R2
+        jz @zero
+        wait 8
+zero:   cmp R1, 0
+        js @negative
+        wait 8
+negative:
+        stop

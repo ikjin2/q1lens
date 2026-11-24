@@ -32,6 +32,7 @@ describe("Q1Lens extension host", function () {
     assert.ok(commands.includes("qbsTimeline.openQ1asmFolder"));
     assert.ok(commands.includes("q1timeline.openPreview"));
     assert.ok(commands.includes("q1timeline.refreshPreview"));
+    assert.ok(commands.includes("q1timeline.openDecisionLanes"));
   });
 
   it("preserves notebook cell IDs and saved tags through real notebook marking", async () => {

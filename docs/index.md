@@ -18,6 +18,7 @@ A sequencer has two cores. The Q1 core runs your instructions and puts RT comman
 | Describe several sequencers, parameters and waveforms | [Set up a project](guide/projects.md) |
 | Choose between Analysis, Concrete and Simulation | [Execution modes](guide/execution-modes.md) |
 | Work with `wait_sync`, LINQ feedback and triggers | [Feedback and external inputs](guide/feedback-and-inputs.md) |
+| See what each feedback-dependent branch decides and changes | [Decision lanes](guide/decision-lanes.md) |
 | Inspect port output, acquisitions and scope capture | [Hardware view](guide/hardware.md) |
 | Run with other DEF values and sweep them | [DEF runs and sweeps](guide/def-sweep.md) |
 | Prove properties or get a counterexample | [Verify a program](guide/verification.md) |

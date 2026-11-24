@@ -1,0 +1,14 @@
+        move 3, R0
+        move 0, R2
+        nop
+body:   wait 100
+        fb_pop_data 16, R1
+        nop
+        cmp R1, 5
+        jge @high
+        add R2, 1, R2
+        jmp @next
+high:   add R2, 10, R2
+next:   nop
+        loop R0, @body
+        stop

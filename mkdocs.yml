@@ -54,6 +54,7 @@ nav:
       - Set up a project: guide/projects.md
       - Execution modes: guide/execution-modes.md
       - Feedback and external inputs: guide/feedback-and-inputs.md
+      - Decision lanes: guide/decision-lanes.md
       - Hardware view: guide/hardware.md
       - DEF runs and sweeps: guide/def-sweep.md
       - Verify a program: guide/verification.md

@@ -18,6 +18,7 @@ Run a command from the Command Palette (`Ctrl+Shift+P`). Type `Q1Lens` to list t
 | **Q1Lens: Refresh Timeline Preview** | Analyzes again |
 | **Q1Lens: Reveal Current Line in Timeline** | Selects the event for the line under the cursor |
 | **Q1Lens: View Selection in Timeline** | Zooms to the selected source lines |
+| **Q1Lens: Open Decision Lanes** | Records one run of the current Q1ASM file and shows its [feedback-dependent branches](../guide/decision-lanes.md) |
 | **Q1Lens: Select Project File** | Chooses which `q1timeline.yml` to use |
 | **Q1Lens: Select Q1ASM Files in Folder...** | Chooses the files to show when there is no project file |
 | **Q1Lens: Set Analysis Parameter...** | Overrides one parameter for this session |

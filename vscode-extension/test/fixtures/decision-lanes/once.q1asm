@@ -1,0 +1,10 @@
+.DEF RESULT R0
+wait 600
+fb_pop_data 16,$RESULT
+nop
+jlt $RESULT,1,@skip
+wait 20
+stop
+skip:
+wait 80
+stop

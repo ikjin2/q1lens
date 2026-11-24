@@ -55,6 +55,20 @@ describe("package metadata", () => {
     }
   });
 
+  it("offers Decision Lanes from the palette and the Q1ASM editor context menu", () => {
+    const manifest = packageJson();
+    const command = manifest.contributes.commands.find((entry: { command: string }) => entry.command === "q1timeline.openDecisionLanes");
+
+    assert.equal(command?.title, "Q1Lens: Open Decision Lanes");
+    assert.ok(manifest.activationEvents.includes("onCommand:q1timeline.openDecisionLanes"));
+    assert.ok(
+      manifest.contributes.menus["editor/context"].some((entry: { command: string; when: string }) => (
+        entry.command === "q1timeline.openDecisionLanes" &&
+        entry.when === "resourceExtname == .q1asm"
+      )),
+    );
+  });
+
   it("uses Q1Lens as the visible command category", () => {
     const commands = packageJson().contributes.commands
       .filter((entry: { category?: string }) => entry.category !== undefined);

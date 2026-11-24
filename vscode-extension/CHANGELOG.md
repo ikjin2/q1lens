@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.2
+
+- Add **Decision lanes**. Run **Q1Lens: Open Decision Lanes** on a Q1ASM file to see each branch that depends on a feedback word on the RT clock: which way it went, the compared values and where they came from, and what the two arms change. Type the feedback words to try, or use the project's LINQ schedule. The panel records the other arm of a decision as a second run with that branch forced, and marks it as an assumption.
+- Decision lanes requires Q1Lens Python 0.3.2 or later.
+
 ## 0.3.1
 
 - List all DEF declarations in Sweep. Enter Min and Max to sweep a template DEF even when its project parameter has no value.

@@ -75,6 +75,18 @@ four original sequencers for three shots with an explicit four-bin override.
 The 1,001-shot PRNG and 513-shot ring profiles run in the separate CLI campaign;
 their large traces are not loaded by browser setup.
 
+## Decision lanes
+
+`decision-lanes.spec.js` loads the actual `decisionLanes.css`, `decisionLanesModel.js`
+and `decisionLanes.js` into a page and starts `python -m q1timeline.decision_lanes`
+for an example project. Only the extension host between the two is replaced: the
+spec relays the same messages. It records `examples/golden-section` with typed
+feedback words, waits for the worker to record the other arm of every decision,
+and checks selection, zoom, the hover readout, a forced run, new feedback words,
+a partial run and a branch that changes timing, in a light and a dark theme and
+in a narrow panel. Screenshots are attached to the report. The extension-host
+suite checks the command, the worker start and the editor integration.
+
 ## Cursor performance budget
 
 `performance-fixture.js` creates a deterministic synthetic mix of **10,000 total

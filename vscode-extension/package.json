@@ -2,7 +2,7 @@
   "name": "q1lens",
   "displayName": "Q1Lens",
   "description": "Visualize Q1ASM in VS Code.",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "publisher": "q1lens",
   "author": {
     "name": "Ik Kyeong Jin",
@@ -44,6 +44,7 @@
     "onCommand:q1timeline.selectQ1asmFilesInFolder",
     "onCommand:q1timeline.revealCurrentLineInTimeline",
     "onCommand:q1timeline.zoomToSelection",
+    "onCommand:q1timeline.openDecisionLanes",
     "onLanguage:q1asm",
     "workspaceContains:**/qbstimeline.yml",
     "workspaceContains:**/qbstimeline.yaml",
@@ -158,6 +159,10 @@
         "title": "Q1Lens: Compare RT Traces Across Inputs"
       },
       {
+        "command": "q1timeline.openDecisionLanes",
+        "title": "Q1Lens: Open Decision Lanes"
+      },
+      {
         "command": "q1timeline.selectProjectFile",
         "title": "Q1Lens: Select Project File"
       },
@@ -242,6 +247,11 @@
           "command": "q1timeline.verifyEquivalence",
           "when": "resourceExtname == .q1asm",
           "group": "navigation@5"
+        },
+        {
+          "command": "q1timeline.openDecisionLanes",
+          "when": "resourceExtname == .q1asm",
+          "group": "navigation@6"
         },
         {
           "command": "q1timeline.zoomToSelection",
@@ -670,7 +680,7 @@
     "test:extension": "npm run compile && npm run bundle && node ./out/test/runTest.js",
     "package": "vsce package",
     "verify:installed": "node ./scripts/verify-installed-assets.js",
-    "reinstall:local": "npm run package && code --install-extension q1lens-0.3.1.vsix --force && npm run verify:installed",
+    "reinstall:local": "npm run package && code --install-extension q1lens-0.3.2.vsix --force && npm run verify:installed",
     "test:browser": "playwright test"
   },
   "dependencies": {

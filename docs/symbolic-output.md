@@ -43,6 +43,8 @@ modules:
 
 Keys under `channel_map` refer to sequencer IDs in the same project. Multiple paths routed to an output are summed after modulation and configured bound-time filtering. The module adds the normalized DC offset and clips once to [−1, 1]. `module.samples(models, "out0", t0, t1, clip=False)` exposes the pre-clipping sum.
 
+`type` also accepts `QCM-RF` and `QRM-RF`. An RF output takes both paths of one sequencer, written `{out0: IQ}`. It is reported as the complex envelope ahead of the IQ mixer, so `module.samples` and the output assertions do not apply to it. `lo_frequency_hz: {out0: 5.2e9}` labels the envelope with its LO, and RF output offsets are not modeled. `cluster: cluster0` names the cluster a module sits in.
+
 For aligned sampling, pass `time_offsets={"drive": -20, "boost": -8}` if the sequencers reach the common anchor at local times 20 ns and 8 ns. Each sequencer contributes from its local time zero, and the module DC offset applies across the entire window. The Hardware preview records its time basis and start time, including negative times before an anchor.
 
 A QCoDeS snapshot can supply the channel map and settings. Assign each project sequencer its `module` and `sequencer_index`, then select the module object inside the snapshot. Omit `snapshot_path` when the file is a module-level snapshot.
@@ -73,6 +75,10 @@ Both projects must identify the same module, module type, port and time basis. T
 
 ## VS Code and verification
 
-Open a Q1ASM source and run **Q1Lens: Open Timeline Preview**. Expand **Details** to find the Hardware port lanes. Each lane names its contributing paths and shows a bounded numerical preview when its timing and parameters resolve. Expand a path to inspect its intervals and select a source event. Missing parameters leave the symbolic intervals available. The Python sampling API accepts any requested time window.
+Open a Q1ASM source and run **Q1Lens: Open Timeline Preview**. Expand **Details** to find **Outputs**, which draws each port and the sequencer paths that feed it on one time axis. See [Hardware view](guide/hardware.md#outputs) for how to read and navigate it.
+
+The TimelineIR `output` section carries what Outputs draws. `modules` lists each module's type, cluster and LO frequencies. `parameters` gives every free parameter a value and a `source` of `project` or `assumed`. `time_offsets` places each sequencer on the shared axis. `overview` holds one window across `extent`. A window reports `exact: true` when it holds every sample. Otherwise each column holds the range computed from the interval structure, and digital filters are not applied. When the project sets a parameter, the sequencer entry also carries a `symbolic` model that keeps the parameter's name.
+
+`python -m q1timeline.output.session` serves further windows over JSON lines. Send `{"id": 1, "command": "load", "output": <the output section>}` once, then `{"id": 2, "command": "window", "t0": 0, "t1": 4000, "bins": 720, "params": {"N": 100}}`. `params` holds trial values that replace project or assumed ones. In Python, `q1timeline.output.window.scene_from_output(section).window(t0, t1, bins)` returns the same result.
 
 The demo workspace includes a six-part notebook, a repeated burst, a gain ramp and a two-sequencer clipping counterexample. The `drive.q1asm` CodeLens opens the Concrete replay at the witness sample. [Demo workspace](../examples/symbolic-output/symbolic-output.code-workspace) · [Runnable notebook](../examples/symbolic-output/output-tour.ipynb) · [Output assertions and their units](verification.md)

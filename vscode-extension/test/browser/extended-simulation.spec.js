@@ -154,7 +154,6 @@ test("full RT queue displays stall and resumes exactly when the first packet sta
 
 test("four-bin preview retains the previous result until wrapped acquisition completes, and rewinds", async ({ page }) => {
   await page.goto("/?case=bin-wrap-preview");
-  await page.getByRole("button", { name: "Open QRM0: 2 sequencers", exact: true }).click();
   await page.getByRole("button", { name: "Inspect sequencer red_tracker", exact: true }).click();
   await tab(page, "Bins");
   const bin0 = value(page, "bins").locator("tr").filter({ has: page.locator('[data-bin="0:0"]') });

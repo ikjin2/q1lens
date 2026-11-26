@@ -109,7 +109,7 @@ view:
 | --- | --- | --- |
 | `external_inputs` | Triggers and feedback words that arrive from outside | [Feedback and external inputs](feedback-and-inputs.md) |
 | `simulation` | Routes, scheduled inputs and the signal model for Simulation | [Event-driven simulation](../simulation.md) |
-| `modules` | Which sequencer paths drive which output ports | [Hardware view](hardware.md#port-output) |
+| `modules` | Which sequencer paths drive which output ports | [Hardware view](hardware.md#outputs) |
 
 ## Examples
 

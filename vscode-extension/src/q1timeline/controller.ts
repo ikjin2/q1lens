@@ -758,6 +758,9 @@ export class TimelineController {
     this.loopPreviewOverrides = new Map();
     this.executionReplayOverride = undefined;
     this.playbackClient = undefined;
+    this.outputClient = undefined;
+    this.outputClientSource = undefined;
+    this.outputClientReady = undefined;
     this.playbackEnvironmentCheck = undefined;
     this.playbackRequestId = 0;
     this.playbackInFlight = false;
@@ -1526,6 +1529,55 @@ export class TimelineController {
     if (this.externalInputsOverride && this.webviewReady) this.postExternalInputsState();
     this.executionState = { status: "idle", can_resume: true, steps: 0 };
     if (wasActive) this.setExecutionState(this.executionState);
+  }
+
+  disposeOutputClient() {
+    const client = this.outputClient;
+    this.outputClient = undefined;
+    this.outputClientSource = undefined;
+    this.outputClientReady = undefined;
+    client?.dispose();
+  }
+
+  // The outputs rack asks for one viewport at a time. A helper process restores the output
+  // model from the current TimelineIR, so its samples always match the displayed analysis.
+  async sampleOutputWindow(message) {
+    const reply = (payload) => this.postWebviewMessage({ type: "outputWindowResult", token: message.token, ...payload });
+    const output = this.timelineIr?.output;
+    let client;
+    try {
+      if (!output) throw new Error("This analysis has no output model to sample.");
+      if (!this.pythonEnvironment) throw new Error("Select a Python environment to sample outputs.");
+      if (!this.outputClient || this.outputClientSource !== output || this.outputClient.failure) {
+        this.disposeOutputClient();
+        const configuration = this.config();
+        this.outputClient = new PlaybackClient(this.pythonEnvironment.pythonPath,
+          prependPythonArgs(this.pythonEnvironment.pythonArgs, ["-u", "-m", "q1timeline.output.session"]), {
+            label: "Output sampling",
+            cwd: this.projectRootCwd(),
+            env: { ...process.env, ...this.normaliseAnalyzerEnv(configuration.get("analyzer.env", {})) },
+            onStderr: (text) => this.output.appendLine(`Output sampling: ${text}`),
+          });
+        this.outputClientSource = output;
+        this.outputClientReady = this.outputClient.request({ command: "load", output });
+      }
+      client = this.outputClient;
+      try {
+        await this.outputClientReady;
+      } catch (error) {
+        if (this.outputClient === client) this.disposeOutputClient();
+        throw error;
+      }
+      const response = await client.request({
+        command: "window", t0: message.t0, t1: message.t1, bins: message.bins, params: message.params,
+      });
+      if (this.outputClient === client) reply({ window: response.window });
+    } catch (error) {
+      // A rejected window keeps the process; a failed process or load starts again on the next request.
+      if (client && this.outputClient === client && client.failure) this.disposeOutputClient();
+      else if (!client) this.disposeOutputClient();
+      reply({ error: error instanceof Error ? error.message : String(error) });
+    }
   }
 
   createPlaybackClient() {
@@ -3258,6 +3310,10 @@ export class TimelineController {
       await this.prepareExecutionReplay(parsedMessage.sequencerId, parsedMessage.scope);
       return;
     }
+    if (parsedMessage.type === "outputWindow") {
+      await this.sampleOutputWindow(parsedMessage);
+      return;
+    }
     if (parsedMessage.type === "webviewReady") {
       this.webviewReady = true;
       this.defRuns.publish();
@@ -3760,6 +3816,7 @@ export class TimelineController {
     this.analysisEnvironmentCheck?.abort();
     this.analysisQueued = false;
     this.resetPlayback();
+    this.disposeOutputClient();
     this.defRuns.invalidate(true);
     this.cancelSourceRangeZoom();
     this.pendingBranchSelection = undefined;

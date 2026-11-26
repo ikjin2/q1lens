@@ -1375,7 +1375,6 @@ test("restores Q1ASM view state only for the same project", async ({page}) => {
   const projectA = {parameterProjectFile: "C:/project-a/q1timeline.yml"};
   await mount(page, "idle", ir, {}, projectA);
   const fullWindow = await page.locator("#q1timeline-time-window").getAttribute("title");
-  await page.getByRole("button", {name: "Open QCM0: 1 sequencer", exact: true}).click();
   await page.getByRole("button", {name: "Inspect sequencer seq", exact: true}).click();
   const time = page.getByRole("spinbutton", {name: "Selected time in nanoseconds"});
   await time.fill("600");
@@ -2056,8 +2055,7 @@ for (const initialSelection of ["none", "source range"]) {
     await page.getByRole("button", {name: "Zoom in", exact: true}).click();
     await page.getByRole("button", {name: "Zoom in", exact: true}).click();
     await expect(first).toHaveCount(0);
-    await page.locator("[data-module-card]").click();
-    await page.locator('[data-sequencer-card="seq"]').click();
+    await page.getByRole("button", {name: "Inspect sequencer seq", exact: true}).click();
     await page.getByRole("button", {name: "Execution replay", exact: true}).click();
     const time = page.getByRole("spinbutton", {name: "Selected time in nanoseconds"});
     const zoomEvent = page.locator("#q1timeline-zoom-event-button");

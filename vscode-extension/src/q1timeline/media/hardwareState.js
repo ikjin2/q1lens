@@ -710,6 +710,8 @@
       rt: coreStateAt(series, "rt", time, rtRisk),
       ...(series.terminal && { terminal: series.terminal }),
       warnings: Array.from(warnings),
+      // Warnings tied to this time, as opposed to caveats that hold for the whole run.
+      alerts: [...new Set([q1Risk, rtRisk].filter(Boolean).map((risk) => risk.message))],
     };
   }
 
@@ -752,12 +754,15 @@
     });
     return {
       sequencerId: String(sequencerId), time, range: series.range, warnings: Array.from(warnings), execution: index.execution[String(sequencerId)] || null,
+      alerts: [...new Set([q1Risk, rtRisk].filter(Boolean).map((risk) => risk.message))],
       ...(series.terminal && { terminal: series.terminal }),
       q1: coreStateAt(series, "q1", time, q1Risk), rt: coreStateAt(series, "rt", time, rtRisk), registers, parameters,
       simulation: simulationAt(index, sequencerId, series, time, basis),
       awg: Array.from(series.awg, ([path, items]) => ({ path, ...stateAt(items, time, outputRisk) })),
       acquisition: acquisitionAt(series, time, outputRisk),
       bins: { total, records, partial: Boolean(outputRisk), offset, limit },
+      // What the program does at any time, so a view can leave out what never happens.
+      program: { acquires: series.acquisitions.length > 0 || series.binOrder.length > 0 || series.gateWindows.size > 0 || series.digitalSamples.length > 0 },
     };
   }
 

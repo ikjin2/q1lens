@@ -78,8 +78,7 @@ test("removed comparison events do not create hardware state or move its cursor"
     ],
   } }));
   await page.goto("/?case=01-digital");
-  await expect(page.locator("[data-module-card]")).toHaveCount(1);
-  await page.getByRole("button", { name: "Open QCM0: 1 sequencer", exact: true }).click();
+  await expect(page.locator(".rack-row.is-module")).toHaveCount(1);
   await page.getByRole("button", { name: "Inspect sequencer seq", exact: true }).click();
   await at(page, 4);
   await page.evaluate(() => window.hardwarePreview.selectEvent("removed-acquire"));
@@ -183,7 +182,6 @@ test("bin paging resets consistently when choosing a different sequencer", async
     }))),
   } }));
   await page.goto("/?case=01-digital");
-  await page.getByRole("button", { name: "Open QRM0: 2 sequencers", exact: true }).click();
   await page.getByRole("button", { name: "Inspect sequencer first", exact: true }).click();
   await at(page, 68);
   await tab(page, "Bins");
@@ -216,7 +214,7 @@ test("rewinding or refreshing before a selected bin exists cannot open another b
   expect((await page.evaluate(() => window.revealedSource)).line).toBe(2);
   await at(page, 3);
   await expect(value(page, "bin-history")).toContainText("Select a bin number");
-  await expect(openSource).toBeDisabled();
+  await expect(openSource).toBeHidden();
   await at(page, 8);
   await expect(value(page, "bin-history")).toContainText("Acquisition 0 · bin 1");
   await openSource.click();
@@ -229,7 +227,7 @@ test("rewinding or refreshing before a selected bin exists cannot open another b
     }, { initialState, onSourceClick(source) { window.revealedSource = source; } });
   });
   await expect(value(page, "bin-history")).toContainText("Select a bin number");
-  await expect(openSource).toBeDisabled();
+  await expect(openSource).toBeHidden();
 });
 
 test("missing signal samples leave chart gaps and real zero samples remain visible", async ({ page }) => {
@@ -462,7 +460,6 @@ test("Hardware shows the latest digital bin outcome, timing and event link", asy
 test("underflow remains a visible error with the partial queue trace", async ({ page }) => {
   await page.goto("/?case=04-underflow");
   await expect(value(page, "warnings")).toContainText("underflow");
-  await page.getByRole("button", { name: "Open QCM0: 1 sequencer", exact: true }).click();
   await page.getByRole("button", { name: "Inspect sequencer starved", exact: true }).click();
   await at(page, 24);
   await expect(value(page, "execution")).toContainText("Error");
@@ -568,12 +565,12 @@ test("Hardware ends the failed receiver observation while the peer continues", a
   await expect(value(page, "execution")).toContainText("Observation end 120 ns");
   await expect(value(page, "simulation-queue")).toContainText("simulation end 200 ns");
   await page.evaluate(() => window.hardwarePreview.setTimeBasis("aligned"));
-  await page.locator('[data-level="sequencers"]').click();
-  const card = (id) => page.locator(`[data-sequencer-card="${id}"]`);
-  await expect(card("rx").locator('[data-card-status="rt"]')).toHaveText("observation ended");
-  await expect(card("rx").locator("[data-sequencer-execution]")).toContainText("Observation end 20 ns");
-  await expect(card("peer").locator('[data-card-status="rt"]')).toHaveText("active");
-  await card("rx").click();
+  await page.locator('[data-level="modules"]').click();
+  const row = (id) => page.getByRole("button", { name: `Inspect sequencer ${id}`, exact: true });
+  await expect(row("rx")).toHaveAttribute("title", /RT observation ended[\s\S]*Observation end 20 ns/);
+  await expect(page.locator('[data-rack-state="rx"]')).toHaveText("error");
+  await expect(row("peer")).toHaveAttribute("title", /RT active/);
+  await row("rx").click();
   await page.locator('[data-action="replay-toggle"]').click();
   const track = (id) => page.locator(`[data-replay-sequencer="${id}"]`);
   await expect(track("rx").locator('[data-value="project-rt"]')).toContainText("RT: observation ended");
@@ -691,10 +688,11 @@ test("Hardware Play rejection ends Q1 alone and keeps the analytical RT wait", a
   await expect(value(page, "execution")).not.toContainText("at Q1 16 ns");
   await page.evaluate(() => window.hardwarePreview.setTimeBasis("local"));
   await expect(value(page, "execution")).toContainText("Q1 observation end 16 ns");
-  for (const [name, time, expected] of [["early", 0, "observation ended · No active event"],
+  for (const [name, time, expected] of [["early", 0, "observation ended"],
     ["stop", 6, "observation ended · stop"], ["success", 28, "stopped · stop"]]) {
     await mountHardwareTrace(page, fixtures[name], {level: "detail", sequencerId: "seq", basis: "local", time});
     await expect(value(page, "q1-event")).toContainText(expected);
+    await expect(value(page, "q1-event")).not.toContainText("No active event");
   }
 });
 
@@ -1296,23 +1294,25 @@ test("Hardware states each fact once and keeps explanations and exact values in 
   const hardware = page.locator("#hardware");
   await expect(hardware.locator(".hardware-title")).toHaveText("Hardware Simulated");
   await expect(value(page, "trace-kind")).toHaveAttribute("title", /Timing uses an event-driven model of queues and configured inputs\./);
-  const card = page.getByRole("button", { name: "Open QRM_RF0: 1 sequencer", exact: true });
-  await expect(card.locator(".hardware-card-name")).toHaveText("QRM_RF0");
-  await expect(card.locator(".hardware-card-count")).toHaveText("1 sequencer");
-  await expect(card.locator("[data-preview-sequencer]")).toHaveText("readout");
-  await expect(card.locator("[data-module-status]")).toContainText("at 0 ns");
+  const rack = hardware.locator(".hardware-rack");
+  await expect(rack.locator(".rack-row.is-cluster strong")).toHaveText("Cluster");
+  await expect(rack.locator(".rack-row.is-module strong")).toHaveText(["QCM_RF0", "QRM_RF0", "QCM0"]);
+  await expect(page.getByRole("button", { name: "Hide QRM_RF0", exact: true })).toHaveAttribute("aria-expanded", "true");
   await expect(hardware).not.toContainText(/MODULE|Explore sequencers|Select a module/);
   await expect(page.getByRole("button", { name: "Zoom out one hardware level" })).toHaveCount(0);
-  await card.click();
   await expect(hardware).not.toContainText(/SEQUENCER|Inspect internal state|Select a sequencer/);
   await page.getByRole("button", { name: "Inspect sequencer readout", exact: true }).click();
   await at(page, 420);
 
   const crumbs = page.getByRole("navigation", { name: "Hardware hierarchy" });
-  await expect(crumbs.getByRole("button")).toHaveText(["Modules", "QRM_RF0", "readout"]);
+  await expect(crumbs.getByRole("button")).toHaveText(["Outputs", "QRM_RF0", "readout"]);
   await expect(crumbs.getByRole("combobox", { name: "Hardware module" })).toHaveValue("QRM_RF0");
   await expect(crumbs.getByRole("combobox", { name: "Hardware sequencer" })).toHaveCount(0);
-  await expect(hardware.locator(".hardware-flow-label")).toHaveText(["Command execution", "Acquisition targets"]);
+  // The state table names each part once; a simulated program that acquires has every row and tab.
+  await expect(hardware.locator(".hardware-row:visible .hardware-row-name")).toHaveText(["Q1", "RT", "RT queue", "Output", "Acquisition"]);
+  await expect(page.getByRole("tab")).toHaveText(["Registers", "Parameters", "Bins", "Simulation"]);
+  await expect(value(page, "absent")).toBeHidden();
+  await expect(hardware.locator("svg.hardware-diagram")).toHaveCount(0);
   await expect(value(page, "execution")).toHaveText("Completed · 5 instr · stop 0");
   await expect(value(page, "execution")).toHaveAttribute("title", "Event-driven simulation · completed · 5 / 10000 instructions · Stop code 0");
   await expect(value(page, "instruction-detail")).not.toContainText("Flags before");
@@ -1323,9 +1323,9 @@ test("Hardware states each fact once and keeps explanations and exact values in 
   await expect(hardware.locator('[data-view="register-pager"]')).toBeHidden();
   await expect(value(page, "register-history")).toBeHidden();
   await expect(value(page, "selection-detail")).toHaveText("");
+  // With nothing selected there is no source bar; each row links to its own line.
   const source = page.getByRole("button", { name: "Open source", exact: true });
-  await expect(source).toBeDisabled();
-  await expect(source).toHaveAttribute("title", "Select a register or active block to inspect its source instruction.");
+  await expect(source).toBeHidden();
 
   await tab(page, "Parameters");
   await expect(value(page, "parameters")).toHaveText("No settings yet");
@@ -1346,13 +1346,38 @@ test("Hardware states each fact once and keeps explanations and exact values in 
   await expect(value(page, "selection-detail")).toHaveText("readout.q1asm:3");
   await expect(value(page, "selection-detail")).toHaveAttribute("title", /[\\/]03-signals[\\/]readout\.q1asm:3$/);
   await expect(source).toBeEnabled();
-  await expect(source).toHaveAttribute("title", "");
 
   await crumbs.getByRole("combobox", { name: "Hardware module" }).selectOption("QCM0");
-  await expect(crumbs.getByRole("button")).toHaveText(["Modules", "QCM0"]);
+  await expect(crumbs.getByRole("button")).toHaveText(["Outputs"]);
+  await expect(value(page, "overview-title")).toHaveText("Outputs");
+  await expect(value(page, "overview-title")).toBeFocused();
   await page.getByRole("button", { name: "Inspect sequencer controller", exact: true }).click();
+  await expect(crumbs.getByRole("button")).toHaveText(["Outputs", "QCM0", "controller"]);
   await crumbs.getByRole("button", { name: "QCM0", exact: true }).click();
-  await expect(value(page, "overview-title")).toHaveText("QCM0 · Sequencers");
-  await crumbs.getByRole("button", { name: "Modules", exact: true }).click();
-  await expect(page.getByRole("button", { name: "Open QCM0: 1 sequencer", exact: true })).toBeVisible();
+  await expect(crumbs.getByRole("button")).toHaveText(["Outputs"]);
+  await expect(page.getByRole("button", { name: "Inspect sequencer controller", exact: true })).toBeVisible();
+});
+
+test("A sequencer with unknown alignment is read on its own clock instead of as unknown", async ({ page }) => {
+  const ir = {
+    sequencers: [{ id: "seq", module: "QCM0" }, { id: "peer", module: "QCM0" }], register_history: [],
+    alignment: { seq: { confidence: "unknown" }, peer: { offset: 0, confidence: "exact" } },
+    events: [
+      { id: "wait", kind: "wait", sequencer_id: "seq", lane: "rt.wait", t0: 0, t1: 20, label: "wait 20", source: { file: "seq.q1asm", line: 1 }, meta: { op: "wait", rt_packet_id: "seq-0" } },
+      { id: "peer-wait", kind: "wait", sequencer_id: "peer", lane: "rt.wait", t0: 0, t1: 20, label: "wait 20", source: { file: "peer.q1asm", line: 1 }, meta: { op: "wait", rt_packet_id: "peer-0" } },
+    ],
+  };
+  await mountHardwareTrace(page, ir, { level: "detail", sequencerId: "seq", basis: "aligned", time: 4 });
+  await expect(value(page, "basis")).toHaveText("Local time");
+  await expect(value(page, "rt-event")).toHaveText("active · wait 20");
+  await expect(value(page, "warnings").locator(".is-alert")).toHaveText("This sequencer's start relative to the others is unknown, so times here are its own.");
+  await expect(page.locator('[data-row-source="rt"]')).toHaveText("seq.q1asm:1");
+  await page.locator('[data-row-source="rt"]').click();
+  expect(await page.evaluate(() => window.hardwareSources.at(-1))).toEqual({ file: "seq.q1asm", line: 1 });
+
+  // A sequencer with a known offset stays on the shared clock, and the shared basis itself is unchanged.
+  await mountHardwareTrace(page, ir, { level: "detail", sequencerId: "peer", basis: "aligned", time: 4 });
+  await expect(value(page, "basis")).toHaveText("Aligned time");
+  await expect(value(page, "warnings")).toBeHidden();
+  expect(await page.evaluate(() => window.hardwarePreview.getState().basis)).toBe("aligned");
 });

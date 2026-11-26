@@ -12,18 +12,6 @@
 }
 
 .q1-hardware [hidden] { display: none !important; }
-.hardware-port-lanes { padding: 2px 14px 12px; }
-.hardware-port-lane { padding: 9px 0; border-top: 1px solid var(--hardware-border); }
-.hardware-port-lane header { display: flex; flex-wrap: wrap; gap: 12px; align-items: baseline; }
-.hardware-port-lane figure { margin: 8px 0; }
-.hardware-port-lane svg { display: block; width: 100%; height: 44px; }
-.hardware-port-lane line { stroke: var(--hardware-border); }
-.hardware-port-lane polyline { fill: none; stroke: var(--hardware-accent); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
-.hardware-port-lane figcaption, .hardware-port-lane p { color: var(--hardware-muted); }
-.hardware-port-lane details { margin: 5px 0; }
-.hardware-port-lane summary { cursor: pointer; }
-.hardware-port-lane ul { max-height: 200px; overflow: auto; margin: 5px 0; padding-left: 18px; }
-.hardware-port-lane li { margin: 3px 0; }
 .q1-hardware button, .q1-hardware input, .q1-hardware select { box-sizing: border-box; font: inherit; }
 .q1-hardware button, .q1-hardware select, .q1-hardware input[type="number"] {
   min-height: 27px;
@@ -83,37 +71,100 @@
 .hardware-crumb-switch:hover { background: var(--vscode-list-hoverBackground, #343a42); color: var(--vscode-foreground, #dedede); }
 .hardware-crumb-switch:focus-within { outline: 1px solid var(--vscode-focusBorder, #5da9e9); outline-offset: 1px; }
 .q1-hardware .hardware-crumb-switch select { position: absolute; inset: 0; width: 100%; min-height: 0; height: 100%; max-width: none; padding: 0; border: 0; opacity: 0; cursor: pointer; }
-.hardware-overview { padding: 16px; }
-.hardware-overview-heading { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 6px 16px; margin-bottom: 13px; }
-.hardware-overview-heading h3 { margin: 0; color: var(--vscode-foreground, #dedede); font-size: 13px; font-weight: 600; }
-.hardware-overview-heading > span { color: var(--hardware-muted); font-size: 11px; }
-.hardware-overview-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(245px, 100%), 1fr)); gap: 12px; max-height: 410px; padding: 2px; overflow-y: auto; animation: hardware-level-enter 140ms ease-out; }
-.q1-hardware .hardware-module-card, .q1-hardware .hardware-sequencer-card { display: flex; flex-direction: column; gap: 12px; min-width: 0; max-width: 480px; padding: 14px; border-radius: 8px; border-color: var(--hardware-border); background: var(--vscode-sideBar-background, #25272b); text-align: left; transition: border-color 120ms ease-out, box-shadow 120ms ease-out; animation: hardware-level-enter 140ms ease-out; }
-.q1-hardware .hardware-module-card { border-left-width: 5px; }
-.q1-hardware .hardware-module-card:hover, .q1-hardware .hardware-sequencer-card:hover { border-color: var(--hardware-accent); }
-.q1-hardware .hardware-module-card.is-selected, .q1-hardware .hardware-sequencer-card.is-selected { border-color: var(--hardware-accent); box-shadow: inset 0 0 0 1px var(--hardware-accent); }
-.hardware-card-top { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 6px; }
-.hardware-card-count, .hardware-card-selection { color: var(--hardware-muted); font-size: 10px; }
-.hardware-card-selection { color: var(--hardware-accent); }
-.hardware-card-name { min-width: 0; overflow-wrap: anywhere; font-size: 14px; font-weight: 600; line-height: 1.4; }
-.hardware-module-slots { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; padding: 8px; border: 1px solid var(--hardware-border); border-radius: 5px; background: var(--vscode-editor-background, #1e1e1e); }
-.hardware-module-slot { display: flex; align-items: center; gap: 6px; min-width: 0; padding: 6px 4px; border: 1px solid var(--hardware-border); border-radius: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--hardware-muted); font: 10px var(--vscode-editor-font-family, monospace); }
-.hardware-module-slot > i { flex: 0 0 5px; height: 5px; border-radius: 50%; background: var(--hardware-muted); }
-.hardware-module-slot.is-active > i { background: var(--vscode-charts-green, #6bc8a3); }
-.hardware-module-more { color: var(--hardware-muted); font-size: 10px; padding: 6px 4px; }
-.hardware-card-status { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--hardware-muted); font: 11px var(--vscode-editor-font-family, monospace); }
-.hardware-card-execution { color: var(--hardware-muted); font-size: 10px; line-height: 1.5; overflow-wrap: anywhere; }
-.hardware-card-cores { display: grid; grid-template-columns: minmax(0, 1fr) 16px minmax(0, 1fr); gap: 6px; align-items: center; }
-.hardware-card-cores > [data-card-core] { display: flex; flex-direction: column; gap: 8px; min-width: 0; padding: 10px; border: 1px solid var(--hardware-border); border-radius: 5px; background: var(--vscode-editor-background, #1e1e1e); }
-.hardware-card-cores > [data-card-core] > span { color: var(--hardware-muted); font-size: 11px; }
-.hardware-card-cores strong { overflow-wrap: anywhere; font-size: 11px; font-weight: 500; }
-.hardware-card-cores .is-active strong { color: var(--vscode-charts-green, #6bc8a3); }
-.hardware-card-core-arrow { color: var(--hardware-muted); text-align: center; }
+/* Outputs rack. Ink is what leaves a connector; hue names the sequencer path that feeds it;
+   amber dashes mark anything drawn from a value the project does not supply. */
+.q1-hardware {
+  --rack-ink: var(--vscode-editor-foreground, #e6e6e6);
+  --rack-i: var(--vscode-charts-blue, #4ea1e6);
+  --rack-q: var(--vscode-charts-orange, #d18616);
+  --rack-assumed: var(--vscode-charts-yellow, #cca700);
+  --rack-clip: var(--vscode-charts-red, #f14c4c);
+  --rack-gutter: 216px;
+  --rack-line: color-mix(in srgb, var(--hardware-border) 60%, transparent);
+}
+.hardware-rack { padding: 10px 14px 12px; }
+.rack-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin-bottom: 8px; }
+.rack-bar h3 { margin: 0; color: var(--vscode-foreground, #dedede); font-size: 13px; font-weight: 600; }
+.rack-params { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
+.q1-hardware .rack-param { gap: 4px; padding: 0 6px; border: 1px solid var(--hardware-border); border-radius: 4px; font-variant-numeric: tabular-nums; }
+.q1-hardware .rack-param.is-assumed { border: 1px dashed var(--rack-assumed); }
+.q1-hardware .rack-param.is-trial { border-color: var(--hardware-accent); }
+.rack-param-name { font-family: var(--vscode-editor-font-family, monospace); }
+.q1-hardware .rack-param input { min-height: 22px; padding: 0 2px; border: 0; background: transparent; appearance: textfield; }
+/* The stepper arrows would cover a short value; the field is typed into. */
+.rack-param input::-webkit-outer-spin-button, .rack-param input::-webkit-inner-spin-button { margin: 0; -webkit-appearance: none; }
+.rack-param output { min-height: 22px; line-height: 22px; }
+.rack-param-source { font-size: 10px; }
+.rack-param.is-assumed .rack-param-source { color: var(--rack-assumed); }
+.rack-param.is-trial .rack-param-source { color: var(--hardware-accent); }
+.rack-zoom { display: inline-flex; align-items: center; gap: 4px; margin-left: auto; }
+.rack-zoom > span { margin-right: 6px; color: var(--hardware-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.q1-hardware .rack-zoom button { min-width: 27px; }
+.rack-assumed { margin: 0 0 8px; padding: 3px 0 3px 8px; border-left: 2px dashed var(--rack-assumed); line-height: 1.5; max-width: 78ch; }
+.rack-body { position: relative; border-bottom: 1px solid var(--rack-line); }
+.rack-row { display: grid; grid-template-columns: var(--rack-gutter) minmax(0, 1fr); border-top: 1px solid var(--rack-line); }
+.rack-cell { display: flex; flex-wrap: wrap; align-items: center; align-content: flex-start; gap: 2px 6px; min-width: 0; min-height: 24px; padding: 3px 8px 3px calc(2px + var(--rack-depth) * 14px); }
+.rack-cell strong { font-weight: 600; overflow-wrap: anywhere; }
+.rack-sub { color: var(--hardware-muted); font-size: 11px; }
+.rack-lane { position: relative; min-width: 0; overflow: hidden; cursor: crosshair; }
+.rack-row.is-cluster, .rack-row.is-module { background: color-mix(in srgb, var(--vscode-foreground, #dedede) 4%, transparent); }
+.rack-row.is-cluster .rack-lane, .rack-row.is-module .rack-lane { cursor: default; }
+.rack-row.is-port strong { font-size: 13px; }
+.rack-row.is-ruler { position: sticky; top: 0; z-index: 2; border-top: 0; background: var(--vscode-editor-background, #1e1e1e); }
+.rack-row.is-ruler .rack-lane { cursor: grab; touch-action: none; }
+.rack-axis { color: var(--hardware-muted); font-size: 10px; }
+.rack-ruler, .rack-plot { display: block; }
+.rack-ruler text { fill: var(--hardware-muted); font-size: 10px; font-variant-numeric: tabular-nums; }
+.rack-tick, .rack-zero { stroke: var(--hardware-border); }
+.rack-rail { stroke: var(--hardware-border); stroke-dasharray: 2 3; }
+.rack-trace { fill-opacity: .2; stroke-width: 1.25; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+.rack-trace.is-sum { fill: var(--rack-ink); stroke: var(--rack-ink); }
+.rack-trace.is-i { fill: var(--rack-i); stroke: var(--rack-i); }
+.rack-trace.is-q { fill: var(--rack-q); stroke: var(--rack-q); }
+.rack-clip { fill: var(--rack-clip); opacity: .25; }
+.rack-notes { position: relative; }
+.q1-hardware .rack-tag { position: absolute; height: 18px; min-height: 0; padding: 0 4px; overflow: hidden; border: 0; border-left: 1px solid var(--vscode-editor-background, #1e1e1e); border-radius: 0; background: color-mix(in srgb, var(--vscode-foreground, #dedede) 10%, transparent); font: 11px/18px var(--vscode-editor-font-family, monospace); text-align: left; text-overflow: ellipsis; white-space: nowrap; }
+.q1-hardware .rack-tag.is-idle { background: transparent; color: var(--hardware-muted); }
+.q1-hardware .rack-tag.is-assumed { border-bottom: 2px dashed var(--rack-assumed); line-height: 16px; }
+.rack-repeat { position: absolute; box-sizing: border-box; height: 13px; padding-left: 4px; overflow: hidden; border: 1px solid var(--hardware-muted); border-bottom: 0; color: var(--hardware-muted); font-size: 10px; line-height: 12px; white-space: nowrap; }
+.rack-repeat.is-assumed { border-style: dashed; border-color: var(--rack-assumed); color: var(--rack-assumed); }
+.rack-reason { margin: 0; padding: 5px 8px; color: var(--hardware-muted); line-height: 1.5; cursor: default; }
+.q1-hardware .rack-toggle { position: relative; flex: 0 0 16px; width: 16px; height: 16px; min-height: 0; padding: 0; border: 0; background: transparent; }
+.rack-toggle::before { content: ""; position: absolute; top: 5px; left: 5px; border: 4px solid transparent; border-left-color: currentColor; border-right-width: 0; }
+.rack-toggle[aria-expanded="true"]::before { top: 6px; left: 4px; border: 4px solid transparent; border-top-color: currentColor; border-bottom-width: 0; }
+.rack-toggle-gap { flex: 0 0 16px; }
+.q1-hardware .rack-seq { display: inline-flex; align-items: center; gap: 6px; min-width: 0; min-height: 0; padding: 1px 4px; border-color: transparent; background: transparent; text-align: left; }
+.q1-hardware .rack-seq:hover > span { text-decoration: underline; }
+.rack-seq > span { overflow-wrap: anywhere; }
+.rack-dot { flex: 0 0 6px; height: 6px; border-radius: 50%; background: var(--hardware-muted); }
+.rack-dot.is-active { background: var(--vscode-charts-green, #6bc8a3); }
+.rack-path { padding: 0 4px; border: 1px solid currentColor; border-radius: 3px; font-size: 10px; line-height: 14px; }
+.rack-path.is-i { color: var(--rack-i); }
+.rack-path.is-q { color: var(--rack-q); }
+.rack-state { color: var(--hardware-muted); font-size: 10px; }
+.rack-state.is-error { color: var(--rack-clip); }
+.rack-uses { flex-basis: 100%; padding-left: 16px; color: var(--rack-assumed); font-size: 10px; }
+.rack-uses:empty { display: none; }
+.rack-clips { flex-basis: 100%; padding-left: 22px; color: var(--rack-clip); font-size: 10px; }
+.rack-extra { flex-basis: 100%; padding-left: 22px; color: var(--hardware-muted); font-size: 10px; }
+.rack-clips:empty { display: none; }
+.rack-cursor { position: absolute; top: 0; bottom: 0; z-index: 3; width: 1px; background: var(--hardware-accent); pointer-events: none; }
+/* One sequencer: its lane sits directly above the state read from it. */
+.hardware-rack.is-focus { --rack-gutter: 64px; padding-bottom: 10px; }
+.hardware-rack.is-focus .rack-bar h3 { display: none; }
+.hardware-rack.is-bare { padding: 6px 14px; }
+.hardware-rack.is-bare .rack-bar, .hardware-rack.is-bare .rack-assumed, .hardware-rack.is-bare .rack-note { display: none; }
+.hardware-rack.is-bare .rack-body { border-bottom: 0; }
+.hardware-rack.is-bare .rack-reason { padding-left: 0; }
+.rack-note { margin: 8px 0 0; color: var(--hardware-muted); line-height: 1.5; max-width: 78ch; }
+@media (max-width: 640px) {
+  .q1-hardware { --rack-gutter: 132px; }
+  .rack-zoom { margin-left: 0; }
+}
 @keyframes hardware-level-enter { from { opacity: .6; transform: translateY(3px); } to { opacity: 1; transform: translateY(0); } }
 .hardware-body:not([hidden]) { animation: hardware-level-enter 140ms ease-out; }
 @media (prefers-reduced-motion: reduce) {
-  .hardware-overview-grid, .hardware-body:not([hidden]) { animation: none; }
-  .q1-hardware .hardware-module-card, .q1-hardware .hardware-sequencer-card { transition: none; animation: none; }
+  .hardware-body:not([hidden]) { animation: none; }
 }
 .hardware-controls { display: flex; align-items: center; gap: 6px; padding: 9px 14px; border-top: 1px solid var(--hardware-border); border-bottom: 1px solid var(--hardware-border); background: var(--vscode-sideBar-background, #25272b); }
 .hardware-controls > button { font-size: 20px; line-height: 18px; width: 28px; }
@@ -121,31 +172,42 @@
 .hardware-time input { width: 98px; padding: 3px 6px; font-family: var(--vscode-editor-font-family, monospace); }
 .hardware-controls input[type="range"] { flex: 1; min-width: 70px; margin: 0 10px; accent-color: var(--hardware-accent); cursor: pointer; }
 .hardware-muted { color: var(--hardware-muted); }
-.hardware-controls > span { white-space: nowrap; font-size: 11px; }
-.hardware-warnings { margin: 0; padding: 8px 14px; border-bottom: 1px solid var(--hardware-border); color: var(--vscode-editorWarning-foreground, #ddb365); font-size: 11px; line-height: 1.5; }
-.hardware-execution { margin: 10px 0 6px; font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.hardware-controls > span { margin-left: auto; white-space: nowrap; font-size: 11px; }
+/* Caveats that hold for the whole analysis read quietly; one tied to the cursor is an alert. */
+.hardware-warnings { margin: 0; padding: 7px 14px; border-bottom: 1px solid var(--hardware-border); color: var(--hardware-muted); font-size: 11px; line-height: 1.5; }
+.hardware-warnings .is-alert { color: var(--vscode-editorWarning-foreground, #ddb365); }
+.hardware-warnings { display: flex; flex-wrap: wrap; gap: 2px 14px; }
+.hardware-warnings summary { cursor: pointer; }
+.hardware-warnings ul { margin: 4px 0 2px; padding-left: 18px; }
+/* State at the cursor: one row per part of the sequencer, read as name, state, source line.
+   A part the program never uses, or the run cannot know, has no row. */
+.hardware-body { display: grid; grid-template-columns: minmax(0, 1fr) minmax(350px, 420px); border-top: 1px solid var(--hardware-border); }
+.hardware-state { min-width: 0; padding: 4px 14px 10px; }
+.hardware-state:focus { outline: none; }
+.hardware-row { display: grid; grid-template-columns: 96px minmax(0, 1fr) auto; align-items: baseline; gap: 2px 12px; margin: 0 -14px; padding: 8px 14px; border-bottom: 1px solid var(--rack-line); }
+.hardware-row.is-selected { box-shadow: inset 2px 0 var(--hardware-accent); background: color-mix(in srgb, var(--vscode-foreground, #dedede) 4%, transparent); }
+.q1-hardware .hardware-row-name { position: relative; min-height: 0; padding: 1px 0 1px 14px; border: 0; background: transparent; color: var(--hardware-muted); text-align: left; }
+.q1-hardware .hardware-row-name:hover:not(:disabled) { background: transparent; color: var(--vscode-foreground, #dedede); }
+.hardware-row-name::before { content: ""; position: absolute; top: 50%; left: 1px; width: 6px; height: 6px; margin-top: -3px; border-radius: 50%; background: var(--hardware-muted); opacity: .4; }
+.hardware-row-name.is-active::before { background: var(--vscode-charts-green, #6bc8a3); opacity: 1; }
+.hardware-row-name.is-selected { color: var(--vscode-foreground, #dedede); }
+.hardware-row-main { display: flex; flex-direction: column; align-items: flex-start; gap: 3px; min-width: 0; }
+.hardware-row-value { font: 12px/1.5 var(--vscode-editor-font-family, monospace); text-align: left; overflow-wrap: anywhere; }
+.q1-hardware button.hardware-row-value { min-height: 0; padding: 0; border: 0; background: transparent; color: inherit; }
+.q1-hardware button.hardware-row-value:hover:not(:disabled) { background: transparent; text-decoration: underline; }
+.q1-hardware button.hardware-row-value:disabled { opacity: 1; color: var(--hardware-muted); }
+.hardware-row-more { display: flex; flex-direction: column; align-items: flex-start; gap: 3px; color: var(--hardware-muted); font: 11px/1.5 var(--vscode-editor-font-family, monospace); overflow-wrap: anywhere; }
+.hardware-row-more strong { font-weight: 500; }
+.q1-hardware .hardware-row-more button { min-height: 20px; padding: 0 4px; text-align: left; overflow-wrap: anywhere; }
+.q1-hardware .hardware-row-source { min-height: 0; padding: 0; border: 0; background: transparent; color: var(--vscode-textLink-foreground, #79b8ff); font-size: 11px; white-space: nowrap; }
+.q1-hardware .hardware-row-source:hover:not(:disabled) { background: transparent; text-decoration: underline; }
+.hardware-path { display: inline-flex; align-items: baseline; gap: 6px; margin-right: 20px; }
+.hardware-path code { font: inherit; }
+.hardware-path .rack-path { font-family: var(--vscode-font-family, sans-serif); font-weight: 500; }
+.hardware-assumed { color: var(--rack-assumed); }
+.hardware-absent { margin: 10px 0 0; color: var(--hardware-muted); font-size: 11px; line-height: 1.5; max-width: 78ch; }
+.hardware-execution { margin: 4px 0 0; color: var(--hardware-muted); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
 .hardware-execution.is-incomplete { color: var(--vscode-editorWarning-foreground, #ddb365); }
-.hardware-instruction-detail { display: flex; flex-direction: column; gap: 4px; color: var(--hardware-muted); font: 10px/1.5 var(--vscode-editor-font-family, monospace); overflow-wrap: anywhere; }
-.hardware-body { display: grid; grid-template-columns: minmax(410px, 1fr) minmax(350px, 420px); }
-.hardware-diagram-panel { padding: 12px 16px 8px; min-width: 0; align-self: center; }
-.hardware-diagram-scroll { overflow-x: auto; padding-bottom: 3px; }
-.hardware-diagram { width: 100%; min-width: 620px; display: block; overflow: visible; }
-.hardware-links { fill: none; stroke: var(--hardware-muted); stroke-width: 1.5; }
-.hardware-links .hardware-data-link { stroke-dasharray: 4 3; }
-.hardware-diagram marker path { fill: var(--hardware-muted); }
-.hardware-block { cursor: pointer; }
-.hardware-block rect { fill: var(--vscode-sideBar-background, #25272b); stroke: var(--hardware-border); stroke-width: 1.3; transition: stroke .1s; }
-.hardware-block:hover rect { stroke: var(--vscode-focusBorder, #5da9e9); }
-.hardware-block.is-selected rect { stroke: var(--hardware-accent); stroke-width: 2; }
-.hardware-block circle { fill: var(--hardware-muted); opacity: .4; }
-.hardware-block.is-active circle { fill: var(--vscode-charts-green, #6bc8a3); opacity: 1; }
-.hardware-block-title { fill: var(--vscode-foreground, #dedede); font-size: 13px; font-weight: 600; }
-.hardware-block-value { fill: var(--hardware-muted); font-size: 10px; font-family: var(--vscode-editor-font-family, monospace); }
-.hardware-flow-label { fill: var(--hardware-muted); font-size: 10px; }
-.hardware-core-status { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-.hardware-core-status button { display: flex; gap: 8px; align-items: baseline; min-width: 0; text-align: left; border-color: transparent; background: transparent; padding: 5px 0; }
-.hardware-core-status button > span:first-child { color: var(--hardware-accent); font-size: 10px; font-weight: 600; }
-.hardware-core-status button > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
 .hardware-footnote { margin: 7px 0 0; color: var(--hardware-muted); font-size: 10px; line-height: 1.5; }
 .hardware-inspector { min-width: 0; border-left: 1px solid var(--hardware-border); }
 .hardware-tabs { display: flex; border-bottom: 1px solid var(--hardware-border); padding: 0 10px; gap: 8px; }
@@ -218,16 +280,18 @@
   .hardware-body { grid-template-columns: 1fr; }
   .hardware-inspector { border-left: 0; border-top: 1px solid var(--hardware-border); }
   .hardware-register-grid { grid-template-columns: repeat(8, minmax(0, 1fr)); }
-  .hardware-diagram-panel { padding: 9px 12px; }
+  .hardware-state { padding: 4px 12px 9px; }
+  .hardware-row { margin: 0 -12px; padding: 7px 12px; }
 }
 @media (max-width: 480px) {
   .hardware-heading, .hardware-controls { padding-left: 9px; padding-right: 9px; }
-  .hardware-overview { padding: 12px 9px; }
+  .hardware-rack { padding: 10px 9px; }
   .q1-hardware select { max-width: 190px; }
   .hardware-time input { width: 75px; }
   .hardware-controls { flex-wrap: wrap; }
   .hardware-controls input[type="range"] { order: 2; flex-basis: 100%; margin: 4px 0; }
-  .hardware-core-status { grid-template-columns: 1fr; }
+  .hardware-row { grid-template-columns: 72px minmax(0, 1fr); }
+  .hardware-row-source { grid-column: 2; justify-self: start; }
   .hardware-replay { padding: 12px 9px; }
   .hardware-replay-body { grid-template-columns: minmax(0, 1fr); gap: 16px; }
 }

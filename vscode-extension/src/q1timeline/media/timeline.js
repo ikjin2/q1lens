@@ -5644,6 +5644,9 @@
       onReplayScopeChange(scope) {
         if (scope === "project") setTimelineTimeBasis("local");
       },
+      onRequestOutputWindow(request) {
+        vscode.postMessage({ type: "outputWindow", ...request });
+      },
       onSelectEvent(eventId, selectionOptions = {}) {
         const event = visiblePlaybackEvent(timelineEventsById.get(String(eventId)));
         if (!selectionOptions.replay) zoomTimelineToHighlightedEvent(event);
@@ -5835,6 +5838,10 @@
     }
     if (event.data && event.data.type === "setAnalysisStatus") {
       if (["error", "idle"].includes(event.data.status)) hardwareView?.finishReplayPreparation();
+      return;
+    }
+    if (event.data && event.data.type === "outputWindowResult") {
+      hardwareView?.setOutputWindow(event.data);
       return;
     }
     if (event.data && event.data.type === "setExecutionState") {

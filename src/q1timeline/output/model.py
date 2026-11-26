@@ -49,6 +49,14 @@ class Segment:
             "frequency": _json(self.frequency), "phase": _json(self.phase), "source_event": self.source_event,
         }
 
+    @classmethod
+    def from_json(cls, data):
+        expr = Expr.from_value_json
+        return cls(expr(data["start"]), expr(data["end"]),
+                   tuple(w if w is None or type(w) is int else expr(w) for w in data["waveforms"]),
+                   expr(data["sample_offset"]), tuple(map(expr, data["gain"])), tuple(map(expr, data["offset"])),
+                   expr(data["frequency"]), expr(data["phase"]), data["source_event"])
+
 
 @dataclass(frozen=True)
 class Repeat:
@@ -67,6 +75,16 @@ class Repeat:
         return {"kind": "repeat", "start": _json(self.start), "count": _json(self.count),
                 "period": _json(self.period), "iteration": self.iteration, "source_event": self.source_event,
                 "body": [node.to_json() for node in self.body]}
+
+    @classmethod
+    def from_json(cls, data):
+        expr = Expr.from_value_json
+        return cls(expr(data["start"]), expr(data["count"]), expr(data["period"]), data["iteration"],
+                   tuple(_node_from_json(node) for node in data["body"]), data["source_event"])
+
+
+def _node_from_json(data):
+    return (Repeat if data["kind"] == "repeat" else Segment).from_json(data)
 
 
 def _free_symbols(nodes) -> frozenset[str]:
@@ -364,6 +382,17 @@ class Output:
                 "static_gain": list(self.static_gain), "static_offset": list(self.static_offset),
                 "fir": list(self.fir), "iir": {"a": list(self.iir_a), "b": list(self.iir_b)}, "dac_bits": self.dac_bits,
                 "dac_assumption": DAC_ASSUMPTION}
+
+    @classmethod
+    def from_json(cls, data, waveforms=None):
+        """Restore a serialized model. Waveform memory travels separately because it can be large."""
+        memory = {int(index): tuple(map(float, samples)) for index, samples in (waveforms or {}).items()}
+        return cls(tuple(_node_from_json(node) for node in data["segments"]), memory,
+                   Segment.from_json(data["tail"]) if data.get("tail") else None, tuple(data.get("issues", ())),
+                   static_gain=tuple(data.get("static_gain", (1.0, 1.0))),
+                   static_offset=tuple(data.get("static_offset", (0.0, 0.0))),
+                   fir=tuple(data.get("fir", (1.0,))), iir_a=tuple(data.get("iir", {}).get("a", (1.0,))),
+                   iir_b=tuple(data.get("iir", {}).get("b", (1.0,))), dac_bits=data.get("dac_bits", 16))
 
     def _repr_html_(self):
         def scaled(expr):

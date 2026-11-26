@@ -117,6 +117,18 @@ function parseWebviewMessage(message) {
     return { valid: true, type: "prepareExecutionReplay", sequencerId: message.sequencerId, ...(message.scope === undefined ? {} : { scope: message.scope }) };
   }
 
+  if (message.type === "outputWindow") {
+    const { token, t0, t1, bins, params } = message;
+    const entries = params && typeof params === "object" && !Array.isArray(params) ? Object.entries(params) : undefined;
+    if (Number.isSafeInteger(token) && token > 0 && Number.isSafeInteger(t0) && Number.isSafeInteger(t1) && t0 < t1 &&
+        Number.isSafeInteger(bins) && bins >= 1 && bins <= 2000 && entries && entries.length <= 256 &&
+        entries.every(([name, value]) => /^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(name) && Number.isSafeInteger(value)) &&
+        hasOnlyKeys(message, ["type", "token", "t0", "t1", "bins", "params"])) {
+      return { valid: true, type: "outputWindow", token, t0, t1, bins, params: Object.fromEntries(entries) };
+    }
+    return { valid: false, reason: "invalid output window request" };
+  }
+
   if (message.type === "webviewReady" && hasOnlyKeys(message, ["type"])) {
     return { valid: true, type: "webviewReady" };
   }

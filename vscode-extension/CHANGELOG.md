@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.3
+
+- Hardware opens on **Outputs**: one time axis with the cluster, its modules, each output port, and the sequencer paths that feed it. A port shows the waveform that leaves the connector. Each path below it shows its own waveform, the formula of every interval and the loops that repeat them. Select an interval to jump to its instruction, or a sequencer name to inspect its registers, parameters and bins.
+- A parameter without a value is drawn with an assumed one. Outputs names every assumed parameter and marks what depends on it in amber. Type a value to try another without editing the project.
+- Zoom and pan across long outputs. A span with more samples than the screen has columns shows the range the output covers, and every sample appears once you zoom in. Loops stay labeled with their count and period.
+- Formulas keep parameter names such as `G/32768 × wf0` when the project sets their values.
+- Draw QCM-RF and QRM-RF outputs as a complex envelope, with the LO frequency when the project or snapshot records it. Name the cluster with `cluster` under `modules`. Scheduler projects take both from the compiled hardware.
+- A selected sequencer keeps its output lane on screen. Rows below the lane show Q1, RT, the output and its settings in effect at the cursor, each with a link to its source line. This replaces the block diagram. Rows and tabs for acquisitions and for the RT queue appear only when the program acquires or the run is simulated.
+- Press or drag on a lane to move the time cursor.
+- A sequencer whose start relative to the others is unknown shows its state on its own clock instead of reporting it as unknown.
+- Limits that apply to the whole analysis are folded behind a count. A warning about the selected time stays visible.
+- Outputs requires Q1Lens Python from the same release.
+
 ## 0.3.2
 
 - Add **Decision lanes**. Run **Q1Lens: Open Decision Lanes** on a Q1ASM file to see each branch that depends on a feedback word on the RT clock: which way it went, the compared values and where they came from, and what the two arms change. Type the feedback words to try, or use the project's LINQ schedule. The panel records the other arm of a decision as a second run with that branch forced, and marks it as an assumption.

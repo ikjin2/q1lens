@@ -1,14 +1,31 @@
 (function hardwareViewFactory(root) {
   const PAGE_SIZE = 16;
+  // Rows of the state table, in the order a command travels through the sequencer. A row is left
+  // out when the program never uses that part (acquisition) or the run cannot know it (RT queue).
   const BLOCKS = [
-    { id: "registers", title: "Registers", x: 16, y: 144, w: 138, h: 68 },
-    { id: "q1", title: "Q1 core", x: 16, y: 32, w: 138, h: 80 },
-    { id: "queue", title: "RT queue", x: 190, y: 32, w: 138, h: 80 },
-    { id: "rt", title: "RT core", x: 364, y: 32, w: 138, h: 80 },
-    { id: "awg", title: "AWG", x: 538, y: 32, w: 156, h: 80 },
-    { id: "acquisition", title: "Acquisition", x: 364, y: 144, w: 156, h: 68 },
-    { id: "bins", title: "Bins", x: 556, y: 144, w: 138, h: 68 },
+    { id: "q1", title: "Q1" },
+    { id: "rt", title: "RT" },
+    { id: "queue", title: "RT queue" },
+    { id: "awg", title: "Output" },
+    { id: "acquisition", title: "Acquisition" },
   ];
+  // A selection is a row, or a tab of the inspector that has no row of its own.
+  const SELECTIONS = new Set(["registers", "bins", "simulation", ...BLOCKS.map((block) => block.id)]);
+
+  function rowHtml(block) {
+    const core = block.id === "q1" || block.id === "rt";
+    const value = core
+      ? `<button type="button" class="hardware-row-value" data-action="${block.id}-event" title="Move the cursor to the start of this command"><span data-value="${block.id}-event"></span></button>`
+      : `<span class="hardware-row-value" data-block-value="${block.id}"></span>`;
+    const more = block.id === "q1" ? '<div class="hardware-row-more" data-value="instruction-detail"></div>'
+      : block.id === "awg" ? '<div class="hardware-row-more" data-value="output-detail"></div>'
+      : core ? "" : `<div class="hardware-row-more" data-block-title="${block.id}"></div>`;
+    return `<div class="hardware-row" data-row="${block.id}">
+      <button type="button" class="hardware-row-name" data-block="${block.id}" aria-pressed="false">${block.title}</button>
+      <div class="hardware-row-main">${value}${more}</div>
+      <button type="button" class="hardware-row-source" data-row-source="${block.id}" hidden></button>
+    </div>`;
+  }
 
   function escapeHtml(value) {
     return String(value === undefined || value === null ? "" : value)
@@ -20,11 +37,6 @@
     if (value === undefined || value === null) return "unknown";
     if (typeof value === "object") return value.display !== undefined ? String(value.display) : JSON.stringify(value);
     return String(value);
-  }
-
-  function short(value, limit = 22) {
-    const text = display(value);
-    return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
   }
 
   function eventLabel(event) {
@@ -85,65 +97,610 @@
     return `${labels[source.kind] || statusLabel(source.kind)}${source.label ? ` · ${source.label}` : ""}`;
   }
 
-  function scaledWord(word, divisor) {
-    const value = display(word);
-    return `${value.includes(" ") ? `(${value})` : value}/${divisor}`;
+  // ---- Outputs rack: cluster, module, port, sequencer path, on one time axis ----
+
+  const DRAWN_MODULE_TYPES = new Set(["QCM", "QRM", "QCM-RF", "QRM-RF"]);
+
+  function portLabel(port) {
+    const match = /^out(\d+)$/.exec(String(port));
+    return match ? `O${Number(match[1]) + 1}` : String(port);
   }
 
-  function outputIntervals(nodes, path, output, prefix = "") {
-    return nodes.map((node) => {
-      if (node.kind === "repeat") {
-        const repeat = `${prefix}from ${display(node.start)} ns · ×${display(node.count)} every ${display(node.period)} ns`;
-        return `<li>${escapeHtml(repeat)}<ul>${outputIntervals(node.body, path, output, "relative ")}</ul></li>`;
-      }
-      const wave = node.waveforms[path];
-      const offset = node.offset[path];
-      const staticGain = output.static_gain?.[path] ?? 1;
-      const gain = `${scaledWord(node.gain[path], 32768)}${staticGain === 1 ? "" : ` × (${staticGain})`}`;
-      const offsetSamples = display(node.sample_offset);
-      const sample = offsetSamples === "0" ? "τ" : `τ + (${offsetSamples})`;
-      const terms = wave == null ? [] : [`${gain} × wf${display(wave)}[${sample}]`];
-      if (display(offset) !== "0") terms.push(scaledWord(offset, 32768));
-      if (output.static_offset?.[path]) terms.push(String(output.static_offset[path]));
-      const interval = `${prefix}[${display(node.start)}, ${display(node.end)}) ns`;
-      const nco = display(node.frequency) !== "0" || display(node.phase) !== "0"
-        ? ` · NCO ${scaledWord(node.frequency, 4)} Hz, phase ${scaledWord(node.phase, "4e9")} turns` : "";
-      return `<li><button type="button" data-event="${escapeHtml(node.source_event)}">${escapeHtml(interval)}</button>
-        <code>${escapeHtml(terms.join(" + ").replace(/ \+ -/g, " - ") || "0")}</code>${escapeHtml(nco)}</li>`;
-    }).join("");
+  function timeScale(span) {
+    if (span < 5e3) return { unit: "ns", scale: 1 };
+    if (span < 5e6) return { unit: "µs", scale: 1e3 };
+    if (span < 5e9) return { unit: "ms", scale: 1e6 };
+    return { unit: "s", scale: 1e9 };
   }
 
-  function portLane(port, outputs) {
-    const routes = Object.entries(port.routes);
-    const label = `${port.module} · ${port.port}`;
-    const contributors = routes.map(([seq, path]) => `${seq}.${path}`).concat(port.offset || !routes.length ? [String(port.offset)] : []);
-    const samples = port.preview?.values;
-    let trace = "";
-    if (samples?.length) {
-      const t0 = port.preview.t0;
-      const t1 = t0 + samples.length * port.preview.dt_ns;
-      const points = samples.map((v, i) => `${i},${22 - 20 * v} ${i + 1},${22 - 20 * v}`).join(" ");
-      trace = `<figure><svg viewBox="0 0 ${samples.length} 44" preserveAspectRatio="none" role="img"
-        aria-label="Clipped port output from ${escapeHtml(t0)} to ${escapeHtml(t1)} ns"><line x1="0" x2="100%" y1="22" y2="22"></line>
-        <polyline points="${points}"></polyline></svg><figcaption>[${escapeHtml(t0)}, ${escapeHtml(t1)}) ns · normalized full scale [−1, +1]</figcaption></figure>`;
-    } else if (port.preview_issue) {
-      trace = `<p>${escapeHtml(port.preview_issue)}</p>`;
+  function formatTime(ns) {
+    const { unit, scale } = timeScale(Math.abs(ns));
+    return `${Number((ns / scale).toPrecision(6))} ${unit}`;
+  }
+
+  function tickStep(span, count) {
+    const raw = span / Math.max(1, count);
+    const power = 10 ** Math.floor(Math.log10(Math.max(raw, 1e-9)));
+    return Math.max(1, [1, 2, 5, 10].find((multiple) => multiple * power >= raw) * power);
+  }
+
+  function listNames(names) {
+    return names.length < 3 ? names.join(" and ") : `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+  }
+
+  function createRack(host, context) {
+    const { ir, sequencers, options } = context;
+    const output = ir.output || {};
+    const saved = context.initial && typeof context.initial === "object" ? context.initial : {};
+    const collapsed = new Set(Array.isArray(saved.collapsed) ? saved.collapsed.filter((key) => typeof key === "string") : []);
+    let trial = {};
+    if (saved.trial && typeof saved.trial === "object") {
+      for (const [name, value] of Object.entries(saved.trial)) if (Number.isSafeInteger(value)) trial[name] = value;
     }
-    const intervals = routes.map(([seq, path]) => {
-      const output = outputs[seq];
-      if (!output) return "";
-      const p = Number(path === "Q");
-      const nodes = output.tail && display(output.waveform_end) !== display(output.duration)
-        ? [...output.segments, { ...output.tail, end: output.waveform_end }] : output.segments;
-      const held = output.tail && (display(output.tail.offset[p]) !== "0" || output.static_offset?.[p]);
-      return `<details><summary>${escapeHtml(seq)} · path ${escapeHtml(path)} intervals</summary>
-        <p>Local time · pre-NCO amplitude · τ is time since the interval began.</p>
-        ${output.issues.map((issue) => `<p>${escapeHtml(issue)}</p>`).join("")}
-        <ul>${outputIntervals(nodes, p, output)}</ul>
-        ${held ? `<p>Retained offset after waveform end: ${escapeHtml(scaledWord(output.tail.offset[p], 32768))} + ${escapeHtml(output.static_offset?.[p] ?? 0)}</p>` : ""}</details>`;
-    }).join("");
-    return `<article class="hardware-port-lane"><header><strong>${escapeHtml(label)}</strong>
-      <code>clip(${escapeHtml(contributors.join(" + "))})</code></header>${trace}${intervals}</article>`;
+    let data = output.overview || null;
+    let extent = data ? data.extent : { t0: 0, t1: 1 };
+    let view = { t0: 0, t1: 1 };
+    let live = options.onRequestOutputWindow && data ? "unknown" : "off";
+    let liveIssue = "";
+    let token = 0;
+    let requestTimer;
+    let timeoutTimer;
+    let frame;
+    let width = 0;
+    let gutter = 0;
+    let rowsKey;
+    let paramsKey;
+    let drag;
+    let scrubbing = false;
+    let destroyed = false;
+    // A focused rack shows one sequencer: its two paths, on that sequencer's own clock.
+    let focus = null;
+    const shift = () => focus === null ? 0 : context.labelShift();
+
+    const ports =(output.ports || []).map((port, number) => ({ ...port, number }));
+    const routed = new Set(ports.flatMap((port) => Object.keys(port.routes || {})));
+    const described = new Map((output.modules || []).map((module) => [String(module.name), module]));
+    const tree = [];
+    // A project names its cluster on the modules it routes. Modules it only mentions belong to the same rack.
+    const named = [...new Set((output.modules || []).map((module) => module.cluster).filter(Boolean).map(String))];
+    for (const id of new Set([...sequencers.map(moduleId), ...ports.map((port) => String(port.module))])) {
+      const about = described.get(id) || {};
+      const members = sequencers.filter((seq) => moduleId(seq) === id);
+      const name = about.cluster ? String(about.cluster) : named.length === 1 ? named[0] : "";
+      let cluster = tree.find((entry) => entry.name === name);
+      if (!cluster) tree.push(cluster = { name, modules: [] });
+      cluster.modules.push({
+        id, members, type: String(about.type || members.find((seq) => seq.module_type)?.module_type || ""),
+        lo: about.lo_frequency_hz || {}, ports: ports.filter((port) => String(port.module) === id),
+        loose: members.filter((seq) => !routed.has(seq.id)),
+      });
+    }
+    const labels = new Map(sequencers.map((seq) => [seq.id, seq.label || seq.id]));
+
+    host.innerHTML = `
+      <div class="rack-bar">
+        <h3 data-value="overview-title" tabindex="-1">Outputs</h3>
+        <div class="rack-params" data-rack="params"></div>
+        <div class="rack-zoom">
+          <span data-rack="range"></span>
+          <button type="button" data-rack-action="zoom-out" aria-label="Zoom out of outputs" title="Zoom out">−</button>
+          <button type="button" data-rack-action="zoom-in" aria-label="Zoom in on outputs" title="Zoom in">+</button>
+          <button type="button" data-rack-action="fit" title="Show the whole output">Fit</button>
+        </div>
+      </div>
+      <p class="rack-assumed" data-rack="assumed" role="status" hidden></p>
+      <div class="rack-body" data-rack="body" tabindex="0" role="group" aria-label="Output lanes. Arrow keys pan, plus and minus zoom, Home shows everything.">
+        <div class="rack-rows" data-rack="rows"></div>
+        <div class="rack-cursor" data-rack="cursor" hidden></div>
+      </div>
+      <p class="rack-note" data-rack="note" hidden></p>`;
+    const part = Object.fromEntries(Array.from(host.querySelectorAll("[data-rack]")).map((node) => [node.dataset.rack, node]));
+
+    function setHtml(node, value) { if (node.innerHTML !== value) node.innerHTML = value; }
+    function setText(node, value) { if (node.textContent !== value) node.textContent = value; }
+
+    function fullView() {
+      const span = Math.max(1, extent.t1 - extent.t0);
+      return { t0: extent.t0, t1: extent.t1 + Math.max(1, Math.round(span * 0.03)) };
+    }
+
+    function clampView() {
+      const full = fullView();
+      const limit = full.t1 - full.t0;
+      const span = Math.min(limit, Math.max(Math.min(8, limit), view.t1 - view.t0));
+      const t0 = Math.min(full.t1 - span, Math.max(full.t0, view.t0));
+      view = { t0, t1: t0 + span };
+    }
+
+    view = Array.isArray(saved.view) && saved.view.length === 2 && saved.view.every(Number.isFinite) && saved.view[1] > saved.view[0]
+      ? { t0: saved.view[0], t1: saved.view[1] } : fullView();
+    clampView();
+
+    const x = (time) => (time - view.t0) / (view.t1 - view.t0) * width;
+    const edge = (j) => data.t0 + Math.floor((data.t1 - data.t0) * j / data.bins);
+
+    function envelope(trace, height) {
+      if (!trace || !trace.min || !trace.min.length) return "";
+      const y = (value) => (5 + (1 - (Math.max(-1, Math.min(1, value)) + 1) / 2) * (height - 10)).toFixed(1);
+      let top = "";
+      let bottom = "";
+      for (let j = 0; j < trace.min.length; j++) {
+        const x0 = x(edge(j));
+        const x1 = x(edge(j + 1));
+        if (x1 < -1 || x0 > width + 1) continue;
+        const a = Math.max(-1, x0).toFixed(1);
+        const b = Math.min(width + 1, x1).toFixed(1);
+        top += `${top ? "L" : "M"}${a},${y(trace.max[j])}H${b}`;
+        bottom = `L${b},${y(trace.min[j])}H${a}${bottom}`;
+      }
+      return top ? `${top}${bottom}Z` : "";
+    }
+
+    function plot(height, traces, name, clipBins) {
+      const middle = (height / 2).toFixed(1);
+      let marks = "";
+      for (const j of clipBins || []) {
+        const x0 = Math.max(0, x(edge(j)));
+        const x1 = Math.min(width, x(edge(j + 1)));
+        if (x1 > x0) marks += `<rect class="rack-clip" x="${x0.toFixed(1)}" y="2" width="${Math.max(1, x1 - x0).toFixed(1)}" height="${height - 4}"></rect>`;
+      }
+      return `<svg class="rack-plot" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(name)}">
+        <line class="rack-rail" x1="0" x2="${width}" y1="5" y2="5"></line><line class="rack-rail" x1="0" x2="${width}" y1="${height - 5}" y2="${height - 5}"></line>
+        <line class="rack-zero" x1="0" x2="${width}" y1="${middle}" y2="${middle}"></line>${marks}
+        ${traces.map(([kind, trace]) => `<path class="rack-trace is-${kind}" d="${envelope(trace, height)}"></path>`).join("")}</svg>`;
+    }
+
+    function span(from, to) {
+      const x0 = Math.max(0, x(from));
+      const x1 = Math.min(width, x(to));
+      return x1 - x0 < 1.5 ? null : { left: x0.toFixed(1), width: (x1 - x0).toFixed(1), size: x1 - x0 };
+    }
+
+    function notes(seq, path) {
+      const entry = data.sequencers[seq];
+      if (!entry || entry.issue) return "";
+      const origin = entry.time_offset || 0;
+      const repeats = entry.repeats.filter((repeat) => repeat.depth < 3);
+      const depth = repeats.reduce((most, repeat) => Math.max(most, repeat.depth + 1), 0);
+      let text = "";
+      for (const repeat of repeats) {
+        const place = span(repeat.t0 + origin, repeat.t1 + origin);
+        if (!place) continue;
+        const symbolic = repeat.count_label !== String(repeat.count);
+        const period = repeat.period_label === String(repeat.period) ? formatTime(repeat.period) : `${repeat.period_label} ns`;
+        const label = `× ${repeat.count_label} every ${period}${repeat.collapsed ? `, showing ${repeat.index} = ${repeat.shown}` : ""}`;
+        const detail = [`Repeats ${repeat.count} times, ${formatTime(repeat.period)} apart`,
+          symbolic ? `${repeat.count_label} = ${repeat.count}` : "",
+          repeat.wraps_at_zero ? "A count of 0 runs 2³² times" : "",
+          repeat.assumed.length ? `Drawn with assumed ${listNames(repeat.assumed)}` : ""].filter(Boolean).join("\n");
+        text += `<span class="rack-repeat${repeat.assumed.length ? " is-assumed" : ""}" style="left:${place.left}px;width:${place.width}px;top:${repeat.depth * 14}px" title="${escapeHtml(detail)}">${place.size >= 40 ? escapeHtml(label) : ""}</span>`;
+      }
+      let shown = 0;
+      for (const item of entry.intervals) {
+        const place = span(item.t0 + origin, item.t1 + origin);
+        if (!place || shown >= 240) continue;
+        shown++;
+        const label = path === "IQ" ? item.labels[0] === item.labels[1] ? item.labels[0] : `I ${item.labels[0]}, Q ${item.labels[1]}` : item.labels[Number(path === "Q")];
+        const detail = [`${formatTime(item.t0 + origin - shift())} to ${formatTime(item.t1 + origin - shift())}`, label, item.nco ? `NCO ${item.nco}` : "",
+          item.assumed.length ? `Drawn with assumed ${listNames(item.assumed)}` : ""].filter(Boolean).join("\n");
+        text += `<button type="button" class="rack-tag${item.assumed.length ? " is-assumed" : ""}${label === "0" ? " is-idle" : ""}" data-rack-event="${escapeHtml(item.event)}" data-rack-time="${item.t0 + origin}" tabindex="${shown === 1 ? 0 : -1}" style="left:${place.left}px;width:${place.width}px;top:${depth * 14}px" title="${escapeHtml(detail)}" aria-label="${escapeHtml(detail.replaceAll("\n", ". "))}">${place.size >= 22 ? escapeHtml(label) : ""}</button>`;
+      }
+      return `<div class="rack-notes" style="height:${depth * 14 + 20}px">${text}</div>`;
+    }
+
+    function laneHtml(lane) {
+      if (!data) return '<p class="rack-reason">No waveform memory for this sequencer. Add sequence_json to draw its output.</p>';
+      const [kind, first, second] = lane.split("|");
+      const until = `${formatTime(view.t0 - shift())} to ${formatTime(view.t1 - shift())}`;
+      if (kind === "port") {
+        const port = data.ports[Number(first)];
+        if (!port) return "";
+        if (port.issue) return `<p class="rack-reason">${escapeHtml(port.issue)}</p>`;
+        const name = `${port.module} ${portLabel(port.port)} output, ${until}`;
+        if (port.kind === "rf") return plot(60, [["i", port.traces.i], ["q", port.traces.q]], name);
+        return plot(60, [["sum", port.traces.sum]], name, port.clip_bins);
+      }
+      const seq = kind === "path" ? second : first;
+      const entry = data.sequencers[seq];
+      if (!entry) return '<p class="rack-reason">No waveform memory for this sequencer. Add sequence_json to draw its output.</p>';
+      if (entry.issue) return `<p class="rack-reason">${escapeHtml(entry.issue)}</p>`;
+      const path = kind === "path" ? ports[Number(first)].routes[seq] : "IQ";
+      const traces = path === "IQ" ? [["i", entry.traces.i], ["q", entry.traces.q]] : [[path.toLowerCase(), entry.traces[path.toLowerCase()]]];
+      return plot(focus === null ? 40 : 64, traces, `${labels.get(seq) || seq} path ${path}, ${until}`) + notes(seq, path);
+    }
+
+    function focusReason() {
+      const module = tree.flatMap((cluster) => cluster.modules).find((entry) => entry.members.some((seq) => seq.id === focus));
+      const type = module ? module.type : "";
+      if (type && !DRAWN_MODULE_TYPES.has(type.toUpperCase().replace("_", "-"))) return `Q1Lens does not draw ${type} outputs.`;
+      return "No waveform memory for this sequencer. Add sequence_json to draw its output.";
+    }
+
+    function hasLanes() {
+      if (!data) return false;
+      return focus === null || Boolean(data.sequencers[focus] && !data.sequencers[focus].issue);
+    }
+
+    function toggle(key, name) {
+      const closed = collapsed.has(key);
+      return `<button type="button" class="rack-toggle" data-rack-toggle="${escapeHtml(key)}" aria-expanded="${!closed}" aria-label="${closed ? "Show" : "Hide"} ${escapeHtml(name)}"></button>`;
+    }
+
+    function sequencerCell(seq, path) {
+      const label = labels.get(seq) || seq;
+      const badge = path ? `<span class="rack-path is-${path.toLowerCase()}" title="${path === "IQ" ? "Both sequencer paths" : `Sequencer path ${path}`}">${path}</span>` : "";
+      return `<button type="button" class="rack-seq" data-rack-inspect="${escapeHtml(seq)}" aria-label="Inspect sequencer ${escapeHtml(label)}"><i class="rack-dot" data-rack-status="${escapeHtml(seq)}" aria-hidden="true"></i><span>${escapeHtml(label)}</span></button>
+        ${badge}<span class="rack-state" data-rack-state="${escapeHtml(seq)}"></span><span class="rack-uses" data-rack-uses="${escapeHtml(seq)}"></span>`;
+    }
+
+    function row(kind, depth, cell, lane, extra = "") {
+      return `<div class="rack-row is-${kind}" style="--rack-depth:${depth}"><div class="rack-cell">${cell}</div><div class="rack-lane"${lane ? ` data-lane="${escapeHtml(lane)}"` : ""}>${extra}</div></div>`;
+    }
+
+    function rowsHtml() {
+      if (focus !== null) {
+        const entry = data && data.sequencers[focus];
+        if (!entry) return `<p class="rack-reason">${escapeHtml(focusReason())}</p>`;
+        const cell = `<span class="rack-path is-i" title="Sequencer path I">I</span><span class="rack-path is-q" title="Sequencer path Q">Q</span><span class="rack-uses" data-rack-uses="${escapeHtml(focus)}"></span>`;
+        return row("ruler", 0, '<span class="rack-axis" data-rack-axis></span>', "ruler") + row("path", 0, cell, `seq|${focus}`);
+      }
+      // Without waveform memory there is nothing to place in time, so the rack is only the hierarchy.
+      const rows = data ? [row("ruler", 0, '<span class="rack-axis" data-rack-axis></span>', "ruler")] : [];
+      for (const cluster of tree) {
+        const clusterName = cluster.name || "Cluster";
+        const clusterKey = `c|${cluster.name}`;
+        const moduleCount = `${cluster.modules.length} module${cluster.modules.length === 1 ? "" : "s"}`;
+        rows.push(row("cluster", 0, `${toggle(clusterKey, clusterName)}<strong>${escapeHtml(clusterName)}</strong><span class="rack-sub">${moduleCount}</span>`));
+        if (collapsed.has(clusterKey)) continue;
+        for (const module of cluster.modules) {
+          const name = moduleLabel(module.id);
+          const moduleKey = `m|${module.id}`;
+          let reason = "";
+          const drawn = !module.type || DRAWN_MODULE_TYPES.has(module.type.toUpperCase().replace("_", "-"));
+          if (!drawn) reason = `Q1Lens does not draw ${module.type} outputs. Select a sequencer to inspect its state.`;
+          else if (!module.ports.length && module.id) reason = "No output routing for this module. List it under modules in q1timeline.yml to draw its ports.";
+          rows.push(row("module", 1, `${toggle(moduleKey, name)}<strong>${escapeHtml(name)}</strong><span class="rack-sub">${escapeHtml(module.type)}</span>`, "", reason ? `<p class="rack-reason">${escapeHtml(reason)}</p>` : ""));
+          if (collapsed.has(moduleKey)) continue;
+          for (const port of module.ports) {
+            const portKey = `p|${module.id}|${port.port}`;
+            const routes = Object.entries(port.routes || {});
+            const lo = module.lo[port.port];
+            const extra = port.kind === "rf" ? `complex envelope${Number.isFinite(lo) ? `, LO ${Number((lo / 1e9).toPrecision(6))} GHz` : ""}` : port.offset ? `offset ${compactNumber(port.offset)} of full scale` : "";
+            rows.push(row("port", 2, `${routes.length ? toggle(portKey, `what feeds ${name} ${portLabel(port.port)}`) : '<span class="rack-toggle-gap"></span>'}<strong>${escapeHtml(portLabel(port.port))}</strong><span class="rack-sub">${escapeHtml(port.port)}</span>${extra ? `<span class="rack-extra">${escapeHtml(extra)}</span>` : ""}<span class="rack-clips" data-rack-clips="${port.number}"></span>`, `port|${port.number}`));
+            if (collapsed.has(portKey)) continue;
+            for (const [seq, path] of routes) rows.push(row("path", 3, sequencerCell(seq, path), `path|${port.number}|${seq}`));
+          }
+          // A sequencer without a port still shows both of its paths when its output is modeled.
+          for (const seq of module.loose) {
+            const modeled = drawn && output.sequencers && output.sequencers[seq.id];
+            rows.push(row("path", 2, sequencerCell(seq.id, modeled ? "IQ" : ""), drawn ? `seq|${seq.id}` : ""));
+          }
+        }
+      }
+      if (!sequencers.length) rows.push('<p class="hardware-empty">No sequencers are available in this analysis.</p>');
+      return rows.join("");
+    }
+
+    function ruler() {
+      const range = view.t1 - view.t0;
+      const { unit, scale } = timeScale(range);
+      const step = tickStep(range, width / 96);
+      let ticks = "";
+      const moved = shift();
+      for (let time = Math.ceil((view.t0 - moved) / step) * step; time <= view.t1 - moved; time += step) {
+        const at = x(time + moved).toFixed(1);
+        // Labels at either end stay inside the lane instead of being cut in half.
+        const anchor = x(time + moved) < 14 ? "start" : x(time + moved) > width - 14 ? "end" : "middle";
+        ticks += `<line class="rack-tick" x1="${at}" x2="${at}" y1="15" y2="22"></line><text x="${at}" y="11" text-anchor="${anchor}">${escapeHtml(String(Number((time / scale).toPrecision(9))))}</text>`;
+      }
+      return { unit, svg: `<svg class="rack-ruler" width="${width}" height="22" viewBox="0 0 ${width} 22" aria-hidden="true">${ticks}</svg>` };
+    }
+
+    function parameters() {
+      const list = data && data.parameters || output.parameters || [];
+      const key = JSON.stringify([list, live === "off", Object.keys(trial).length > 0]);
+      if (paramsKey !== key) {
+        paramsKey = key;
+        const focused = host.ownerDocument.activeElement?.dataset?.rackParam;
+        const editable = live !== "off";
+        const said = { project: "set by the project", assumed: "assumed", trial: "a value you are trying" };
+        setHtml(part.params, list.map((item) => {
+          const name = escapeHtml(item.name);
+          const value = escapeHtml(item.value ?? "");
+          const control = editable
+            ? `<input type="number" step="1" data-rack-param="${name}" value="${value}" style="width:${Math.max(5, String(item.value ?? "").length + 4)}ch" aria-label="${name}, ${said[item.source]}">`
+            : `<output>${value}</output>`;
+          const tag = item.source === "project" ? "" : `<span class="rack-param-source">${item.source === "assumed" ? "assumed" : "trying"}</span>`;
+          return `<label class="rack-param is-${item.source}" title="${name} is ${said[item.source]}${item.roles?.length ? `. Sets ${listNames(item.roles)}` : ""}"><span class="rack-param-name">${name} =</span>${control}${tag}</label>`;
+        }).join("") + (Object.keys(trial).length ? '<button type="button" data-rack-action="reset-params">Use project values</button>' : ""));
+        if (focused) part.params.querySelector(`[data-rack-param="${CSS.escape(focused)}"]`)?.focus();
+      }
+      const assumed = list.filter((item) => item.source === "assumed").map((item) => item.name);
+      part.assumed.hidden = !assumed.length;
+      if (assumed.length) {
+        const one = assumed.length === 1;
+        setText(part.assumed, `${listNames(assumed)} ${one ? "has" : "have"} no value in this project. The rack draws ${one ? "it with an assumed value" : "them with assumed values"}, marked in amber.${live !== "off" ? " Type a value to try another." : ""}`);
+      }
+      return new Set(assumed);
+    }
+
+    function draw() {
+      frame = undefined;
+      if (destroyed) return;
+      const key = JSON.stringify([focus, focus !== null && hasLanes(), ...collapsed]);
+      if (rowsKey !== key) { rowsKey = key; part.rows.innerHTML = rowsHtml(); }
+      host.classList.toggle("is-focus", focus !== null);
+      host.classList.toggle("is-bare", focus !== null && !hasLanes());
+      const firstLane = part.rows.querySelector(".rack-lane");
+      const measured = firstLane ? Math.floor(firstLane.clientWidth) : 0;
+      width = Math.max(120, measured || 640);
+      gutter = firstLane ? firstLane.offsetLeft : 0;
+      const assumed = parameters();
+      const drawn = ruler();
+      for (const node of part.rows.querySelectorAll("[data-lane]")) {
+        setHtml(node, node.dataset.lane === "ruler" ? drawn.svg : laneHtml(node.dataset.lane));
+      }
+      const axis = part.rows.querySelector("[data-rack-axis]");
+      if (axis) setText(axis, `Time in ${drawn.unit}`);
+      for (const node of part.rows.querySelectorAll("[data-rack-uses]")) {
+        const entry = data && data.sequencers[node.dataset.rackUses];
+        const names = new Set();
+        for (const item of [...(entry?.intervals || []), ...(entry?.repeats || [])]) for (const name of item.assumed) if (assumed.has(name)) names.add(name);
+        setText(node, names.size ? `assumes ${[...names].sort().join(", ")}` : "");
+      }
+      for (const node of part.rows.querySelectorAll("[data-rack-clips]")) {
+        const clips = data && data.ports[Number(node.dataset.rackClips)]?.clip_bins?.length;
+        setText(node, clips ? data.exact ? "clips at full scale" : "can reach full scale" : "");
+      }
+      setText(part.range, `${formatTime(view.t0 - shift())} to ${formatTime(view.t1 - shift())}`);
+      const remarks = [];
+      if (data && !data.exact) remarks.push("This span holds more samples than fit on screen, so each column shows the range the output covers there, before any digital filter. Zoom in to see every sample.");
+      if (liveIssue) remarks.push(liveIssue);
+      part.note.hidden = !remarks.length;
+      setText(part.note, remarks.join(" "));
+      host.querySelector(".rack-zoom").hidden = !data;
+      renderCursor();
+    }
+
+    function schedule() {
+      if (frame === undefined && !destroyed) frame = root.requestAnimationFrame(draw);
+    }
+
+    function renderCursor() {
+      const time = context.axisTime();
+      const at = x(time);
+      const visible = data && Number.isFinite(at) && at >= 0 && at <= width;
+      part.cursor.hidden = !visible;
+      if (visible) part.cursor.style.left = `${(gutter + at).toFixed(1)}px`;
+      for (const node of part.rows.querySelectorAll("[data-rack-status]")) {
+        const status = context.status(node.dataset.rackStatus);
+        node.classList.toggle("is-active", status.active);
+        node.parentElement.title = status.title;
+      }
+      for (const node of part.rows.querySelectorAll("[data-rack-state]")) {
+        const status = context.status(node.dataset.rackState);
+        setText(node, status.state);
+        node.classList.toggle("is-error", status.error);
+      }
+    }
+
+    function covered() {
+      // The embedded overview already holds every sample of a short output.
+      return data && data.exact && data.bins === data.t1 - data.t0 && view.t0 >= data.t0 && view.t1 <= data.t1 + 1;
+    }
+
+    function request(force) {
+      if (live === "off" || !options.onRequestOutputWindow || !data) return;
+      if (!force && !Object.keys(trial).length && covered()) return;
+      root.clearTimeout(requestTimer);
+      requestTimer = root.setTimeout(() => {
+        const t0 = Math.floor(view.t0);
+        const mine = ++token;
+        options.onRequestOutputWindow({ token: mine, t0, t1: Math.max(t0 + 1, Math.ceil(view.t1)), bins: Math.max(64, Math.min(1600, Math.round(width))), params: { ...trial } });
+        root.clearTimeout(timeoutTimer);
+        timeoutTimer = root.setTimeout(() => {
+          if (mine !== token || live === "on") return;
+          live = "off";
+          liveIssue = "Live sampling did not answer. The rack shows the overview stored with this analysis.";
+          schedule();
+        }, 8000);
+      }, force ? 0 : 90);
+    }
+
+    function receive(message) {
+      if (destroyed || !message || message.token !== token) return;
+      root.clearTimeout(timeoutTimer);
+      if (message.error || !message.window) {
+        liveIssue = message.error || "Live sampling is unavailable.";
+        if (live === "unknown") live = "off";
+      } else {
+        // A view that showed the whole output keeps showing all of it when a value changes its length.
+        const full = fullView();
+        const whole = view.t0 <= full.t0 && view.t1 >= full.t1;
+        const grown = message.window.extent.t0 !== extent.t0 || message.window.extent.t1 !== extent.t1;
+        live = "on";
+        liveIssue = "";
+        data = message.window;
+        extent = data.extent;
+        if (whole && grown) { view = fullView(); request(true); }
+        clampView();
+        context.received();
+      }
+      schedule();
+    }
+
+    function changeView(next) {
+      view = next;
+      clampView();
+      schedule();
+      request(false);
+      context.changed();
+    }
+
+    function zoom(factor, anchor = (view.t0 + view.t1) / 2) {
+      changeView({ t0: anchor - (anchor - view.t0) * factor, t1: anchor + (view.t1 - anchor) * factor });
+    }
+
+    function pan(fraction) {
+      const shift = (view.t1 - view.t0) * fraction;
+      changeView({ t0: view.t0 + shift, t1: view.t1 + shift });
+    }
+
+    function timeAt(event) {
+      const lane = part.rows.querySelector(".rack-lane");
+      if (!lane) return undefined;
+      const offset = event.clientX - lane.getBoundingClientRect().left;
+      return view.t0 + Math.max(0, Math.min(width, offset)) / width * (view.t1 - view.t0);
+    }
+
+    function onClick(event) {
+      const node = event.target.closest("[data-rack-toggle], [data-rack-inspect], [data-rack-action], [data-rack-event], .rack-lane");
+      if (!node || !host.contains(node)) return;
+      if (node.dataset.rackToggle !== undefined) {
+        const key = node.dataset.rackToggle;
+        if (collapsed.has(key)) collapsed.delete(key); else collapsed.add(key);
+        draw();
+        part.rows.querySelector(`[data-rack-toggle="${CSS.escape(key)}"]`)?.focus();
+        context.changed();
+        return;
+      }
+      if (node.dataset.rackInspect !== undefined) { context.inspect(node.dataset.rackInspect); return; }
+      if (node.dataset.rackEvent !== undefined) { context.selectEvent(node.dataset.rackEvent, Number(node.dataset.rackTime)); return; }
+      if (node.dataset.rackAction === "zoom-in") { zoom(0.5); return; }
+      if (node.dataset.rackAction === "zoom-out") { zoom(2); return; }
+      if (node.dataset.rackAction === "fit") { changeView(fullView()); return; }
+      if (node.dataset.rackAction === "reset-params") { trial = {}; context.changed(); request(true); schedule(); return; }
+      if (node.classList.contains("rack-lane") && data && !drag?.moved) {
+        const time = timeAt(event);
+        if (time !== undefined) context.setAxisTime(Math.round(time));
+      }
+    }
+
+    function onChange(event) {
+      const name = event.target.dataset?.rackParam;
+      if (name === undefined) return;
+      const value = Number(event.target.value);
+      if (event.target.value === "" || !Number.isSafeInteger(value)) delete trial[name];
+      else trial[name] = value;
+      context.changed();
+      request(true);
+    }
+
+    function onWheel(event) {
+      if (!data || !event.target.closest(".rack-rows")) return;
+      if (event.ctrlKey || event.metaKey) {
+        event.preventDefault();
+        zoom(event.deltaY > 0 ? 1.25 : 0.8, timeAt(event));
+      } else if (event.shiftKey || Math.abs(event.deltaX) > Math.abs(event.deltaY)) {
+        event.preventDefault();
+        pan((event.deltaX || event.deltaY) / Math.max(1, width));
+      }
+    }
+
+    function onKeyDown(event) {
+      // One tab stop per lane; the arrow keys walk its intervals.
+      if (event.target.classList?.contains("rack-tag") && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
+        let next = event.target;
+        do next = event.key === "ArrowRight" ? next.nextElementSibling : next.previousElementSibling;
+        while (next && !next.classList.contains("rack-tag"));
+        if (next) { event.preventDefault(); next.focus(); }
+        return;
+      }
+      if (event.target !== part.body || !data) return;
+      const actions = { ArrowLeft: () => pan(-0.1), ArrowRight: () => pan(0.1), "+": () => zoom(0.5), "=": () => zoom(0.5), "-": () => zoom(2), Home: () => changeView(fullView()) };
+      if (!actions[event.key]) return;
+      event.preventDefault();
+      actions[event.key]();
+    }
+
+    function scrub(event) {
+      const time = timeAt(event);
+      if (time !== undefined) context.setAxisTime(Math.round(time));
+    }
+
+    // Dragging the ruler pans; pressing or dragging on a lane places the time cursor.
+    function onPointerDown(event) {
+      if (!data || event.button !== 0) return;
+      if (event.target.closest('[data-lane="ruler"]')) {
+        drag = { x: event.clientX, t0: view.t0, t1: view.t1, moved: false };
+      } else if (event.target.closest(".rack-lane[data-lane]") && !event.target.closest(".rack-tag")) {
+        scrubbing = true;
+        scrub(event);
+      } else return;
+      part.rows.setPointerCapture?.(event.pointerId);
+    }
+
+    function onPointerMove(event) {
+      if (scrubbing) { scrub(event); return; }
+      if (!drag) return;
+      const shift = (drag.x - event.clientX) / Math.max(1, width) * (drag.t1 - drag.t0);
+      if (Math.abs(event.clientX - drag.x) > 2) drag.moved = true;
+      if (drag.moved) changeView({ t0: drag.t0 + shift, t1: drag.t1 + shift });
+    }
+
+    function onPointerUp() {
+      scrubbing = false;
+      if (drag) root.setTimeout(() => { drag = undefined; }, 0);
+    }
+
+    host.addEventListener("click", onClick);
+    host.addEventListener("change", onChange);
+    host.addEventListener("wheel", onWheel, { passive: false });
+    host.addEventListener("keydown", onKeyDown);
+    part.rows.addEventListener("pointerdown", onPointerDown);
+    part.rows.addEventListener("pointermove", onPointerMove);
+    part.rows.addEventListener("pointerup", onPointerUp);
+    part.rows.addEventListener("pointercancel", onPointerUp);
+    const observer = typeof root.ResizeObserver === "function" ? new root.ResizeObserver(() => { if (!host.hidden) schedule(); }) : undefined;
+    observer?.observe(part.body);
+    if (Object.keys(trial).length) request(true);
+
+    return {
+      title: host.querySelector('[data-value="overview-title"]'),
+      render() { if (rowsKey === undefined || !width) draw(); else renderCursor(); },
+      redraw: draw,
+      receive,
+      hasLanes,
+      // The rack narrows to one sequencer, or widens back to every output with `null`.
+      focus(id) {
+        const next = id === undefined || id === null ? null : String(id);
+        if (focus === next) return;
+        focus = next;
+        draw();
+      },
+      // What one sequencer puts out at a time on the rack axis: the drawn interval and each path's range.
+      at(seq, time) {
+        const entry = data && data.sequencers[seq];
+        if (!entry || entry.issue || !Number.isFinite(time)) return null;
+        const local = time - (entry.time_offset || 0);
+        const column = Math.floor((time - data.t0) * data.bins / Math.max(1, data.t1 - data.t0));
+        const range = (trace) => trace && trace.min && column >= 0 && column < trace.min.length ? [trace.min[column], trace.max[column]] : null;
+        return {
+          interval: entry.intervals.find((item) => item.t0 <= local && local < item.t1) || null,
+          i: range(entry.traces.i), q: range(entry.traces.q), ended: Number.isFinite(entry.end) && local >= entry.end,
+        };
+      },
+      reveal(id) {
+        const cluster = tree.find((entry) => entry.modules.some((module) => module.id === id));
+        if (!cluster) return;
+        collapsed.delete(`c|${cluster.name}`);
+        collapsed.delete(`m|${id}`);
+        draw();
+        part.rows.querySelector(`[data-rack-toggle="${CSS.escape(`m|${id}`)}"]`)?.scrollIntoView({ block: "nearest" });
+      },
+      state() { return { view: [view.t0, view.t1], collapsed: [...collapsed], trial: { ...trial } }; },
+      destroy() {
+        destroyed = true;
+        root.clearTimeout(requestTimer);
+        root.clearTimeout(timeoutTimer);
+        if (frame !== undefined) root.cancelAnimationFrame(frame);
+        observer?.disconnect();
+        host.removeEventListener("click", onClick);
+        host.removeEventListener("change", onChange);
+        host.removeEventListener("wheel", onWheel);
+        host.removeEventListener("keydown", onKeyDown);
+      },
+    };
   }
 
   function replayTrackHtml(prefix) {
@@ -177,14 +734,14 @@
       sequencerId: sequencers.some((seq) => seq.id === initial.sequencerId) ? initial.sequencerId : sequencers[0] && sequencers[0].id,
       time: Number.isFinite(initial.time) ? snapTime(initial.time) : 0,
       basis: initial.basis === "aligned" ? "aligned" : "local",
-      selectedBlock: BLOCKS.some((block) => block.id === initial.selectedBlock) || initial.selectedBlock === "simulation" ? initial.selectedBlock : "registers",
+      selectedBlock: SELECTIONS.has(initial.selectedBlock) ? initial.selectedBlock : "registers",
       signalStage: initial.signalStage || "dac",
       registerFormat: initial.registerFormat === "hex" ? "hex" : "decimal",
       showAllRegisters: initial.showAllRegisters === true,
       replaySpeed: [100, 450, 900].includes(initial.replaySpeed) ? initial.replaySpeed : 450,
       replayScope: sequencers.length > 1 && initial.replayScope !== "sequencer" ? "project" : "sequencer",
       binOffset: Number.isInteger(initial.binOffset) && initial.binOffset >= 0 ? initial.binOffset : 0,
-      level: ["modules", "sequencers", "detail"].includes(initial.level) ? initial.level : "modules",
+      level: initial.level === "detail" ? "detail" : "modules",
       moduleId: modules.includes(initial.moduleId) ? initial.moduleId : undefined,
     };
     const initialSequencer = sequencers.find((seq) => seq.id === state.sequencerId);
@@ -197,9 +754,9 @@
     let destroyed = false;
     let sourceTarget;
     let times = [];
-    let overviewKey;
-    let portScope;
-    let overviewCards = [];
+    let rack;
+    let rackSummaries = new Map();
+    let rowEvents = {};
     let signalChartKey;
     let replayOpen = initial.replayOpen === true && state.level === "detail";
     let preparingReplay = false;
@@ -224,8 +781,8 @@
       <div class="hardware-heading">
         <div class="hardware-title">Hardware <span class="hardware-badge" data-value="trace-kind">Analyzed</span></div>
         <nav class="hardware-breadcrumb" aria-label="Hardware hierarchy">
-          <button type="button" data-level="modules">Modules</button>
-          <span data-crumb="module" aria-hidden="true">/</span><button type="button" data-level="sequencers"></button><span class="hardware-crumb-switch" data-switch="module"><select data-control="module" aria-label="Hardware module" title="Switch module"></select></span>
+          <button type="button" data-level="modules">Outputs</button>
+          <span data-crumb="module" aria-hidden="true">/</span><button type="button" data-crumb-module></button><span class="hardware-crumb-switch" data-switch="module"><select data-control="module" aria-label="Hardware module" title="Switch module"></select></span>
           <span data-crumb="sequencer" aria-hidden="true">/</span><button type="button" data-level="detail"></button><span class="hardware-crumb-switch" data-switch="sequencer"><select data-control="sequencer" aria-label="Hardware sequencer" title="Switch sequencer"></select></span>
         </nav>
         <button type="button" data-action="replay-toggle" data-view="detail" aria-expanded="false">Execution replay</button>
@@ -237,7 +794,7 @@
         <input data-control="scrubber" type="range" step="${timeStep}" aria-label="Explore sequencer state over time">
         <span data-value="basis" class="hardware-muted"></span>
       </div>
-      <p class="hardware-warnings" data-value="warnings" role="status" hidden></p>
+      <div class="hardware-warnings" data-value="warnings" role="status" hidden></div>
       <section class="hardware-replay" data-view="replay" aria-label="Execution replay" hidden>
         <label class="hardware-replay-scope" data-replay-scope>Replay <select data-control="replay-scope" aria-label="Execution replay scope"><option value="project">All sequencers</option><option value="sequencer">Selected sequencer</option></select></label>
         <div class="hardware-replay-toolbar" data-replay-controls>
@@ -253,32 +810,12 @@
         <div data-replay-empty hidden><button type="button" data-action="replay-prepare">Generate execution trace</button></div>
         <p class="hardware-panel-hint" data-replay-note>Replays the recorded execution. Playback speed does not change Q1/RT timing.</p>
       </section>
-      <section class="hardware-overview" data-view="overview" aria-label="Hardware overview">
-        <div class="hardware-overview-heading"><h3 data-value="overview-title" tabindex="-1"></h3><span data-value="overview-hint"></span></div>
-        <div class="hardware-overview-grid" data-value="overview-cards"></div>
-      </section>
-      <section class="hardware-port-lanes" aria-label="Output port lanes" hidden></section>
+      <section class="hardware-rack" data-view="overview" aria-label="Outputs"></section>
       <div class="hardware-body" data-view="detail">
-        <div class="hardware-diagram-panel">
-          <div class="hardware-diagram-scroll" tabindex="0" role="region" aria-label="Sequencer diagram, scroll horizontally to see all blocks">
-          <svg class="hardware-diagram" viewBox="0 0 710 234" role="group" aria-label="Sequencer command and acquisition data flow">
-            <defs><marker id="hardware-arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z"></path></marker></defs>
-            <g class="hardware-links" marker-end="url(#hardware-arrow)">
-              <path d="M154 72H186"></path><path d="M328 72H360"></path><path d="M502 72H534"></path>
-              <path d="M85 144V116"></path><path d="M433 112V140"></path>
-              <path class="hardware-data-link" d="M520 178H552"></path>
-            </g>
-            ${BLOCKS.map((block) => `<g class="hardware-block" data-block="${block.id}" role="button" tabindex="0" aria-label="Inspect ${block.title}" transform="translate(${block.x} ${block.y})"><rect width="${block.w}" height="${block.h}" rx="7"></rect><circle cx="${block.w - 14}" cy="17" r="3"></circle><text class="hardware-block-title" x="12" y="23">${block.title}</text><text class="hardware-block-value" data-block-value="${block.id}" x="12" y="45"></text><title data-block-title="${block.id}">${block.title}</title></g>`).join("")}
-            <text class="hardware-flow-label" x="16" y="17">Command execution</text>
-            <text class="hardware-flow-label" x="556" y="230">Acquisition targets</text>
-          </svg>
-          </div>
-          <div class="hardware-core-status">
-            <button type="button" data-action="q1-event"><span>Q1</span><span data-value="q1-event"></span></button>
-            <button type="button" data-action="rt-event"><span>RT</span><span data-value="rt-event"></span></button>
-          </div>
+        <div class="hardware-state" tabindex="-1" role="group" aria-label="Sequencer state at the selected time">
+          <div class="hardware-rows">${BLOCKS.map(rowHtml).join("")}</div>
+          <p class="hardware-absent" data-value="absent" hidden></p>
           <p class="hardware-execution" data-value="execution" role="status"></p>
-          <div class="hardware-instruction-detail" data-value="instruction-detail"></div>
           <p class="hardware-footnote" data-value="timing-note" hidden></p>
         </div>
         <div class="hardware-inspector">
@@ -323,9 +860,54 @@
     const controls = Object.fromEntries(["module", "sequencer", "time", "scrubber", "register-format", "all-registers", "signal-stage", "replay-speed", "replay-scope"].map((name) => [name, find(`[data-control="${name}"]`)]));
     const values = Object.fromEntries(Array.from(container.querySelectorAll("[data-value]")).map((node) => [node.dataset.value, node]));
     const registerNodes = Array.from(container.querySelectorAll("[data-register]"));
+    const rowNodes = Object.fromEntries(BLOCKS.map((block) => [block.id, find(`[data-row="${block.id}"]`)]));
     const blockNodes = Object.fromEntries(BLOCKS.map((block) => [block.id, find(`[data-block="${block.id}"]`)]));
     const blockValues = Object.fromEntries(BLOCKS.map((block) => [block.id, find(`[data-block-value="${block.id}"]`)]));
     const blockTitles = Object.fromEntries(BLOCKS.map((block) => [block.id, find(`[data-block-title="${block.id}"]`)]));
+    const rowSources = Object.fromEntries(BLOCKS.map((block) => [block.id, find(`[data-row-source="${block.id}"]`)]));
+
+    rack = createRack(find('[data-view="overview"]'), {
+      ir, sequencers, options, initial: initial.rack,
+      axisTime,
+      setAxisTime(time) { setTime(basis() === "aligned" ? time : time - rackOffset()); },
+      // A focused lane is labeled in the time the cursor field shows.
+      labelShift() { return basis() === "aligned" ? 0 : rackOffset(); },
+      inspect(sequencerId) {
+        const sequencer = sequencers.find((seq) => seq.id === sequencerId);
+        if (sequencer) navigate("detail", moduleId(sequencer), sequencer.id);
+      },
+      // An interval in the rack selects its instruction and stays in the rack.
+      selectEvent(eventId, axisTime) {
+        const event = events.get(String(eventId));
+        const sequencer = event && sequencers.find((seq) => seq.id === String(event.sequencer_id));
+        if (!sequencer) return;
+        state.sequencerId = sequencer.id;
+        state.moduleId = moduleId(sequencer);
+        setSequencerOptions();
+        if (Number.isFinite(axisTime)) setTime(basis() === "aligned" ? axisTime : axisTime - rackOffset());
+        else render();
+        if (options.onSelectEvent) options.onSelectEvent(String(event.id));
+      },
+      status(sequencerId) {
+        const summary = rackSummaries.get(sequencerId);
+        if (!summary) return { active: false, title: "", state: "", error: false };
+        const command = summary.rt.event || summary.q1.event;
+        const execution = index.execution[sequencerId];
+        // A run that did not complete is worth reading without opening the sequencer.
+        const unfinished = execution && execution.status && execution.status !== "completed";
+        return {
+          active: summary.q1.status === "active" || summary.rt.status === "active",
+          title: `Q1 ${statusLabel(summary.q1.status)}, RT ${statusLabel(summary.rt.status)}${command ? `, ${eventLabel(command)}` : ""}\n${sentence(executionLabel(execution, summary.terminal, true))}`,
+          state: unfinished ? statusLabel(execution.status) : "",
+          error: Boolean(unfinished && execution.status === "error"),
+        };
+      },
+      changed() { notify(); },
+      // Newly sampled output changes what the output row reads at the cursor.
+      received() {
+        if (state.level === "detail" && snapshot && !replayOpen) renderOutput(snapshot.awg.filter((entry) => entry.event));
+      },
+    });
 
     function text(node, value) {
       const next = String(value);
@@ -337,7 +919,7 @@
     }
 
     function notify() {
-      if (options.onStateChange) options.onStateChange({ ...state, selectedRegister, selectedBin, replayOpen });
+      if (options.onStateChange) options.onStateChange({ ...state, selectedRegister, selectedBin, replayOpen, rack: rack?.state() });
     }
 
     function setSequencerOptions() {
@@ -400,7 +982,7 @@
     }
 
     function updateReplayTrace() {
-      replayTrace = model.executionTrace(index, state.sequencerId, state.basis);
+      replayTrace = model.executionTrace(index, state.sequencerId, basis());
       replayEnd = -Infinity;
       for (const instruction of replayTrace.instructions) {
         replayEnd = Math.max(replayEnd, instruction.end);
@@ -473,7 +1055,7 @@
       const source = instruction && instruction.event.source;
       find('[data-action="replay-source"]').disabled = !(source && source.file && options.onSourceClick);
       const previousTime = replayPosition > 0 ? instructions[replayPosition - 1].end : instructions[0].time;
-      renderReplayTrack(find('[data-replay-single]'), "replay", replayTrace, replayRegisterNames, snapshot, replayPosition, previousTime, state.basis);
+      renderReplayTrack(find('[data-replay-single]'), "replay", replayTrace, replayRegisterNames, snapshot, replayPosition, previousTime, basis());
       const execution = snapshot.execution;
       text(values["replay-status"], finished ? execution && execution.status !== "completed" ? `Recorded trace ended · ${executionLabel(execution, snapshot.terminal)}` : "Execution replay complete" : instruction ? `Instruction ${replayPosition + 1} · ${instruction.event.source && instruction.event.source.raw || eventLabel(instruction.event)}` : "Ready to replay");
     }
@@ -548,7 +1130,7 @@
 
     function stepTimesForView() {
       if (replayOpen && isProjectReplay()) return projectFrames();
-      if (state.level === "detail") return model.stepTimes(index, state.sequencerId, state.basis);
+      if (state.level === "detail") return model.stepTimes(index, state.sequencerId, basis());
       const key = JSON.stringify([state.basis, state.level === "modules" ? null : state.moduleId]);
       if (!overviewSteps.has(key)) {
         const merged = new Set();
@@ -569,11 +1151,13 @@
       find(".hardware-body").hidden = !detail || replayOpen;
       find(".hardware-source").hidden = !detail || replayOpen;
       find('[data-view="replay"]').hidden = !detail || !replayOpen;
-      find('[data-view="overview"]').hidden = detail;
+      // The rack stays on screen for one sequencer, narrowed to that sequencer's lane.
+      find('[data-view="overview"]').hidden = detail && replayOpen;
+      rack.focus(detail ? state.sequencerId : null);
       // A switcher appears beside its crumb only when there is a sibling to switch to.
       find('[data-switch="module"]').hidden = state.level === "modules" || controls.module.options.length < 2;
       find('[data-switch="sequencer"]').hidden = !detail || controls.sequencer.options.length < 2;
-      const moduleCrumb = find('[data-level="sequencers"]');
+      const moduleCrumb = find("[data-crumb-module]");
       const sequencerCrumb = find('[data-level="detail"]');
       text(moduleCrumb, moduleLabel(state.moduleId));
       moduleCrumb.title = state.moduleId || "Module assignment is not specified in this project";
@@ -591,61 +1175,32 @@
     }
 
     function renderOverview() {
-      const showingModules = state.level === "modules";
-      const visibleSequencers = sequencers.filter((seq) => showingModules || moduleId(seq) === state.moduleId);
-      const summaries = new Map(visibleSequencers.map((seq) => [seq.id, model.summarize(index, seq.id, state.time, state.basis)]));
-      text(values["overview-title"], showingModules ? "Modules" : `${moduleLabel(state.moduleId)} · Sequencers`);
-      values["overview-hint"].hidden = true;
-      const key = showingModules ? "modules" : `sequencers:${state.moduleId}`;
-      if (overviewKey !== key) {
-        overviewKey = key;
-        const cards = showingModules ? modules.map((id) => {
-          const children = sequencers.filter((seq) => moduleId(seq) === id);
-          return `<button type="button" class="hardware-module-card" data-module-card="${escapeHtml(id)}" aria-label="Open ${escapeHtml(moduleLabel(id))}: ${children.length} sequencer${children.length === 1 ? "" : "s"}">
-            <span class="hardware-card-top"><strong class="hardware-card-name">${escapeHtml(moduleLabel(id))}</strong><span class="hardware-card-count">${children.length} sequencer${children.length === 1 ? "" : "s"}</span></span>
-            <span class="hardware-module-slots">${children.slice(0, 6).map((seq) => `<span class="hardware-module-slot" data-preview-sequencer="${escapeHtml(seq.id)}"><i aria-hidden="true"></i>${escapeHtml(seq.label || seq.id)}</span>`).join("")}${children.length > 6 ? `<span class="hardware-module-more">+${children.length - 6} more</span>` : ""}</span>
-            <span class="hardware-card-status" data-module-status></span>
-          </button>`;
-        }) : visibleSequencers.map((seq) => `<button type="button" class="hardware-sequencer-card" data-sequencer-card="${escapeHtml(seq.id)}" aria-label="Inspect sequencer ${escapeHtml(seq.label || seq.id)}">
-          <span class="hardware-card-top"><strong class="hardware-card-name">${escapeHtml(seq.label || seq.id)}</strong><span class="hardware-card-selection" data-card-selection>Selected</span></span>
-          <span class="hardware-card-cores"><span data-card-core="q1"><span>Q1 core</span><strong data-card-status="q1"></strong></span><span class="hardware-card-core-arrow" aria-hidden="true">→</span><span data-card-core="rt"><span>RT core</span><strong data-card-status="rt"></strong></span></span>
-          <span class="hardware-card-status" data-sequencer-command></span>
-          <span class="hardware-card-execution" data-sequencer-execution></span>
-        </button>`);
-        html(values["overview-cards"], cards.join("") || '<p class="hardware-empty">No sequencers are available in this analysis.</p>');
-        overviewCards = Array.from(values["overview-cards"].querySelectorAll("[data-module-card], [data-sequencer-card]"));
-      }
-      for (const card of overviewCards) {
-        if (card.dataset.moduleCard !== undefined) {
-          const children = visibleSequencers.filter((seq) => moduleId(seq) === card.dataset.moduleCard);
-          const active = children.filter((seq) => { const summary = summaries.get(seq.id); return summary.q1.status === "active" || summary.rt.status === "active"; }).length;
-          const uncertain = children.filter((seq) => { const summary = summaries.get(seq.id); return summary.q1.status === "unknown" || summary.rt.status === "unknown"; }).length;
-          text(card.querySelector("[data-module-status]"), `${active} executing${uncertain ? ` · ${uncertain} unknown` : ""} · at ${state.time} ns`);
-          card.classList.toggle("is-selected", card.dataset.moduleCard === state.moduleId);
-          card.querySelectorAll("[data-preview-sequencer]").forEach((node) => {
-            const summary = summaries.get(node.dataset.previewSequencer);
-            const active = summary.q1.status === "active" || summary.rt.status === "active";
-            node.classList.toggle("is-active", active);
-            node.title = `Q1: ${statusLabel(summary.q1.status)} · RT: ${statusLabel(summary.rt.status)}`;
-          });
-        } else {
-          const summary = summaries.get(card.dataset.sequencerCard);
-          const selected = card.dataset.sequencerCard === state.sequencerId;
-          card.classList.toggle("is-selected", selected);
-          card.querySelector("[data-card-selection]").hidden = !selected;
-          for (const core of ["q1", "rt"]) {
-            text(card.querySelector(`[data-card-status="${core}"]`), statusLabel(summary[core].status));
-            card.querySelector(`[data-card-core="${core}"]`).classList.toggle("is-active", summary[core].status === "active");
-          }
-          const command = summary.rt.event || summary.q1.event;
-          text(card.querySelector("[data-sequencer-command]"), command ? eventLabel(command) : "No resolved command at this time");
-          const cardExecution = card.querySelector("[data-sequencer-execution]");
-          text(cardExecution, sentence(executionLabel(index.execution[card.dataset.sequencerCard], summary.terminal)));
-          cardExecution.title = executionLabel(index.execution[card.dataset.sequencerCard], summary.terminal, true);
-          card.title = `Q1: ${statusLabel(summary.q1.status)} · RT: ${statusLabel(summary.rt.status)}${command ? ` · ${eventLabel(command)}` : ""}`;
-        }
-      }
-      return [...new Set([...summaries.values()].flatMap((summary) => summary.warnings || []))];
+      rackSummaries = new Map(sequencers.map((seq) => [seq.id, model.summarize(index, seq.id, state.time, state.basis)]));
+      rack.render();
+      return [...new Set([...rackSummaries.values()].flatMap((summary) => summary.warnings || []))];
+    }
+
+    function rackOffset() {
+      return Number((ir.output?.time_offsets || {})[state.sequencerId]) || 0;
+    }
+
+    function axisTime() {
+      return basis() === "aligned" ? state.time : state.time + rackOffset();
+    }
+
+    // A sequencer whose start relative to the others is unknown has no place on the shared clock.
+    // Its own view reads its own clock instead of reporting every state as unknown.
+    function ownClock() {
+      return state.level === "detail" && state.basis === "aligned" && alignmentUnknown();
+    }
+
+    function basis() {
+      return ownClock() ? "local" : state.basis;
+    }
+
+    // The basis a sequencer's own view will use, before that view is open.
+    function detailBasis(sequencerId) {
+      return state.basis === "aligned" && alignmentUnknown(String(sequencerId)) ? "local" : state.basis;
     }
 
     function navigate(level, module, sequencer) {
@@ -657,18 +1212,19 @@
       state.level = level;
       setSequencerOptions();
       render();
-      const focusTarget = level === "detail" ? replayOpen ? find('[data-action="replay-toggle"]') : find(".hardware-diagram-scroll") : values["overview-title"];
+      const focusTarget = level === "detail" ? replayOpen ? find('[data-action="replay-toggle"]') : find(".hardware-state") : rack.title;
       focusTarget.focus({ preventScroll: true });
     }
 
     function zoomOut() {
       if (state.level === "modules") return;
-      navigate(state.level === "detail" ? "sequencers" : "modules");
+      navigate("modules");
     }
 
+    // A tab is offered only when the program has something to put in it.
     function activeTab() {
-      if (["acquisition", "bins"].includes(state.selectedBlock)) return "bins";
-      if (state.selectedBlock === "simulation" || state.selectedBlock === "queue" && snapshot.simulation) return "simulation";
+      if (["acquisition", "bins"].includes(state.selectedBlock)) return snapshot.program.acquires ? "bins" : "registers";
+      if (["simulation", "queue"].includes(state.selectedBlock)) return snapshot.simulation ? "simulation" : "registers";
       return ["registers", "q1"].includes(state.selectedBlock) ? "registers" : "parameters";
     }
 
@@ -691,7 +1247,7 @@
       if (register.confidence) parts.push(statusLabel(register.confidence));
       const reason = meta.reason || register.value && typeof register.value === "object" && (register.value.reason || register.value.source || register.value.expr);
       if (reason && !value.includes(String(reason))) parts.push(String(reason));
-      if (register.time !== undefined) parts.push(`${hasRegisterWrite(register) && !meta.invalidated ? "readable at" : "state unknown since"} ${display(register.time)} ns (${state.basis})`);
+      if (register.time !== undefined) parts.push(`${hasRegisterWrite(register) && !meta.invalidated ? "readable at" : "state unknown since"} ${display(register.time)} ns (${basis()})`);
       else parts.push("no register write at this time");
       if (Array.isArray(meta.branch_assumptions) && meta.branch_assumptions.length) parts.push(`assumptions: ${meta.branch_assumptions.map((entry) => `${entry.branch_id}: ${entry.assumed_branch_path}`).join(", ")}`);
       if (register.source && register.source.file) parts.push(`${shortSource ? baseName(register.source.file) : register.source.file}:${register.source.line || 1}`);
@@ -702,8 +1258,8 @@
     function registerInput(name, value, writerId) {
       const label = `${name} = ${registerValue({ value, known: model.numericValue(value) !== undefined })}`;
       const event = events.get(String(writerId));
-      const writer = event && model.registerWrite(index, event.sequencer_id, name, writerId, state.basis);
-      return writer ? `<button type="button" data-event="${escapeHtml(writerId)}" data-writer-register="${escapeHtml(name)}" title="Inspect ${escapeHtml(name)} when readable at ${writer.time} ns (${state.basis}) and its source instruction">${escapeHtml(label)} ↗</button>` : `<span>${escapeHtml(label)}</span>`;
+      const writer = event && model.registerWrite(index, event.sequencer_id, name, writerId, basis());
+      return writer ? `<button type="button" data-event="${escapeHtml(writerId)}" data-writer-register="${escapeHtml(name)}" title="Inspect ${escapeHtml(name)} when readable at ${writer.time} ns (${basis()}) and its source instruction">${escapeHtml(label)} ↗</button>` : `<span>${escapeHtml(label)}</span>`;
     }
 
     function renderRegisters() {
@@ -734,7 +1290,7 @@
       const start = Math.max(0, steps.length - 8);
       const trace = steps.length ? `<details><summary>Calculation steps${start ? ` (last 8 of ${steps.length})` : ` (${steps.length})`}</summary><ol>${steps.slice(start).map((step, offset) => `<li><code>${escapeHtml(step.expression)} = ${escapeHtml(valueText(step.value))}</code>${step.source && step.source.file ? ` <button type="button" data-provenance-step="${start + offset}" title="${escapeHtml(step.source.file)}:${escapeHtml(step.source.line || 1)}"${options.onSourceClick ? "" : " disabled"}>${escapeHtml(baseName(step.source.file))}:${escapeHtml(step.source.line || 1)}</button>` : ""}</li>`).join("")}</ol></details>` : "";
       const inputEvent = provenance.input_event_id ? `<p><button type="button" data-event="${escapeHtml(provenance.input_event_id)}" data-communication-event="${escapeHtml(provenance.input_event_id)}">Show received input that supplied this value</button></p>` : "";
-      const history = model.registerHistory(index, state.sequencerId, selectedRegister, state.time, state.basis);
+      const history = model.registerHistory(index, state.sequencerId, selectedRegister, state.time, basis());
       // A register that is never written has nothing to page through: one line says so.
       const unwritten = history.total === 0 && (!register || !hasRegisterWrite(register) && register.time === undefined);
       find('[data-view="register-pager"]').hidden = unwritten;
@@ -753,14 +1309,14 @@
 
     function renderInstruction() {
       const event = snapshot.q1.event;
-      if (!event) { text(values["instruction-detail"], "Q1 operands are unavailable at this cursor."); return; }
+      values["instruction-detail"].hidden = !event;
+      if (!event) { text(values["instruction-detail"], ""); return; }
       const meta = event.meta || {};
       const reads = meta.register_reads;
       const parts = [];
-      let flagsRecorded = false;
       if (Number.isInteger(meta.execution_index)) parts.push(`<strong>Instruction ${meta.execution_index + 1}</strong>`);
       if (reads && Object.keys(reads).length) parts.push(`<span>Read at issue: ${Object.entries(reads).map(([name, value]) => {
-        const writer = model.registerAt(index, event.sequencer_id, name, model.eventTime(index, event, state.basis), state.basis);
+        const writer = model.registerAt(index, event.sequencer_id, name, model.eventTime(index, event, basis()), basis());
         return registerInput(name, value, writer && writer.eventId);
       }).join(" · ")}</span>`);
       if (meta.input_event_ids && meta.input_event_ids.length) parts.push(`<span>Received input: ${meta.input_event_ids.map((id) => `<button type="button" data-event="${escapeHtml(id)}">${escapeHtml(id)}</button>`).join(" ")}</span>`);
@@ -770,10 +1326,11 @@
         const flags = (value) => value ? ["zf", "nf", "cf", "of"].map((name) => `${name.toUpperCase()}=${value[name] === undefined ? "?" : Number(value[name])}`).join(" ") : "unknown";
         const after = clipped ? "unobserved" : flags(meta.flags_after);
         // "unknown → unknown" carries no information; a known side or an observation cutoff does.
-        flagsRecorded = true;
         if (clipped || meta.flags_before || meta.flags_after) parts.push(`<span>Flags before → after: ${escapeHtml(flags(meta.flags_before))} → ${escapeHtml(after)}</span>`);
       }
-      html(values["instruction-detail"], parts.join("") || (flagsRecorded ? "" : '<span>Register reads and flags were not recorded for this instruction.</span>'));
+      // An instruction with no recorded reads or flags has nothing to add under its row.
+      html(values["instruction-detail"], parts.join(""));
+      values["instruction-detail"].hidden = !parts.length;
     }
 
     function renderParameters() {
@@ -784,7 +1341,7 @@
         const cell = (entry, applied) => {
           if (!entry) return '<span class="hardware-muted">—</span>';
           const origin = entry.issueEventId ? ` data-instruction-event="${escapeHtml(entry.issueEventId)}"` : "";
-          const timing = applied && Number.isFinite(entry.appliedAt) ? `<br><small class="hardware-muted">Applied at ${entry.appliedAt} ns (${state.basis})${entry.time !== entry.appliedAt ? ` · RT event at ${entry.time} ns` : ""}</small>` : "";
+          const timing = applied && Number.isFinite(entry.appliedAt) ? `<br><small class="hardware-muted">Applied at ${entry.appliedAt} ns (${basis()})${entry.time !== entry.appliedAt ? ` · RT event at ${entry.time} ns` : ""}</small>` : "";
           return `<button type="button" data-event="${escapeHtml(entry.issueEventId || entry.eventId || "")}"${origin} title="${entry.issueEventId ? "Show parameter instruction" : "Show RT event"}">${escapeHtml(entry.display === undefined ? display(entry.value) : entry.display)}</button>${timing}`;
         };
         return `<tr><th>${escapeHtml(parameter.field)}</th><td>${cell(parameter.pending, false)}</td><td>${cell(parameter.applied, true)}</td></tr>`;
@@ -848,10 +1405,10 @@
       html(controls["signal-stage"], [...stages.keys()].map((stage) => `<option value="${escapeHtml(stage)}">${escapeHtml(statusLabel(stage))}</option>`).join(""));
       controls["signal-stage"].value = state.signalStage || "";
       controls["signal-stage"].disabled = !stages.size;
-      const signal = model.signalAt(index, state.sequencerId, state.signalStage, state.time, state.basis);
+      const signal = model.signalAt(index, state.sequencerId, state.signalStage, state.time, basis());
       if (signal) {
         // Paths are prepared once by the state index; cursor changes read only one sample per path.
-        const chartKey = JSON.stringify([state.sequencerId, state.signalStage, state.basis]);
+        const chartKey = JSON.stringify([state.sequencerId, state.signalStage, basis()]);
         if (signalChartKey !== chartKey) {
           const paths = signal.traces.flatMap((trace) => trace.segments.map((points) => {
             const attributes = `class="hardware-signal-path" data-path="${escapeHtml(trace.path)}"`;
@@ -925,13 +1482,50 @@
       html(values["bin-history"], bin ? `<span>Acquisition ${escapeHtml(bin.acquisitionIndex)} · bin ${escapeHtml(bin.binIndex)}${kind ? ` · ${kind}` : ""} · latest ${bin.history.length} targets</span><div>${bin.history.map((entry) => `<button type="button" data-event="${escapeHtml(entry.eventId)}">${escapeHtml(entry.time)} ns</button>`).join("")}</div>${gate ? `<div>${gate}</div>` : ""}${bin.result === "unknown" ? "<p>No acquisition outcome at this cursor.</p>" : `<p title="${escapeHtml(resultLabel(bin.result, { exact: true }))}">${escapeHtml(resultLabel(bin.result, { units: inlineUnits }))} · ${resultTimeLabel(bin.result)}<br>${escapeHtml(inputSource(bin.result.input_source || bin.result.source))}</p>`}` : '<span>Select a bin number to inspect its target history.</span>');
     }
 
-    function setBlock(id, value, active, detail) {
-      text(blockValues[id], short(value));
-      text(blockTitles[id], detail || value);
-      blockNodes[id].classList.toggle("is-active", !!active);
-      blockNodes[id].classList.toggle("is-selected", state.selectedBlock === id);
-      blockNodes[id].setAttribute("aria-pressed", String(state.selectedBlock === id));
-      blockNodes[id].setAttribute("aria-label", `${BLOCKS.find((block) => block.id === id).title}: ${value}. Inspect details.`);
+    function setBlock(id, value, active, detail = "") {
+      if (blockValues[id] && value !== undefined) text(blockValues[id], value);
+      if (blockTitles[id]) { text(blockTitles[id], detail); blockTitles[id].hidden = !detail; }
+      const selected = state.selectedBlock === id;
+      for (const node of [rowNodes[id], blockNodes[id]]) {
+        node.classList.toggle("is-active", !!active);
+        node.classList.toggle("is-selected", selected);
+      }
+      blockNodes[id].setAttribute("aria-pressed", String(selected));
+    }
+
+    function pathValue(label, range) {
+      const formula = label ? `<code>${escapeHtml(label)}</code>` : "";
+      if (!range) return formula || "—";
+      const [low, high] = range;
+      if (low !== high) return `${formula ? `${formula}, ` : ""}from ${escapeHtml(compactNumber(low))} to ${escapeHtml(compactNumber(high))}`;
+      const number = compactNumber(low);
+      return formula && label !== number ? `${formula} = ${escapeHtml(number)}` : escapeHtml(number);
+    }
+
+    // The output row reads the lane above it: the formula of the interval under the cursor and what
+    // each path holds there, as a fraction of full scale. Settings in effect follow on their own line.
+    function renderOutput(plays) {
+      const drawn = rack.at(state.sequencerId, axisTime());
+      if (drawn && (drawn.interval || drawn.i || drawn.q)) {
+        const labels = drawn.interval ? drawn.interval.labels : ["", ""];
+        html(blockValues.awg, ["i", "q"].map((path, number) => `<span class="hardware-path" title="Sequencer path ${path.toUpperCase()}, as a fraction of full scale"><b class="rack-path is-${path}">${path.toUpperCase()}</b> ${pathValue(labels[number], drawn[path])}</span>`).join(""));
+      } else {
+        const unknown = snapshot.awg.some((entry) => entry.status === "unknown");
+        text(blockValues.awg, plays.length ? `${statusLabel(plays[0].status)} · ${eventLabel(plays[0].event)}` : unknown ? "unknown" : "no play command yet");
+      }
+      const lines = [];
+      const assumed = drawn && drawn.interval ? drawn.interval.assumed : [];
+      if (assumed.length) lines.push(`<span class="hardware-assumed">Drawn with assumed ${escapeHtml(listNames(assumed))}</span>`);
+      // One instruction plays on both paths; it is named once.
+      const seen = new Set();
+      const named = (event) => `${eventLabel(event)}|${event.source ? `${event.source.file}:${event.source.line}` : event.id}`;
+      const commands = plays.filter((entry) => !seen.has(named(entry.event)) && seen.add(named(entry.event)));
+      if (drawn && commands.length) lines.push(`<span>Last play: ${commands.map((entry) => `<button type="button" data-event="${escapeHtml(entry.event.id)}" title="Move the cursor to the start of this command">${escapeHtml(eventLabel(entry.event))}</button>`).join(" ")}</span>`);
+      const applied = snapshot.parameters.filter((parameter) => parameter.applied && parameter.applied.known !== false);
+      const pending = snapshot.parameters.filter((parameter) => parameter.pending).length;
+      if (applied.length || pending) lines.push(`<span>${applied.length ? `In effect: ${applied.map((parameter) => `${escapeHtml(parameter.field)} ${escapeHtml(parameter.applied.display === undefined ? display(parameter.applied.value) : parameter.applied.display)}`).join(" · ")}` : "No setting in effect yet"}${pending ? ` · ${pending} pending` : ""}</span>`);
+      html(values["output-detail"], lines.join(""));
+      values["output-detail"].hidden = !lines.length;
     }
 
     function selectedEvent() {
@@ -949,15 +1543,15 @@
         : "Q1 registers advance independently of RT execution. Timing is analytical; RT queue stalls are not modeled. Values are computed from the program, not measured on hardware.";
     }
 
-    function alignmentUnknown() {
-      const alignment = index.alignment[state.sequencerId] || {};
+    function alignmentUnknown(sequencerId = state.sequencerId) {
+      const alignment = index.alignment[sequencerId] || {};
       return alignment.unaligned || alignment.confidence === "unknown" || (alignment.offset !== undefined && model.numericValue(alignment.offset) === undefined);
     }
 
     function render(notifyChange = true) {
       if (destroyed) return;
-      const range = ranges[state.basis];
-      const unavailableAlignment = state.basis === "aligned" && alignmentUnknown();
+      const range = ranges[basis()];
+      const unavailableAlignment = basis() === "aligned" && alignmentUnknown();
       const clampedTime = unavailableAlignment ? state.time : Math.min(range.max, Math.max(range.min, state.time));
       if (state.time !== clampedTime) { state.time = clampedTime; syncReplayPosition(); }
       for (const control of [controls.time, controls.scrubber]) {
@@ -968,46 +1562,52 @@
       }
       controls["register-format"].value = state.registerFormat;
       controls["all-registers"].checked = state.showAllRegisters;
-      text(values.basis, state.basis === "aligned" ? "Aligned time" : "Local time");
+      text(values.basis, basis() === "aligned" ? "Aligned time" : "Local time");
       find('[data-action="previous"]').disabled = !times.length || times[0] >= state.time;
       find('[data-action="next"]').disabled = !times.length || times[times.length - 1] <= state.time;
       const stepScope = state.level === "detail" ? state.sequencerId || "no sequencer" : "visible sequencers";
       find('[data-action="previous"]').title = `Previous state change · ${stepScope}`;
       find('[data-action="next"]').title = `Next state change · ${stepScope}`;
       renderNavigation();
-      if (ir.output?.ports?.length) {
-        const scope = state.level === "modules" ? null : state.moduleId;
-        if (portScope !== scope) {
-          portScope = scope;
-          const target = find(".hardware-port-lanes");
-          const ports = ir.output.ports.filter((p) => scope === null || p.module === scope);
-          target.hidden = !ports.length;
-          html(target, ports.map((port) => portLane(port, ir.output.sequencers)).join(""));
-        }
-      }
+      // Where lanes are drawn they are the scrubber: press or drag on one to move the cursor.
+      controls.scrubber.hidden = rack.hasLanes() && !(replayOpen && state.level === "detail");
       find('[data-action="replay-toggle"]').setAttribute("aria-expanded", String(replayOpen && state.level === "detail"));
       const simulated = sequencers.some((seq) => index.simulation[seq.id]);
       text(values["trace-kind"], simulated ? "Simulated" : sequencers.some((seq) => index.execution[seq.id]?.mode === "playback") ? "Path execution" : "Analyzed");
       values["trace-kind"].title = timingNote(simulated);
-      if (state.level !== "detail") {
-        const warnings = renderOverview();
+      // What holds at this time is said outright. Caveats that hold for the whole run are said once
+      // when there is one, and folded behind a count when there are several.
+      const showWarnings = (warnings, alerts) => {
+        const said = (warning) => escapeHtml(/[.!?]$/.test(warning) ? warning : `${warning}.`);
+        const now = warnings.filter((warning) => alerts.includes(warning));
+        const always = warnings.filter((warning) => !alerts.includes(warning));
+        const open = values.warnings.querySelector("details")?.open ? ' open=""' : "";
         values.warnings.hidden = warnings.length === 0;
-        text(values.warnings, warnings.join(" · "));
+        html(values.warnings, now.map((warning) => `<span class="is-alert">${said(warning)}</span>`).join(" ") +
+          (always.length > 1 ? `<details${open}><summary>${always.length} limits of this analysis</summary><ul>${always.map((warning) => `<li>${said(warning)}</li>`).join("")}</ul></details>`
+            : always.map((warning) => `<span>${said(warning)}</span>`).join("")));
+      };
+      if (state.level !== "detail") {
+        showWarnings(renderOverview(), [...rackSummaries.values()].flatMap((summary) => summary.alerts || []));
         sourceTarget = undefined;
         if (notifyChange) notify();
         return;
       }
-      snapshot = model.snapshot(index, state.sequencerId, state.time, state.basis, { offset: state.binOffset, limit: PAGE_SIZE });
+      snapshot = model.snapshot(index, state.sequencerId, state.time, basis(), { offset: state.binOffset, limit: PAGE_SIZE });
       if (state.binOffset && state.binOffset >= snapshot.bins.total) {
         state.binOffset = 0;
-        snapshot = model.snapshot(index, state.sequencerId, state.time, state.basis, { offset: 0, limit: PAGE_SIZE });
+        snapshot = model.snapshot(index, state.sequencerId, state.time, basis(), { offset: 0, limit: PAGE_SIZE });
       }
       const warnings = snapshot.warnings.map((warning) => typeof warning === "string" ? warning : warning.message || display(warning));
-      values.warnings.hidden = warnings.length === 0;
-      text(values.warnings, warnings.join(" · "));
+      const alerts = [...(snapshot.alerts || [])];
+      if (ownClock()) {
+        alerts.unshift("This sequencer's start relative to the others is unknown, so times here are its own.");
+        warnings.unshift(alerts[0]);
+      }
+      showWarnings(warnings, alerts);
       renderReplay();
       if (replayOpen) { sourceTarget = undefined; if (notifyChange) notify(); return; }
-      const known = snapshot.registers.filter((register) => register.known).length;
+      rack.render();
       text(values.execution, sentence(executionLabel(snapshot.execution, snapshot.terminal)));
       values.execution.title = executionLabel(snapshot.execution, snapshot.terminal, true);
       text(values["trace-kind"], snapshot.simulation ? "Simulated" : snapshot.execution?.mode === "playback" ? "Path execution" : "Analyzed");
@@ -1015,12 +1615,25 @@
       values["trace-kind"].title = values["timing-note"].textContent;
       values.execution.classList.toggle("is-incomplete", !!snapshot.execution && snapshot.execution.status !== "completed");
       renderInstruction();
-      setBlock("registers", `${known} / 64 known`, snapshot.registers.some((register) => register.changed));
-      setBlock("q1", statusLabel(snapshot.q1.status), ["active", "stalled"].includes(snapshot.q1.status), eventLabel(snapshot.q1.event));
-      setBlock("queue", snapshot.simulation ? `${display(snapshot.simulation.queue.depth)} / ${display(snapshot.simulation.queue.capacity)} packets` : "Depth unknown", snapshot.simulation && snapshot.simulation.queue.depth > 0, snapshot.simulation ? "Simulated RT packet queue. Inspect queue stalls, input events and signals." : "RT command queue. Occupancy is unavailable in analytical timing.");
-      setBlock("rt", statusLabel(snapshot.rt.status), snapshot.rt.status === "active", eventLabel(snapshot.rt.event));
+      const simulation = snapshot.simulation;
+      const acquires = snapshot.program.acquires;
+      setBlock("q1", undefined, ["active", "stalled"].includes(snapshot.q1.status));
+      setBlock("rt", undefined, snapshot.rt.status === "active");
+      rowNodes.queue.hidden = !simulation;
+      if (simulation) {
+        const stall = simulation.stall;
+        setBlock("queue", `${display(simulation.queue.depth)} / ${display(simulation.queue.capacity)} packets`, simulation.queue.depth > 0,
+          stall ? `Q1 stalled: ${statusLabel(stall.event.meta.reason)} (${stall.time}–${stall.end} ns)` : "");
+      }
       const plays = snapshot.awg.filter((entry) => entry.event);
-      setBlock("awg", plays.length ? "Last play command" : "No resolved play", false, plays.map((entry) => `Path ${entry.path}: ${eventLabel(entry.event)}`).join(" · ") || "No resolved play command. Waveform duration is not inferred from RT command duration.");
+      setBlock("awg", undefined, plays.some((entry) => entry.status === "active"));
+      renderOutput(plays);
+      rowNodes.acquisition.hidden = !acquires;
+      const absent = [];
+      if (!acquires) absent.push("This program has no acquisitions.");
+      if (!simulation) absent.push("RT queue depth and signals need a simulation run.");
+      text(values.absent, absent.join(" "));
+      values.absent.hidden = !absent.length;
       const acquisition = snapshot.acquisition;
       const activeAcquisition = acquisition.status === "active";
       const integration = acquisition.event?.meta?.acquisition_window;
@@ -1039,13 +1652,25 @@
       }
       const assumed = integration?.source === "instruction_duration_fallback" && integration.status !== "unknown";
       setBlock("acquisition", assumed ? `${acquisitionStatus} (assumed)` : acquisitionStatus,
-        activeAcquisition, acquisitionDetail);
-      setBlock("bins", `${snapshot.bins.total} targets`, activeAcquisition, snapshot.simulation ? "Acquisition targets, completed I/Q and threshold results, with input provenance." : "Acquisition targets and their write history; measured results are unavailable.");
+        activeAcquisition, `${acquisition.event ? `${acquisitionDetail} · ` : ""}${snapshot.bins.total} bin ${snapshot.bins.total === 1 ? "target" : "targets"} so far`);
       for (const core of ["q1", "rt"]) {
-        text(values[`${core}-event`], `${statusLabel(snapshot[core].status)} · ${eventLabel(snapshot[core].event)}`);
-        find(`[data-action="${core}-event"]`).disabled = !snapshot[core].event;
+        const event = snapshot[core].event;
+        text(values[`${core}-event`], `${statusLabel(snapshot[core].status)}${event ? ` · ${eventLabel(event)}` : ""}`);
+        find(`[data-action="${core}-event"]`).disabled = !event;
+      }
+      rowEvents = { q1: snapshot.q1.event, rt: snapshot.rt.event, queue: simulation && simulation.queue.event, awg: plays[0] && plays[0].event, acquisition: acquisition.event };
+      for (const block of BLOCKS) {
+        const source = rowEvents[block.id] && rowEvents[block.id].source;
+        const link = rowSources[block.id];
+        link.hidden = !(source && source.file);
+        if (link.hidden) continue;
+        text(link, `${baseName(source.file)}:${source.line || 1}`);
+        link.title = `Open ${source.file}:${source.line || 1}`;
+        link.disabled = !options.onSourceClick;
       }
       const tab = activeTab();
+      find('[data-tab="bins"]').hidden = !acquires;
+      find('[data-tab="simulation"]').hidden = !simulation;
       container.querySelectorAll("[data-tab]").forEach((node) => {
         const selected = node.dataset.tab === tab;
         node.setAttribute("aria-selected", String(selected));
@@ -1066,8 +1691,9 @@
       text(values["selection-detail"], source && source.file ? `${baseName(source.file)}:${source.line || 1}` : "");
       values["selection-detail"].title = source && source.file ? `${source.file}:${source.line || 1}` : "";
       const sourceButton = find('[data-action="source"]');
+      // Rows link to their own source lines; this bar is for a selected register, bin or row.
+      find(".hardware-source").hidden = !(source && source.file);
       sourceButton.disabled = !(source && source.file && options.onSourceClick);
-      sourceButton.title = source && source.file ? "" : "Select a register or active block to inspect its source instruction.";
       if (notifyChange) notify();
     }
 
@@ -1091,7 +1717,7 @@
     function chooseEvent(eventId, notifyEvent = true) {
       const event = events.get(String(eventId));
       if (!event) return;
-      const time = model.eventTime(index, event, state.basis);
+      const time = model.eventTime(index, event, detailBasis(event.sequencer_id));
       const seqId = String(event.sequencer_id);
       const sequencer = sequencers.find((seq) => seq.id === seqId);
       if (!sequencer) return;
@@ -1109,7 +1735,7 @@
     function chooseRegisterWriter(register, eventId) {
       const event = events.get(String(eventId));
       if (!event) return;
-      const writer = model.registerWrite(index, event.sequencer_id, register, eventId, state.basis);
+      const writer = model.registerWrite(index, event.sequencer_id, register, eventId, detailBasis(event.sequencer_id));
       const sequencer = sequencers.find((seq) => seq.id === String(event.sequencer_id));
       if (!writer || !sequencer) return;
       pauseReplay();
@@ -1141,8 +1767,13 @@
     }
 
     function onClick(event) {
-      const node = event.target.closest("[data-action], [data-register], [data-register-time], [data-provenance-step], [data-block], [data-tab], [data-event], [data-bin], [data-module-card], [data-sequencer-card], [data-level]");
+      const node = event.target.closest("[data-action], [data-register], [data-register-time], [data-provenance-step], [data-block], [data-row-source], [data-tab], [data-event], [data-bin], [data-level], [data-crumb-module]");
       if (!node || !container.contains(node)) return;
+      if (node.dataset.rowSource) {
+        const target = rowEvents[node.dataset.rowSource];
+        if (target && options.onSourceClick) options.onSourceClick(target.source, target.id);
+        return;
+      }
       if (node.dataset.action === "replay-toggle") { pauseReplay(); replayOpen = !replayOpen; if (replayOpen && isProjectReplay()) useProjectClock(); times = stepTimesForView(); render(); return; }
       if (node.dataset.action === "replay-prepare") {
         if (!options.onPrepareReplay || preparingReplay) return;
@@ -1169,8 +1800,7 @@
         if (current.q1.event && options.onSourceClick) options.onSourceClick(current.q1.event.source, current.q1.event.id);
         return;
       }
-      if (node.dataset.moduleCard !== undefined) { navigate("sequencers", node.dataset.moduleCard); return; }
-      if (node.dataset.sequencerCard !== undefined) { navigate("detail", state.moduleId, node.dataset.sequencerCard); return; }
+      if (node.dataset.crumbModule !== undefined) { rack.reveal(state.moduleId); navigate("modules"); return; }
       if (node.dataset.level) { navigate(node.dataset.level); return; }
       if (node.dataset.registerTime !== undefined) { setTime(Number(node.dataset.registerTime)); notifySelection(); return; }
       if (node.dataset.provenanceStep !== undefined) {
@@ -1189,7 +1819,7 @@
       if (node.dataset.action === "previous") step(-1);
       if (node.dataset.action === "next") step(1);
       if (node.dataset.action === "register-previous" || node.dataset.action === "register-next") {
-        const history = model.registerHistory(index, state.sequencerId, selectedRegister, state.time, state.basis);
+        const history = model.registerHistory(index, state.sequencerId, selectedRegister, state.time, basis());
         const entry = node.dataset.action === "register-previous" ? history.previous : history.next;
         if (entry) { setTime(entry.time); notifySelection(); }
       }
@@ -1205,7 +1835,9 @@
     function onChange(event) {
       const control = event.target.dataset.control;
       if (control === "module") {
-        navigate("sequencers", controls.module.value);
+        // Another module is chosen from the rack, where its ports and sequencers are listed.
+        rack.reveal(controls.module.value);
+        navigate("modules", controls.module.value);
       }
       if (control === "sequencer") navigate("detail", state.moduleId, controls.sequencer.value);
       if (control === "register-format") { state.registerFormat = controls[control].value; render(); }
@@ -1232,11 +1864,9 @@
         event.preventDefault();
         commitTimeInput();
       }
-      const block = event.target.closest("[data-block]");
-      if (block && (event.key === "Enter" || event.key === " ")) { event.preventDefault(); state.selectedBlock = block.dataset.block; render(); notifySelection(); }
       if (event.target.dataset.tab && ["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
         event.preventDefault();
-        const tabs = Array.from(container.querySelectorAll("[data-tab]"));
+        const tabs = Array.from(container.querySelectorAll("[data-tab]")).filter((tab) => !tab.hidden);
         const current = tabs.indexOf(event.target);
         const next = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : (current + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
         tabs[next].click();
@@ -1275,9 +1905,11 @@
         updateReplayTrace();
         render();
       },
-      getState() { return { ...state, selectedRegister, selectedBin, replayOpen }; },
+      getState() { return { ...state, selectedRegister, selectedBin, replayOpen, rack: rack.state() }; },
+      setOutputWindow(message) { rack.receive(message); },
       destroy() {
         destroyed = true;
+        rack.destroy();
         pauseReplay();
         root.document.removeEventListener("visibilitychange", onVisibilityChange);
         if (frame !== undefined) root.cancelAnimationFrame(frame);

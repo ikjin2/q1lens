@@ -679,6 +679,16 @@ def _analyze_command(args: argparse.Namespace) -> int:
         sequence = config.output_sequence(sequencer, sequence_names.data if sequence_names else None)
         if sequence:
             state.metadata["output_sequence"] = sequence
+            if execution_mode == "analysis" and any(type(value) is int for value in params.values()):
+                # Leave the project's parameters open once more so output formulas keep their names.
+                state.metadata["output_symbolic"] = (interpret_program(
+                    program, sequencer_id=sequencer.id, params={},
+                    waveform_names=sequence_names.waveforms if sequence_names else None,
+                    acquisition_names=sequence_names.acquisitions if sequence_names else None,
+                    branch_policy=config.analysis.branch_policy, branch_assumptions=branch_assumptions,
+                    loop_preview_counts=loop_preview_counts, strict_q1asm=False,
+                    execution_mode="analysis", max_steps=max_steps,
+                ), dict(params))
         states.append(state)
     if execution_mode == "simulation":
         from q1timeline.simulation.runtime import simulate_programs

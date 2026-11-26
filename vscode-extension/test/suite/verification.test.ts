@@ -134,18 +134,30 @@ describe("Verification in VS Code", function () {
       const frame = await frameWith(browser, "#q1timeline-analysis-details");
       const details = frame.locator("#q1timeline-analysis-details");
       if (await details.getAttribute("open") === null) await details.locator(":scope > summary").click();
-      const ports = frame.locator(".hardware-port-lanes");
+      const ports = frame.locator(".hardware-rack");
       await ports.waitFor({ state: "visible" });
-      assert.deepEqual((await ports.locator("header strong").allTextContents()).sort(), ["Mix · out0", "Pulse · out0", "Pulse · out1"]);
-      const drive = ports.locator(".hardware-port-lane").filter({ hasText: "Mix · out0" }).locator("details").filter({ hasText: "drive · path I" });
-      await drive.locator("summary").click();
-      const interval = drive.getByRole("button", { name: "[4, 24) ns", exact: true });
-      const event = await interval.getAttribute("data-event");
+      assert.deepEqual(await ports.locator(".rack-row.is-module strong").allTextContents(), ["Pulse", "Mix"]);
+      assert.deepEqual(await ports.locator(".rack-row.is-port strong").allTextContents(), ["O1", "O2", "O1"]);
+      // Mix O1 is the third port; drive feeds its I path from 4 ns to 24 ns.
+      const interval = ports.locator('[data-lane="path|2|drive"] .rack-tag').nth(1);
+      const event = await interval.getAttribute("data-rack-event");
       assert.ok(event);
       const output = process.env.Q1LENS_EXTENSION_HOST_OUTPUT!;
       await ports.screenshot({ path: join(output, "hardware-ports.png") });
       await interval.click();
       await frame.locator(`.timeline-block.is-selected[data-event-id="${event}"]`).first().waitFor({ state: "attached" });
+      // A typed value travels through the extension to the output session and returns resampled.
+      const range = ports.locator('[data-rack="range"]');
+      await expect(range).toHaveText("0 ns to 140 ns");
+      const count = ports.getByLabel("N, set by the project");
+      await count.fill("6");
+      await count.press("Enter");
+      await expect(range).toHaveText("0 ns to 239 ns");
+      await expect(ports.locator(".rack-param.is-trial")).toContainText("trying");
+      await expect(ports.locator('[data-rack="note"]')).toBeHidden();
+      await ports.screenshot({ path: join(output, "hardware-ports-trial.png") });
+      await ports.getByRole("button", { name: "Use project values", exact: true }).click();
+      await expect(range).toHaveText("0 ns to 140 ns");
       await vscode.window.showTextDocument(source);
       const lenses = await vscode.commands.executeCommand<vscode.CodeLens[]>("vscode.executeCodeLensProvider", source);
       const replay = lenses.find((item) => item.range.start.line === 3)?.command;

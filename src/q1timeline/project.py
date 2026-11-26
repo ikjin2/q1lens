@@ -15,7 +15,7 @@ from q1timeline.analysis.trigger_counters import TRIGGER_COUNTER_PARAMETERS, tri
 from q1timeline.diagnostics import Diagnostic
 from q1timeline.external_inputs import concrete_receiver_inputs, validate_external_inputs
 from q1timeline.feedback_fifo import DEFAULT_FEEDBACK_QUEUE_CAPACITY
-from q1timeline.output.modules import ModuleConfig
+from q1timeline.output.modules import ModuleConfig, normalize_module_type
 from q1timeline.q1asm.core_devices import ExternalInputs
 from q1timeline.q1asm.ast import SourceLocation
 from q1timeline.simulation.config import validate_simulation
@@ -351,9 +351,10 @@ def _load_output_modules(specs, root, sequencers):
     for name, spec in specs.items():
         if not isinstance(spec, dict) or not isinstance(spec.get("type"), str):
             raise ValueError(f"modules.{name} requires a baseband type")
-        kind = spec["type"].upper()
+        kind = normalize_module_type(spec["type"])
+        cluster = spec.get("cluster")
         if "snapshot" in spec:
-            if set(spec) - {"type", "snapshot", "snapshot_path"} or not isinstance(spec["snapshot"], str):
+            if set(spec) - {"type", "snapshot", "snapshot_path", "cluster"} or not isinstance(spec["snapshot"], str):
                 raise ValueError(f"Invalid snapshot settings for modules.{name}")
             snapshot = json.loads((root / spec["snapshot"]).read_text(encoding="utf-8-sig"))
             path = spec.get("snapshot_path", [])
@@ -364,14 +365,15 @@ def _load_output_modules(specs, root, sequencers):
                     raise ValueError(f"Missing snapshot_path key {key!r} for {name}")
                 snapshot = snapshot[key]
             indices = {seq.id: seq.sequencer_index for seq in sequencers if seq.module == name}
-            module = ModuleConfig.from_snapshot(name, kind, snapshot, indices)
+            module = replace(ModuleConfig.from_snapshot(name, kind, snapshot, indices), cluster=cluster)
         else:
-            if set(spec) - {"type", "channel_map", "output_offsets"}:
+            if set(spec) - {"type", "channel_map", "output_offsets", "cluster", "lo_frequency_hz"}:
                 raise ValueError(f"Unknown output settings for modules.{name}")
-            module = ModuleConfig(name, kind, spec.get("channel_map", {}), spec.get("output_offsets", {}))
+            module = ModuleConfig(name, kind, spec.get("channel_map", {}), spec.get("output_offsets", {}),
+                                  cluster=cluster, lo_frequency_hz=spec.get("lo_frequency_hz", {}))
         for seq in module.channel_map:
             if (seq not in by_id or seq in owners or by_id[seq].module not in (None, name)
-                    or by_id[seq].module_type not in (None, kind)):
+                    or by_id[seq].module_type is not None and normalize_module_type(by_id[seq].module_type) != kind):
                 raise ValueError(f"Unknown or conflicting sequencer {seq!r} in modules.{name}")
             owners[seq] = name
         modules[name] = module

@@ -967,10 +967,19 @@ describe("hardware state cursor model", () => {
         for (const time of [-21, 0, 10, 20, 100, 119, 130]) {
           const summary = hardware.summarize(index, "seq0", time, basis);
           const detail = hardware.snapshot(index, "seq0", time, basis);
-          assert.deepEqual(summary, { q1: detail.q1, rt: detail.rt, warnings: detail.warnings });
+          assert.deepEqual(summary, { q1: detail.q1, rt: detail.rt, warnings: detail.warnings, alerts: detail.alerts });
+          // An alert is a warning tied to this time, so it is always one of the warnings.
+          assert.ok(detail.alerts.every((alert: string) => detail.warnings.includes(alert)));
         }
       }
     }
+    const risky = hardware.snapshot(hardware.createIndex(loop), "seq0", 119);
+    assert.ok(risky.alerts.length >= 1);
+    assert.equal(new Set(risky.alerts).size, risky.alerts.length);
+    assert.deepEqual(hardware.snapshot(hardware.createIndex(straight), "seq0", 119).alerts, []);
+    // Whether the program acquires at all does not depend on the cursor.
+    assert.equal(hardware.snapshot(hardware.createIndex(straight), "seq0", -21).program.acquires, true);
+    assert.equal(hardware.snapshot(hardware.createIndex({ sequencers: [{ id: "idle" }], events: [] }), "idle", 0).program.acquires, false);
     assert.equal(hardware.summarize(hardware.createIndex(loop), "seq0", 119).rt.status, "unknown");
     assert.equal(hardware.summarize(hardware.createIndex(branch), "seq0", 130).q1.status, "unknown");
   });

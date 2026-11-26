@@ -20,7 +20,7 @@ async function analysisDetails(page) {
 
 async function open(page, scenario, module, sequencer) {
   await page.goto(`/?case=${scenario}`);
-  await page.getByRole("button", { name: `Open ${module}: 1 sequencer`, exact: true }).click();
+  await expect(page.getByRole("button", { name: `Hide ${module}`, exact: true })).toBeVisible();
   await page.getByRole("button", { name: `Inspect sequencer ${sequencer}`, exact: true }).click();
 }
 async function at(page, time) {

@@ -47,18 +47,33 @@ def write_q1timeline_project(output_dir: Path, programs: list[Q1ASMProgram], *,
                 and program.module_type != module_types[name]):
             raise ValueError(f"Conflicting module types for {name}")
         kind = (module_types or {}).get(name, program.module_type)
-        if kind not in ("QCM", "QRM"):
+        kind = str(kind).strip().upper().replace("_", "-") if kind is not None else None
+        if kind not in ("QCM", "QRM", "QCM-RF", "QRM-RF"):
             continue
+        rf = kind.endswith("-RF")
         settings = program.settings
         channel = settings.get("channel_name", "")
         if "connected_output_indices" in settings and channel.startswith(("real_", "complex_")):
-            routes = {f"out{i}": "Q" if channel.startswith("complex_") and i % 2 else "I"
-                      for i in settings["connected_output_indices"]}
+            if rf:
+                # An RF output takes both DAC paths of one sequencer: indices 0,1 feed out0 and 2,3 feed out1.
+                routes = {f"out{i // 2}": "IQ" for i in settings["connected_output_indices"]}
+            else:
+                routes = {f"out{i}": "Q" if channel.startswith("complex_") and i % 2 else "I"
+                          for i in settings["connected_output_indices"]}
         else:
             routes = {key[8:]: path for key, path in settings.items()
                       if key.startswith("connect_out") and path != "off"}
-        module = modules.setdefault(name, {"type": kind, "channel_map": {}, "output_offsets": {}})
+        module = modules.setdefault(name, {
+            "type": kind, **({"cluster": program.path[0]} if len(program.path) >= 3 else {}),
+            "channel_map": {}, **({"lo_frequency_hz": {}} if rf else {"output_offsets": {}}),
+        })
         module["channel_map"][program.sequencer_id] = routes
+        if rf:
+            for i in range(2 if kind == "QCM-RF" else 1):
+                hertz = program.module_settings.get(f"lo{i}_freq")
+                if isinstance(hertz, (int, float)) and not isinstance(hertz, bool) and hertz >= 0:
+                    module["lo_frequency_hz"][f"out{i}"] = hertz
+            continue
         for i in range(4 if kind == "QCM" else 2):
             native = program.module_settings.get(f"offset_ch{i // 2}_path_{'IQ'[i % 2]}")
             volts = program.module_settings.get(f"out{i}_offset", native)

@@ -1,4 +1,4 @@
-"""Baseband output routing. All sample amplitudes and offsets use peak full scale."""
+"""Output routing for baseband and RF modules. Sample amplitudes and offsets use peak full scale."""
 from __future__ import annotations
 
 import math
@@ -11,7 +11,14 @@ if TYPE_CHECKING:
     from q1timeline.output import Output
 
 
-_HARDWARE = {"QCM": (4, 2.5), "QRM": (2, 0.5)}
+# Output count and baseband peak volts. An RF output carries one sequencer's I/Q pair as a
+# complex envelope ahead of the IQ mixer, so it has no baseband voltage scale.
+_HARDWARE = {"QCM": (4, 2.5), "QRM": (2, 0.5), "QCM-RF": (2, None), "QRM-RF": (1, None)}
+
+
+def normalize_module_type(value) -> str:
+    text = str(value).strip().upper().replace("_", "-").replace(" ", "-")
+    return {"QCMRF": "QCM-RF", "QRMRF": "QRM-RF"}.get(text, text)
 
 
 @dataclass(frozen=True)
@@ -21,20 +28,36 @@ class ModuleConfig:
     channel_map: dict[str, dict[str, str]]
     output_offsets: dict[str, float] = field(default_factory=dict)
     sequencer_settings: dict[str, dict] = field(default_factory=dict)
+    cluster: str | None = None
+    lo_frequency_hz: dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self):
+        object.__setattr__(self, "module_type", normalize_module_type(self.module_type))
         if self.module_type not in _HARDWARE or not isinstance(self.name, str) or not self.name:
-            raise ValueError("An output module needs a name and baseband type QCM or QRM")
+            raise ValueError("An output module needs a name and a type of QCM, QRM, QCM-RF or QRM-RF")
+        if self.cluster is not None and (not isinstance(self.cluster, str) or not self.cluster):
+            raise ValueError(f"modules.{self.name}.cluster must be a nonempty name")
         valid = {f"out{index}" for index in range(_HARDWARE[self.module_type][0])}
         if not isinstance(self.channel_map, Mapping) or not isinstance(self.output_offsets, Mapping):
             raise ValueError("channel_map and output_offsets must be mappings")
         for seq, routes in self.channel_map.items():
             if (not isinstance(seq, str) or not seq or not isinstance(routes, Mapping)
-                    or routes.keys() - valid or any(path not in ("I", "Q") for path in routes.values())):
+                    or routes.keys() - valid
+                    or any(path not in (("IQ",) if self.rf else ("I", "Q")) for path in routes.values())):
                 raise ValueError(f"Invalid {self.module_type} output routing for {seq!r}")
+        if self.rf and self.output_offsets:
+            raise ValueError(f"modules.{self.name}: RF output offsets are not modeled")
+        if not isinstance(self.lo_frequency_hz, Mapping) or any(
+                port not in valid or type(value) not in (float, int) or not math.isfinite(value) or value < 0
+                for port, value in self.lo_frequency_hz.items()):
+            raise ValueError(f"Invalid LO frequency for modules.{self.name}")
         for port, value in self.output_offsets.items():
             if port not in valid or type(value) not in (float, int) or not -1 <= value <= 1:
                 raise ValueError(f"Invalid normalized output offset for {self.name}.{port}")
+
+    @property
+    def rf(self) -> bool:
+        return _HARDWARE[self.module_type][1] is None
 
     @property
     def ports(self) -> list[str]:
@@ -49,6 +72,8 @@ class ModuleConfig:
         """
         if port not in self.ports:
             raise ValueError(f"No configured port {self.name}.{port}")
+        if self.rf:
+            raise ValueError(f"{self.name}.{port} is an RF output. Its complex envelope has no single baseband sample.")
         if type(t0) is not int or type(t1) is not int or t1 < t0 or (time_offsets is None and t0 < 0):
             raise ValueError("Expected an ordered integer-ns window; negative times require alignment offsets")
         if time_offsets is not None and not isinstance(time_offsets, Mapping):
@@ -71,13 +96,22 @@ class ModuleConfig:
     @classmethod
     def from_snapshot(cls, name: str, module_type: str, snapshot: dict, sequencers: Mapping[str, int]) -> ModuleConfig:
         """Read the selected QCoDeS module snapshot and map sequencer IDs to hardware slots."""
+        module_type = normalize_module_type(module_type)
         if module_type not in _HARDWARE:
-            raise ValueError(f"Unsupported baseband module type {module_type!r}")
+            raise ValueError(f"Unsupported output module type {module_type!r}")
         count, peak_volts = _HARDWARE[module_type]
         offsets = {}
         routes = {}
         settings = {}
+        lo = {}
         for port in range(count):
+            if peak_volts is None:
+                # Recorded LO settings label the envelope. A cropped snapshot may omit them.
+                for key in (f"out{port}_lo_freq", f"out{port}_in{port}_lo_freq"):
+                    value = snapshot.get("parameters", {}).get(key, {}).get("value")
+                    if type(value) in (float, int) and math.isfinite(value) and value >= 0:
+                        lo[f"out{port}"] = value
+                continue
             volts = _snapshot_value(snapshot, f"out{port}_offset")
             if type(volts) not in (float, int) or not math.isfinite(volts):
                 raise ValueError(f"Expected numeric out{port}_offset in volts")
@@ -113,7 +147,7 @@ class ModuleConfig:
                 static["static_phase_steps"] = round(degrees * (1_000_000_000 / 360))
             if static:
                 settings[seq] = static
-        return cls(name, module_type, routes, offsets, settings)
+        return cls(name, module_type, routes, offsets, settings, lo_frequency_hz=lo)
 
 
 def _snapshot_value(node, key):

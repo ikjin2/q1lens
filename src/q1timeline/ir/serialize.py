@@ -111,6 +111,8 @@ def timeline_ir_from_states(
         sequencer = {"id": state.sequencer_id}
         if state.metadata.get("module"):
             sequencer["module"] = state.metadata["module"]
+        if state.metadata.get("module_type"):
+            sequencer["module_type"] = state.metadata["module_type"]
         if state.metadata.get("hardware_parameters"):
             sequencer["hardware_parameters"] = _jsonable(state.metadata["hardware_parameters"])
         sequencers.append(sequencer)

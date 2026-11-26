@@ -61,6 +61,26 @@ describe("q1timeline webview message validation", () => {
     assert.deepEqual(parseWebviewMessage({ type: "webviewReady" }), { valid: true, type: "webviewReady" });
   });
 
+  it("accepts a bounded output window request and rejects malformed ones", () => {
+    const message = { type: "outputWindow", token: 3, t0: -8, t1: 4000, bins: 720, params: { N: 6, T: 20 } };
+    assert.deepEqual(parseWebviewMessage(message), { valid: true, ...message });
+    assert.deepEqual(parseWebviewMessage({ ...message, params: {} }), { valid: true, ...message, params: {} });
+    for (const invalid of [
+      { ...message, token: 0 },
+      { ...message, t1: -8 },
+      { ...message, t0: 0.5 },
+      { ...message, bins: 2001 },
+      { ...message, bins: 0 },
+      { ...message, params: { "N;": 1 } },
+      { ...message, params: { N: 1.5 } },
+      { ...message, params: [1] },
+      { ...message, params: undefined },
+      { ...message, command: "load" },
+    ]) {
+      assert.equal(parseWebviewMessage(invalid).valid, false, JSON.stringify(invalid));
+    }
+  });
+
   it("accepts execution replay preparation for a sequencer", () => {
     const message = { type: "prepareExecutionReplay", sequencerId: "seq0" };
     assert.deepEqual(parseWebviewMessage(message), { valid: true, ...message });

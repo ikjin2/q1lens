@@ -10,7 +10,6 @@ const projectRegister = (page, id) => projectValue(page, id, "registers").locato
 
 async function openJoint(page, scenario = "joint-sync-replay") {
   await page.goto(`/?case=${scenario}`);
-  await page.getByRole("button", { name: "Open QCM0: 2 sequencers", exact: true }).click();
   await page.getByRole("button", { name: "Inspect sequencer early", exact: true }).click();
   await page.getByRole("button", { name: "Execution replay", exact: true }).click();
 }
@@ -24,10 +23,9 @@ test("execution replay is opt-in inside sequencer detail and fits a narrow view"
   const manifest = await (await request.get("/manifest.json")).json();
   expect(manifest.extended_cases.find((item) => item.name === "concrete-replay")).toMatchObject({ exit_code: 0, expected_status: "completed" });
   await page.goto("/?case=concrete-replay");
-  await expect(page.getByRole("button", { name: "Open QCM0: 1 sequencer", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Inspect sequencer counter", exact: true })).toBeVisible();
   await expect(replay(page)).toBeHidden();
   await expect(page.getByRole("button", { name: "Execution replay", exact: true })).toBeHidden();
-  await page.getByRole("button", { name: "Open QCM0: 1 sequencer", exact: true }).click();
   await page.getByRole("button", { name: "Inspect sequencer counter", exact: true }).click();
   await expect(replay(page)).toBeHidden();
   await page.getByRole("button", { name: "Execution replay", exact: true }).click();
@@ -122,7 +120,6 @@ test("closing replay, leaving detail, and moving the cursor stop playback", asyn
 test("changing sequencers stops replay and closes its detail panel", async ({ page }) => {
   await freezeClock(page);
   await page.goto("/?case=bin-wrap-preview");
-  await page.getByRole("button", { name: "Open QRM0: 2 sequencers", exact: true }).click();
   await page.getByRole("button", { name: "Inspect sequencer red_tracker", exact: true }).click();
   await page.getByRole("button", { name: "Execution replay", exact: true }).click();
   await run(page).click();

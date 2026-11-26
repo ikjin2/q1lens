@@ -505,6 +505,8 @@ def _check_fir(scenario, domain, query, module, ports, max_steps, max_paths, dea
 def check_output(scenario, domain, query, *, max_steps, max_paths, deadline, include_replay):
     try:
         module = _module(scenario)
+        if module.rf:
+            raise ValueError("Output checks cover baseband ports. An RF output is shown as a complex envelope only.")
         ports = [query.port] if query.port else module.ports
         if not ports or any(p not in module.ports for p in ports):
             raise ValueError("The assertion requires a configured output port.")
